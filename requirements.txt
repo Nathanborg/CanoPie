@@ -1,0 +1,8 @@
+PyQt5>=5.15
+numpy>=1.20
+opencv-python>=4.5
+exifread>=3.0
+folium>=0.12
+shapely>=2.0
+geopy>=2.0
+scipy>=1.7
