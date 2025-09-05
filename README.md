@@ -1,8 +1,27 @@
-# CanoPie
+<img width="456" height="135" alt="logo" src="https://github.com/user-attachments/assets/8cf3f529-817b-45cb-b9ce-0315d12cea37" />
 
-This repository contains the CanoPie codebase split into individual modules.  Each class from the original
-monolithic script has been extracted into its own file under the `canopie` package.  The main entry
-point is `main.py`.
+## CanoPie
+
+This repository contains the CanoPie codebase.
+
+## Project Description
+CanoPie is an image analysis tool for RGB, multispectral, and multitemporal data, designed for forest and agricultural canopy studies. With an intuitive PyQt5-based GUI, it enables researchers to process UAV and phenocam imagery (multispectral, thermal, and RGB), draw and manage polygons for data extraction, compute image statistics, and retrieve metadata directly via ExifTool,  all without relying on heavy photogrammetry pipelines.
+
+Unlike orthomosaics, which can distort radiometry and demand large storage and computing resources, CanoPie provides fast, direct access to raw image data while preserving metadata and maintaining spectral integrity.
+<img width="800" height="800" alt="Canopie_fig1" src="https://github.com/user-attachments/assets/02aac60c-c71c-42b0-8d3c-acd9f4233f0d" />
+
+## Why CanoPie?
+Orthomosaics are useful for mapping when you need , but they come at a cost:
+-   *Require resampling and interpolation, which alters pixel values.
+-   *Blend across overlaps in the stiching process, often smoothing or distorting radiometry.
+-   *Add artifacts, shadows, or inconsistencies due to geometry and illumination differences.
+-   *Can be computationally intensive and storage-heavy.
+-   *For many ecological and forestry applications — such as monitoring specific trees, crown patches, or hundreds of individuals over time — orthomosaics are not necessary. -   *CanoPie provides a faster, lighter, and more spectrally faithful alternative.
+
+## Features
+-   **Multispectral Image Processing:** Analyze images across multiple spectral bands.
+-   **Image Annotation and Editing:** Use an intuitive graphical interface to draw and edit polygons.
+-   **Data Management:** Easily load, view, and extract  data.
 
 ## Running the application
 
@@ -23,4 +42,31 @@ python main.py
 * `image_data.py` – contains `ImageData` class.
 * `loaders.py` – contains loading worker classes.
 * `utils.py` – re-exports helper functions from the original script.
+
+## Getting Started
+
+### Prerequisites
+Before you begin, ensure you have the following installed:
+*   Python 3.x
+*   The required libraries listed in `requirements.txt`
+
+### Installation and usage
+1.  **Clone the repository** (if you haven't already):
+    ```sh
+    git clone https://github.com/Nathanborg/CanoPie.git
+    ```
+2.  **Navigate to the project directory**:
+    ```sh
+    cd CanoPie
+    ```
+3.  **Install the dependencies**:
+    ```sh
+    pip install -r requirements.txt
+    ```
+4.  **To run the main application**:
+    ```sh
+    python main.py
+    ```
+
+
 
