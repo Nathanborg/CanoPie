@@ -68,5 +68,9 @@ Before you begin, ensure you have the following installed:
     python main.py
     ```
 
+    conda create --name canopie-env python=3.10
+pip install -r requirements.txt
+
+
 
 
