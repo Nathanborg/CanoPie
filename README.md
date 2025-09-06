@@ -14,26 +14,6 @@ Orthomosaics are useful for mapping when you need , but they come at a cost:
 -   *Can be computationally intensive and storage-heavy.
 -   *For many ecological and forestry applications — such as monitoring specific trees, crown patches, or hundreds of individuals over time — orthomosaics are not necessary. -   *CanoPie provides a faster, lighter, and more spectrally faithful alternative.
 
-## Running the application
-
-Install dependencies listed in `requirements.txt` and run:
-
-```bash
-python main.py
-```
-
-## Structure
-
-* `main_window.py` – contains `MainWindow` class.
-* `project_tab.py` – contains `ProjectTab` class with imports of helpers and managers.
-* `polygon_manager.py` – contains `PolygonManager` class.
-* `machine_learning_manager.py` – contains machine learning dialogs.
-* `image_viewer.py` – contains image viewing and editable polygon items.
-* `image_editor_dialog.py` – contains image editing dialog.
-* `image_data.py` – contains `ImageData` class.
-* `loaders.py` – contains loading worker classes.
-* `utils.py` – re-exports helper functions from the original script.
-
 ## Getting Started
 
 ### Prerequisites
