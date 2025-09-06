@@ -7,8 +7,9 @@ opencv_python==4.10.0.84
 Pillow
 PyQt5==5.15.11
 PyQt5_sip
-scikit_learn==1.7.1
+scikit_learn
 scipy
-Shapely==2.1.1
+Shapely
 sip==6.7.12
-tifffile==2025.1.10
+tifffile
+imagecodecs
