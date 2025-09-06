@@ -40,27 +40,23 @@ Before you begin, ensure you have the following installed:
     ```
 ### Installation and Usage (Conda)
 
-
-# 1. Create and activate environment
+1. **Create and activate environment**
 ```sh
 conda create --name canopie-env python=3.10 -y
-conda activate canopie-env
-```
+conda activate canopie-env```
 
-# 2. Navigate to the project directory
-```
+2. **Navigate to the project directory**
+```sh
 cd CanoPie
-```sh
-# 3. Install dependencies
 ```
-
+3. **Install dependencies**
+```sh
 pip install -r requirements.txt
-```sh
-# 4. (Optional) Run CanoPie
 ```
-
-python main.py
+4. **Run CanoPie**
 ```sh
+python main.py
+```
 
 
 
