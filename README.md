@@ -58,6 +58,10 @@ pip install -r requirements.txt
 python main.py
 ```
 
+### Project status
+CanoPie is an early-stage collaborative project intirelly python-based developed by and for the research community. 
+As a project in active development, it welcomes contributions from researchers, developers, 
+and users interested in advancing open-source tools for environmental and agricultural monitoring.
 
 
 
