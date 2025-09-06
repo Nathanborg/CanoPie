@@ -44,7 +44,7 @@ Before you begin, ensure you have the following installed:
 ```sh
 conda create --name canopie-env python=3.10 -y
 conda activate canopie-env```
-
+```
 2. **Navigate to the project directory**
 ```sh
 cd CanoPie
