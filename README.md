@@ -18,11 +18,6 @@ Orthomosaics are useful for mapping when you need , but they come at a cost:
 -   *Can be computationally intensive and storage-heavy.
 -   *For many ecological and forestry applications — such as monitoring specific trees, crown patches, or hundreds of individuals over time — orthomosaics are not necessary. -   *CanoPie provides a faster, lighter, and more spectrally faithful alternative.
 
-## Features
--   **Multispectral Image Processing:** Analyze images across multiple spectral bands.
--   **Image Annotation and Editing:** Use an intuitive graphical interface to draw and edit polygons.
--   **Data Management:** Easily load, view, and extract  data.
-
 ## Running the application
 
 Install dependencies listed in `requirements.txt` and run:
@@ -50,7 +45,7 @@ Before you begin, ensure you have the following installed:
 *   Python 3.x
 *   The required libraries listed in `requirements.txt`
 
-### Installation and usage
+### Installation and usage Python
 1.  **Clone the repository** (if you haven't already):
     ```sh
     git clone https://github.com/Nathanborg/CanoPie.git
@@ -67,9 +62,18 @@ Before you begin, ensure you have the following installed:
     ```sh
     python main.py
     ```
+### Installation and usage Conda
 
-    conda create --name canopie-env python=3.10
-pip install -r requirements.txt
+    ```sh
+ 1.    conda create --name canopie-env python=3.10
+    ```
+ 2.  **Navigate to the project directory**:
+    ```sh
+    cd CanoPie
+    ```sh
+ 3.    pip install -r requirements.txt
+    ```
+
 
 
 
