@@ -40,7 +40,7 @@ python main.py
 
 ### Prerequisites
 Before you begin, ensure you have the following installed:
-*   Python 3.x
+*   Python 3.1
 *   The required libraries listed in `requirements.txt`
 
 ### Installation and usage Python
@@ -60,17 +60,21 @@ Before you begin, ensure you have the following installed:
     ```sh
     python main.py
     ```
-### Installation and usage Conda
+### Installation and Usage (Conda)
 
-    ```sh
- 1.    conda create --name canopie-env python=3.10
-    ```
- 2.  **Navigate to the project directory**:
-    ```sh
-    cd CanoPie
-    ```sh
- 3.    pip install -r requirements.txt
-    ```
+```sh
+# 1. Create and activate environment
+conda create --name canopie-env python=3.10 -y
+conda activate canopie-env
+
+# 2. Navigate to the project directory
+cd CanoPie
+
+# 3. Install dependencies
+pip install -r requirements.txt
+
+# 4. (Optional) Run CanoPie
+python main.py
 
 
 
