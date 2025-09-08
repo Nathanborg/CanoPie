@@ -1,6 +1,3 @@
-"""Auto-generated module extracted from original CanoPie code."""
-
-
 import sys
 import os
 import re
@@ -4127,6 +4124,14 @@ class ProjectTab(QtWidgets.QWidget):
             except Exception:
                 a_min, a_max = float(a.min()), float(a.max())
             looks_beyond_8bit = (a_max - a_min) > 255.0 or a_max > 255.0
+            
+            def _nn(x): 
+                return None if (x is None or not np.isfinite(x)) else float(x)
+
+            if stats_cfg.get('mean'):   out['Mean']   = _nn(np.nanmean(a))
+            if stats_cfg.get('median'): out['Median'] = _nn(np.nanmedian(a))
+            if stats_cfg.get('std'):    out['Standard Deviation'] = _nn(np.nanstd(a, ddof=0))
+
 
             if stats_cfg.get('mean'):   out['Mean']   = float(np.mean(a))
             if stats_cfg.get('median'): out['Median'] = float(np.median(a))
@@ -4143,9 +4148,9 @@ class ProjectTab(QtWidgets.QWidget):
             for q_orig, q_for_np in q_norm:
                 try:
                     try:
-                        q_val = np.percentile(a, q_for_np, method='nearest')
+                        q_val = np.nanpercentile(a, q_for_np, method='nearest')
                     except TypeError:
-                        q_val = np.percentile(a, q_for_np, interpolation='nearest')
+                        q_val = np.nanpercentile(a, q_for_np, interpolation='nearest')
                 except Exception:
                     q_val = np.nan
                 if orig_is_int or looks_beyond_8bit:
@@ -4154,6 +4159,7 @@ class ProjectTab(QtWidgets.QWidget):
                     q_val = float(q_val) if np.isfinite(q_val) else None
                 q_str = (str(q_orig).rstrip('0').rstrip('.') if isinstance(q_orig, float) else str(q_orig))
                 out[f'Q{q_str}'] = q_val
+
             return out
 
         # ===================== SPEED TWEAKS START (cache + I/O gate) =====================
@@ -4236,14 +4242,16 @@ class ProjectTab(QtWidgets.QWidget):
                 local_map = {k: v.astype(np.float32, copy=False) for k, v in bmap_arrays.items()}
                 with np.errstate(divide='ignore', invalid='ignore', over='ignore', under='ignore'):
                     res = eval(code, env, local_map)
-                return np.nan_to_num(np.asarray(res, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+                return np.asarray(res, dtype=np.float32)  # keep NaNs/±Inf; let stats handle them
+
             else:
                 local_map = {k: float(v[yi, xi]) for k, v in bmap_arrays.items()}
                 with np.errstate(divide='ignore', invalid='ignore', over='ignore', under='ignore'):
                     res = eval(code, env, local_map)
                 try: res = float(res)
-                except Exception: res = float(np.nan)
-                return 0.0 if not np.isfinite(res) else res
+                except Exception: res = float('nan')
+                return res if np.isfinite(res) else float('nan')
+
 
         # Scene stats (once per image)
         scene_stats = {}
