@@ -53,7 +53,7 @@ It should run on other operating systems (Linux, macOS) as long as Python 3.10+ 
 conda create --name canopie-env python=3.10 -y
 conda activate canopie-env```
 ```
-3. **Navigate to the project directory**
+3. **Navigate to the project directory (Folder where canopy)**
 ```sh
 cd CanoPie
 ```
