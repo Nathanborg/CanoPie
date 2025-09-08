@@ -1,23 +1,3 @@
-"""Utility functions and constants for CanoPie.
-
-This module re‑exports a selection of constants and helper functions
-from the original :mod:`CanoPie_V_1_0_0` module.  Exposing these
-symbols here makes it simpler for other modules in the package to
-depend on them without pulling in the entire monolithic file.  The
-functions cover a range of image normalisation, geometry and band
-expression helpers, as well as basic vegetation indices.
-
-Note that duplicates of some helper functions exist in the original
-module.  Importing them through this module ensures that only one
-definition is used consistently throughout the code base.
-"""
-
-# We replicate a handful of constants and helper functions from the original
-# CanoPie implementation here.  Defining them locally avoids the need for
-# external dependencies on the original monolithic file.  Any modules within
-# this package that relied on those symbols can import them directly from
-# this module.  Where possible we mirror the original implementations exactly.
-
 import os
 import json
 import tempfile
@@ -26,8 +6,7 @@ import logging
 import numpy as np
 import cv2
 
-# Stretch/normalisation parameters used for image display.  See the original
-# CanoPie code for further context.
+
 STRETCH_LOW_P = 0.05
 STRETCH_HIGH_P = 99.5
 STRETCH_PER_CHANNEL = True

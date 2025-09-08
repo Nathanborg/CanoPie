@@ -1,6 +1,3 @@
-"""Auto-generated module extracted from original CanoPie code."""
-
-
 import sys
 import os
 import re
@@ -123,6 +120,29 @@ class MachineLearningManager(QtWidgets.QDialog):
 
         self.populate_polygon_groups()
 
+    def _rotate_any_channels(self, img, rot):
+        """Rotate 2D or HxWxC arrays; supports C > 4 using NumPy."""
+        import numpy as np, cv2
+        if rot not in (90, 180, 270):
+            return img
+        if img.ndim == 2 or (img.ndim == 3 and img.shape[2] <= 4):
+            if rot == 90:  return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+            if rot == 180: return cv2.rotate(img, cv2.ROTATE_180)
+            return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        # C > 4 → per-channel via rot90 (CCW): 90° CW == 3×CCW
+        k = {90: 3, 180: 2, 270: 1}[rot]
+        return np.stack([np.rot90(img[:, :, i], k=k) for i in range(img.shape[2])], axis=2)
+
+    def _resize_any_channels(self, img, new_w, new_h, interpolation):
+        """Resize 2D or HxWxC arrays; supports C > 4 via per-channel loop."""
+        import numpy as np, cv2
+        if img.ndim == 2:
+            return cv2.resize(img, (new_w, new_h), interpolation=interpolation)
+        C = img.shape[2]
+        if C <= 4:
+            return cv2.resize(img, (new_w, new_h), interpolation=interpolation)
+        chans = [cv2.resize(img[:, :, i], (new_w, new_h), interpolation=interpolation) for i in range(C)]
+        return np.stack(chans, axis=2)
 
     def _ensure_hwc(self, arr):
         """Return 2D or HxWxC. Accepts (bands,H,W) and (pages,H,W[,samples]) stacks."""
@@ -175,17 +195,17 @@ class MachineLearningManager(QtWidgets.QDialog):
         Tolerant eval for export:
           - If expr references unknown names or bands > available, return None (caller skips appending).
           - Silences numpy warnings; returns float32 2D when ok.
+          - PRESERVES NaNs/Infs so downstream stats/CSV can reflect missing data.
         """
-        import numpy as np, logging
+        import numpy as np, logging, re
         if not expr:
             return None
 
-        x = np.nan_to_num(img_float.astype(np.float32, copy=False))
+        x = img_float.astype(np.float32, copy=False)  # keep NaNs; no nan_to_num here
         C = 1 if x.ndim == 2 else (x.shape[2] if x.ndim == 3 else 0)
         if C == 0:
             return None
 
-        # Build mapping
         mapping = {'b1': x} if x.ndim == 2 else {f"b{i+1}": x[:, :, i] for i in range(C)}
 
         code = compile(expr, "<expr>", "eval")
@@ -194,8 +214,6 @@ class MachineLearningManager(QtWidgets.QDialog):
                 logging.warning("Illegal name '%s' in band expr '%s' (export); skipping index.", name, expr)
                 return None
 
-        # Quick band-number guard (e.g., asks for b4 but only 1 band)
-        import re
         req = sorted({int(b) for b in re.findall(r'b(\d+)', expr)})
         if any(b > C for b in req):
             logging.warning("Expr '%s' requests b%d but only %d band(s) available; skipping index.",
@@ -206,13 +224,15 @@ class MachineLearningManager(QtWidgets.QDialog):
             res = eval(code, {"__builtins__": {}}, mapping)
 
         if not isinstance(res, np.ndarray):
-            res = np.full(x.shape[:2], float(res), dtype=np.float32)
-        else:
-            if res.ndim == 3:
-                res = np.mean(res.astype(np.float32, copy=False), axis=2)
-            res = np.nan_to_num(res.astype(np.float32, copy=False),
-                                nan=0.0, posinf=0.0, neginf=0.0)
-        return res
+            try:
+                r = float(res)
+            except Exception:
+                r = float('nan')
+            return np.full(x.shape[:2], r, dtype=np.float32)
+
+        if res.ndim == 3:
+            res = np.mean(res.astype(np.float32, copy=False), axis=2)
+        return res.astype(np.float32, copy=False)  # keep NaNs; no nan_to_num
 
     def _apply_ax_to_raw(self, raw_img, ax):
         """
@@ -258,12 +278,7 @@ class MachineLearningManager(QtWidgets.QDialog):
             nonlocal img
             if rot in (90, 180, 270):
                 try:
-                    if rot == 90:
-                        img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
-                    elif rot == 180:
-                        img = cv2.rotate(img, cv2.ROTATE_180)
-                    else:
-                        img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                    img = self._rotate_any_channels(img, rot)
                 except Exception as e:
                     logging.warning(f"Rotation failed ({rot} deg): {e}")
 
@@ -331,7 +346,8 @@ class MachineLearningManager(QtWidgets.QDialog):
                 ph = float(resize.get("height", 100)) / 100.0
                 new_w = max(1, int(round(w0 * pw)))
                 new_h = max(1, int(round(h0 * ph)))
-            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            img = self._resize_any_channels(img, new_w, new_h, interpolation=cv2.INTER_AREA)
+
 
         def _do_band_expr():
             nonlocal img
@@ -849,15 +865,16 @@ class MachineLearningManager(QtWidgets.QDialog):
                             if any_rgb:
                                 for i in range(3):
                                     vals = chans[i][mask == 255] if i < len(chans) else np.array([])
-                                    means.append(float(vals.mean()) if vals.size else np.nan)
+                                    means.append(float(np.nanmean(vals)) if vals.size else np.nan)
                                 for i in range(max_extras):
                                     b = 3 + i
                                     vals = chans[b][mask == 255] if b < len(chans) else np.array([])
-                                    means.append(float(vals.mean()) if vals.size else np.nan)
+                                    means.append(float(np.nanmean(vals)) if vals.size else np.nan)
                             else:
                                 for i in range(max_small):
                                     vals = chans[i][mask == 255] if i < len(chans) else np.array([])
-                                    means.append(float(vals.mean()) if vals.size else np.nan)
+                                    means.append(float(np.nanmean(vals)) if vals.size else np.nan)
+
                             row = [group_name, filepath] + means
                             all_rows.append(dict(zip(header, row)))
 
