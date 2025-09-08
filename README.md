@@ -21,6 +21,10 @@ Before you begin, ensure you have the following installed:
 *   Python 3.1
 *   The required libraries listed in `requirements.txt`
 
+### Platform support
+CanoPie has been developed and tested on **Windows 10/11**.  
+It should run on other operating systems (Linux, macOS) as long as Python 3.10+ and all dependencies are correctly installed, but cross-platform support has not been fully tested yet.  
+
 ### Installation and usage Python
 1.  **Clone the repository** (if you haven't already):
     ```sh
@@ -40,16 +44,20 @@ Before you begin, ensure you have the following installed:
     ```
 ### Installation and Usage (Conda)
 
-1. **Create and activate environment**
+1. **Install Miniconda/Conda (if not already installed)**  
+   Download and install Miniconda for your operating system from:  
+   [https://docs.conda.io/en/latest/miniconda.html](https://docs.conda.io/en/latest/miniconda.html)  
+
+2. **Create and activate environment**
 ```sh
 conda create --name canopie-env python=3.10 -y
 conda activate canopie-env```
 ```
-2. **Navigate to the project directory**
+3. **Navigate to the project directory**
 ```sh
 cd CanoPie
 ```
-3. **Install dependencies**
+4. **Install dependencies**
 ```sh
 pip install -r requirements.txt
 ```
@@ -62,6 +70,9 @@ python main.py
 CanoPie is an early-stage collaborative project intirelly python-based developed by and for the research community. 
 As a project in active development, it welcomes contributions from researchers, developers, 
 and users interested in advancing open-source tools for environmental and agricultural monitoring.
+
+
+
 
 
 
