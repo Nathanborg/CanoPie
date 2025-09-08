@@ -4108,6 +4108,7 @@ class ProjectTab(QtWidgets.QWidget):
         def _calc_stats(array_1d):
             out = {}
             qs = stats_cfg.get('quantiles', []) or []
+
             if array_1d is None or (hasattr(array_1d, "size") and array_1d.size == 0):
                 if stats_cfg.get('mean'):   out['Mean'] = None
                 if stats_cfg.get('median'): out['Median'] = None
@@ -4117,31 +4118,41 @@ class ProjectTab(QtWidgets.QWidget):
                     out[f'Q{q_str}'] = None
                 return out
 
-            orig_is_int = np.issubdtype(array_1d.dtype, np.integer)
+            # Detect original integer-ness BEFORE casting for math
+            orig_is_int = np.issubdtype(np.asarray(array_1d).dtype, np.integer)
+
             a = np.asarray(array_1d, dtype=np.float64)
-            try:
-                a_min = float(np.nanmin(a)); a_max = float(np.nanmax(a))
-            except Exception:
-                a_min, a_max = float(a.min()), float(a.max())
-            looks_beyond_8bit = (a_max - a_min) > 255.0 or a_max > 255.0
-            
-            def _nn(x): 
-                return None if (x is None or not np.isfinite(x)) else float(x)
 
-            if stats_cfg.get('mean'):   out['Mean']   = _nn(np.nanmean(a))
-            if stats_cfg.get('median'): out['Median'] = _nn(np.nanmedian(a))
-            if stats_cfg.get('std'):    out['Standard Deviation'] = _nn(np.nanstd(a, ddof=0))
+            def _cast_num(x, round_int=False):
+                if x is None or not np.isfinite(x):
+                    return None
+                if round_int:
+                    return int(np.rint(x))
+                return float(x)
 
+            # Mean / Std are normally floats even for integer arrays
+            if stats_cfg.get('mean'):
+                out['Mean'] = _cast_num(np.nanmean(a))
+            if stats_cfg.get('std'):
+                out['Standard Deviation'] = _cast_num(np.nanstd(a, ddof=0))
 
-            if stats_cfg.get('mean'):   out['Mean']   = float(np.mean(a))
-            if stats_cfg.get('median'): out['Median'] = float(np.median(a))
-            if stats_cfg.get('std'):    out['Standard Deviation'] = float(np.std(a, ddof=0))
+            # Median: use percentile(50) with nearest to align with your quantile policy
+            if stats_cfg.get('median'):
+                try:
+                    med = np.nanpercentile(a, 50, method='nearest')  # numpy >=1.22
+                except TypeError:
+                    med = np.nanpercentile(a, 50, interpolation='nearest')  # older numpy
+                out['Median'] = _cast_num(med, round_int=orig_is_int)
 
+            # Quantiles
             q_norm = []
             for q in qs:
-                try: qf = float(q)
-                except Exception: continue
-                if 0.0 <= qf <= 1.0: qf *= 100.0
+                try:
+                    qf = float(q)
+                except Exception:
+                    continue
+                if 0.0 <= qf <= 1.0:
+                    qf *= 100.0
                 qf = 0.0 if qf < 0.0 else (100.0 if qf > 100.0 else qf)
                 q_norm.append((q, qf))
 
@@ -4153,16 +4164,13 @@ class ProjectTab(QtWidgets.QWidget):
                         q_val = np.nanpercentile(a, q_for_np, interpolation='nearest')
                 except Exception:
                     q_val = np.nan
-                if orig_is_int or looks_beyond_8bit:
-                    q_val = int(round(q_val)) if np.isfinite(q_val) else None
-                else:
-                    q_val = float(q_val) if np.isfinite(q_val) else None
+
+                q_val_out = _cast_num(q_val, round_int=orig_is_int)
                 q_str = (str(q_orig).rstrip('0').rstrip('.') if isinstance(q_orig, float) else str(q_orig))
-                out[f'Q{q_str}'] = q_val
+                out[f'Q{q_str}'] = q_val_out
 
             return out
 
-        # ===================== SPEED TWEAKS START (cache + I/O gate) =====================
         cache = getattr(self, "_export_cache", None)
         cache_lock = getattr(self, "_export_cache_lock", None)
         cached_tuple = None
@@ -4376,7 +4384,8 @@ class ProjectTab(QtWidgets.QWidget):
                     if len(chans) > 3:
                         for i_extra, ch in enumerate(chans[3:], start=4):
                             channel_name = f"band_{i_extra}"
-                            v = np.array([ch[yi, xi]], dtype=np.float32)
+                            v = np.array([ch[yi, xi]])
+
                             channel_stats = _calc_stats(v)
                             row = {
                                 "Project": os.path.basename(os.path.normpath(self.project_folder)) if self.project_folder else "N/A",
@@ -4489,10 +4498,11 @@ class ProjectTab(QtWidgets.QWidget):
                 blue_channel  = chans[2][mask_bool]
 
                 channel_triplets = {
-                    "R": red_channel.astype(float, copy=False),
-                    "G": green_channel.astype(float, copy=False),
-                    "B": blue_channel.astype(float, copy=False),
+                    "R": red_channel,
+                    "G": green_channel,
+                    "B": blue_channel,
                 }
+
 
                 # RF (optional)
                 if rf_enabled:
@@ -4555,7 +4565,7 @@ class ProjectTab(QtWidgets.QWidget):
                 if len(chans) > 3:
                     for i_extra, ch in enumerate(chans[3:], start=4):
                         channel_name = f"band_{i_extra}"
-                        channel_pixels = ch[mask_bool].astype(float, copy=False)
+                        channel_pixels = ch[mask_bool]
                         if channel_pixels.size == 0:
                             continue
                         channel_stats = _calc_stats(channel_pixels)
