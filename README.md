@@ -54,9 +54,9 @@ conda create --name canopie-env python=3.10 -y
 conda activate canopie-env```
 ```
 3.**Clone the repository** (if you haven't already) or download the raw file andextract:
-    ```sh
+```sh
     git clone https://github.com/Nathanborg/CanoPie.git
-    ```
+```
 4. **Navigate to the project directory (Folder where CanoPie was stored and extracted)**
 ```sh
 cd CanoPie
