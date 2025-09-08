@@ -51,7 +51,7 @@ It should run on other operating systems (Linux, macOS) as long as Python 3.10+ 
 2. **Create and activate environment**
 ```sh
 conda create --name canopie-env python=3.10 -y
-conda activate canopie-env```
+conda activate canopie-env
 ```
 3.**Clone the repository** (if you haven't already) or download the raw file andextract:
 ```sh
