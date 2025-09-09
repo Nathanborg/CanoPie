@@ -18,7 +18,7 @@ Orthomosaics are useful for mapping when you need , but they come at a cost:
 
 ### Prerequisites
 Before you begin, ensure you have the following installed:
-*   Python 3.1
+*   Python 3.1.0
 *   The required libraries listed in `requirements.txt`
 
 ### Platform support
