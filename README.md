@@ -39,7 +39,7 @@ conda activate canopie-env
 3.**Clone the repository** (if you haven't already) or download the raw file (on the top) and extract from zipfile
 anywhere in your computer:
 ```sh
-    git clone https://github.com/Nathanborg/CanoPie.git
+git clone https://github.com/Nathanborg/CanoPie.git
 ```
 4. **Navigate to the project directory (Folder where CanoPie was stored and extracted)**
 ```sh
