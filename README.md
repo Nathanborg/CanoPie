@@ -25,23 +25,6 @@ Before you begin, ensure you have the following installed:
 CanoPie has been developed and tested on **Windows 10/11**.  
 It should run on other operating systems (Linux, macOS) as long as Python 3.10+ and all dependencies are correctly installed, but cross-platform support has not been fully tested yet.  
 
-### Installation and usage Python
-1.  **Clone the repository** (if you haven't already) or download the raw file and extract:
-    ```sh
-    git clone https://github.com/Nathanborg/CanoPie.git
-    ```
-2.  **Navigate to the project directory**:
-    ```sh
-    cd CanoPie
-    ```
-3.  **Install the dependencies**:
-    ```sh
-    pip install -r requirements.txt
-    ```
-4.  **To run the main application**:
-    ```sh
-    python main.py
-    ```
 ### Installation and Usage (Conda)
 
 1. **Install Miniconda/Conda (if not already installed)**  
@@ -53,7 +36,8 @@ It should run on other operating systems (Linux, macOS) as long as Python 3.10+ 
 conda create --name canopie-env python=3.10 -y
 conda activate canopie-env
 ```
-3.**Clone the repository** (if you haven't already) or download the raw file andextract:
+3.**Clone the repository** (if you haven't already) or download the raw file (on the top) and extract from zipfile
+anywhere in your computer:
 ```sh
     git clone https://github.com/Nathanborg/CanoPie.git
 ```
