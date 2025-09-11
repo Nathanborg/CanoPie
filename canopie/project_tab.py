@@ -1,3 +1,4 @@
+import sip
 import sys
 import os
 import re
@@ -15,6 +16,7 @@ import threading
 import pickle
 import concurrent.futures
 import copy
+
 
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
@@ -42,7 +44,7 @@ from PyQt5.QtWidgets import (
     QSizePolicy, QStyle, QShortcut, QAbstractSlider
 )
 
-import sip
+
 
 # Prevent logging from writing to files by removing filename and file handlers
 _original_basicConfig = logging.basicConfig
@@ -64,6 +66,282 @@ from .image_data import ImageData
 from .loaders import _LoaderSignals, _ImageLoadRunnable, ImageProcessor, ImageLoaderWorker
 from .utils import *
 
+class _StretchParams(object):
+    def __init__(self, mode="percentile", low_p=0.5, high_p=99.5,
+                 k_sigma=1.0, min_val=None, max_val=None,
+                 per_channel=True, clip=True, scope="viewer",
+                 display_band=None,                 # single-band index or None
+                 display_mode="auto",               # "auto" | "single" | "rgb"
+                 r_band=None, g_band=None, b_band=None):  # for RGB compose
+        self.mode = mode
+        self.low_p = float(low_p)
+        self.high_p = float(high_p)
+        self.k_sigma = float(k_sigma)
+        self.min_val = None if min_val is None else float(min_val)
+        self.max_val = None if max_val is None else float(max_val)
+        self.per_channel = bool(per_channel)
+        self.clip = bool(clip)
+        self.scope = scope
+        self.display_band = (None if display_band is None else int(display_band))
+        self.display_mode = str(display_mode or "auto").lower()
+        self.r_band = (None if r_band is None else int(r_band))
+        self.g_band = (None if g_band is None else int(g_band))
+        self.b_band = (None if b_band is None else int(b_band))
+
+class ImageStretchDialog(QtWidgets.QDialog):
+    resetRequested = QtCore.pyqtSignal(str)
+
+    def __init__(self, parent, base_image, initial_params=None):
+        super().__init__(parent)
+        self.setWindowTitle("Stretch Viewer")
+        self._img = base_image
+        self._init = initial_params or _StretchParams()
+
+        # stats image (unchanged)
+        try:
+            stats_img = _preview_take3(self._img, prefer_last_band=False)
+        except Exception:
+            stats_img = self._img
+        s = _sample_for_stats(stats_img)
+        import numpy as np
+        self._real_min = float(np.nanmin(s)) if s is not None else 0.0
+        self._real_max = float(np.nanmax(s)) if s is not None else 1.0
+
+        # --- UI ---
+        self.mode_percent = QtWidgets.QRadioButton("Percentiles")
+        self.mode_sigma   = QtWidgets.QRadioButton("±σ")
+        self.mode_abs     = QtWidgets.QRadioButton("Absolute range")
+        group = QtWidgets.QButtonGroup(self); group.setExclusive(True)
+        group.addButton(self.mode_percent); group.addButton(self.mode_sigma); group.addButton(self.mode_abs)
+        modes = QtWidgets.QHBoxLayout(); modes.addWidget(self.mode_percent); modes.addWidget(self.mode_sigma); modes.addWidget(self.mode_abs)
+
+        # Percentiles
+        self.sp_low  = QtWidgets.QDoubleSpinBox(); self.sp_low.setRange(0.0,100.0); self.sp_low.setDecimals(2)
+        self.sp_high = QtWidgets.QDoubleSpinBox(); self.sp_high.setRange(0.0,100.0); self.sp_high.setDecimals(2)
+        self.sp_low.setValue(self._init.low_p); self.sp_high.setValue(self._init.high_p)
+
+        # Sigma
+        self.cb_k = QtWidgets.QComboBox()
+        for k in (0.5, 1.0, 1.5, 2.0):
+            self.cb_k.addItem(f"{k}σ", k)
+        try:
+            idx = [0.5,1.0,1.5,2.0].index(min([0.5,1.0,1.5,2.0], key=lambda v: abs(v - self._init.k_sigma)))
+        except ValueError:
+            idx = 1
+        self.cb_k.setCurrentIndex(idx)
+
+        # Absolute
+        self.lb_range = QtWidgets.QLabel(f"Data range: [{self._real_min:.4g}, {self._real_max:.4g}]")
+        self.sp_min = QtWidgets.QDoubleSpinBox(); self.sp_min.setRange(-1e12, 1e12); self.sp_min.setDecimals(6)
+        self.sp_max = QtWidgets.QDoubleSpinBox(); self.sp_max.setRange(-1e12, 1e12); self.sp_max.setDecimals(6)
+        self.sp_min.setValue(self._init.min_val if self._init.min_val is not None else self._real_min)
+        self.sp_max.setValue(self._init.max_val if self._init.max_val is not None else self._real_max)
+
+        # Common toggles
+        self.cb_perch = QtWidgets.QCheckBox("Per channel"); self.cb_perch.setChecked(self._init.per_channel)
+        self.cb_clip  = QtWidgets.QCheckBox("Clip to [0,1]"); self.cb_clip.setChecked(self._init.clip)
+
+        # Scope
+        self.cb_scope_root    = QtWidgets.QCheckBox("Apply to this root")
+        self.cb_scope_project = QtWidgets.QCheckBox("Apply to whole project")
+
+        # ---------- Display mode & band pickers (NEW) ----------
+        # channels count
+        try:
+            C = self._img.shape[2] if (hasattr(self._img, "ndim") and self._img.ndim == 3) else 1
+        except Exception:
+            C = 1
+
+        self.cb_disp_mode = QtWidgets.QComboBox()
+        self.cb_disp_mode.addItem("Auto (default)", "auto")
+        self.cb_disp_mode.addItem("Single band (gray)", "single")
+        self.cb_disp_mode.addItem("RGB composite", "rgb")
+        # disable RGB if fewer than 3 channels
+        if C < 3:
+            idx_rgb = self.cb_disp_mode.findData("rgb")
+            self.cb_disp_mode.model().item(idx_rgb).setEnabled(False)
+
+        # single-band chooser
+        self.cb_band = QtWidgets.QComboBox()
+        self.cb_band.addItem("Band 1 (gray)", 0)
+        for b in range(1, C):
+            self.cb_band.addItem(f"Band {b+1}", b)
+
+        # RGB choosers (R,G,B)
+        self.cb_r = QtWidgets.QComboBox(); self.cb_g = QtWidgets.QComboBox(); self.cb_b = QtWidgets.QComboBox()
+        for combo in (self.cb_r, self.cb_g, self.cb_b):
+            for b in range(C):
+                combo.addItem(f"Band {b+1}", b)
+        # init from incoming params
+        # display mode
+        mode_init = (self._init.display_mode or "auto").lower()
+        mi = self.cb_disp_mode.findData(mode_init)
+        if mi != -1:
+            self.cb_disp_mode.setCurrentIndex(mi)
+        # single
+        if self._init.display_band is not None:
+            idx = self.cb_band.findData(int(self._init.display_band))
+            if idx != -1:
+                self.cb_band.setCurrentIndex(idx)
+        # rgb
+        for combo, val in ((self.cb_r, self._init.r_band), (self.cb_g, self._init.g_band), (self.cb_b, self._init.b_band)):
+            if val is not None:
+                ix = combo.findData(int(val))
+                if ix != -1:
+                    combo.setCurrentIndex(ix)
+
+        # visibility toggling
+        def _toggle_display_widgets():
+            mode = self.cb_disp_mode.currentData()
+            self.cb_band.setVisible(mode == "single")
+            self.cb_r.setVisible(mode == "rgb")
+            self.cb_g.setVisible(mode == "rgb")
+            self.cb_b.setVisible(mode == "rgb")
+        self.cb_disp_mode.currentIndexChanged.connect(_toggle_display_widgets)
+        _toggle_display_widgets()
+        # -------------------------------------------------------
+
+        # Layout
+        grid = QtWidgets.QFormLayout()
+        grid.addRow("Display:", self.cb_disp_mode)         # NEW
+        grid.addRow("Single band:", self.cb_band)          # NEW (auto hidden)
+        row_rgb = QtWidgets.QHBoxLayout()                  # NEW (auto hidden)
+        row_rgb.addWidget(QtWidgets.QLabel("R:")); row_rgb.addWidget(self.cb_r)
+        row_rgb.addWidget(QtWidgets.QLabel("G:")); row_rgb.addWidget(self.cb_g)
+        row_rgb.addWidget(QtWidgets.QLabel("B:")); row_rgb.addWidget(self.cb_b)
+        grid.addRow("RGB bands:", row_rgb)
+
+        grid.addRow("Mode:", modes)
+        grid.addRow("Low percentile:", self.sp_low)
+        grid.addRow("High percentile:", self.sp_high)
+        grid.addRow("±σ:", self.cb_k)
+        grid.addRow(self.lb_range)
+        grid.addRow("Absolute min:", self.sp_min)
+        grid.addRow("Absolute max:", self.sp_max)
+        grid.addRow(self.cb_perch)
+        grid.addRow(self.cb_clip)
+        grid.addRow(self.cb_scope_root)
+        grid.addRow(self.cb_scope_project)
+
+        # Buttons (incl. resets)
+        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        self._btn_reset_img  = btns.addButton("Reset image", QtWidgets.QDialogButtonBox.ActionRole)
+        self._btn_reset_root = btns.addButton("Reset root",  QtWidgets.QDialogButtonBox.ActionRole)
+        self._btn_reset_all  = btns.addButton("Reset all",   QtWidgets.QDialogButtonBox.ActionRole)
+        self._btn_reset_img.clicked.connect(lambda: (self.resetRequested.emit("viewer"), self.accept()))
+        self._btn_reset_root.clicked.connect(lambda: (self.resetRequested.emit("root"), self.accept()))
+        self._btn_reset_all.clicked.connect(lambda: (self.resetRequested.emit("project"), self.accept()))
+        btns.accepted.connect(self.accept); btns.rejected.connect(self.reject)
+
+        v = QtWidgets.QVBoxLayout(self); v.addLayout(grid); v.addWidget(btns)
+
+        # Radio enable/disable
+        self.mode_percent.toggled.connect(self._update_enabled)
+        self.mode_sigma.toggled.connect(self._update_enabled)
+        self.mode_abs.toggled.connect(self._update_enabled)
+        m = (self._init.mode or "percentile").lower()
+        (self.mode_percent if m=="percentile" else self.mode_sigma if m=="stddev" else self.mode_abs).setChecked(True)
+        self._update_enabled()
+
+    def _update_enabled(self):
+        p = self.mode_percent.isChecked(); s = self.mode_sigma.isChecked(); a = self.mode_abs.isChecked()
+        self.sp_low.setEnabled(p); self.sp_high.setEnabled(p)
+        self.cb_k.setEnabled(s)
+        self.sp_min.setEnabled(a); self.sp_max.setEnabled(a)
+
+    def get_params(self):
+        mode = "percentile" if self.mode_percent.isChecked() else ("stddev" if self.mode_sigma.isChecked() else "absolute")
+        k = float(self.cb_k.currentData()) if self.cb_k.currentData() is not None else 1.0
+        scope = "project" if self.cb_scope_project.isChecked() else ("root" if self.cb_scope_root.isChecked() else "viewer")
+        disp_mode = self.cb_disp_mode.currentData()
+        disp_band = self.cb_band.currentData() if disp_mode == "single" else None
+        r = self.cb_r.currentData() if disp_mode == "rgb" else None
+        g = self.cb_g.currentData() if disp_mode == "rgb" else None
+        b = self.cb_b.currentData() if disp_mode == "rgb" else None
+
+        return _StretchParams(
+            mode=mode,
+            low_p=self.sp_low.value(), high_p=self.sp_high.value(),
+            k_sigma=k,
+            min_val=self.sp_min.value(), max_val=self.sp_max.value(),
+            per_channel=self.cb_perch.isChecked(),
+            clip=self.cb_clip.isChecked(),
+            scope=scope,
+            display_mode=disp_mode, display_band=disp_band,
+            r_band=r, g_band=g, b_band=b
+        )
+
+
+
+def _as_contig_uint8(img):
+    import numpy as np
+    if img is None:
+        return None
+    u8 = img if (img.dtype == np.uint8) else img.astype(np.uint8, copy=False)
+    return np.ascontiguousarray(u8)
+
+def _per_channel_stats(sample):
+    import numpy as np
+    # returns (mean, std) either scalars (global) or vectors (per-channel)
+    if sample.ndim == 2:
+        return float(np.nanmean(sample)), float(np.nanstd(sample))
+    C = sample.shape[2]
+    flat = sample.reshape(-1, C)
+    mu = np.nanmean(flat, axis=0)
+    sd = np.nanstd(flat, axis=0)
+    return mu, sd
+
+def _preview_take3(cv_img, prefer_last_band=False):
+    # mirror current preview choice (no channel reordering)
+    # same logic you use inside convert_cv_to_pixmap【turn1file1†L8-L16】
+    if cv_img.ndim == 3:
+        C = cv_img.shape[2]
+        if prefer_last_band and C > 3:
+            return cv_img[..., -1]     # grayscale preview of last plane
+        return cv_img[..., :min(3, C)]
+    return cv_img
+
+def _pixmap_from_uint8(disp_u8):
+    """
+    Build QPixmap from an already-normalised uint8 (no channel reordering).
+    Mirrors the bottom half of convert_cv_to_pixmap so behavior stays identical.
+    """
+    from PyQt5 import QtGui
+    import numpy as np, cv2, sip
+
+    if disp_u8 is None:
+        return None
+    disp = _as_contig_uint8(disp_u8)
+
+    if disp.ndim == 2:
+        h, w = disp.shape
+        try:
+            qimg = QtGui.QImage(sip.voidptr(disp.ctypes.data), w, h, disp.strides[0],
+                                QtGui.QImage.Format_Grayscale8)
+        except TypeError:
+            qimg = QtGui.QImage(disp.tobytes(), w, h, disp.strides[0], QtGui.QImage.Format_Grayscale8)
+    else:
+        h, w, _ = disp.shape
+        fmt_bgr = getattr(QtGui.QImage, "Format_BGR888", None)
+        if fmt_bgr is not None:
+            try:
+                qimg = QtGui.QImage(sip.voidptr(disp.ctypes.data), w, h, disp.strides[0], fmt_bgr)
+            except TypeError:
+                qimg = QtGui.QImage(disp.tobytes(), w, h, disp.strides[0], fmt_bgr)
+        else:
+            # Fallback: convert BGR→RGB once (same as your code)【turn1file1†L44-L51】
+            rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
+            rgb = np.ascontiguousarray(rgb)
+            try:
+                qimg = QtGui.QImage(sip.voidptr(rgb.ctypes.data), w, h, rgb.strides[0],
+                                    QtGui.QImage.Format_RGB888)
+            except TypeError:
+                qimg = QtGui.QImage(rgb.tobytes(), w, h, rgb.strides[0], QtGui.QImage.Format_RGB888)
+
+    return QtGui.QPixmap.fromImage(qimg.copy())
+
+
+
 class ProjectTab(QtWidgets.QWidget):
     def __init__(self, project_name, tab_widget, parent=None, exiftool_path=None):
         super().__init__(parent)
@@ -80,6 +358,9 @@ class ProjectTab(QtWidgets.QWidget):
         self._load_stop_event = None
         self._pending_root = None
         self.setAcceptDrops(True)
+        self._project_default_stretch = None       # type: Optional[_StretchParams]
+        self._root_stretch_map = {}                # root_name -> _StretchParams
+
 
         
 
@@ -90,7 +371,6 @@ class ProjectTab(QtWidgets.QWidget):
             if saved:
                 self.exiftool_path = saved
                 logging.info(f"[{self.project_name}] exiftool path restored from settings: {saved}")
-
 
     def dragEnterEvent(self, event):
         import os
@@ -3370,93 +3650,28 @@ class ProjectTab(QtWidgets.QWidget):
             worker.signals.done_one.connect(on_done_one)
             pool.start(worker)
 
+ 
 
+    def _read_json_silently(self, path):
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
 
-    def display_image_group(self, image_data_list, root_name):
-        # Stop repaints while rebuilding the grid
-        self.setUpdatesEnabled(False)
+    def _write_json_safely(self, path, data):
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4)
+        except Exception as e:
+            logging.warning(f"Failed to write {path}: {e}")
 
-        # Clear previous viewers and labels
-        for widget in self.viewer_widgets:
-            self.image_grid_layout.removeWidget(widget['container'])
-            widget['container'].deleteLater()
-        self.viewer_widgets = []
-
-        # Determine grid size
-        num_images = len(image_data_list)
-        grid_cols = 5  # Adjust columns as needed
-        grid_rows = (num_images + grid_cols - 1) // grid_cols
-        positions = [(i, j) for i in range(grid_rows) for j in range(grid_cols)]
-        positions = positions[:num_images]
-
-        # Build all widgets with updates still disabled
-        local_viewers = []
-        for idx, (position, image_data) in enumerate(zip(positions, image_data_list)):
-            label = QLabel(os.path.basename(image_data.filepath))
-            label.setAlignment(Qt.AlignCenter)
-            label.setMaximumHeight(20)
-
-            viewer = ImageViewer()
-            self._wire_viewer_for_inspection(viewer)
-            viewer.drawing_mode = self.current_drawing_mode
-            viewer.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-            viewer.polygon_drawn.connect(self.on_polygon_drawn)
-            viewer.polygon_changed.connect(self.on_polygon_modified)
-            viewer.editing_finished.connect(self.reload_current_root)
-
-            clean_button = QPushButton("Clean Vector")
-            clean_button.setFixedSize(70, 25)
-            clean_button.setStyleSheet("QPushButton { padding: 1px 5px; font-size: 9px; }")
-            edit_button = QPushButton("Edit Image Viewer")
-            edit_button.setFixedSize(130, 25)
-            edit_button.setStyleSheet("QPushButton { padding: 1px 5px; font-size: 9px; }")
-            clean_button.clicked.connect(partial(self.clean_polygons, viewer))
-            clean_button.clicked.connect(partial(self.delete_polygons_for_viewer, viewer))
-            edit_button.clicked.connect(partial(self.edit_image_viewer, viewer))
-
-            buttons_layout = QHBoxLayout()
-            buttons_layout.setSpacing(2)
-            buttons_layout.setContentsMargins(0, 0, 0, 0)
-            buttons_layout.addWidget(clean_button)
-            buttons_layout.addWidget(edit_button)
-
-            container = QWidget()
-            v_layout = QVBoxLayout(container)
-            v_layout.setSpacing(1)
-            v_layout.setContentsMargins(1, 1, 1, 1)
-            v_layout.addWidget(label)
-            v_layout.addWidget(viewer)
-            v_layout.addLayout(buttons_layout)
-
-            vw_rec = {
-                'container': container,
-                'viewer': viewer,
-                'image_data': image_data,
-                'band_index': idx + 1
-            }
-            local_viewers.append(vw_rec)
-            self.image_grid_layout.addWidget(container, position[0], position[1])
-
-        # Swap in the new list at once
-        self.viewer_widgets = local_viewers
-
-        # Now set images + polygons after all widgets exist
-        for rec in self.viewer_widgets:
-            viewer = rec['viewer']
-            image_data = rec['image_data']
-            pixmap = self.convert_cv_to_pixmap(image_data.image)
-            if pixmap is not None:
-                # IMPORTANT: assign image_data BEFORE set_image
-                viewer.image_data = image_data
-                viewer.set_image(pixmap)
-                # EXPLICITLY load polygons from the tab (don’t rely on viewer.parent())
-                self.load_polygons(viewer, image_data)
-            else:
-                QMessageBox.warning(self, "Error", f"Could not display image: {image_data.filepath}")
-
-        self.update_polygon_manager()
-        self._rewire_all_viewers_for_inspection()
-        self.setUpdatesEnabled(True)
+    def _ax_path_for(self, image_path):
+        # same convention your .ax already uses
+        return image_path + ".ax"
 
     def edit_image_viewer(self, viewer):
         """
@@ -4011,6 +4226,68 @@ class ProjectTab(QtWidgets.QWidget):
             s = "'" + s
         return s
 
+  
+    def _extract_exif_for_file(self, filepath, exif_tags):
+        """Uses your existing EXIF method if present; falls back to exiftool JSON."""
+        # If you already have a reader, use it
+        if hasattr(self, "_read_exif_tags"):
+            try:
+                data = self._read_exif_tags(filepath, exif_tags) or {}
+                return data
+            except Exception as e:
+                logging.warning(f"_read_exif_tags failed for {filepath}: {e}")
+
+        # Fallback: exiftool
+        try:
+            exe = self.exiftool_path or "exiftool"
+            args = [exe, "-s", "-s", "-s", "-j"] + [f"-{t}" for t in exif_tags] + [filepath]
+            p = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               encoding="utf-8", shell=False)
+            if p.returncode == 0 and p.stdout.strip():
+                arr = json.loads(p.stdout)
+                return (arr[0] if isinstance(arr, list) and arr else {}) or {}
+            else:
+                logging.warning(f"exiftool failed for {filepath}: {p.stderr.strip()}")
+        except Exception as e:
+            logging.warning(f"EXIF fallback error for {filepath}: {e}")
+
+        return {}
+
+    def _build_exif_cache_with_progress(self, filepaths, exif_tags):
+        """
+        Build {norm_abspath: exif_dict} with a modal progress dialog.
+        Returns tuple (exif_dict, canceled_flag).
+        """
+        filepaths = [fp for fp in filepaths if fp]  # guard
+        total = len(filepaths)
+        exif_dict = {}
+
+        if total == 0 or not exif_tags:
+            return exif_dict, False
+
+        dlg = QtWidgets.QProgressDialog("Extracting EXIF…", "Cancel", 0, total, self)
+        dlg.setWindowModality(QtCore.Qt.ApplicationModal)
+        dlg.setAutoClose(True)
+        dlg.setMinimumDuration(0)  # show immediately
+        dlg.setValue(0)
+
+        for i, fp in enumerate(filepaths, 1):
+            if dlg.wasCanceled():
+                return exif_dict, True
+            dlg.setLabelText(f"Extracting EXIF ({i}/{total})\n{os.path.basename(fp)}")
+            QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents)
+
+            key = os.path.normcase(os.path.abspath(fp))
+            try:
+                exif_dict[key] = self._extract_exif_for_file(fp, exif_tags) or {}
+            except Exception as e:
+                logging.warning(f"EXIF read error for {fp}: {e}")
+                exif_dict[key] = {}
+
+            dlg.setValue(i)
+            QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents)
+
+        return exif_dict, False
 
     def process_polygon(self, group_name, filepath, polygon_dict, exif_data_dict, exif_tags, model_loaded, opts=None):
         """
@@ -4100,6 +4377,9 @@ class ProjectTab(QtWidgets.QWidget):
         bm_enabled  = bool(bm_opts.get('enabled', False))
         bm_formulas = dict(bm_opts.get('formulas', {}) or {}) if bm_enabled else {}
 
+        # NEW: optional NoData values (fast path remains unchanged when empty)
+        nodata_values = list((opts or {}).get("nodata_values", []) or [])
+
         rf_enabled = bool(
             model_loaded and hasattr(self, "random_forest_model")
             and self.random_forest_model is not None and "model" in self.random_forest_model
@@ -4170,6 +4450,12 @@ class ProjectTab(QtWidgets.QWidget):
                 out[f'Q{q_str}'] = q_val_out
 
             return out
+
+        # Helper: count of unmasked (non-NaN) values used for stats
+        def _valid_count(arr):
+            a = np.asarray(arr)
+            # Only NaNs represent masked pixels here; Inf is not considered "masked"
+            return int(np.count_nonzero(~np.isnan(a)))
 
         cache = getattr(self, "_export_cache", None)
         cache_lock = getattr(self, "_export_cache_lock", None)
@@ -4251,7 +4537,6 @@ class ProjectTab(QtWidgets.QWidget):
                 with np.errstate(divide='ignore', invalid='ignore', over='ignore', under='ignore'):
                     res = eval(code, env, local_map)
                 return np.asarray(res, dtype=np.float32)  # keep NaNs/±Inf; let stats handle them
-
             else:
                 local_map = {k: float(v[yi, xi]) for k, v in bmap_arrays.items()}
                 with np.errstate(divide='ignore', invalid='ignore', over='ignore', under='ignore'):
@@ -4260,41 +4545,102 @@ class ProjectTab(QtWidgets.QWidget):
                 except Exception: res = float('nan')
                 return res if np.isfinite(res) else float('nan')
 
+        # ---- Precompute NoData masks per channel (once) ----
+        nd_masks = None
+        if nodata_values:
+            tol = 1e-6
+            ints, floats = [], []
+            for v in nodata_values:
+                try:
+                    fv = float(v)
+                    if float(fv).is_integer():
+                        ints.append(int(round(fv)))
+                    else:
+                        floats.append(float(fv))
+                except Exception:
+                    # ignore unparsable tokens
+                    pass
+            nd_masks = []
+            for ch in chans:
+                m = np.zeros((H, W), dtype=bool)
+                if ints:
+                    # works for both int and float channels; np.isin upcasts as needed
+                    m |= np.isin(ch, ints, assume_unique=False)
+                if floats:
+                    chf = ch.astype(np.float32, copy=False)
+                    for fv in floats:
+                        m |= np.isclose(chf, fv, rtol=0.0, atol=tol)
+                nd_masks.append(m)
+
+        # For band-math: map each formula to the bands it actually uses (0-based)
+        expr_bands_used = {}
+        if bm_formulas:
+            for fname, expr in bm_formulas.items():
+                try:
+                    code = expr_code_cache.get(expr) or compile(expr, "<expr>", "eval")
+                    expr_code_cache[expr] = code
+                    used = []
+                    for name in code.co_names:
+                        if name.startswith('b'):
+                            bi = int(name[1:]) - 1
+                            if 0 <= bi < len(chans):
+                                used.append(bi)
+                    expr_bands_used[fname] = used
+                except Exception:
+                    expr_bands_used[fname] = []
 
         # Scene stats (once per image)
         scene_stats = {}
         if is_rgb:
-            for channel_name, ch in zip(["R", "G", "B"], chans[:3]):
-                a = ch.astype(float, copy=False)
+            for i, (channel_name, ch) in enumerate(zip(["R", "G", "B"], chans[:3])):
+                if nd_masks is not None:
+                    a = ch[~nd_masks[i]].astype(float, copy=False)
+                else:
+                    a = ch.astype(float, copy=False)
                 scene_stats[channel_name] = {
-                    "Scene Mean": float(np.mean(a)),
-                    "Scene Median": float(np.median(a)),
-                    "Scene Standard Deviation": float(np.std(a)),
+                    "Scene Mean": float(np.nanmean(a) if a.size else np.nan),
+                    "Scene Median": float(np.nanmedian(a) if a.size else np.nan),
+                    "Scene Standard Deviation": float(np.nanstd(a) if a.size else np.nan),
                 }
-            for i_extra, ch in enumerate(chans[3:], start=4):
-                a = ch.astype(float, copy=False)
-                scene_stats[f"band_{i_extra}"] = {
-                    "Scene Mean": float(np.mean(a)),
-                    "Scene Median": float(np.median(a)),
-                    "Scene Standard Deviation": float(np.std(a)),
+            for j, ch in enumerate(chans[3:], start=3):
+                if nd_masks is not None:
+                    a = ch[~nd_masks[j]].astype(float, copy=False)
+                else:
+                    a = ch.astype(float, copy=False)
+                scene_stats[f"band_{j+1}"] = {
+                    "Scene Mean": float(np.nanmean(a) if a.size else np.nan),
+                    "Scene Median": float(np.nanmedian(a) if a.size else np.nan),
+                    "Scene Standard Deviation": float(np.nanstd(a) if a.size else np.nan),
                 }
         else:
-            a = img.astype(float, copy=False)
+            # Single/other channel
+            ch0 = chans[0]
+            if nd_masks is not None:
+                a = ch0[~nd_masks[0]].astype(float, copy=False)
+            else:
+                a = ch0.astype(float, copy=False).ravel()
             channel_type = "Gray" if img.ndim == 2 else "Other"
             scene_stats[channel_type] = {
-                "Scene Mean": float(np.mean(a)),
-                "Scene Median": float(np.median(a)),
-                "Scene Standard Deviation": float(np.std(a)),
+                "Scene Mean": float(np.nanmean(a) if a.size else np.nan),
+                "Scene Median": float(np.nanmedian(a) if a.size else np.nan),
+                "Scene Standard Deviation": float(np.nanstd(a) if a.size else np.nan),
             }
 
         if bm_formulas:
             for fname, expr in bm_formulas.items():
                 try:
-                    aa = _eval_band_expr(expr).astype(float, copy=False)
+                    arr = _eval_band_expr(expr).astype(float, copy=False)
+                    if nd_masks is not None and expr_bands_used.get(fname):
+                        m = np.zeros((H, W), dtype=bool)
+                        for bi in expr_bands_used[fname]:
+                            m |= nd_masks[bi]
+                        vals = arr[~m]
+                    else:
+                        vals = arr.ravel()
                     scene_stats[fname] = {
-                        "Scene Mean": float(np.mean(aa)),
-                        "Scene Median": float(np.median(aa)),
-                        "Scene Standard Deviation": float(np.std(aa)),
+                        "Scene Mean": float(np.nanmean(vals) if vals.size else np.nan),
+                        "Scene Median": float(np.nanmedian(vals) if vals.size else np.nan),
+                        "Scene Standard Deviation": float(np.nanstd(vals) if vals.size else np.nan),
                     }
                 except Exception as e:
                     logging.warning(f"Band-math scene stats skipped ({fname}='{expr}') for '{filepath}': {e}")
@@ -4321,9 +4667,14 @@ class ProjectTab(QtWidgets.QWidget):
                     continue
 
                 if is_rgb:
-                    red_channel   = np.array([chans[0][yi, xi]], dtype=np.float32)
-                    green_channel = np.array([chans[1][yi, xi]], dtype=np.float32)
-                    blue_channel  = np.array([chans[2][yi, xi]], dtype=np.float32)
+                    # build per-channel 1-element arrays; honor NoData
+                    vals_rgb = []
+                    for bi in (0, 1, 2):
+                        if nd_masks is not None and nd_masks[bi][yi, xi]:
+                            vals_rgb.append(np.array([np.nan], dtype=np.float32))
+                        else:
+                            vals_rgb.append(np.array([chans[bi][yi, xi]], dtype=np.float32))
+                    red_channel, green_channel, blue_channel = vals_rgb
 
                 if rf_enabled and is_rgb:
                     try:
@@ -4340,12 +4691,21 @@ class ProjectTab(QtWidgets.QWidget):
                         additional = ["exg", "gcc", "bcc", "gbd", "wdx", "shd"]
                         if any(feat in model_feature_names for feat in additional):
                             features_map["exg"] = calculate_exg(red_channel, green_channel, blue_channel)
-                            features_map["gcc"] = calculate_gcc(red_channel, green_channel, blue_channel)
-                            features_map["bcc"] = calculate_bcc(red_channel, green_channel, blue_channel)
+                            features_map["gcc"] = calculate_gcc(red_channel, green_channel)
+                            features_map["bcc"] = calculate_bcc(red_channel, green_channel)
                             features_map["gbd"] = calculate_gbd(green_channel, blue_channel)
-                            features_map["wdx"] = calculate_wdx(red_channel, green_channel, blue_channel)
+                            features_map["wdx"] = calculate_wdx(red_channel, green_channel)
                             features_map["shd"] = calculate_shd(red_channel, green_channel, blue_channel)
-                        X = np.column_stack([features_map[feat] for feat in model_feature_names])
+                        # only keep finite rows (point → at most one)
+                        valid = None
+                        for feat in model_feature_names:
+                            f = np.asarray(features_map[feat], dtype=np.float32)
+                            valid = np.isfinite(f) if valid is None else (valid & np.isfinite(f))
+                        if valid is not None and np.any(valid):
+                            X = np.column_stack([np.asarray(features_map[feat], dtype=np.float32)[valid] for feat in model_feature_names])
+                        else:
+                            X = np.empty((0, len(model_feature_names)), dtype=np.float32)
+
                         if X.size == 0:
                             class_percentages = {f"Class {cls} %": 0.0 for cls in model_classes}
                         else:
@@ -4362,9 +4722,10 @@ class ProjectTab(QtWidgets.QWidget):
                     class_percentages = {}
 
                 if is_rgb:
-                    for channel_name, ch in zip(["R","G","B"], chans[:3]):
-                        v = np.array([ch[yi, xi]], dtype=np.float32)
+                    for channel_name, bi in zip(["R","G","B"], (0,1,2)):
+                        v = vals_rgb[bi]
                         channel_stats = _calc_stats(v)
+                        pixel_count = _valid_count(v)  # 1 if not masked, else 0
                         row = {
                             "Project": os.path.basename(os.path.normpath(self.project_folder)) if self.project_folder else "N/A",
                             "Root ID": root_id,
@@ -4372,7 +4733,7 @@ class ProjectTab(QtWidgets.QWidget):
                             "File Name": os.path.basename(filepath),
                             "Object ID": f"{name}_point_{idx}",   # fixed
                             "Channel": channel_name,
-                            "Pixel Count": 1,
+                            "Pixel Count": pixel_count,
                         }
                         row.update(channel_stats)
                         sc = scene_stats.get(channel_name, {"Scene Mean": None, "Scene Median": None, "Scene Standard Deviation": None})
@@ -4382,11 +4743,14 @@ class ProjectTab(QtWidgets.QWidget):
                         data_rows.append(row)
 
                     if len(chans) > 3:
-                        for i_extra, ch in enumerate(chans[3:], start=4):
-                            channel_name = f"band_{i_extra}"
-                            v = np.array([ch[yi, xi]])
-
+                        for j, ch in enumerate(chans[3:], start=3):
+                            channel_name = f"band_{j+1}"
+                            if nd_masks is not None and nd_masks[j][yi, xi]:
+                                v = np.array([np.nan], dtype=np.float32)
+                            else:
+                                v = np.array([ch[yi, xi]], dtype=np.float32)
                             channel_stats = _calc_stats(v)
+                            pixel_count = _valid_count(v)
                             row = {
                                 "Project": os.path.basename(os.path.normpath(self.project_folder)) if self.project_folder else "N/A",
                                 "Root ID": root_id,
@@ -4394,7 +4758,7 @@ class ProjectTab(QtWidgets.QWidget):
                                 "File Name": os.path.basename(filepath),
                                 "Object ID": f"{name}_point_{idx}",
                                 "Channel": channel_name,
-                                "Pixel Count": 1,
+                                "Pixel Count": pixel_count,
                             }
                             row.update(channel_stats)
                             sc = scene_stats.get(channel_name, {"Scene Mean": None, "Scene Median": None, "Scene Standard Deviation": None})
@@ -4403,9 +4767,14 @@ class ProjectTab(QtWidgets.QWidget):
                             _attach_exif(row)
                             data_rows.append(row)
                 else:
-                    pix = img[yi, xi]
-                    pixs = np.array([pix]).reshape(-1) if np.isscalar(pix) else np.array(pix).reshape(-1)
+                    # single channel
+                    if nd_masks is not None and nd_masks[0][yi, xi]:
+                        pixs = np.array([np.nan], dtype=np.float32)
+                    else:
+                        pix = chans[0][yi, xi]
+                        pixs = np.array([pix], dtype=np.float32)
                     point_stats = _calc_stats(pixs)
+                    pixel_count = _valid_count(pixs)
                     channel_type = "Gray" if img.ndim == 2 else "Other"
                     row = {
                         "Project": os.path.basename(os.path.normpath(self.project_folder)) if self.project_folder else "N/A",
@@ -4414,7 +4783,7 @@ class ProjectTab(QtWidgets.QWidget):
                         "File Name": os.path.basename(filepath),
                         "Object ID": f"{name}_point_{idx}",
                         "Channel": channel_type,
-                        "Pixel Count": 1,
+                        "Pixel Count": pixel_count,
                     }
                     row.update(point_stats)
                     sc = scene_stats.get(channel_type, {"Scene Mean": None, "Scene Median": None, "Scene Standard Deviation": None})
@@ -4425,9 +4794,18 @@ class ProjectTab(QtWidgets.QWidget):
                 if bm_formulas:
                     for fname, expr in bm_formulas.items():
                         try:
-                            val = _eval_band_expr(expr, xi=xi, yi=yi)
+                            # If any used band is NoData at this pixel, mark as NaN
+                            if nd_masks is not None and expr_bands_used.get(fname):
+                                bad = False
+                                for bi in expr_bands_used[fname]:
+                                    if nd_masks[bi][yi, xi]:
+                                        bad = True; break
+                                val = float('nan') if bad else _eval_band_expr(expr, xi=xi, yi=yi)
+                            else:
+                                val = _eval_band_expr(expr, xi=xi, yi=yi)
                             v = np.array([val], dtype=np.float32)
                             channel_stats = _calc_stats(v)
+                            pixel_count = _valid_count(v)
                             row = {
                                 "Project": os.path.basename(os.path.normpath(self.project_folder)) if self.project_folder else "N/A",
                                 "Root ID": root_id,
@@ -4435,7 +4813,7 @@ class ProjectTab(QtWidgets.QWidget):
                                 "File Name": os.path.basename(filepath),
                                 "Object ID": f"{name}_point_{idx}",
                                 "Channel": fname,
-                                "Pixel Count": 1,
+                                "Pixel Count": pixel_count,
                             }
                             row.update(channel_stats)
                             sc = scene_stats.get(fname, {"Scene Mean": None, "Scene Median": None, "Scene Standard Deviation": None})
@@ -4476,7 +4854,6 @@ class ProjectTab(QtWidgets.QWidget):
             pts_img = self._points_to_export_frame(filepath, mod_points, polygon_dict, img.shape)
             pts_img = [(int(round(x)), int(round(y))) for (x, y) in pts_img]
 
-            import numpy as np, cv2
             mask = np.zeros((H, W), dtype=np.uint8)
             if len(pts_img) == 1:
                 xi, yi = pts_img[0]
@@ -4487,22 +4864,31 @@ class ProjectTab(QtWidgets.QWidget):
                 cv2.fillPoly(mask, [pts], 255)
 
             mask_bool = mask.astype(bool)
-            num_pixels = int(mask_bool.sum())
+            num_pixels = int(mask_bool.sum())  # total in polygon (kept for reference; per-row Pixel Count uses unmasked)
+
             if num_pixels == 0:
                 logging.warning(f"No pixels found within polygon for '{filepath}'. Skipping.")
                 return data_rows, modified_polygons
 
             if is_rgb:
-                red_channel   = chans[0][mask_bool]
-                green_channel = chans[1][mask_bool]
-                blue_channel  = chans[2][mask_bool]
+                # Slice polygon pixels to vectors (length = num_pixels)
+                red_vec   = chans[0][mask_bool].astype(np.float32, copy=False)
+                green_vec = chans[1][mask_bool].astype(np.float32, copy=False)
+                blue_vec  = chans[2][mask_bool].astype(np.float32, copy=False)
 
-                channel_triplets = {
-                    "R": red_channel,
-                    "G": green_channel,
-                    "B": blue_channel,
-                }
+                # Apply NoData masks only within the polygon (set to NaN to keep alignment)
+                if nd_masks is not None:
+                    m0 = nd_masks[0][mask_bool]
+                    if m0.any():
+                        red_vec = red_vec.copy();   red_vec[m0] = np.nan
+                    m1 = nd_masks[1][mask_bool]
+                    if m1.any():
+                        green_vec = green_vec.copy(); green_vec[m1] = np.nan
+                    m2 = nd_masks[2][mask_bool]
+                    if m2.any():
+                        blue_vec = blue_vec.copy();  blue_vec[m2] = np.nan
 
+                channel_triplets = {"R": red_vec, "G": green_vec, "B": blue_vec}
 
                 # RF (optional)
                 if rf_enabled:
@@ -4513,9 +4899,9 @@ class ProjectTab(QtWidgets.QWidget):
                             "feature_names", ["red_channel", "green_channel", "blue_channel"]
                         )
                         features_map = {
-                            "red_channel": red_channel.astype(np.float32, copy=False),
-                            "green_channel": green_channel.astype(np.float32, copy=False),
-                            "blue_channel": blue_channel.astype(np.float32, copy=False),
+                            "red_channel":   red_vec,
+                            "green_channel": green_vec,
+                            "blue_channel":  blue_vec,
                         }
                         additional = ["exg", "gcc", "bcc", "gbd", "wdx", "shd"]
                         if any(feat in model_feature_names for feat in additional):
@@ -4525,7 +4911,17 @@ class ProjectTab(QtWidgets.QWidget):
                             features_map["gbd"] = calculate_gbd(features_map["green_channel"], features_map["blue_channel"])
                             features_map["wdx"] = calculate_wdx(features_map["red_channel"], features_map["green_channel"])
                             features_map["shd"] = calculate_shd(features_map["red_channel"], features_map["green_channel"], features_map["blue_channel"])
-                        X = np.column_stack([features_map[feat] for feat in model_feature_names])
+
+                        # filter rows that have any NaN across used features
+                        valid = None
+                        for feat in model_feature_names:
+                            f = np.asarray(features_map[feat], dtype=np.float32)
+                            valid = np.isfinite(f) if valid is None else (valid & np.isfinite(f))
+                        if valid is not None and np.any(valid):
+                            X = np.column_stack([np.asarray(features_map[feat], dtype=np.float32)[valid] for feat in model_feature_names])
+                        else:
+                            X = np.empty((0, len(model_feature_names)), dtype=np.float32)
+
                         if X.size == 0:
                             class_percentages = {f"Class {cls} %": 0.0 for cls in model_classes}
                         else:
@@ -4541,11 +4937,13 @@ class ProjectTab(QtWidgets.QWidget):
                 else:
                     class_percentages = {}
 
+                # Per-channel stats (Pixel Count = unmasked count)
                 for channel_name in ["R", "G", "B"]:
                     channel_pixels = channel_triplets[channel_name]
                     if channel_pixels.size == 0:
                         continue
                     channel_stats = _calc_stats(channel_pixels)
+                    pixel_count = _valid_count(channel_pixels)
                     row = {
                         "Project": os.path.basename(os.path.normpath(self.project_folder)) if self.project_folder else "N/A",
                         "Root ID": root_id,
@@ -4553,7 +4951,7 @@ class ProjectTab(QtWidgets.QWidget):
                         "File Name": os.path.basename(filepath),
                         "Object ID": name,
                         "Channel": channel_name,
-                        "Pixel Count": num_pixels,
+                        "Pixel Count": pixel_count,
                     }
                     row.update(channel_stats)
                     sc = scene_stats.get(channel_name, {"Scene Mean": None, "Scene Median": None, "Scene Standard Deviation": None})
@@ -4562,13 +4960,19 @@ class ProjectTab(QtWidgets.QWidget):
                     _attach_exif(row)
                     data_rows.append(row)
 
+                # Extras
                 if len(chans) > 3:
-                    for i_extra, ch in enumerate(chans[3:], start=4):
-                        channel_name = f"band_{i_extra}"
-                        channel_pixels = ch[mask_bool]
-                        if channel_pixels.size == 0:
+                    for j, ch in enumerate(chans[3:], start=3):
+                        channel_name = f"band_{j+1}"
+                        vec = ch[mask_bool].astype(np.float32, copy=False)
+                        if nd_masks is not None:
+                            mj = nd_masks[j][mask_bool]
+                            if mj.any():
+                                vec = vec.copy(); vec[mj] = np.nan
+                        if vec.size == 0:
                             continue
-                        channel_stats = _calc_stats(channel_pixels)
+                        channel_stats = _calc_stats(vec)
+                        pixel_count = _valid_count(vec)
                         row = {
                             "Project": os.path.basename(os.path.normpath(self.project_folder)) if self.project_folder else "N/A",
                             "Root ID": root_id,
@@ -4576,7 +4980,7 @@ class ProjectTab(QtWidgets.QWidget):
                             "File Name": os.path.basename(filepath),
                             "Object ID": name,
                             "Channel": channel_name,
-                            "Pixel Count": num_pixels,
+                            "Pixel Count": pixel_count,
                         }
                         row.update(channel_stats)
                         sc = scene_stats.get(channel_name, {"Scene Mean": None, "Scene Median": None, "Scene Standard Deviation": None})
@@ -4585,12 +4989,21 @@ class ProjectTab(QtWidgets.QWidget):
                         _attach_exif(row)
                         data_rows.append(row)
 
+                # Band-math (Pixel Count = unmasked count after masking used bands)
                 if bm_formulas:
                     for fname, expr in bm_formulas.items():
                         try:
                             arr = _eval_band_expr(expr)
-                            vals = arr[mask_bool].astype(float, copy=False)
+                            vals = arr[mask_bool].astype(np.float32, copy=False)
+                            if nd_masks is not None and expr_bands_used.get(fname):
+                                m = np.zeros((H, W), dtype=bool)
+                                for bi in expr_bands_used[fname]:
+                                    m |= nd_masks[bi]
+                                mv = m[mask_bool]
+                                if mv.any():
+                                    vals = vals.copy(); vals[mv] = np.nan
                             channel_stats = _calc_stats(vals)
+                            pixel_count = _valid_count(vals)
                             row = {
                                 "Project": os.path.basename(os.path.normpath(self.project_folder)) if self.project_folder else "N/A",
                                 "Root ID": root_id,
@@ -4598,7 +5011,7 @@ class ProjectTab(QtWidgets.QWidget):
                                 "File Name": os.path.basename(filepath),
                                 "Object ID": name,
                                 "Channel": fname,
-                                "Pixel Count": num_pixels,
+                                "Pixel Count": pixel_count,
                             }
                             row.update(channel_stats)
                             sc = scene_stats.get(fname, {"Scene Mean": None, "Scene Median": None, "Scene Standard Deviation": None})
@@ -4610,12 +5023,19 @@ class ProjectTab(QtWidgets.QWidget):
                             logging.warning(f"Band-math polygon eval skipped ({fname}='{expr}') for '{filepath}': {e}")
 
             else:
-                pixels = img[mask_bool]
-                if pixels.size == 0:
+                # Non-RGB (single/other)
+                ch0 = chans[0]
+                vec = ch0[mask_bool].astype(np.float32, copy=False)
+                if nd_masks is not None:
+                    m0 = nd_masks[0][mask_bool]
+                    if m0.any():
+                        vec = vec.copy(); vec[m0] = np.nan
+                if vec.size == 0:
                     logging.warning(f"No pixels under mask for '{filepath}'.")
                     return data_rows, modified_polygons
 
-                poly_stats = _calc_stats(pixels.reshape(-1))
+                poly_stats = _calc_stats(vec)
+                pixel_count = _valid_count(vec)
                 channel_type = "Gray" if img.ndim == 2 else "Other"
                 row = {
                     "Project": os.path.basename(os.path.normpath(self.project_folder)) if self.project_folder else "N/A",
@@ -4624,7 +5044,7 @@ class ProjectTab(QtWidgets.QWidget):
                     "File Name": os.path.basename(filepath),
                     "Object ID": name,
                     "Channel": channel_type,
-                    "Pixel Count": int(pixels.size if img.ndim == 2 else pixels.shape[0]),
+                    "Pixel Count": pixel_count,
                 }
                 row.update(poly_stats)
                 sc = scene_stats.get(channel_type, {"Scene Mean": None, "Scene Median": None, "Scene Standard Deviation": None})
@@ -4636,8 +5056,16 @@ class ProjectTab(QtWidgets.QWidget):
                     for fname, expr in bm_formulas.items():
                         try:
                             arr = _eval_band_expr(expr)
-                            vals = arr[mask_bool].astype(float, copy=False)
+                            vals = arr[mask_bool].astype(np.float32, copy=False)
+                            if nd_masks is not None and expr_bands_used.get(fname):
+                                m = np.zeros((H, W), dtype=bool)
+                                for bi in expr_bands_used[fname]:
+                                    m |= nd_masks[bi]
+                                mv = m[mask_bool]
+                                if mv.any():
+                                    vals = vals.copy(); vals[mv] = np.nan
                             channel_stats = _calc_stats(vals)
+                            pixel_count = _valid_count(vals)
                             row = {
                                 "Project": os.path.basename(os.path.normpath(self.project_folder)) if self.project_folder else "N/A",
                                 "Root ID": root_id,
@@ -4645,7 +5073,7 @@ class ProjectTab(QtWidgets.QWidget):
                                 "File Name": os.path.basename(filepath),
                                 "Object ID": name,
                                 "Channel": fname,
-                                "Pixel Count": int(vals.size),
+                                "Pixel Count": pixel_count,
                             }
                             row.update(channel_stats)
                             sc = scene_stats.get(fname, {"Scene Mean": None, "Scene Median": None, "Scene Standard Deviation": None})
@@ -4664,10 +5092,13 @@ class ProjectTab(QtWidgets.QWidget):
                 unique_data_rows.append(row)
         return unique_data_rows, modified_polygons
 
-    
+
     def save_polygons_to_csv(self):
         """
         Saves all polygon data to a CSV file using multithreading for faster processing.
+
+        NEW: If EXIF is selected, a modal QProgressDialog shows the EXIF extraction progress
+             (first step) before polygon extraction starts.
 
         - EXIF sanitization + strict delimiter guard (no commas inside cells when delimiter=',').
         - No thumbnails.
@@ -4675,7 +5106,7 @@ class ProjectTab(QtWidgets.QWidget):
         - Auto-suffixes filenames if exists.
         - Writes CSV with QUOTE_NONE; UTF-8-BOM for Excel friendliness.
         """
-        import os, time, csv, random, string, concurrent.futures, functools, logging, threading
+        import os, time, csv, random, string, concurrent.futures, functools, logging, threading, json, subprocess
         from PyQt5 import QtWidgets, QtCore
 
         # ----------------- helpers -----------------
@@ -4724,29 +5155,24 @@ class ProjectTab(QtWidgets.QWidget):
                              for k, v in sorted(val.items()))
             elif isinstance(val, (bytes, bytearray)):
                 s = f"[{len(val)} bytes]"
-            elif _np_ok and isinstance(val, np.ndarray):
-                a = np.ravel(val)
+            elif _np_ok and isinstance(val, np.ndarray):  # noqa: F821 (np imported in try)
+                a = val.ravel()
                 if a.size > 64:
                     s = f"[{a.size} values]"
                 else:
                     s = " ".join(_sanitize_for_csv(x, delim) for x in a.tolist())
             elif _is_numeric_scalar(val):
-                # numeric scalar: write as-is; no Excel guard
                 s = str(val)
             else:
                 s = str(val)
 
-            # normalize whitespace + remove delimiter
             s = s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
             if delim and delim in s:
                 s = s.replace(delim, " ")
-
-            # Excel guard ONLY for non-numeric strings
             s_stripped = s.lstrip()
             if s_stripped and s_stripped[0] in "=+-@" and not _is_numeric_string(s_stripped):
                 s = "'" + s
             return s
-
 
         def _audit_row_for_delim(safe_row: dict, delim: str, where: str):
             """Guarantee no cell contains the delimiter; replace+log if any do."""
@@ -4758,7 +5184,41 @@ class ProjectTab(QtWidgets.QWidget):
                     logging.warning(f"[csv-guard:{where}] Delimiter found in field '{k}' → replaced.")
                 fixed[k] = vv
             return fixed
-        # ------------------------------------------
+
+        def _normkey(p): 
+            return os.path.normcase(os.path.abspath(p))
+
+        # ---------- per-file EXIF reader (used by the EXIF progress step) ----------
+        def _read_exif_for_file(filepath: str) -> dict:
+            """
+            Try class helper first (if you have one), else call exiftool.
+            Returns a flat dict of EXIF tags for the file (strings, numbers, etc.).
+            """
+            # Your optional fast path
+            try:
+                if hasattr(self, "_read_exif_tags"):
+                    d = self._read_exif_tags(filepath, None)  # None => all tags if your helper supports
+                    if isinstance(d, dict):
+                        return d
+            except Exception as e:
+                logging.debug(f"_read_exif_tags failed for {filepath}: {e}")
+
+            # Fallback: exiftool -j (JSON, numeric where possible with -n)
+            try:
+                exe = getattr(self, "exiftool_path", None) or "exiftool"
+                args = [exe, "-j", "-n", filepath]
+                p = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   encoding="utf-8", shell=False)
+                if p.returncode == 0 and p.stdout.strip():
+                    arr = json.loads(p.stdout)
+                    if isinstance(arr, list) and arr:
+                        return arr[0] or {}
+                else:
+                    logging.warning(f"exiftool failed for {filepath}: {p.stderr.strip()}")
+            except Exception as e:
+                logging.warning(f"EXIF fallback error for {filepath}: {e}")
+            return {}
+        # ---------------------------------------------------------------------------
 
         # -- show the export/options dialog --
         dlg = AnalysisOptionsDialog(self)
@@ -4792,8 +5252,7 @@ class ProjectTab(QtWidgets.QWidget):
 
         # Any polygons to save?
         if not self.all_polygons:
-            from PyQt5 import QtWidgets as _QtW
-            _QtW.QMessageBox.warning(self, "No Polygons", "There are no polygons to save.")
+            QtWidgets.QMessageBox.warning(self, "No Polygons", "There are no polygons to save.")
             return
 
         # Determine final CSV path (unique)
@@ -4804,40 +5263,93 @@ class ProjectTab(QtWidgets.QWidget):
             save_path = _next_available_path(os.path.join(exports_dir, default_name))
             project_name = os.path.basename(os.path.normpath(self.project_folder))
         else:
-            options = QtWidgets.QFileDialog.Options()
-            options |= QtWidgets.QFileDialog.DontUseNativeDialog
+            options_fd = QtWidgets.QFileDialog.Options()
+            options_fd |= QtWidgets.QFileDialog.DontUseNativeDialog
             chosen_path, _ = QtWidgets.QFileDialog.getSaveFileName(
-                self, "Save All CSV", os.path.expanduser("~"), "CSV Files (*.csv)", options=options)
+                self, "Save All CSV", os.path.expanduser("~"), "CSV Files (*.csv)", options=options_fd)
             if not chosen_path:
                 return
             save_path = _next_available_path(chosen_path)
             project_name = "N/A"
 
-        def _normkey(p): return os.path.normcase(os.path.abspath(p))
+        # Collect unique, normalized filepaths that actually have polygons
         filepaths_with_polygons = []
         for group_polygons in self.all_polygons.values():
             for fp in group_polygons.keys():
                 filepaths_with_polygons.append(fp)
         filepaths_with_polygons = list({_normkey(p) for p in filepaths_with_polygons})
 
-        # Build EXIF map / tags per option
-        if include_exif_opt:
-            raw_exif = self._get_exif_data_with_optional_path(filepaths_with_polygons)
-            raw_exif = {_normkey(k): v for k, v in (raw_exif or {}).items()}
-            sanitized_exif, sanitized_tags = self._sanitize_exif_map_for_csv(raw_exif, filepaths_with_polygons)
-            if sanitized_tags:
-                exif_tags = sanitized_tags[:]
-                exif_data_dict = sanitized_exif
-            else:
+        # ---------- FIRST STEP: EXIF extraction with a progress dialog ----------
+        if include_exif_opt and filepaths_with_polygons:
+            exif_progress = QtWidgets.QProgressDialog("Extracting EXIF…", "Cancel", 0, len(filepaths_with_polygons), self)
+            exif_progress.setWindowModality(QtCore.Qt.ApplicationModal)
+            exif_progress.setAutoClose(True)
+            exif_progress.setMinimumDuration(0)
+            exif_progress.setValue(0)
+
+            raw_exif_map = {}
+            canceled = False
+            for i, fp_abs in enumerate(filepaths_with_polygons, 1):
+                if exif_progress.wasCanceled():
+                    canceled = True
+                    break
+                exif_progress.setLabelText(f"Extracting EXIF ({i}/{len(filepaths_with_polygons)})\n{os.path.basename(fp_abs)}")
+                QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents)
+
+                try:
+                    raw_exif_map[fp_abs] = _read_exif_for_file(fp_abs) or {}
+                except Exception as e:
+                    logging.warning(f"EXIF read error for {fp_abs}: {e}")
+                    raw_exif_map[fp_abs] = {}
+
+                exif_progress.setValue(i)
+                QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents)
+
+            if canceled:
+                logging.info("User canceled EXIF extraction.")
+                return
+
+            # If you have a sanitizer that decides which tags to keep, use it:
+            exif_tags = []
+            exif_data_dict = raw_exif_map
+            try:
+                if hasattr(self, "_sanitize_exif_map_for_csv"):
+                    # This expects original (non-normalized) paths; build a mapping
+                    # back to original forms if you need. Here we reuse normalized list.
+                    sanitized_exif, sanitized_tags = self._sanitize_exif_map_for_csv(raw_exif_map, filepaths_with_polygons)
+                    if sanitized_tags:
+                        exif_tags = [str(t) for t in sanitized_tags]
+                        exif_data_dict = sanitized_exif
+            except Exception as e:
+                logging.debug(f"_sanitize_exif_map_for_csv failed, falling back to union of keys: {e}")
+
+            if not exif_tags:
+                # Fallback: union of keys in encountered order (may be many)
+                seen = set()
+                for fp_abs in filepaths_with_polygons:
+                    for k in (exif_data_dict.get(fp_abs, {}) or {}).keys():
+                        k = str(k)
+                        if k not in seen:
+                            seen.add(k)
+                exif_tags = list(seen)
+
+            # If still empty, create a fake column so rows aren't broken
+            if not exif_tags:
                 exif_tags = ['FakePath']
-                exif_data_dict = {fp: {'FakePath': _fake_path_token()} for fp in filepaths_with_polygons}
+                for fp_abs in filepaths_with_polygons:
+                    exif_data_dict.setdefault(fp_abs, {})['FakePath'] = _fake_path_token()
+
+            # Hints for logging inside process_polygon
+            self._exif_last_method = "per-file exiftool"
         else:
+            # EXIF disabled → provide a single fake column to keep headers stable
             exif_tags = ['FakePath']
             exif_data_dict = {fp: {'FakePath': _fake_path_token()} for fp in filepaths_with_polygons}
 
         # Deduplicate EXIF tag headers while preserving order; ensure strings
-        seen = set()
-        exif_tags = [str(t) for t in exif_tags if not (t in seen or seen.add(t))]
+        seen_tags = set()
+        exif_tags = [str(t) for t in exif_tags if not (t in seen_tags or seen_tags.add(t))]
+        # -----------------------------------------------------------------------
 
         # RF model decision: dialog decides
         if use_rf:
@@ -4883,8 +5395,8 @@ class ProjectTab(QtWidgets.QWidget):
         data_rows = []
         modified_polygons = []
 
-        # Progress & parallel
-        progress_dialog = QtWidgets.QProgressDialog("Saving polygons...", "Cancel", 0, len(polygons_to_process), self)
+        # Progress & parallel for polygon extraction
+        progress_dialog = QtWidgets.QProgressDialog("Extracting polygons…", "Cancel", 0, len(polygons_to_process), self)
         progress_dialog.setWindowModality(QtCore.Qt.WindowModal)
         progress_dialog.setMinimumDuration(0)
         progress_dialog.show()
@@ -4942,7 +5454,7 @@ class ProjectTab(QtWidgets.QWidget):
                 # header: double-sanitize + audit just in case
                 header_safe = {safe: _sanitize_for_csv(safe, csv_delimiter) for safe in fieldnames_safe}
                 header_safe = _audit_row_for_delim(header_safe, csv_delimiter, "header")
-                writer.writeheader()  # DictWriter ignores provided dict for header, uses fieldnames
+                writer.writeheader()  # DictWriter uses fieldnames
 
                 # rows
                 for row in data_rows:
@@ -4983,7 +5495,6 @@ class ProjectTab(QtWidgets.QWidget):
             json_save_path = _next_available_path(f"{json_base}_modified_polygons.json")
             try:
                 with open(json_save_path, 'w', encoding='utf-8') as jsonfile:
-                    import json
                     json.dump(modified_polygons, jsonfile, indent=4)
                 logging.info(f"Modified polygons successfully saved to {json_save_path}")
             except Exception as e:
@@ -6762,7 +7273,767 @@ class ProjectTab(QtWidgets.QWidget):
                 root_name = os.path.splitext(filename)[0]
             return root_name
   
-   
+    
+    
+    def _stats200(self, arr, k=200):
+        """
+        Deterministic tiny sampler for stats (≈200 samples total).
+        Works for HxW or HxWxC (C<=3). Returns a small array shaped (k,) or (k,C).
+        """
+        import numpy as np
+
+        if arr is None:
+            return None
+
+        a = np.nan_to_num(arr, copy=False)
+        if a.ndim == 2:
+            flat = a.reshape(-1)
+            n = flat.size
+            if n <= k:
+                return flat.astype(np.float32, copy=False)
+            idx = np.linspace(0, n - 1, num=k, dtype=np.int64)
+            return flat[idx].astype(np.float32, copy=False)
+
+        elif a.ndim == 3:
+            h, w, c = a.shape
+            c = min(c, 3)
+            use = a[:, :, :c].reshape(-1, c)
+            n = use.shape[0]
+            if n <= k:
+                return use.astype(np.float32, copy=False)
+            idx = np.linspace(0, n - 1, num=k, dtype=np.int64)
+            return use[idx].astype(np.float32, copy=False)
+
+        # fallback (unexpected ndim)
+        return np.asarray(a, dtype=np.float32)
+       
+    
+    def _preview_sized_for_widget(preview, viewer, oversample=1.25):
+        """
+        Downscale preview to ~viewer size (with a small oversample for crispness)
+        before stretching. Keeps channel order as-is. INTER_AREA for quality/speed.
+        """
+        import cv2
+        if preview is None or viewer is None:
+            return preview
+        h, w = preview.shape[:2]
+        tw = max(1, viewer.width())
+        th = max(1, viewer.height())
+        tw = int(tw * oversample)
+        th = int(th * oversample)
+        if w <= tw and h <= th:
+            return preview
+        scale = min(tw / float(w), th / float(h))
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        # prefer your project’s safe resizer if present
+        try:
+            return resize_safe(preview, new_w, new_h, interp=cv2.INTER_AREA)
+        except NameError:
+            return cv2.resize(preview, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    # --- helper: resize preview to roughly the widget size (for speed) ---
+    def _viewer_preview_sized(self, preview, viewer, oversample=1.25):
+        """
+        Downscale preview to ~viewer size (with a small oversample for crispness)
+        before stretching. Keeps channel order as-is. INTER_AREA for quality/speed.
+        """
+        import cv2
+        # Guard: preview must be a numpy array
+        if preview is None or viewer is None or not hasattr(preview, "shape"):
+            return preview
+
+        h, w = preview.shape[:2]
+        # Viewer might report 0 before being shown; bail out if so
+        try:
+            tw = int(max(1, viewer.width()))
+            th = int(max(1, viewer.height()))
+        except Exception:
+            return preview
+        if tw <= 1 or th <= 1:
+            return preview
+
+        tw = int(tw * oversample)
+        th = int(th * oversample)
+        if w <= tw and h <= th:
+            return preview
+
+        scale = min(tw / float(w), th / float(h))
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+
+        try:
+            return resize_safe(preview, new_w, new_h, interp=cv2.INTER_AREA)  # your project helper if present
+        except NameError:
+            return cv2.resize(preview, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+
+
+
+    def reset_stretch(self, scope: str, viewer=None, root_name: str=None):
+        """
+        scope: 'viewer' | 'root' | 'project'
+        - viewer: removes this image's saved stretch (.ax) and clears viewer.stretch_params
+        - root:   removes this root's default from global.ax and clears active viewers' params
+        - project:removes project default & all root defaults from global.ax and clears active viewers' params
+        Then re-renders affected viewers with the normal system stretch.
+        """
+        def _refresh(v):
+            base = getattr(getattr(v, "image_data", None), "image", None)
+            if base is None:
+                return
+            # No custom stretch → convert_cv_to_pixmap handles default system stretch
+            v.stretch_params = None
+            pm = self.convert_cv_to_pixmap(base)
+            if pm is not None:
+                v.set_image(pm)
+
+        if scope == "viewer" and viewer is not None:
+            fp = getattr(getattr(viewer, "image_data", None), "filepath", None)
+            if fp and hasattr(self, "_delete_file_stretch"):
+                self._delete_file_stretch(fp)
+            if hasattr(viewer, "stretch_params"):
+                viewer.stretch_params = None
+            _refresh(viewer)
+
+        elif scope == "root" and root_name:
+            if hasattr(self, "_delete_root_stretch"):
+                self._delete_root_stretch(root_name)
+            for rec in self.viewer_widgets:
+                _refresh(rec['viewer'])
+
+        elif scope == "project":
+            if hasattr(self, "_delete_project_stretch_default"):
+                self._delete_project_stretch_default()
+            for rec in self.viewer_widgets:
+                _refresh(rec['viewer'])
+
+
+    def _apply_viewer_stretch_numpy(self, preview, params):
+        """
+        SUPER FAST:
+          • stats from ~200 samples (deterministic)
+          • uint8 previews: map via per-channel LUTs (cv2.LUT)
+          • non-uint8: single vectorized pass
+        Works for modes: percentile | stddev | absolute.
+        Preserves channel order, pads to <=3 channels for display.
+        """
+        import numpy as np, cv2
+
+        if preview is None:
+            return None
+
+        x = preview  # avoid copies until the end
+        per_ch = bool(getattr(params, "per_channel", True))
+        clip = bool(getattr(params, "clip", True))
+
+        # ---------- 1) Compute lo/hi for ALL modes (incl. percentile on uint8) ----------
+        # Tiny deterministic sampler (~200 values) → quick robust stats
+        s = self._stats200(x, k=200)
+        if s is None:
+            return None
+
+        # Decide lo/hi depending on mode
+        mode = (getattr(params, "mode", "percentile") or "percentile").lower()
+
+        if mode == "percentile":
+            # Percentiles from the sample (per-channel if requested and C>1)
+            if x.ndim == 3 and per_ch and x.shape[2] > 1:
+                lo = np.percentile(s, params.low_p,  axis=0)
+                hi = np.percentile(s, params.high_p, axis=0)
+            else:
+                lo = float(np.percentile(s, params.low_p))
+                hi = float(np.percentile(s, params.high_p))
+
+        elif mode == "stddev":
+            if x.ndim == 3 and per_ch and x.shape[2] > 1:
+                mu = np.mean(s, axis=0); sd = np.std(s, axis=0)
+                lo = mu - params.k_sigma * sd
+                hi = mu + params.k_sigma * sd
+            else:
+                mu = float(np.mean(s)); sd = float(np.std(s))
+                lo = mu - params.k_sigma * sd
+                hi = mu + params.k_sigma * sd
+
+        elif mode == "absolute":
+            if x.ndim == 3 and per_ch and x.shape[2] > 1:
+                min_s = np.min(s, axis=0); max_s = np.max(s, axis=0)
+                lo = (np.full(s.shape[1], params.min_val, dtype=np.float32)
+                      if params.min_val is not None else min_s.astype(np.float32))
+                hi = (np.full(s.shape[1], params.max_val, dtype=np.float32)
+                      if params.max_val is not None else max_s.astype(np.float32))
+            else:
+                lo = float(params.min_val if params.min_val is not None else np.min(s))
+                hi = float(params.max_val if params.max_val is not None else np.max(s))
+
+        else:
+            # Fallback to your existing default behavior
+            from .utils import _normalize_for_display
+            return _normalize_for_display(x)
+
+        # ---------- 2) Guard degenerate ranges ----------
+        if np.isscalar(hi):
+            if hi <= lo:
+                hi = float(lo) + 1e-6
+        else:
+            lo = np.asarray(lo, dtype=np.float32)
+            hi = np.asarray(hi, dtype=np.float32)
+            hi = np.maximum(hi, lo + 1e-6)
+
+        # ---------- 3) Map to uint8 ----------
+        # Fast path for uint8 via LUTs; otherwise one vectorized pass.
+        if x.dtype == np.uint8:
+            if x.ndim == 2 or (x.ndim == 3 and (not per_ch or x.shape[2] == 1)):
+                # Single LUT for all channels
+                lo_s = float(lo); hi_s = float(hi)
+                scale = 255.0 / (hi_s - lo_s)
+                lut = np.arange(256, dtype=np.float32)
+                lut = (lut - lo_s) * scale
+                if clip:
+                    lut = np.clip(lut, 0.0, 255.0)
+                lut = lut.astype(np.uint8)
+                if x.ndim == 2:
+                    disp = cv2.LUT(x, lut)
+                else:
+                    ch = cv2.split(x[:, :, :min(3, x.shape[2])])
+                    ch = [cv2.LUT(c, lut) for c in ch]
+                    disp = cv2.merge(ch)
+            else:
+                # Per-channel LUTs
+                C = min(3, x.shape[2])
+                lo_v = np.asarray(lo, dtype=np.float32).reshape(-1)[:C]
+                hi_v = np.asarray(hi, dtype=np.float32).reshape(-1)[:C]
+                base = np.arange(256, dtype=np.float32)
+                luts = []
+                for i in range(C):
+                    lut = (base - lo_v[i]) * (255.0 / (hi_v[i] - lo_v[i]))
+                    if clip:
+                        lut = np.clip(lut, 0.0, 255.0)
+                    luts.append(lut.astype(np.uint8))
+                ch = cv2.split(x[:, :, :C])
+                ch = [cv2.LUT(ch[i], luts[i]) for i in range(C)]
+                disp = cv2.merge(ch)
+        else:
+            # float/uint16/etc.
+            x32 = np.nan_to_num(x.astype(np.float32, copy=False), copy=False)
+            if x32.ndim == 2 or (x32.ndim == 3 and (not per_ch or x32.shape[2] == 1)):
+                scale = 255.0 / (float(hi) - float(lo))
+                n = (x32 - float(lo)) * scale
+            else:
+                lo_v = lo.reshape(1, 1, -1).astype(np.float32, copy=False)
+                scale = (255.0 / (hi - lo_v)).reshape(1, 1, -1).astype(np.float32, copy=False)
+                n = (x32 - lo_v) * scale
+            if clip:
+                n = np.clip(n, 0.0, 255.0)
+            disp = n.astype(np.uint8, copy=False)
+
+        # Ensure <=3 channels for display (match your utils)
+        if disp.ndim == 3:
+            c = disp.shape[2]
+            if c == 1:
+                disp = np.repeat(disp, 3, axis=2)
+            elif c == 2:
+                disp = np.concatenate([disp, disp[:, :, :1]], axis=2)
+            elif c > 3:
+                disp = disp[:, :, :3].copy()
+
+        return disp
+
+       
+    def _render_with_viewer_stretch(self, cv_img, viewer, prefer_last_band=False):
+        sp = getattr(viewer, "stretch_params", None)
+        base = cv_img
+
+        if sp is not None and base is not None and hasattr(base, "ndim"):
+            dm = (getattr(sp, "display_mode", "auto") or "auto").lower()
+
+            if dm == "single" and getattr(sp, "display_band", None) is not None and base.ndim == 3:
+                sel = int(sp.display_band)
+                if 0 <= sel < base.shape[2]:
+                    base = base[..., sel]  # 2D grayscale
+
+            elif dm == "rgb" and base.ndim == 3:
+                import numpy as np
+                C = base.shape[2]
+                r = sp.r_band if sp.r_band is not None else min(2, C-1)
+                g = sp.g_band if sp.g_band is not None else min(1, C-1)
+                b = sp.b_band if sp.b_band is not None else 0
+                # clamp
+                r = max(0, min(int(r), C-1)); g = max(0, min(int(g), C-1)); b = max(0, min(int(b), C-1))
+                # Build BGR composite to match QImage.Format_BGR888 fast path
+                base = np.stack([base[..., b], base[..., g], base[..., r]], axis=2)
+
+        # Then your normal preview-plane selection on that base
+        try:
+            preview = _preview_take3(base, prefer_last_band=prefer_last_band)
+        except NameError:
+            preview = base
+
+        if sp is None:
+            return self.convert_cv_to_pixmap(preview)
+
+        disp = self._apply_viewer_stretch_numpy(preview, sp)
+        return self.convert_cv_to_pixmap(disp)
+
+
+
+    # ----------------- STRETCH: resets (image / root / all) -----------------
+
+    def _clear_file_stretch(self, filepath: str):
+        """Remove per-file viewer stretch from the .ax sidecar (key: 'viewer_stretch')."""
+        try:
+            axp = self._ax_path_for(filepath)
+            d = self._read_json_silently(axp)
+            if "viewer_stretch" in d:
+                d.pop("viewer_stretch", None)
+                self._write_json_safely(axp, d)
+        except Exception:
+            pass
+
+    def _clear_root_stretch_entry(self, root_name: str):
+        """Remove root-level default stretch (global.ax: root_stretch[root_name])."""
+        try:
+            gp = self._global_ax_path()
+            data = self._read_json_silently(gp)
+            roots = data.get("root_stretch") or {}
+            if root_name in roots:
+                roots.pop(root_name, None)
+                data["root_stretch"] = roots
+                self._write_json_safely(gp, data)
+        except Exception:
+            pass
+        # clear in-memory cache, too
+        try:
+            if getattr(self, "_root_stretch_map", None):
+                self._root_stretch_map.pop(root_name, None)
+        except Exception:
+            pass
+
+    def _clear_project_stretch_default(self):
+        """Remove project-level default (global.ax: viewer_stretch_default)."""
+        try:
+            gp = self._global_ax_path()
+            data = self._read_json_silently(gp)
+            if "viewer_stretch_default" in data:
+                data.pop("viewer_stretch_default", None)
+                self._write_json_safely(gp, data)
+        except Exception:
+            pass
+        # clear in-memory cache
+        self._project_default_stretch = None
+
+    def _filepaths_for_loaded_root(self, root_name: str):
+        """
+        Return list of filepaths currently associated with this root in the UI.
+        load_image_group() already populates image_data_groups[root_name] with
+        MS + paired Thermal/RGB when in dual-folder mode; use that if present.
+        """
+        fps = list((self.image_data_groups or {}).get(root_name, []))
+        if fps:
+            return fps
+        # Fallback: use raw groups directly
+        fps = list((self.multispectral_image_data_groups or {}).get(root_name, []))
+        # If you're in dual-folder, try to append the paired TRGB set (best-effort)
+        try:
+            ms_idx = self.multispectral_root_names.index(root_name)
+            trg_idx = ms_idx + int(getattr(self, "root_offset", 0))
+            if 0 <= trg_idx < len(self.thermal_rgb_root_names):
+                trg_name = self.thermal_rgb_root_names[trg_idx]
+                fps.extend((self.thermal_rgb_image_data_groups or {}).get(trg_name, []))
+        except Exception:
+            pass
+        return fps
+
+    def _rerender_viewer_now(self, viewer):
+        """Re-render a viewer using _render_with_viewer_stretch (sp=None → default)."""
+        try:
+            base = getattr(getattr(viewer, "image_data", None), "image", None)
+            if base is None:
+                return
+            pm = self._render_with_viewer_stretch(base, viewer)
+            if pm is not None:
+                viewer.set_image(pm)
+        except Exception:
+            pass
+
+    def _reset_stretch_viewer(self, viewer):
+        """
+        Reset only this image:
+          - Clear per-file override from its .ax
+          - Clear viewer.stretch_params
+          - Re-render with project/default behavior
+        """
+        fp = getattr(getattr(viewer, "image_data", None), "filepath", None)
+        if fp:
+            self._clear_file_stretch(fp)
+        # make sure this viewer no longer carries an in-memory override
+        try:
+            viewer.stretch_params = None
+        except Exception:
+            pass
+        self._rerender_viewer_now(viewer)
+
+    def _reset_stretch_root(self, root_name: str):
+        """
+        Reset all images shown under this root:
+          - Clear all per-file overrides (.ax)
+          - Clear root-level default (global.ax)
+          - Clear in-memory viewer overrides for on-screen viewers of this root
+          - Re-render them
+        """
+        fps = set(self._filepaths_for_loaded_root(root_name))
+        for fp in fps:
+            self._clear_file_stretch(fp)
+        self._clear_root_stretch_entry(root_name)
+
+        # update on-screen viewers that belong to this root
+        for rec in (self.viewer_widgets or []):
+            v = rec.get("viewer")
+            imgd = rec.get("image_data")
+            if v is None or imgd is None:
+                continue
+            if imgd.filepath in fps:
+                try:
+                    v.stretch_params = None
+                except Exception:
+                    pass
+                self._rerender_viewer_now(v)
+
+    def _reset_stretch_all(self):
+        """
+        Reset EVERYTHING in the project:
+          - Clear all per-file overrides for every known image
+          - Clear all root-level defaults
+          - Clear project-level default
+          - Clear in-memory viewer overrides and re-render all viewers
+        """
+        # 1) per-file
+        all_fps = set()
+        for g in (self.multispectral_image_data_groups or {}).values():
+            all_fps.update(g)
+        for g in (self.thermal_rgb_image_data_groups or {}).values():
+            all_fps.update(g)
+        # include already-assembled groups (when present)
+        for g in (self.image_data_groups or {}).values():
+            all_fps.update(g)
+
+        for fp in all_fps:
+            self._clear_file_stretch(fp)
+
+        # 2) root-level + project-level
+        try:
+            gp = self._global_ax_path()
+            data = self._read_json_silently(gp)
+            if "root_stretch" in data:
+                data.pop("root_stretch", None)
+            if "viewer_stretch_default" in data:
+                data.pop("viewer_stretch_default", None)
+            self._write_json_safely(gp, data)
+        except Exception:
+            pass
+        # nuke in-memory caches
+        self._root_stretch_map = {}
+        self._project_default_stretch = None
+
+        # 3) live viewers → clear any in-memory sp and repaint
+        for rec in (self.viewer_widgets or []):
+            v = rec.get("viewer")
+            if v is None:
+                continue
+            try:
+                v.stretch_params = None
+            except Exception:
+                pass
+            self._rerender_viewer_now(v)
+
+    def _on_stretch_reset(self, which: str, viewer, root_name: str):
+        """
+        Handle ImageStretchDialog.resetRequested('viewer'|'root'|'project').
+        """
+        w = (which or "").lower().strip()
+        if w == "viewer":
+            self._reset_stretch_viewer(viewer)
+        elif w == "root":
+            self._reset_stretch_root(root_name)
+        else:  # 'project' or unknown -> treat as ALL
+            self._reset_stretch_all()
+       
+
+    def _on_dialog_reset_stretch(self, scope, viewer, root_name, dlg):
+        # Perform reset now and mark so we skip applying params on return
+        self.reset_stretch(scope, viewer=viewer, root_name=root_name)
+        setattr(dlg, "_did_reset", True)
+
+    def open_stretch_dialog(self, viewer, root_name):
+        # NEW: bail if the clicked viewer was already destroyed
+        if viewer is None or sip.isdeleted(viewer):
+            return
+
+        if not getattr(viewer, "image_data", None) or viewer.image_data.image is None:
+            return
+
+        init = getattr(viewer, "stretch_params", None) \
+            or self._load_file_stretch(getattr(viewer.image_data, "filepath", "")) \
+            or self._load_root_stretch(root_name) \
+            or self._load_project_stretch_default() \
+            or self._project_default_stretch
+
+        dlg = ImageStretchDialog(self, viewer.image_data.image, initial_params=init)
+
+        action = {"reset": None}
+        dlg.resetRequested.connect(lambda scope: action.__setitem__("reset", scope))
+        dlg.resetRequested.connect(lambda scope: self._on_stretch_reset(scope, viewer, root_name))
+
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+
+        if action["reset"]:
+            return
+
+        params = dlg.get_params()
+
+        if params.scope == "project":
+            self._project_default_stretch = params
+            self._save_project_stretch_default(params)
+            targets = [rec['viewer'] for rec in self.viewer_widgets]
+        elif params.scope == "root":
+            self._root_stretch_map[root_name] = params
+            self._save_root_stretch(root_name, params)
+            targets = [rec['viewer'] for rec in self.viewer_widgets]
+        else:  # "viewer"
+            fp = getattr(getattr(viewer, "image_data", None), "filepath", None)
+            if fp:
+                self._save_file_stretch(fp, params)
+            targets = [viewer]
+
+        # Apply to targets now
+        for v in targets:
+            # NEW: skip destroyed/stale widgets safely
+            if v is None or sip.isdeleted(v):
+                continue
+
+            v.stretch_params = params
+            base = v.image_data.image if getattr(v, "image_data", None) else None
+            if base is None:
+                continue
+
+            pm = self._render_with_viewer_stretch(base, v)
+            if pm is not None:
+                # NEW (optional but robust): schedule after event loop turn
+                QtCore.QTimer.singleShot(0, lambda v=v, pm=pm: (None if sip.isdeleted(v) else v.set_image(pm)))
+
+    def _stretch_to_dict(self, sp):
+        if sp is None:
+            return None
+        return {
+            "mode": sp.mode,
+            "low_p": sp.low_p,
+            "high_p": sp.high_p,
+            "k_sigma": sp.k_sigma,
+            "min_val": sp.min_val,
+            "max_val": sp.max_val,
+            "per_channel": sp.per_channel,
+            "clip": sp.clip,
+            # visualization:
+            "display_mode": sp.display_mode,
+            "display_band": sp.display_band,
+            "r_band": sp.r_band,
+            "g_band": sp.g_band,
+            "b_band": sp.b_band,
+            # NOTE: scope is runtime-only; do NOT persist
+        }
+
+    def _stretch_from_dict(self, d):
+        if not isinstance(d, dict):
+            return None
+        return _StretchParams(
+            mode=str(d.get("mode", "percentile")),
+            low_p=float(d.get("low_p", 0.5)),
+            high_p=float(d.get("high_p", 99.5)),
+            k_sigma=float(d.get("k_sigma", 1.0)),
+            min_val=d.get("min_val", None),
+            max_val=d.get("max_val", None),
+            per_channel=bool(d.get("per_channel", True)),
+            clip=bool(d.get("clip", True)),
+            scope="viewer",
+            display_mode=str(d.get("display_mode", "auto")),
+            display_band=d.get("display_band", None),
+            r_band=d.get("r_band", None),
+            g_band=d.get("g_band", None),
+            b_band=d.get("b_band", None),
+        )
+
+
+    def _global_ax_path(self):
+        # One small file at the project root to hold defaults/mappings
+        return os.path.join(self.project_folder, "global.ax")
+
+    # ---- Save scopes ----
+    def _save_project_stretch_default(self, sp):
+        gp = self._global_ax_path()
+        data = self._read_json_silently(gp)
+        data["viewer_stretch_default"] = self._stretch_to_dict(sp)
+        self._write_json_safely(gp, data)
+
+    def _save_root_stretch(self, root_name, sp):
+        gp = self._global_ax_path()
+        data = self._read_json_silently(gp)
+        roots = data.setdefault("root_stretch", {})
+        roots[root_name] = self._stretch_to_dict(sp)
+        self._write_json_safely(gp, data)
+
+    def _save_file_stretch(self, filepath, sp):
+        axp = self._ax_path_for(filepath)
+        data = self._read_json_silently(axp)
+        data["viewer_stretch"] = self._stretch_to_dict(sp)
+        self._write_json_safely(axp, data)
+
+    # ---- Load scopes ----
+    def _load_project_stretch_default(self):
+        gp = self._global_ax_path()
+        d = self._read_json_silently(gp).get("viewer_stretch_default")
+        return self._stretch_from_dict(d)
+
+    def _load_root_stretch(self, root_name):
+        gp = self._global_ax_path()
+        d = (self._read_json_silently(gp).get("root_stretch") or {}).get(root_name)
+        return self._stretch_from_dict(d)
+
+    def _load_file_stretch(self, filepath):
+        axp = self._ax_path_for(filepath)
+        d = self._read_json_silently(axp).get("viewer_stretch")
+        return self._stretch_from_dict(d)
+
+    def _ensure_cached_stretch_defaults(self):
+        # Fill in-memory caches lazily from global.ax
+        if getattr(self, "_project_default_stretch", None) is None:
+            self._project_default_stretch = self._load_project_stretch_default()
+        # load root map once
+        if not getattr(self, "_root_stretch_map", None):
+            self._root_stretch_map = {}
+            gp = self._global_ax_path()
+            root_map = (self._read_json_silently(gp).get("root_stretch") or {})
+            for rn, d in root_map.items():
+                sp = self._stretch_from_dict(d)
+                if sp: self._root_stretch_map[rn] = sp
+
+    def _resolve_stretch_for_viewer(self, filepath, root_name):
+        # 1) per-file
+        sp = self._load_file_stretch(filepath)
+        if sp: return sp
+        # 2) root-level from cache/disk
+        self._ensure_cached_stretch_defaults()
+        sp = self._root_stretch_map.get(root_name)
+        if sp: return sp
+        # 3) project default
+        return self._project_default_stretch
+
+    def display_image_group(self, image_data_list, root_name):
+        # Stop repaints while rebuilding the grid
+        self.setUpdatesEnabled(False)
+
+        # Clear previous viewers and labels
+        for widget in self.viewer_widgets:
+            self.image_grid_layout.removeWidget(widget['container'])
+            widget['container'].deleteLater()
+        self.viewer_widgets = []
+
+        # Determine grid size
+        num_images = len(image_data_list)
+        grid_cols = 5  # Adjust columns as needed
+        grid_rows = (num_images + grid_cols - 1) // grid_cols
+        positions = [(i, j) for i in range(grid_rows) for j in range(grid_cols)]
+        positions = positions[:num_images]
+
+        # Build all widgets with updates still disabled
+        local_viewers = []
+        for idx, (position, image_data) in enumerate(zip(positions, image_data_list)):
+            label = QLabel(os.path.basename(image_data.filepath))
+            label.setAlignment(Qt.AlignCenter)
+            label.setMaximumHeight(20)
+
+            viewer = ImageViewer()
+            self._wire_viewer_for_inspection(viewer)
+            viewer.drawing_mode = self.current_drawing_mode
+            viewer.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+            viewer.polygon_drawn.connect(self.on_polygon_drawn)
+            viewer.polygon_changed.connect(self.on_polygon_modified)
+            viewer.editing_finished.connect(self.reload_current_root)
+
+            # Buttons row
+            buttons_layout = QHBoxLayout()
+            buttons_layout.setSpacing(2)
+            buttons_layout.setContentsMargins(0, 0, 0, 0)
+
+            clean_button = QPushButton("Clean Vector")
+            clean_button.setFixedSize(70, 25)
+            clean_button.setStyleSheet("QPushButton { padding: 1px 5px; font-size: 9px; }")
+            edit_button = QPushButton("Edit Image Viewer")
+            edit_button.setFixedSize(130, 25)
+            edit_button.setStyleSheet("QPushButton { padding: 1px 5px; font-size: 9px; }")
+            stretch_button = QPushButton("Stretch…")
+            stretch_button.setFixedSize(85, 25)
+            stretch_button.setStyleSheet("QPushButton { padding: 1px 5px; font-size: 9px; }")
+
+            clean_button.clicked.connect(partial(self.clean_polygons, viewer))
+            clean_button.clicked.connect(partial(self.delete_polygons_for_viewer, viewer))
+            edit_button.clicked.connect(partial(self.edit_image_viewer, viewer))
+            stretch_button.clicked.connect(lambda _=False, v=viewer, rn=root_name: self.open_stretch_dialog(v, rn))
+
+            buttons_layout.addWidget(clean_button)
+            buttons_layout.addWidget(edit_button)
+            buttons_layout.addWidget(stretch_button)
+
+            container = QWidget()
+            v_layout = QVBoxLayout(container)
+            v_layout.setSpacing(1)
+            v_layout.setContentsMargins(1, 1, 1, 1)
+            v_layout.addWidget(label)
+            v_layout.addWidget(viewer)
+            v_layout.addLayout(buttons_layout)
+
+            vw_rec = {
+                'container': container,
+                'viewer': viewer,
+                'image_data': image_data,
+                'band_index': idx + 1
+            }
+            local_viewers.append(vw_rec)
+            self.image_grid_layout.addWidget(container, position[0], position[1])
+
+        # Swap in the new list at once
+        self.viewer_widgets = local_viewers
+
+        # Now set images + polygons after all widgets exist
+        # (Pick persisted stretch: file -> root -> project)
+        self._ensure_cached_stretch_defaults()
+        for rec in self.viewer_widgets:
+            viewer = rec['viewer']
+            image_data = rec['image_data']
+
+            # attach per-viewer stretch (persisted if exists)
+            resolved = self._resolve_stretch_for_viewer(image_data.filepath, root_name)
+            if resolved:
+                viewer.stretch_params = resolved
+
+            # render with stretch-aware helper; fallback to your existing path if needed
+            try:
+                pixmap = self._render_with_viewer_stretch(image_data.image, viewer)
+            except NameError:
+                pixmap = self.convert_cv_to_pixmap(image_data.image)
+
+            if pixmap is not None:
+                # IMPORTANT: assign image_data BEFORE set_image
+                viewer.image_data = image_data
+                viewer.set_image(pixmap)
+                # EXPLICITLY load polygons from the tab (don’t rely on viewer.parent())
+                self.load_polygons(viewer, image_data)
+            else:
+                QMessageBox.warning(self, "Error", f"Could not display image: {image_data.filepath}")
+
+        self.update_polygon_manager()
+        self._rewire_all_viewers_for_inspection()
+        self.setUpdatesEnabled(True)
+
 
     def convert_cv_to_pixmap(self, cv_img, prefer_last_band: bool = False):
         from PyQt5 import QtGui
