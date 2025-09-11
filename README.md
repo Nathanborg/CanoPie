@@ -20,10 +20,10 @@ Orthomosaics are useful for mapping when you need , but they come at a cost:
 Before you begin, ensure you have the following installed:
 *   Python 3.1.0
 *   The required libraries listed in `requirements.txt`
-
+*   ExifTool by Phil Harvey if you need exif data information from imagery
 ### Platform support
 CanoPie has been developed and tested on **Windows 10/11**.  
-It should run on other operating systems (Linux, macOS) as long as Python 3.10+ and all dependencies are correctly installed, but cross-platform support has not been fully tested yet.  
+It should run on other operating systems (Linux, macOS) as long as Python 3.10 and all dependencies are correctly installed, but cross-platform support has not been fully tested yet.  
 
 ### Installation and Usage (Conda)
 
@@ -41,7 +41,7 @@ anywhere in your computer:
 ```sh
 git clone https://github.com/Nathanborg/CanoPie.git
 ```
-4. **Navigate to the project directory (Folder where CanoPie was stored and extracted)**
+4. **Navigate to the project directory (Folder where CanoPie was stored and extracted where main.py is stored)**
 ```sh
 cd CanoPie
 ```
