@@ -4160,9 +4160,12 @@ class ProjectTab(QtWidgets.QWidget):
         return raw_map
 
 
-    def _safe_cell(v):
-        """Sanitize a value for CSV: strip control chars, remove active delimiter,
-        and ONLY Excel-guard non-numeric strings that start with = + - @."""
+    def _safe_cell(self, v):
+        """
+        Sanitize a value for CSV: strip control chars, remove active delimiter,
+        and ONLY Excel-guard non-numeric strings that start with = + - @.
+        Treat strings of numbers (e.g., "12 -34.5" or "1,2,3") as numeric lists (no guard).
+        """
         import re
         try:
             import numpy as _np
@@ -4171,34 +4174,42 @@ class ProjectTab(QtWidgets.QWidget):
             _np_ok = False
 
         def _is_numeric_scalar(x):
-            # Python numbers or NumPy scalar (not array)
             if isinstance(x, (int, float)):
                 return True
             if _np_ok:
                 import numpy as _np
-                if isinstance(x, (_np.integer, _np.floating)):  # NumPy scalars
+                if isinstance(x, (_np.integer, _np.floating)):
                     return True
             return False
 
+        # one number like -2.93 or 1e3
         def _is_numeric_string(s: str) -> bool:
             s = s.strip()
-            # Plain number: ±digits[.digits][e±digits]
             return bool(re.match(r'^[+\-]?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?$', s))
+
+        # multiple numbers separated by space or comma
+        def _is_numeric_list_string(s: str) -> bool:
+            s = s.strip()
+            if not s:
+                return False
+            tokens = re.split(r'[,\s]+', s)
+            num = r'[+\-]?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?'
+            return all(re.fullmatch(num, t) for t in tokens if t)
 
         if v is None:
             return ""
 
         # Containers
         if isinstance(v, (list, tuple, set)):
-            return " ".join(_safe_cell(x) for x in v if x is not None)
+            return " ".join(self._safe_cell(x) for x in v if x is not None)
         if isinstance(v, dict):
-            return " ".join(f"{_safe_cell(k)}:{_safe_cell(val)}" for k, val in sorted(v.items()))
+            return " ".join(f"{self._safe_cell(k)}:{self._safe_cell(val)}" for k, val in sorted(v.items()))
         if isinstance(v, (bytes, bytearray)):
             return f"[{len(v)} bytes]"
 
         # NumPy arrays
         if _np_ok and isinstance(v, _np.ndarray):
-            if v.ndim == 0:  # scalar array
+            if v.ndim == 0:
                 try:
                     return str(v.item())
                 except Exception:
@@ -4206,27 +4217,47 @@ class ProjectTab(QtWidgets.QWidget):
             flat = v.ravel()
             if flat.size > 64:
                 return f"[{flat.size} values]"
-            return " ".join(_safe_cell(x) for x in flat.tolist())
+            return " ".join(self._safe_cell(x) for x in flat.tolist())
 
         # Numeric scalars → plain string (no Excel guard)
         if _is_numeric_scalar(v):
             return str(v)
 
-        # Everything else → string sanitize
+        # Strings
         s = str(v).replace("\r", " ").replace("\n", " ").replace("\t", " ")
 
-        # remove active delimiter so naive split works
+        # Remove the active delimiter so naive split works
         delim = getattr(self, "_active_csv_delimiter", ",")
         if delim and delim in s:
             s = s.replace(delim, " ")
 
-        # Excel-injection guard ONLY for *non-numeric* strings
+        # Excel-injection guard ONLY for non-numeric strings
         s_stripped = s.lstrip()
-        if s_stripped and s_stripped[0] in "=+-@" and not _is_numeric_string(s_stripped):
+        if s_stripped and s_stripped[0] in "=+-@" and not (
+            _is_numeric_string(s_stripped) or _is_numeric_list_string(s_stripped)
+        ):
             s = "'" + s
+
         return s
 
-  
+    from contextlib import contextmanager
+
+
+    @contextmanager
+    def _busy_dialog(self, text="Please wait…"):
+        dlg = QtWidgets.QProgressDialog(text, None, 0, 0, self)
+        dlg.setWindowTitle("Working")
+        dlg.setWindowModality(QtCore.Qt.ApplicationModal)
+        dlg.setCancelButton(None)            # no cancel button
+        dlg.setMinimumDuration(0)            # show immediately
+        dlg.setAutoClose(True)
+        dlg.setAutoReset(True)
+        dlg.show()
+        QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents)
+        try:
+            yield dlg                        # you can optionally update text with dlg.setLabelText(...)
+        finally:
+            dlg.close()   
     def _extract_exif_for_file(self, filepath, exif_tags):
         """Uses your existing EXIF method if present; falls back to exiftool JSON."""
         # If you already have a reader, use it
@@ -4317,47 +4348,15 @@ class ProjectTab(QtWidgets.QWidget):
 
         exif_key = os.path.normcase(os.path.abspath(filepath))
 
-        # --- CSV cell sanitizer + EXIF attach helper -------------------------------
-        def _safe_cell(v):
-            try:
-                import numpy as _np
-            except Exception:
-                _np = None
 
-            if v is None:
-                return ""
-            if isinstance(v, (list, tuple, set)):
-                return " ".join(_safe_cell(x) for x in v if x is not None)
-            if _np is not None and isinstance(v, _np.ndarray):
-                if v.ndim == 0:
-                    try:
-                        return str(v.item())
-                    except Exception:
-                        return str(v)
-                flat = v.ravel()
-                if flat.size > 64:
-                    return f"[{flat.size} values]"
-                return " ".join(str(x) for x in flat.tolist())
-            if isinstance(v, (bytes, bytearray)):
-                return f"[{len(v)} bytes]"
-            s = str(v).replace("\r", " ").replace("\n", " ").replace("\t", " ")
-            # remove active delimiter from data so naive split works
-            delim = getattr(self, "_active_csv_delimiter", ",")
-            if delim and delim in s:
-                s = s.replace(delim, " ")
-            # Excel injection guard
-            if s and s[0] in "=+-@":
-                s = "'" + s
-            return s
 
         def _attach_exif(row):
             exif_data = exif_data_dict.get(exif_key, {}) or {}
             for tag in exif_tags:
-                row[tag] = _safe_cell(exif_data.get(tag, ""))
+                row[tag] = self._safe_cell(exif_data.get(tag, ""))
             return row
-        # --------------------------------------------------------------------------
 
-        # --- LOG (once) how/if EXIF was obtained for this run ---------------------
+
         try:
             if not getattr(self, "_exif_usage_logged_once", False):
                 method = getattr(self, "_exif_last_method", "unknown")
@@ -5097,16 +5096,13 @@ class ProjectTab(QtWidgets.QWidget):
         """
         Saves all polygon data to a CSV file using multithreading for faster processing.
 
-        NEW: If EXIF is selected, a modal QProgressDialog shows the EXIF extraction progress
-             (first step) before polygon extraction starts.
-
         - EXIF sanitization + strict delimiter guard (no commas inside cells when delimiter=',').
         - No thumbnails.
         - Dialog options decide stats, shrink/swell, RF, EXIF, export modified polygons.
         - Auto-suffixes filenames if exists.
         - Writes CSV with QUOTE_NONE; UTF-8-BOM for Excel friendliness.
         """
-        import os, time, csv, random, string, concurrent.futures, functools, logging, threading, json, subprocess
+        import os, time, csv, random, string, concurrent.futures, functools, logging, threading
         from PyQt5 import QtWidgets, QtCore
 
         # ----------------- helpers -----------------
@@ -5155,24 +5151,29 @@ class ProjectTab(QtWidgets.QWidget):
                              for k, v in sorted(val.items()))
             elif isinstance(val, (bytes, bytearray)):
                 s = f"[{len(val)} bytes]"
-            elif _np_ok and isinstance(val, np.ndarray):  # noqa: F821 (np imported in try)
-                a = val.ravel()
+            elif _np_ok and isinstance(val, np.ndarray):
+                a = np.ravel(val)
                 if a.size > 64:
                     s = f"[{a.size} values]"
                 else:
                     s = " ".join(_sanitize_for_csv(x, delim) for x in a.tolist())
             elif _is_numeric_scalar(val):
+                # numeric scalar: write as-is; no Excel guard
                 s = str(val)
             else:
                 s = str(val)
 
+            # normalize whitespace + remove delimiter
             s = s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
             if delim and delim in s:
                 s = s.replace(delim, " ")
+
+            # Excel guard ONLY for non-numeric strings
             s_stripped = s.lstrip()
             if s_stripped and s_stripped[0] in "=+-@" and not _is_numeric_string(s_stripped):
                 s = "'" + s
             return s
+
 
         def _audit_row_for_delim(safe_row: dict, delim: str, where: str):
             """Guarantee no cell contains the delimiter; replace+log if any do."""
@@ -5184,41 +5185,7 @@ class ProjectTab(QtWidgets.QWidget):
                     logging.warning(f"[csv-guard:{where}] Delimiter found in field '{k}' → replaced.")
                 fixed[k] = vv
             return fixed
-
-        def _normkey(p): 
-            return os.path.normcase(os.path.abspath(p))
-
-        # ---------- per-file EXIF reader (used by the EXIF progress step) ----------
-        def _read_exif_for_file(filepath: str) -> dict:
-            """
-            Try class helper first (if you have one), else call exiftool.
-            Returns a flat dict of EXIF tags for the file (strings, numbers, etc.).
-            """
-            # Your optional fast path
-            try:
-                if hasattr(self, "_read_exif_tags"):
-                    d = self._read_exif_tags(filepath, None)  # None => all tags if your helper supports
-                    if isinstance(d, dict):
-                        return d
-            except Exception as e:
-                logging.debug(f"_read_exif_tags failed for {filepath}: {e}")
-
-            # Fallback: exiftool -j (JSON, numeric where possible with -n)
-            try:
-                exe = getattr(self, "exiftool_path", None) or "exiftool"
-                args = [exe, "-j", "-n", filepath]
-                p = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   encoding="utf-8", shell=False)
-                if p.returncode == 0 and p.stdout.strip():
-                    arr = json.loads(p.stdout)
-                    if isinstance(arr, list) and arr:
-                        return arr[0] or {}
-                else:
-                    logging.warning(f"exiftool failed for {filepath}: {p.stderr.strip()}")
-            except Exception as e:
-                logging.warning(f"EXIF fallback error for {filepath}: {e}")
-            return {}
-        # ---------------------------------------------------------------------------
+        # ------------------------------------------
 
         # -- show the export/options dialog --
         dlg = AnalysisOptionsDialog(self)
@@ -5252,7 +5219,8 @@ class ProjectTab(QtWidgets.QWidget):
 
         # Any polygons to save?
         if not self.all_polygons:
-            QtWidgets.QMessageBox.warning(self, "No Polygons", "There are no polygons to save.")
+            from PyQt5 import QtWidgets as _QtW
+            _QtW.QMessageBox.warning(self, "No Polygons", "There are no polygons to save.")
             return
 
         # Determine final CSV path (unique)
@@ -5263,93 +5231,43 @@ class ProjectTab(QtWidgets.QWidget):
             save_path = _next_available_path(os.path.join(exports_dir, default_name))
             project_name = os.path.basename(os.path.normpath(self.project_folder))
         else:
-            options_fd = QtWidgets.QFileDialog.Options()
-            options_fd |= QtWidgets.QFileDialog.DontUseNativeDialog
+            options = QtWidgets.QFileDialog.Options()
+            options |= QtWidgets.QFileDialog.DontUseNativeDialog
             chosen_path, _ = QtWidgets.QFileDialog.getSaveFileName(
-                self, "Save All CSV", os.path.expanduser("~"), "CSV Files (*.csv)", options=options_fd)
+                self, "Save All CSV", os.path.expanduser("~"), "CSV Files (*.csv)", options=options)
             if not chosen_path:
                 return
             save_path = _next_available_path(chosen_path)
             project_name = "N/A"
 
-        # Collect unique, normalized filepaths that actually have polygons
+        def _normkey(p): return os.path.normcase(os.path.abspath(p))
         filepaths_with_polygons = []
         for group_polygons in self.all_polygons.values():
             for fp in group_polygons.keys():
                 filepaths_with_polygons.append(fp)
         filepaths_with_polygons = list({_normkey(p) for p in filepaths_with_polygons})
 
-        # ---------- FIRST STEP: EXIF extraction with a progress dialog ----------
-        if include_exif_opt and filepaths_with_polygons:
-            exif_progress = QtWidgets.QProgressDialog("Extracting EXIF…", "Cancel", 0, len(filepaths_with_polygons), self)
-            exif_progress.setWindowModality(QtCore.Qt.ApplicationModal)
-            exif_progress.setAutoClose(True)
-            exif_progress.setMinimumDuration(0)
-            exif_progress.setValue(0)
-
-            raw_exif_map = {}
-            canceled = False
-            for i, fp_abs in enumerate(filepaths_with_polygons, 1):
-                if exif_progress.wasCanceled():
-                    canceled = True
-                    break
-                exif_progress.setLabelText(f"Extracting EXIF ({i}/{len(filepaths_with_polygons)})\n{os.path.basename(fp_abs)}")
-                QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents)
-
-                try:
-                    raw_exif_map[fp_abs] = _read_exif_for_file(fp_abs) or {}
-                except Exception as e:
-                    logging.warning(f"EXIF read error for {fp_abs}: {e}")
-                    raw_exif_map[fp_abs] = {}
-
-                exif_progress.setValue(i)
-                QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents)
-
-            if canceled:
-                logging.info("User canceled EXIF extraction.")
-                return
-
-            # If you have a sanitizer that decides which tags to keep, use it:
-            exif_tags = []
-            exif_data_dict = raw_exif_map
-            try:
-                if hasattr(self, "_sanitize_exif_map_for_csv"):
-                    # This expects original (non-normalized) paths; build a mapping
-                    # back to original forms if you need. Here we reuse normalized list.
-                    sanitized_exif, sanitized_tags = self._sanitize_exif_map_for_csv(raw_exif_map, filepaths_with_polygons)
-                    if sanitized_tags:
-                        exif_tags = [str(t) for t in sanitized_tags]
-                        exif_data_dict = sanitized_exif
-            except Exception as e:
-                logging.debug(f"_sanitize_exif_map_for_csv failed, falling back to union of keys: {e}")
-
-            if not exif_tags:
-                # Fallback: union of keys in encountered order (may be many)
-                seen = set()
-                for fp_abs in filepaths_with_polygons:
-                    for k in (exif_data_dict.get(fp_abs, {}) or {}).keys():
-                        k = str(k)
-                        if k not in seen:
-                            seen.add(k)
-                exif_tags = list(seen)
-
-            # If still empty, create a fake column so rows aren't broken
-            if not exif_tags:
-                exif_tags = ['FakePath']
-                for fp_abs in filepaths_with_polygons:
-                    exif_data_dict.setdefault(fp_abs, {})['FakePath'] = _fake_path_token()
-
-            # Hints for logging inside process_polygon
-            self._exif_last_method = "per-file exiftool"
+        # Build EXIF map / tags per option
+        if include_exif_opt:
+            with self._busy_dialog("Extracting EXIF…"):
+                raw_exif = self._get_exif_data_with_optional_path(filepaths_with_polygons)
+                raw_exif = {_normkey(k): v for k, v in (raw_exif or {}).items()}
+                sanitized_exif, sanitized_tags = self._sanitize_exif_map_for_csv(
+                    raw_exif, filepaths_with_polygons
+                )
+                if sanitized_tags:
+                    exif_tags = sanitized_tags[:]
+                    exif_data_dict = sanitized_exif
+                else:
+                    exif_tags = ['FakePath']
+                    exif_data_dict = {fp: {'FakePath': _fake_path_token()} for fp in filepaths_with_polygons}
         else:
-            # EXIF disabled → provide a single fake column to keep headers stable
             exif_tags = ['FakePath']
             exif_data_dict = {fp: {'FakePath': _fake_path_token()} for fp in filepaths_with_polygons}
 
         # Deduplicate EXIF tag headers while preserving order; ensure strings
-        seen_tags = set()
-        exif_tags = [str(t) for t in exif_tags if not (t in seen_tags or seen_tags.add(t))]
-        # -----------------------------------------------------------------------
+        seen = set()
+        exif_tags = [str(t) for t in exif_tags if not (t in seen or seen.add(t))]
 
         # RF model decision: dialog decides
         if use_rf:
@@ -5395,8 +5313,8 @@ class ProjectTab(QtWidgets.QWidget):
         data_rows = []
         modified_polygons = []
 
-        # Progress & parallel for polygon extraction
-        progress_dialog = QtWidgets.QProgressDialog("Extracting polygons…", "Cancel", 0, len(polygons_to_process), self)
+        # Progress & parallel
+        progress_dialog = QtWidgets.QProgressDialog("Saving polygons...", "Cancel", 0, len(polygons_to_process), self)
         progress_dialog.setWindowModality(QtCore.Qt.WindowModal)
         progress_dialog.setMinimumDuration(0)
         progress_dialog.show()
@@ -5454,7 +5372,7 @@ class ProjectTab(QtWidgets.QWidget):
                 # header: double-sanitize + audit just in case
                 header_safe = {safe: _sanitize_for_csv(safe, csv_delimiter) for safe in fieldnames_safe}
                 header_safe = _audit_row_for_delim(header_safe, csv_delimiter, "header")
-                writer.writeheader()  # DictWriter uses fieldnames
+                writer.writeheader()  # DictWriter ignores provided dict for header, uses fieldnames
 
                 # rows
                 for row in data_rows:
@@ -5495,6 +5413,7 @@ class ProjectTab(QtWidgets.QWidget):
             json_save_path = _next_available_path(f"{json_base}_modified_polygons.json")
             try:
                 with open(json_save_path, 'w', encoding='utf-8') as jsonfile:
+                    import json
                     json.dump(modified_polygons, jsonfile, indent=4)
                 logging.info(f"Modified polygons successfully saved to {json_save_path}")
             except Exception as e:
@@ -5511,6 +5430,8 @@ class ProjectTab(QtWidgets.QWidget):
         except Exception:
             pass
 
+    
+   
     def _collect_all_image_paths_for_exif(self):
         """
         Return a sorted, de-duplicated list of every image path known to the project.
