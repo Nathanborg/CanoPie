@@ -7,7 +7,7 @@ import numpy as np
 import cv2
 
 
-STRETCH_LOW_P = 0.05
+STRETCH_LOW_P = 0.5
 STRETCH_HIGH_P = 99.5
 STRETCH_PER_CHANNEL = True
 STRETCH_CLIP = True

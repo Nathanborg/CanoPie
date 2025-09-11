@@ -1456,6 +1456,24 @@ class AnalysisOptionsDialog(QtWidgets.QDialog):
 
         vbox.addWidget(extra_group)
 
+        # --- NEW: NoData masking UI (lightweight; disabled by default) ---
+        nodata_group  = QtWidgets.QGroupBox("NoData masking")
+        nodata_layout = QtWidgets.QGridLayout(nodata_group)
+
+        self.chk_nodata = QtWidgets.QCheckBox("Mask these NoData values in all stats & band-math")
+        self.chk_nodata.setChecked(False)
+
+        self.le_nodata = QtWidgets.QLineEdit()
+        self.le_nodata.setPlaceholderText("{-9999, -32768}  or  -9999, -32768")
+        self.le_nodata.setEnabled(False)
+        self.chk_nodata.toggled.connect(self.le_nodata.setEnabled)
+
+        nodata_layout.addWidget(self.chk_nodata, 0, 0, 1, 2)
+        nodata_layout.addWidget(QtWidgets.QLabel("Values:"), 1, 0)
+        nodata_layout.addWidget(self.le_nodata,             1, 1)
+        vbox.addWidget(nodata_group)
+        # --- end NoData UI ---
+
         # --- Band-math indices ---
         DEFAULT_BANDMATH_TEXT = (
             '{\n'
@@ -1469,7 +1487,6 @@ class AnalysisOptionsDialog(QtWidgets.QDialog):
             '  "WDX_3": "b3 + 2*b1 - 2*b2"\n'
             '}'
         )
-
 
         bm_group  = QtWidgets.QGroupBox("Band-math indices (b1 = Red, b2 = Green, b3 = Blue)")
         bm_layout = QtWidgets.QVBoxLayout(bm_group)
@@ -1527,6 +1544,38 @@ class AnalysisOptionsDialog(QtWidgets.QDialog):
                 out[k] = v
         return out
 
+    @staticmethod
+    def _parse_nodata_text(text: str):
+        """
+        Accepts:
+          - "-9999, -32000"
+          - "{-9999, -32000}"
+          - "-9999 -32000"
+        Returns a sorted unique list (order preserved) of ints/floats.
+        """
+        import re
+        if not text:
+            return []
+        s = text.strip()
+        if s.startswith("{") and s.endswith("}"):
+            s = s[1:-1]
+        parts = re.split(r"[,\s]+", s)
+        out = []
+        for p in parts:
+            p = p.strip()
+            if not p:
+                continue
+            try:
+                if re.fullmatch(r"[+-]?\d+", p):
+                    v = int(p)
+                else:
+                    v = float(p)
+                if v not in out:
+                    out.append(v)
+            except Exception:
+                pass
+        return out
+
     def get_options(self):
         """Collect dialog options into a dict used by the export pipeline."""
         # Parse quantiles safely
@@ -1541,8 +1590,12 @@ class AnalysisOptionsDialog(QtWidgets.QDialog):
                     try:
                         quantiles.append(float(token))
                     except ValueError:
-                        # ignore invalid entries
                         continue
+
+        # NEW: NoData values (empty list when feature disabled)
+        nodata_values = []
+        if self.chk_nodata.isChecked():
+            nodata_values = self._parse_nodata_text(self.le_nodata.text().strip())
 
         opts = {
             "stats": {
@@ -1561,11 +1614,13 @@ class AnalysisOptionsDialog(QtWidgets.QDialog):
             "export_modified_polygons": self.chk_export_mod_polys.isChecked(),
             "include_exif":             self.chk_exif.isChecked(),
 
-            # NEW: user-defined indices to compute during export
+            # user-defined indices to compute during export
             "band_math": {
                 "enabled":  self.chk_bandmath.isChecked(),
                 "formulas": self._parse_bandmath(self.te_bandmath.toPlainText()),
             },
+
+            # NEW: feed to processing (no overhead if empty)
+            "nodata_values": nodata_values,
         }
         return opts
-
