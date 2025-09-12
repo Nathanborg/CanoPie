@@ -36,7 +36,7 @@ It should run on other operating systems (Linux, macOS) as long as Python 3.10 a
 conda create --name canopie-env python=3.10 -y
 conda activate canopie-env
 ```
-3.**Clone the repository** (if you haven't already) or download the raw file (on the top) and extract from zipfile
+3. **Clone the repository** (if you haven't already) or download the raw file (on the top) and extract from zipfile
 anywhere in your computer:
 ```sh
 git clone https://github.com/Nathanborg/CanoPie.git
