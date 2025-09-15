@@ -275,9 +275,9 @@ class ImageEditorDialog(QDialog):
           {"scope": "all"|"group"|"single", "root_name": <str or None>}
 
         Behavior:
-        - For both 'Apply to group' and 'Apply to all groups',only target files that
+        - For both 'Apply to group' and 'Apply to all groups', only target files that
           live in the SAME OS DIRECTORY as the image currently being edited.
-        - If the parent’s group mapping doesn’t include that directory,  fall back to
+        - If the parent’s group mapping doesn’t include that directory, fall back to
           scanning that directory on disk (common image extensions).
         """
         import os, json, logging
@@ -345,7 +345,7 @@ class ImageEditorDialog(QDialog):
                 d = target_dir_norm
                 if not d:
                     return []
-                folder = d  # normcase/normpath is already fine for Windows
+                folder = d  # already normed
                 exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
                 out = []
                 for name in os.listdir(folder):
@@ -356,6 +356,16 @@ class ImageEditorDialog(QDialog):
             except Exception as e:
                 logging.debug(f"_scan_folder_on_disk failed: {e}")
             return []
+
+        def _pre_resize_shape():
+            """Run pipeline up to (but not including) resize to get pre-resize W,H."""
+            mods_wo = dict(self.modifications)
+            mods_wo.pop("resize", None)
+            img_pre = self.apply_all_modifications_to_image(self.base_image, mods_wo)
+            if img_pre is not None and getattr(img_pre, "size", 0) > 0:
+                hh, ww = img_pre.shape[:2]
+                return int(ww), int(hh)
+            return None, None
 
         ui_mods = {}
 
@@ -380,15 +390,32 @@ class ImageEditorDialog(QDialog):
                         Hc, Wc = self.original_image.shape[:2]
                         ui_mods["crop_rect_ref_size"] = {"w": int(Wc), "h": int(Hc)}
 
-        # resize (PROPORTIONAL-ONLY: read single Scale % box)
-        text = self.resize_input.text().strip() if hasattr(self, "resize_input") else ""
-        if text:
+        # --- RESIZE (pixel W×H preferred; else percentage) ---
+        px_w_txt = self.resize_width_input.text().strip() if hasattr(self, "resize_width_input") else ""
+        px_h_txt = self.resize_height_input.text().strip() if hasattr(self, "resize_height_input") else ""
+        pct_txt  = self.resize_input.text().strip() if hasattr(self, "resize_input") else ""
+
+        if px_w_txt and px_h_txt:
             try:
-                ui_mods["resize"] = {"scale": int(text)}
+                tw = int(px_w_txt); th = int(px_h_txt)
+                if tw > 0 and th > 0:
+                    ui_mods["resize"] = {"px_w": tw, "px_h": th}
+                    rw, rh = _pre_resize_shape()
+                    if rw and rh:
+                        ui_mods["resize_ref_size"] = {"w": rw, "h": rh}
+            except ValueError:
+                pass
+        elif pct_txt:
+            try:
+                sc = int(pct_txt)
+                ui_mods["resize"] = {"scale": sc}
+                rw, rh = _pre_resize_shape()
+                if rw and rh:
+                    ui_mods["resize_ref_size"] = {"w": rw, "h": rh}
             except ValueError:
                 pass
 
-        # band expression
+        # band expression (from UI if not already present)
         if hasattr(self, "band_input"):
             expr = self.band_input.text().strip()
             if expr:
@@ -401,7 +428,7 @@ class ImageEditorDialog(QDialog):
             ui_mods["orig_size"] = {"h": int(H0), "w": int(W0), "c": int(C0)}
             ui_mods["anchor_to_original"] = True
 
-        # merge: only add missing keys
+        # merge: only add missing keys (do not override already-set modifications)
         for k, v in ui_mods.items():
             if k not in self.modifications:
                 self.modifications[k] = v
@@ -514,12 +541,13 @@ class ImageEditorDialog(QDialog):
         return None
 
 
-    # ---------- apply pipeline ----------
     def apply_all_modifications_to_image(self, image, modifications):
         """
         Order: rotate(90° steps) -> crop -> resize -> band expression.
         Rotation/crop/resize operate on native dtype. Band expression returns float32 (scientific).
         """
+        import cv2
+        import numpy as np
         if image is None or getattr(image, "size", 0) == 0:
             logging.error("apply_all_modifications_to_image: empty source image.")
             return image
@@ -528,7 +556,6 @@ class ImageEditorDialog(QDialog):
 
         # ---- rotation (90-degree steps) ---- (NumPy so >4 channels are fine)
         def _rotate_90s_numpy(arr, deg):
-            import numpy as np
             d = int(deg) % 360
             if d == 0 or arr is None or getattr(arr, "size", 0) == 0:
                 return arr
@@ -588,20 +615,34 @@ class ImageEditorDialog(QDialog):
             logging.error("Result is empty after crop; skipping further modifications.")
             return image
 
-        # ---- resize (adaptive interpolation for crisp preview) ----
+        # ---- resize (percent OR absolute pixel; adaptive interpolation) ----
         if "resize" in modifications:
             resize_info = modifications["resize"]
             h0, w0 = result.shape[:2]
             if h0 > 0 and w0 > 0:
-                if "scale" in resize_info:
+                new_w, new_h = w0, h0
+                if "px_w" in resize_info or "px_h" in resize_info:
+                    tw = int(resize_info.get("px_w", 0))
+                    th = int(resize_info.get("px_h", 0))
+                    if tw > 0 and th > 0:
+                        new_w, new_h = tw, th
+                    elif tw > 0:
+                        s = tw / float(w0)
+                        new_w = tw
+                        new_h = max(1, int(round(h0 * s)))
+                    elif th > 0:
+                        s = th / float(h0)
+                        new_h = th
+                        new_w = max(1, int(round(w0 * s)))
+                elif "scale" in resize_info:
                     scale = max(1, int(resize_info["scale"]))
-                    new_w = max(1, int(w0 * scale / 100.0))
-                    new_h = max(1, int(h0 * scale / 100.0))
+                    new_w = max(1, int(round(w0 * (scale / 100.0))))
+                    new_h = max(1, int(round(h0 * (scale / 100.0))))
                 else:
                     pct_w = int(resize_info.get("width", 100))
                     pct_h = int(resize_info.get("height", 100))
-                    new_w = max(1, int(w0 * pct_w / 100.0))
-                    new_h = max(1, int(h0 * pct_h / 100.0))
+                    new_w = max(1, int(round(w0 * (pct_w / 100.0))))
+                    new_h = max(1, int(round(h0 * (pct_h / 100.0))))
 
                 if new_w != w0 or new_h != h0:
                     sw = new_w / float(w0)
@@ -625,7 +666,6 @@ class ImageEditorDialog(QDialog):
                 logging.debug("Applied band expression modification.")
 
         return result
-
 
 
     def apply_modifications(self, modifications):
@@ -756,6 +796,33 @@ class ImageEditorDialog(QDialog):
         self.resize_input.returnPressed.connect(scale_apply_btn.click)
 
         controls_bar.addWidget(_tight_row(scale_label, self.resize_input, scale_apply_btn))
+
+
+
+        px_label = QtWidgets.QLabel("Size (px):")
+
+        self.resize_width_input = QtWidgets.QLineEdit()
+        self.resize_width_input.setPlaceholderText("W")
+        self.resize_width_input.setValidator(QtGui.QIntValidator(1, 20000, self))
+        self.resize_width_input.setFixedWidth(70)
+
+        x_sep = QtWidgets.QLabel("×")
+
+        self.resize_height_input = QtWidgets.QLineEdit()
+        self.resize_height_input.setPlaceholderText("H")
+        self.resize_height_input.setValidator(QtGui.QIntValidator(1, 20000, self))
+        self.resize_height_input.setFixedWidth(70)
+
+        px_apply_btn = QtWidgets.QPushButton("apply")
+        px_apply_btn.setFixedHeight(27)
+        px_apply_btn.setFixedWidth(48)
+        px_apply_btn.setToolTip("Resize to exact pixel size (W×H)")
+        px_apply_btn.clicked.connect(self.on_resize_pixels_entered)
+        # pressing Enter in either box triggers the same apply
+        self.resize_width_input.returnPressed.connect(px_apply_btn.click)
+        self.resize_height_input.returnPressed.connect(px_apply_btn.click)
+
+        controls_bar.addWidget(_tight_row(px_label, self.resize_width_input, x_sep, self.resize_height_input, px_apply_btn))
 
         # --- Band expression (label + input + button) ---
         band_label = QtWidgets.QLabel("Band:")
@@ -1168,27 +1235,56 @@ class ImageEditorDialog(QDialog):
     # ---------- crop interactions ----------
     def _inverse_resize_for_rect(self, x, y, w, h, view_w, view_h):
         """
-        If a resize is in the current modifications, convert a rect defined on the *resized view*
-        back to the pre-resize coordinate system so the pipeline (crop -> resize) stays aligned.
-        Returns (x2, y2, w2, h2, ref_w, ref_h) where ref_* is the pre-resize image size.
-        If no resize is present, returns the inputs and (view_w, view_h).
+        Map a rect drawn on the *resized* image back to pre-resize coordinates.
+
+        Supports:
+          • {"scale": pct}
+          • {"width": pct_w, "height": pct_h}  # legacy percent pair
+          • {"px_w": W, "px_h": H}             # absolute pixel target
+        Uses optional self.modifications["resize_ref_size"] = {"w": pre_w, "h": pre_h}
+        for exact inversion in the px case.
         """
         info = self.modifications.get("resize", None)
         if not info:
             return x, y, w, h, int(view_w), int(view_h)
 
-        if "scale" in info:
+        # Default: assume current view is the resized result.
+        # Derive inverse scale factors.
+        sx_inv = sy_inv = 1.0
+        pre_w = int(view_w)
+        pre_h = int(view_h)
+
+        ref = self.modifications.get("resize_ref_size", {}) or {}
+        ref_w = int(ref.get("w", view_w)) if view_w else 0
+        ref_h = int(ref.get("h", view_h)) if view_h else 0
+
+        if "px_w" in info or "px_h" in info:
+            # Absolute pixels
+            tgt_w = int(info.get("px_w", view_w)) or int(view_w)
+            tgt_h = int(info.get("px_h", view_h)) or int(view_h)
+            if tgt_w <= 0 or tgt_h <= 0:
+                return x, y, w, h, int(view_w), int(view_h)
+            # Inverse scales = (pre / post)
+            pre_w = ref_w or int(round(view_w * 1.0))  # fallback if no ref size
+            pre_h = ref_h or int(round(view_h * 1.0))
+            sx_inv = (pre_w / float(tgt_w)) if tgt_w else 1.0
+            sy_inv = (pre_h / float(tgt_h)) if tgt_h else 1.0
+
+        elif "scale" in info:
             s = max(1, int(info["scale"])) / 100.0
             sx_inv = 1.0 / s
             sy_inv = 1.0 / s
+            pre_w = int(round(view_w * sx_inv))
+            pre_h = int(round(view_h * sy_inv))
+
         else:
+            # legacy % pair
             pct_w = max(1, int(info.get("width", 100))) / 100.0
             pct_h = max(1, int(info.get("height", 100))) / 100.0
             sx_inv = 1.0 / pct_w
             sy_inv = 1.0 / pct_h
-
-        pre_w = int(round(view_w * sx_inv))
-        pre_h = int(round(view_h * sy_inv))
+            pre_w = int(round(view_w * sx_inv))
+            pre_h = int(round(view_h * sy_inv))
 
         x2 = int(round(x * sx_inv))
         y2 = int(round(y * sy_inv))
@@ -1201,7 +1297,7 @@ class ImageEditorDialog(QDialog):
         if x2 + w2 > pre_w: w2 = max(0, pre_w - x2)
         if y2 + h2 > pre_h: h2 = max(0, pre_h - y2)
 
-        return x2, y2, w2, h2, pre_w, pre_h
+        return x2, y2, w2, h2, int(pre_w), int(pre_h)
 
     def apply_crop(self):
         """
@@ -1338,6 +1434,42 @@ class ImageEditorDialog(QDialog):
         self.reapply_modifications()
         logging.info(f"Image resized to {scale}% of original size.")
 
+    def on_resize_pixels_entered(self):
+        """Resize to exact (W,H) pixels. Stores resize_ref_size for precise crop inverse-mapping."""
+        w_txt = self.resize_width_input.text().strip() if hasattr(self, "resize_width_input") else ""
+        h_txt = self.resize_height_input.text().strip() if hasattr(self, "resize_height_input") else ""
+        if not (w_txt and h_txt):
+            logging.warning("Pixel resize skipped: both W and H are required.")
+            return
+
+        try:
+            target_w = int(w_txt)
+            target_h = int(h_txt)
+        except ValueError:
+            logging.warning("Pixel resize skipped: invalid integers.")
+            return
+        if target_w <= 0 or target_h <= 0:
+            logging.warning("Pixel resize skipped: W and H must be positive.")
+            return
+
+        # Compute the image size *before* resize in the current pipeline so we can invert cropping later.
+        mods_wo_resize = dict(self.modifications)
+        mods_wo_resize.pop("resize", None)
+        pre_img = self.apply_all_modifications_to_image(self.base_image, mods_wo_resize)
+        if pre_img is None or pre_img.size == 0:
+            logging.warning("Pixel resize skipped: could not compute pre-resize image.")
+            return
+        pre_h, pre_w = pre_img.shape[:2]
+
+        self.modifications["resize"] = {"px_w": int(target_w), "px_h": int(target_h)}
+        self.modifications["resize_ref_size"] = {"w": int(pre_w), "h": int(pre_h)}
+
+        self.reapply_modifications()
+        logging.info(f"Image resized to {target_w}×{target_h} px (ref {pre_w}×{pre_h}).")
+
+    
+    
+    
     def apply_resize(self, scale_factor_width, scale_factor_height=None):
         """
         Kept for API compatibility called this directly.

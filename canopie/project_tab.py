@@ -360,6 +360,7 @@ class ProjectTab(QtWidgets.QWidget):
         self.setAcceptDrops(True)
         self._project_default_stretch = None       # type: Optional[_StretchParams]
         self._root_stretch_map = {}                # root_name -> _StretchParams
+    
 
 
         
@@ -1645,50 +1646,160 @@ class ProjectTab(QtWidgets.QWidget):
 
         def _effective_hw_for_file(fp: str):
             """
-            Best-effort (H,W) after .ax (rotate/crop/resize), no pixel ops.
-            Prefers self._size_after_ax_fast if present; falls back to orig_size in .ax;
-            then numpy image size; then viewer basis.
+            Best-effort (H, W) of the image *after* .ax ops (rotate→crop→resize)
+            without doing pixel work. Uses sidecar .ax if present; falls back to raw.
+
+            Supports:
+              • rotate in {0,90,180,270}
+              • crop_rect with crop_rect_ref_size
+              • resize by percent (scale / width+height) or absolute pixels (px_w, px_h)
             """
-            # (1) Fast helper if class provides it
-            if hasattr(self, "_size_after_ax_fast"):
+            import os, json
+
+            # --- sidecar lookup (project folder first, then same dir) ---
+            def _ax_paths(p):
+                base = os.path.splitext(os.path.basename(p))[0] + ".ax"
+                cands = []
+                pf = getattr(self, "project_folder", None)
+                if pf:
+                    cands.append(os.path.join(pf, base))
+                cands.append(os.path.join(os.path.dirname(p), base))
+                out = []
+                for c in cands:
+                    if c and c not in out:
+                        out.append(c)
+                return out
+
+            def _load_ax(p):
+                for axp in _ax_paths(p):
+                    try:
+                        if os.path.exists(axp):
+                            with open(axp, "r", encoding="utf-8") as f:
+                                return json.load(f) or {}
+                    except Exception:
+                        pass
+                return {}
+
+            # lightweight raw size
+            def _raw_hw(p):
+                # Try cv2 header
                 try:
-                    h, w = self._size_after_ax_fast(fp)
-                    if h and w:
+                    import cv2
+                    img = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+                    if img is not None:
+                        h, w = img.shape[:2]
                         return int(h), int(w)
                 except Exception:
                     pass
+                # Try tifffile metadata
+                try:
+                    import tifffile as tiff
+                    with tiff.TiffFile(p) as tf:
+                        series = tf.series[0] if tf.series else None
+                        if series and series.shape:
+                            axes = getattr(series, "axes", "") or ""
+                            shp  = list(series.shape)
+                            if "Y" in axes and "X" in axes:
+                                return int(shp[axes.index("Y")]), int(shp[axes.index("X")])
+                            if len(shp) >= 2:
+                                return int(shp[-2]), int(shp[-1])
+                except Exception:
+                    pass
+                return (None, None)
 
-            # (2) Parse sidecar lightly for orig_size
-            try:
-                axp = _ax_sidecar_for(fp)
-                if os.path.exists(axp):
-                    with open(axp, "r", encoding="utf-8") as f:
-                        ax = json.load(f) or {}
-                    o = ax.get("orig_size") or {}
-                    H = int(o.get("h") or 0)
-                    W = int(o.get("w") or 0)
-                    if H and W:
-                        return H, W
-            except Exception:
-                pass
+            ax = _load_ax(fp)
 
-            # (3) Numpy image size
-            try:
-                if getattr(image_data, "image", None) is not None:
-                    hh, ww = image_data.image.shape[:2]
-                    return int(hh), int(ww)
-            except Exception:
-                pass
+            # --- start basis: orig_size from .ax, else raw ---
+            h0 = w0 = None
+            if isinstance(ax, dict):
+                o = ax.get("orig_size") or {}
+                try:
+                    h0 = int(o.get("h") or 0) or None
+                    w0 = int(o.get("w") or 0) or None
+                except Exception:
+                    h0 = w0 = None
+            if not (h0 and w0):
+                h0, w0 = _raw_hw(fp)
+            if not (h0 and w0):
+                return (None, None)
 
-            # (4) Viewer basis last
-            try:
-                vh_, vw_ = self._viewer_basis_hw(viewer, fallback_hw=None)
-                if vh_ and vw_:
-                    return int(vh_), int(vw_)
-            except Exception:
-                pass
+            H, W = int(h0), int(w0)
 
-            return (None, None)
+            # op order
+            order = ax.get("op_order")
+            if not (isinstance(order, (list, tuple)) and all(isinstance(s, str) for s in order)):
+                order = ["rotate", "crop", "resize", "band_expression"]
+
+            # ---- simulate ops (geometry only) ----
+            def _sim_rotate():
+                nonlocal H, W
+                try:
+                    deg = int(ax.get("rotate", 0)) % 360
+                except Exception:
+                    deg = 0
+                if deg in (90, 270):
+                    H, W = W, H  # swap
+
+            def _sim_crop():
+                nonlocal H, W
+                rect = ax.get("crop_rect")
+                if not isinstance(rect, dict):
+                    return
+                rw = int(rect.get("width", 0))
+                rh = int(rect.get("height", 0))
+                if rw <= 0 or rh <= 0:
+                    return
+                ref = ax.get("crop_rect_ref_size") or {}
+                try:
+                    ref_w = int(ref.get("w") or 0) or W
+                    ref_h = int(ref.get("h") or 0) or H
+                except Exception:
+                    ref_w, ref_h = W, H
+                # scale rect dims into current basis
+                w_scaled = max(1, int(round(rw * (W / float(ref_w)))))
+                h_scaled = max(1, int(round(rh * (H / float(ref_h)))))
+                W, H = w_scaled, h_scaled
+
+            def _sim_resize():
+                nonlocal H, W
+                rz = ax.get("resize")
+                if not isinstance(rz, dict) or not rz:
+                    return
+                newW, newH = W, H
+                if "px_w" in rz or "px_h" in rz:
+                    tw = int(rz.get("px_w", 0))
+                    th = int(rz.get("px_h", 0))
+                    if tw > 0 and th > 0:
+                        newW, newH = tw, th
+                    elif tw > 0:
+                        s = tw / float(W)
+                        newW, newH = tw, max(1, int(round(H * s)))
+                    elif th > 0:
+                        s = th / float(H)
+                        newH, newW = th, max(1, int(round(W * s)))
+                elif "scale" in rz:
+                    sc = max(1, int(rz.get("scale", 100)))
+                    newW = max(1, int(round(W * (sc / 100.0))))
+                    newH = max(1, int(round(H * (sc / 100.0))))
+                else:
+                    pw = int(rz.get("width", 100))
+                    ph = int(rz.get("height", 100))
+                    newW = max(1, int(round(W * (pw / 100.0))))
+                    newH = max(1, int(round(H * (ph / 100.0))))
+                W, H = int(newW), int(newH)
+
+            ops = {
+                "rotate": _sim_rotate,
+                "crop": _sim_crop,
+                "resize": _sim_resize,
+                # band_expression doesn't affect geometry
+            }
+            for op in order:
+                f = ops.get(op.strip().lower())
+                if f:
+                    f()
+
+            return int(H), int(W)
 
         def _root_of_filepath(fp: str):
             """Find the logical root name that owns this filepath."""
@@ -1844,6 +1955,165 @@ class ProjectTab(QtWidgets.QWidget):
         finally:
             viewer.blockSignals(False)
 
+    def _effective_hw_for_file(self, fp: str):
+        """
+        Return best-effort (H, W) of the image after applying .ax ops (rotate→crop→resize)
+        without actually running pixel ops.
+
+        Priority:
+          1) .ax sidecar: simulate geometry using orig_size, rotate, crop_rect(+ref), resize
+          2) Raw image shape from disk (fast header read)
+          3) (None, None) if all fails
+
+        Supports:
+          • rotate in {0,90,180,270}
+          • crop_rect with crop_rect_ref_size
+          • resize: percent (scale or width/height) and absolute pixels (px_w, px_h)
+        """
+        import os, json
+
+        def _ax_paths(p):
+            base = os.path.splitext(os.path.basename(p))[0] + ".ax"
+            cands = []
+            pf = getattr(self, "project_folder", None)
+            if pf:
+                cands.append(os.path.join(pf, base))
+            cands.append(os.path.join(os.path.dirname(p), base))
+            out = []
+            for c in cands:
+                if c and c not in out:
+                    out.append(c)
+            return out
+
+        def _load_ax(p):
+            for axp in _ax_paths(p):
+                try:
+                    if os.path.exists(axp):
+                        with open(axp, "r", encoding="utf-8") as f:
+                            return json.load(f) or {}
+                except Exception:
+                    pass
+            return {}
+
+        def _raw_hw(p):
+            # Try cv2 header
+            try:
+                import cv2
+                img = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+                if img is not None:
+                    h, w = img.shape[:2]
+                    return int(h), int(w)
+            except Exception:
+                pass
+            # Try tifffile metadata
+            try:
+                import tifffile as tiff
+                with tiff.TiffFile(p) as tf:
+                    series = tf.series[0] if tf.series else None
+                    if series and series.shape:
+                        axes = getattr(series, "axes", "") or ""
+                        shp  = list(series.shape)
+                        if "Y" in axes and "X" in axes:
+                            return int(shp[axes.index("Y")]), int(shp[axes.index("X")])
+                        if len(shp) >= 2:
+                            return int(shp[-2]), int(shp[-1])
+            except Exception:
+                pass
+            return (None, None)
+
+        ax = _load_ax(fp)
+
+        # Start basis: orig_size from .ax, else raw
+        h0 = w0 = None
+        if isinstance(ax, dict):
+            o = ax.get("orig_size") or {}
+            try:
+                h0 = int(o.get("h") or 0) or None
+                w0 = int(o.get("w") or 0) or None
+            except Exception:
+                h0 = w0 = None
+        if not (h0 and w0):
+            h0, w0 = _raw_hw(fp)
+        if not (h0 and w0):
+            return (None, None)
+
+        H, W = int(h0), int(w0)
+
+        # op order
+        order = ax.get("op_order")
+        if not (isinstance(order, (list, tuple)) and all(isinstance(s, str) for s in order)):
+            order = ["rotate", "crop", "resize", "band_expression"]
+
+        # Simulate ops (geometry only)
+        def _sim_rotate():
+            nonlocal H, W
+            try:
+                deg = int(ax.get("rotate", 0)) % 360
+            except Exception:
+                deg = 0
+            if deg in (90, 270):
+                H, W = W, H  # swap
+
+        def _sim_crop():
+            nonlocal H, W
+            rect = ax.get("crop_rect")
+            if not isinstance(rect, dict):
+                return
+            rw = int(rect.get("width", 0))
+            rh = int(rect.get("height", 0))
+            if rw <= 0 or rh <= 0:
+                return
+            ref = ax.get("crop_rect_ref_size") or {}
+            try:
+                ref_w = int(ref.get("w") or 0) or W
+                ref_h = int(ref.get("h") or 0) or H
+            except Exception:
+                ref_w, ref_h = W, H
+            # scale rect dims into current basis
+            w_scaled = max(1, int(round(rw * (W / float(ref_w)))))
+            h_scaled = max(1, int(round(rh * (H / float(ref_h)))))
+            W, H = w_scaled, h_scaled
+
+        def _sim_resize():
+            nonlocal H, W
+            rz = ax.get("resize")
+            if not isinstance(rz, dict) or not rz:
+                return
+            newW, newH = W, H
+            if "px_w" in rz or "px_h" in rz:
+                tw = int(rz.get("px_w", 0))
+                th = int(rz.get("px_h", 0))
+                if tw > 0 and th > 0:
+                    newW, newH = tw, th
+                elif tw > 0:
+                    s = tw / float(W)
+                    newW, newH = tw, max(1, int(round(H * s)))
+                elif th > 0:
+                    s = th / float(H)
+                    newH, newW = th, max(1, int(round(W * s)))
+            elif "scale" in rz:
+                sc = max(1, int(rz.get("scale", 100)))
+                newW = max(1, int(round(W * (sc / 100.0))))
+                newH = max(1, int(round(H * (sc / 100.0))))
+            else:
+                pw = int(rz.get("width", 100))
+                ph = int(rz.get("height", 100))
+                newW = max(1, int(round(W * (pw / 100.0))))
+                newH = max(1, int(round(H * (ph / 100.0))))
+            W, H = int(newW), int(newH)
+
+        ops = {
+            "rotate": _sim_rotate,
+            "crop": _sim_crop,
+            "resize": _sim_resize,
+            # band_expression: no H/W change
+        }
+        for op in order:
+            f = ops.get(op.strip().lower())
+            if f:
+                f()
+
+        return int(H), int(W)
 
     def copy_polygons_between_roots(
         self,
@@ -3191,34 +3461,27 @@ class ProjectTab(QtWidgets.QWidget):
         return _mgr()
 
 
-
     def add_polygon_to_other_images(self, source_viewer, polygon, logical_name="", action="copy", shape_type="polygon"):
         """
         Adds or moves polygons/points to other images in the same root.
-        Adjusts the polygon/point coordinates based on image sizes.
-        
-        Parameters:
-          source_viewer: The viewer where the shape was drawn.
-          polygon: A QPolygonF containing the shape's points.
-          logical_name: The logical name for the shape.
-          action: (Optional) Action type, default "copy".
-          shape_type: "polygon" or "point" to determine which type of shape to add.
+        Adjusts the polygon/point coordinates based on *effective* image sizes (after .ax).
         """
-        # Get the root name for the source viewer's image.
+        from PyQt5 import QtCore, QtGui
+
         source_filepath = source_viewer.image_data.filepath
         root_name = self.get_root_by_filepath(source_filepath)
         if not root_name:
             return
 
-        # Get all image filepaths in the same root.
         all_filepaths_in_root = self.multispectral_image_data_groups.get(root_name, []) + \
-                                  self.thermal_rgb_image_data_groups.get(root_name, [])
+                                self.thermal_rgb_image_data_groups.get(root_name, [])
 
-        # Get source image dimensions.
-        source_image = source_viewer.image_data.image
-        source_height, source_width = source_image.shape[:2]
+        # Effective source size; fallback to viewer image
+        src_eff_h, src_eff_w = self._effective_hw_for_file(source_filepath)
+        if not (src_eff_h and src_eff_w):
+            source_image = source_viewer.image_data.image
+            src_eff_h, src_eff_w = source_image.shape[:2]
 
-        # Determine root number.
         try:
             root_number = str(self.root_names.index(root_name) + 1)
         except ValueError:
@@ -3226,45 +3489,43 @@ class ProjectTab(QtWidgets.QWidget):
 
         for filepath in all_filepaths_in_root:
             if filepath == source_filepath:
-                continue  # Skip the source image
+                continue
 
             viewer = self.get_viewer_by_filepath(filepath)
-            if viewer:
-                # Get target image dimensions.
+            if not viewer:
+                continue
+
+            tgt_eff_h, tgt_eff_w = self._effective_hw_for_file(filepath)
+            if not (tgt_eff_h and tgt_eff_w):
                 target_image = viewer.image_data.image
-                target_height, target_width = target_image.shape[:2]
+                tgt_eff_h, tgt_eff_w = target_image.shape[:2]
 
-                # Calculate scaling factors.
-                scale_x = target_width / source_width
-                scale_y = target_height / source_height
+            # scale factors from source basis -> target basis
+            if src_eff_w <= 0 or src_eff_h <= 0:
+                continue
+            sx = float(tgt_eff_w) / float(src_eff_w)
+            sy = float(tgt_eff_h) / float(src_eff_h)
 
-                # Adjust polygon/point coordinates for the target image.
-                adjusted_polygon = QtGui.QPolygonF()
-                for point in polygon:
-                    adjusted_x = point.x() * scale_x
-                    adjusted_y = point.y() * scale_y
-                    adjusted_polygon.append(QtCore.QPointF(adjusted_x, adjusted_y))
+            adjusted_polygon = QtGui.QPolygonF()
+            for pt in polygon:
+                adjusted_polygon.append(QtCore.QPointF(float(pt.x()) * sx, float(pt.y()) * sy))
 
-                # Determine if the target image is RGB 
-                is_rgb = False
-                if len(target_image.shape) == 3 and target_image.shape[2] == 3:
-                    is_rgb = True
+            if shape_type == "point":
+                viewer.add_point_to_scene(adjusted_polygon, logical_name)
+            else:
+                viewer.add_polygon_to_scene(adjusted_polygon, logical_name)
 
-                # Copy the adjusted shape to the viewer based on shape type.
-                if shape_type == "point":
-                    viewer.add_point_to_scene(adjusted_polygon, logical_name)
-                else:
-                    viewer.add_polygon_to_scene(adjusted_polygon, logical_name)
+            if logical_name not in self.all_polygons:
+                self.all_polygons[logical_name] = {}
+            self.all_polygons[logical_name][filepath] = {
+                'points': [(float(p.x()), float(p.y())) for p in adjusted_polygon],
+                'coord_space': 'image',
+                'image_ref_size': {'w': int(tgt_eff_w), 'h': int(tgt_eff_h)},
+                'name': logical_name,
+                'root': root_number,
+                'type': shape_type,
+            }
 
-                # Update the all_polygons structure with the adjusted points, root number, and shape type.
-                if logical_name not in self.all_polygons:
-                    self.all_polygons[logical_name] = {}
-                self.all_polygons[logical_name][filepath] = {
-                    'points': [(point.x(), point.y()) for point in adjusted_polygon],
-                    'name': logical_name,
-                    'root': root_number,
-                    'type': shape_type  # Added to record whether it's a polygon or point.
-                }
 
     @staticmethod
     def apply_aux_modifications(image_filepath, image, project_folder=None, global_mode=False):
@@ -3399,7 +3660,23 @@ class ProjectTab(QtWidgets.QWidget):
             h0, w0 = result.shape[:2]
             if h0 <= 0 or w0 <= 0:
                 return
-            if "scale" in resize:
+
+            if "px_w" in resize or "px_h" in resize:
+                tw = int(resize.get("px_w", 0))
+                th = int(resize.get("px_h", 0))
+                if tw > 0 and th > 0:
+                    new_w, new_h = tw, th
+                elif tw > 0:
+                    s = tw / float(w0)
+                    new_w = tw
+                    new_h = max(1, int(round(h0 * s)))
+                elif th > 0:
+                    s = th / float(h0)
+                    new_h = th
+                    new_w = max(1, int(round(w0 * s)))
+                else:
+                    return
+            elif "scale" in resize:
                 s = float(resize.get("scale", 100.0)) / 100.0
                 new_w = max(1, int(round(w0 * s)))
                 new_h = max(1, int(round(h0 * s)))
@@ -3408,8 +3685,10 @@ class ProjectTab(QtWidgets.QWidget):
                 ph = float(resize.get("height", 100.0)) / 100.0
                 new_w = max(1, int(round(w0 * pw)))
                 new_h = max(1, int(round(h0 * ph)))
+
             if new_w == w0 and new_h == h0:
                 return
+
             sw = new_w / float(w0); sh = new_h / float(h0)
             if sw < 1.0 or sh < 1.0:
                 interp = cv2.INTER_AREA
@@ -3417,8 +3696,10 @@ class ProjectTab(QtWidgets.QWidget):
                 interp = cv2.INTER_LINEAR
             else:
                 interp = cv2.INTER_CUBIC
+
             result = resize_safe(result, new_w, new_h, interp)
             logging.debug(f"Applied resize to {new_w}x{new_h} (interp={interp}).")
+
 
         def _do_band_expr():
             nonlocal result
@@ -3710,7 +3991,7 @@ class ProjectTab(QtWidgets.QWidget):
             logging.info("edit_image_viewer: editing cancelled by user.")
             return
 
-        # 4) Accepted → fetch modified image and update viewer (no popups)
+        # 4) Accepted → fetch modified image and update viewer
         try:
             modified_image = editor.get_modified_image()
             if modified_image is None:
@@ -3723,7 +4004,7 @@ class ProjectTab(QtWidgets.QWidget):
                 logging.error("edit_image_viewer: convert_cv_to_pixmap failed; viewer not updated.")
                 return
 
-            # Clear overlays that no longer align after edits (safe if method exists)
+            # Clear overlays that no longer align after edits 
             try:
                 viewer.clear_polygons()
             except Exception:
@@ -4658,7 +4939,19 @@ class ProjectTab(QtWidgets.QWidget):
             root_id = self.root_id_mapping.get(root_name, "N/A")
 
             pts_img = self._points_to_export_frame(filepath, parsed_points, polygon_dict, img.shape)
-            pts_img = [(int(round(x)), int(round(y))) for (x, y) in pts_img]
+            def _to_index_coords(pts, W, H):
+                    out = []
+                    for x, y in pts:
+                        xi = int(np.floor(float(x)))
+                        yi = int(np.floor(float(y)))
+                        if xi < 0: xi = 0
+                        elif xi >= W: xi = W - 1
+                        if yi < 0: yi = 0
+                        elif yi >= H: yi = H - 1
+                        out.append((xi, yi))
+                    return out
+
+            pts_img = _to_index_coords(pts_img, W, H)
 
             for idx, (xi, yi) in enumerate(pts_img):
                 if not (0 <= xi < W and 0 <= yi < H):
@@ -4851,7 +5144,24 @@ class ProjectTab(QtWidgets.QWidget):
             root_id = self.root_id_mapping.get(root_name, "N/A")
 
             pts_img = self._points_to_export_frame(filepath, mod_points, polygon_dict, img.shape)
-            pts_img = [(int(round(x)), int(round(y))) for (x, y) in pts_img]
+            
+            
+            def _to_index_coords(pts, W, H):
+                    out = []
+                    for x, y in pts:
+                        xi = int(np.floor(float(x)))
+                        yi = int(np.floor(float(y)))
+                        if xi < 0: xi = 0
+                        elif xi >= W: xi = W - 1
+                        if yi < 0: yi = 0
+                        elif yi >= H: yi = H - 1
+                        out.append((xi, yi))
+                    return out
+
+            pts_img = _to_index_coords(pts_img, W, H)
+
+          
+            
 
             mask = np.zeros((H, W), dtype=np.uint8)
             if len(pts_img) == 1:
@@ -5861,7 +6171,289 @@ class ProjectTab(QtWidgets.QWidget):
         return np.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)
 
 
+    def export_project_images(self):
+        """
+        Export all project images after applying their .ax modifications.
+        - Output: <project_folder>/Exported_images_<N> (auto-incremented per run)
+        - Classic TIFF by default (ExifTool-friendly); fallback to BigTIFF only if needed.
+        - JPEG/PNG read via OpenCV are converted from BGR(A) to RGB(A) so colors match viewer.
+        - Multiband stacks keep their original band order (only axes moved to HWC).
+        - Uses your parallel EXIF copier when available; falls back to per-file exiftool.
+        """
+        import os, logging, shutil, subprocess
+        from contextlib import suppress
+        from PyQt5 import QtWidgets, QtCore
 
+        try:
+            import numpy as np
+            import tifffile as tiff
+            import cv2
+            cv2.setNumThreads(0)
+        except Exception as e:
+            logging.error("export_project_images: missing deps (numpy/tifffile/opencv): %s", e)
+            QtWidgets.QMessageBox.critical(self, "Export", f"Missing dependencies:\n{e}")
+            return
+
+        base_dir = (self.project_folder or "").strip()
+        if not base_dir or not os.path.isdir(base_dir):
+            QtWidgets.QMessageBox.warning(self, "Export", "Invalid project folder.")
+            return
+
+        # ---------- collect project files ----------
+        def _collect_all_paths():
+            s = []
+            for _rn, arr in (getattr(self, "multispectral_image_data_groups", {}) or {}).items():
+                s.extend([p for p in arr if isinstance(p, str) and p])
+            for _rn, arr in (getattr(self, "thermal_rgb_image_data_groups", {}) or {}).items():
+                s.extend([p for p in arr if isinstance(p, str) and p])
+            out, seen = [], set()
+            for p in s:
+                ap = os.path.normcase(os.path.abspath(p))
+                if ap not in seen:
+                    out.append(p); seen.add(ap)
+            return out
+
+        filepaths = _collect_all_paths()
+        if not filepaths:
+            QtWidgets.QMessageBox.information(self, "Export", "No images to export.")
+            return
+
+        # ---------- destination folder ----------
+        def _next_export_dir(root):
+            n = 1
+            while True:
+                d = os.path.join(root, f"Exported_images_{n}")
+                if not os.path.exists(d):
+                    return d
+                n += 1
+
+        export_dir = _next_export_dir(base_dir)
+        os.makedirs(export_dir, exist_ok=True)
+
+        # ---------- helpers ----------
+        def _unique_path(dirpath, filename):
+            stem, ext = os.path.splitext(filename)
+            cand = os.path.join(dirpath, filename)
+            k = 1
+            while os.path.exists(cand):
+                cand = os.path.join(dirpath, f"{stem}_{k}{ext}")
+                k += 1
+            return cand
+
+        def _norm_export_name(fp):
+            return os.path.splitext(os.path.basename(fp))[0] + ".tif"
+
+        def _read_raw_any(fp):
+            """
+            Read image and put channels last (HWC). For non-TIFF via OpenCV:
+            - convert BGR->RGB (3 ch) and BGRA->RGBA (4 ch) so saved colors match.
+            """
+            ext = os.path.splitext(fp)[1].lower()
+            try:
+                if ext in (".tif", ".tiff"):
+                    arr = tiff.imread(fp)
+                    arr = np.squeeze(arr)
+                    # (C,H,W) -> (H,W,C) if looks channel-first; keep band order intact
+                    if arr.ndim == 3 and arr.shape[0] <= 64 and arr.shape[1] >= 32 and arr.shape[2] >= 32:
+                        arr = np.moveaxis(arr, 0, -1)
+                    return np.ascontiguousarray(arr)
+                else:
+                    # robust OpenCV read (handles unicode paths)
+                    data = np.fromfile(fp, dtype=np.uint8)
+                    img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+                    if img is None:
+                        return None
+                    # BGR(A) -> RGB(A) exactly once
+                    if img.ndim == 3:
+                        if img.shape[2] == 3:
+                            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                        elif img.shape[2] == 4:
+                            img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+                    return np.ascontiguousarray(img)
+            except Exception as e:
+                logging.warning("Raw load failed for %s: %s", fp, e)
+                return None
+
+        def _load_ax(fp):
+            import json
+            base = os.path.splitext(os.path.basename(fp))[0] + ".ax"
+            cands = []
+            if getattr(self, "project_folder", None):
+                cands.append(os.path.join(self.project_folder, base))
+            cands.append(os.path.join(os.path.dirname(fp), base))
+            for axp in cands:
+                try:
+                    if os.path.exists(axp):
+                        with open(axp, "r", encoding="utf-8") as f:
+                            return json.load(f) or {}
+                except Exception as e:
+                    logging.debug("AX read failed %s: %s", axp, e)
+            return {}
+
+        bigtiff_written = set()  # paths written as BigTIFF → skip EXIF copy
+
+        def _save_tiff(dst, arr):
+            """
+            Try classic TIFF first (ExifTool can write). On size error → BigTIFF.
+            Photometric:
+              - 'rgb' only when exactly 3 channels (already RGB-ordered),
+              - otherwise 'minisblack' (multiband scientific).
+            """
+            try:
+                if arr is None or arr.size == 0:
+                    return False
+                a = np.ascontiguousarray(arr)
+                if a.ndim == 2:
+                    photometric = "minisblack"
+                elif a.ndim == 3 and a.shape[2] == 3:
+                    photometric = "rgb"
+                else:
+                    photometric = "minisblack"
+
+                with tiff.TiffWriter(dst, bigtiff=False) as tw:
+                    tw.write(a, compression="deflate", photometric=photometric, contiguous=True)
+                return True
+            except Exception as e:
+                msg = str(e)
+                size_related = ("4 GB" in msg) or ("4GB" in msg) or ("too large" in msg) or ("bigtiff=False" in msg) \
+                               or ("exceeds" in msg and "limit" in msg and "TIFF" in msg)
+                if not size_related:
+                    logging.error("Save TIFF failed for %s: %s", dst, e)
+                    return False
+
+                with suppress(Exception):
+                    os.remove(dst)
+                try:
+                    with tiff.TiffWriter(dst, bigtiff=True) as tw:
+                        tw.write(a, compression="deflate", photometric=photometric, contiguous=True)
+                    bigtiff_written.add(dst)
+                    logging.info("Saved as BigTIFF due to size: %s", os.path.basename(dst))
+                    return True
+                except Exception as e2:
+                    logging.error("BigTIFF fallback failed for %s: %s", dst, e2)
+                    return False
+
+        def _copy_exif_per_file(src, dst):
+            exe = getattr(self, "exiftool_path", None) or "exiftool"
+            if not (os.path.isfile(exe) or shutil.which(exe)):
+                logging.warning("ExifTool not found; skipping EXIF copy for %s", os.path.basename(dst))
+                return False
+            try:
+                cmd = [exe, "-m", "-overwrite_original", "-TagsFromFile", src, "-all:all", dst]
+                cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                if cp.returncode != 0:
+                    logging.warning("ExifTool copy failed (%s → %s): %s",
+                                    os.path.basename(src), os.path.basename(dst),
+                                    cp.stderr.decode(errors="ignore"))
+                return cp.returncode == 0
+            except Exception as e:
+                logging.warning("ExifTool invocation failed (%s → %s): %s",
+                                os.path.basename(src), os.path.basename(dst), e)
+                return False
+
+        # ---------- export pass ----------
+        source_files, target_files = [], []
+        ok = fail = 0
+
+        with self._busy_dialog("Exporting images…"):
+            for fp in filepaths:
+                QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents)
+                raw = _read_raw_any(fp)
+                if raw is None:
+                    fail += 1
+                    continue
+
+                ax = _load_ax(fp)
+                try:
+                    # Deterministic replay (rotate/crop/resize/expression), preserves band order
+                    if hasattr(self, "_apply_ax_to_raw"):
+                        img, _C = self._apply_ax_to_raw(raw, ax)
+                    else:
+                        img = raw
+                except Exception as e:
+                    logging.error("AX replay failed for %s: %s", fp, e)
+                    fail += 1
+                    continue
+
+                # -------- Smart, minimal rule to match viewer for 8-bit/JPEG sources --------
+                ext = os.path.splitext(fp)[1].lower()
+                is_jpeg_src = ext in (".jpg", ".jpeg")
+                is_u8_src   = isinstance(raw, np.ndarray) and raw.dtype == np.uint8
+
+                if is_jpeg_src or is_u8_src:
+                    # If pipeline made it float32, quantize back to uint8 as shown in viewer.
+                    if img.dtype != np.uint8:
+                        # If values look 0..1, scale to 0..255 first; else assume 0..255 already.
+                        finite = np.isfinite(img)
+                        # Handle all-NaN edge case cleanly
+                        if finite.any():
+                            vmax = float(np.nanmax(img[finite]))
+                            vmin = float(np.nanmin(img[finite]))
+                        else:
+                            vmax = 0.0; vmin = 0.0
+                        if vmax <= 1.001 and vmin >= -0.001:
+                            img = img * 255.0
+                        # Replace NaN/±Inf, round, clamp, cast
+                        img = np.nan_to_num(img, nan=0.0, posinf=255.0, neginf=0.0)
+                        img = np.clip(np.rint(img), 0, 255).astype(np.uint8, copy=False)
+                # ---------------------------------------------------------------------------
+
+                out_name = _norm_export_name(fp)
+                out_path = _unique_path(export_dir, out_name)
+                if not _save_tiff(out_path, img):
+                    fail += 1
+                    continue
+
+                source_files.append(fp)
+                target_files.append(out_path)
+                ok += 1
+
+        # ---------- EXIF: skip BigTIFFs; multithread first, fallback single-file ----------
+        copied = 0
+        if source_files and target_files:
+            src_ok, dst_ok = [], []
+            for s, d in zip(source_files, target_files):
+                if d in bigtiff_written:
+                    logging.warning("Skipping EXIF copy for BigTIFF (ExifTool can't write): %s", os.path.basename(d))
+                    continue
+                src_ok.append(s); dst_ok.append(d)
+
+            if src_ok and dst_ok:
+                try:
+                    copier = None
+                    if hasattr(self, "copy_metadata_from_multiple_sources_parallel"):
+                        copier = self.copy_metadata_from_multiple_sources_parallel
+                    elif "copy_metadata_from_multiple_sources_parallel" in globals():
+                        copier = globals()["copy_metadata_from_multiple_sources_parallel"]
+
+                    if callable(copier):
+                        copier(src_ok, dst_ok, getattr(self, "exiftool_path", None), max_workers=8)
+                        copied = len(dst_ok)
+                    else:
+                        for s, d in zip(src_ok, dst_ok):
+                            if _copy_exif_per_file(s, d):
+                                copied += 1
+                except Exception as e:
+                    logging.warning("Parallel EXIF copy failed, falling back: %s", e)
+                    for s, d in zip(src_ok, dst_ok):
+                        if _copy_exif_per_file(s, d):
+                            copied += 1
+
+        # ---------- report ----------
+        msg = f"Exported {ok} / {len(filepaths)} image(s) to:\n{export_dir}"
+        if copied:
+            msg += f"\nEXIF copied for {copied} file(s)."
+        if bigtiff_written:
+            msg += f"\n{len(bigtiff_written)} file(s) were saved as BigTIFF due to size; EXIF not written to those."
+        if fail:
+            msg += f"\nFailed: {fail}"
+        logging.info(msg)
+        QtWidgets.QMessageBox.information(self, "Export", msg)
+
+    
+    
+    
+    
     def _apply_ax_to_raw(self, raw_img, ax):
         """
         Deterministic, stack-safe replay (viewer-independent):
@@ -5874,14 +6466,87 @@ class ProjectTab(QtWidgets.QWidget):
         Returns (img_float32, channels)
         """
         import numpy as np, cv2, logging
+
         if raw_img is None:
             return None, 0
 
-        img = self._ensure_hwc(raw_img)
+        def _resize_safe(arr, new_w, new_h, interp=cv2.INTER_AREA):
+            # cv2.resize() asserts for cn > 4; resize per-channel in that case
+            if arr is None or arr.size == 0:
+                return arr
+            a = np.asarray(arr)
+            if a.ndim == 2:
+                return cv2.resize(a, (new_w, new_h), interpolation=interp)
+            if a.ndim == 3:
+                C = a.shape[2]
+                if C <= 4:
+                    return cv2.resize(a, (new_w, new_h), interpolation=interp)
+                # resize each band separately and stack
+                bands = [cv2.resize(a[:, :, i], (new_w, new_h), interpolation=interp) for i in range(C)]
+                return np.stack(bands, axis=2)
+            # anything else → best-effort pass-through
+            return a
+
+        # ——— helpers used by crop remapping (same logic you already use elsewhere) ———
+        def _dims_after_rot(w, h, deg):
+            return (h, w) if (deg % 360) in (90, 270) else (w, h)
+
+        def _rect_after_rot(rect, src_w, src_h, deg):
+            # Map a rect dict {x,y,width,height} from a basis rotated by 'deg' back to 0°
+            x, y, w, h = int(rect.get("x", 0)), int(rect.get("y", 0)), int(rect.get("width", 0)), int(rect.get("height", 0))
+            d = int(deg) % 360
+            if d == 0:
+                return {"x": x, "y": y, "width": w, "height": h}
+            if d == 90:
+                # (x,y) in 90° CW basis → back to 0°
+                nx = src_h - (y + h)
+                ny = x
+                return {"x": nx, "y": ny, "width": h, "height": w}
+            if d == 180:
+                nx = src_w - (x + w)
+                ny = src_h - (y + h)
+                return {"x": nx, "y": ny, "width": w, "height": h}
+            if d == 270:
+                nx = y
+                ny = src_w - (x + w)
+                return {"x": nx, "y": ny, "width": h, "height": w}
+            return {"x": x, "y": y, "width": w, "height": h}
+
+        def _scale_rect(rect, ref_w, ref_h, to_w, to_h):
+            # Scale rect dims from (ref_w,ref_h) → (to_w,to_h)
+            sx = float(to_w) / float(max(1, ref_w))
+            sy = float(to_h) / float(max(1, ref_h))
+            x = int(round(int(rect.get("x", 0)) * sx))
+            y = int(round(int(rect.get("y", 0)) * sy))
+            w = int(round(int(rect.get("width", 0)) * sx))
+            h = int(round(int(rect.get("height", 0)) * sy))
+            # clamp
+            x = max(0, min(x, max(0, to_w - 1)))
+            y = max(0, min(y, max(0, to_h - 1)))
+            if x + w > to_w: w = max(0, to_w - x)
+            if y + h > to_h: h = max(0, to_h - y)
+            return {"x": x, "y": y, "width": w, "height": h}
+
+        def _infer_crop_basis(ax_dict, raw_w, raw_h, rot_deg):
+            # If saved crop_ref matches post-rotate dims → 'after_rotate', else 'pre_rotate'
+            ref = (ax_dict or {}).get("crop_rect_ref_size") or {}
+            try:
+                rw = int(ref.get("w") or 0)
+                rh = int(ref.get("h") or 0)
+            except Exception:
+                rw = rh = 0
+            aw, ah = _dims_after_rot(raw_w, raw_h, rot_deg)
+            if rw and rh and (rw, rh) == (aw, ah):
+                return "after_rotate"
+            return "pre_rotate"
+
+        img = self._ensure_hwc(raw_img).copy()
 
         # AX params
-        try: rot = int(ax.get("rotate", 0)) % 360
-        except Exception: rot = 0
+        try:
+            rot = int(ax.get("rotate", 0)) % 360
+        except Exception:
+            rot = 0
         crop_rect = ax.get("crop_rect") or None
         crop_ref  = ax.get("crop_rect_ref_size") or None
         resize    = ax.get("resize") or None
@@ -5898,12 +6563,10 @@ class ProjectTab(QtWidgets.QWidget):
             nonlocal img
             if rot in (90, 180, 270):
                 try:
-                    # np.rot90: k=-1 = 90° CW, k=2 = 180°, k=1 = 90° CCW
-                    k = {90: -1, 180: 2, 270: 1}[rot]
+                    k = {90: -1, 180: 2, 270: 1}[rot]  # np.rot90 k mapping
                     img = np.ascontiguousarray(np.rot90(img, k))
                 except Exception as e:
-                    logging.warning(f"Rotation failed ({rot} deg) via NumPy: {e}")
-
+                    logging.warning(f"Rotation failed ({rot} deg): {e}")
 
         def _do_crop():
             nonlocal img
@@ -5911,9 +6574,10 @@ class ProjectTab(QtWidgets.QWidget):
                 return
             Hc, Wc = img.shape[:2]
 
-            # saved ref dims for the rectangle’s frame
+            # Determine the saved ref dims
             if isinstance(crop_ref, dict) and "w" in crop_ref and "h" in crop_ref:
-                ref_w_saved, ref_h_saved = int(crop_ref.get("w", raw_w)), int(crop_ref.get("h", raw_h))
+                ref_w_saved = int(crop_ref.get("w", raw_w))
+                ref_h_saved = int(crop_ref.get("h", raw_h))
             else:
                 if crop_basis == "after_rotate":
                     ref_w_saved, ref_h_saved = _dims_after_rot(raw_w, raw_h, rot)
@@ -5924,11 +6588,11 @@ class ProjectTab(QtWidgets.QWidget):
                               op_order.index("rotate") < op_order.index("crop"))
 
             rect_to_apply = dict(crop_rect)
-            if crop_basis == "after_rotate" and not rotate_applied and rot in (90,180,270):
-                # un-rotate rect back to RAW basis
+            if crop_basis == "after_rotate" and not rotate_applied and rot in (90, 180, 270):
+                # un-rotate rect back to raw basis
                 rect_to_apply = _rect_after_rot(rect_to_apply, ref_w_saved, ref_h_saved, (360 - rot) % 360)
                 ref_w_use, ref_h_use = raw_w, raw_h
-            elif crop_basis == "pre_rotate" and rotate_applied and rot in (90,180,270):
+            elif crop_basis == "pre_rotate" and rotate_applied and rot in (90, 180, 270):
                 # rotate rect into rotated basis
                 rect_to_apply = _rect_after_rot(rect_to_apply, raw_w, raw_h, rot)
                 ref_w_use, ref_h_use = _dims_after_rot(raw_w, raw_h, rot)
@@ -5945,19 +6609,52 @@ class ProjectTab(QtWidgets.QWidget):
 
         def _do_resize():
             nonlocal img
-            if not resize:
+            if not isinstance(resize, dict) or not resize:
                 return
             h0, w0 = img.shape[:2]
-            if "scale" in resize:
-                s = float(resize["scale"]) / 100.0
+            if h0 <= 0 or w0 <= 0:
+                return
+
+            # Support absolute pixel size OR percent
+            if ("px_w" in resize) or ("px_h" in resize):
+                tw = int(resize.get("px_w", 0) or 0)
+                th = int(resize.get("px_h", 0) or 0)
+                if tw > 0 and th > 0:
+                    new_w, new_h = tw, th
+                elif tw > 0:
+                    s = tw / float(w0)
+                    new_w, new_h = tw, max(1, int(round(h0 * s)))
+                elif th > 0:
+                    s = th / float(h0)
+                    new_h, new_w = th, max(1, int(round(w0 * s)))
+                else:
+                    return  # nothing to do
+            elif "scale" in resize:
+                s = float(resize.get("scale", 100.0)) / 100.0
                 new_w = max(1, int(round(w0 * s)))
                 new_h = max(1, int(round(h0 * s)))
             else:
-                pw = float(resize.get("width", 100)) / 100.0
-                ph = float(resize.get("height", 100)) / 100.0
+                pw = float(resize.get("width", 100.0)) / 100.0
+                ph = float(resize.get("height", 100.0)) / 100.0
                 new_w = max(1, int(round(w0 * pw)))
                 new_h = max(1, int(round(h0 * ph)))
-            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+            if new_w == w0 and new_h == h0:
+                return
+
+            sw = new_w / float(w0)
+            sh = new_h / float(h0)
+            if sw < 1.0 or sh < 1.0:
+                interp = cv2.INTER_AREA        # best for downscale
+            elif max(sw, sh) < 2.0:
+                interp = cv2.INTER_LINEAR      # mild upscale
+            else:
+                interp = cv2.INTER_CUBIC       # larger upscales
+
+            try:
+                img = _resize_safe(img, new_w, new_h, interp)
+            except Exception as e:
+                logging.warning(f"Resize failed to {new_w}x{new_h}: {e}")
 
         def _do_band_expr():
             nonlocal img
@@ -5975,12 +6672,59 @@ class ProjectTab(QtWidgets.QWidget):
         }
         for op in op_order:
             f = ops.get(op.strip().lower())
-            if f: f()
+            if f:
+                f()
 
         img = img.astype(np.float32, copy=False)
         C = img.shape[2] if img.ndim == 3 else 1
         return img, C
 
+    def _ensure_hwc(self, img):
+        """
+        Ensure numpy image is channels-last:
+          - HxW (grayscale) → unchanged
+          - CxHxW with small C (<=64) → moveaxis(0, -1) → HxWxC
+          - HxWxC → unchanged
+          - Higher-dim TIFF stacks: squeeze and apply same heuristics
+        Returns a contiguous array (np.ascontiguousarray).
+        """
+        import numpy as np
+
+        if img is None:
+            return None
+
+        arr = np.asarray(img)
+        # Remove singleton dims like (1,H,W) or (H,W,1,1)
+        arr = np.squeeze(arr)
+
+        # Grayscale
+        if arr.ndim == 2:
+            return np.ascontiguousarray(arr)
+
+        # 3D cases
+        if arr.ndim == 3:
+            h, w = arr.shape[0], arr.shape[1]
+            # Heuristic: channel-first if first dim is small (<=64) and the next two look like image dims
+            if arr.shape[0] <= 64 and arr.shape[1] >= 32 and arr.shape[2] >= 32:
+                arr = np.moveaxis(arr, 0, -1)  # (C,H,W) -> (H,W,C)
+            return np.ascontiguousarray(arr)
+
+        # 4D+ (e.g., pages x H x W x C or Z x H x W)
+        # Try to interpret first dim as channels if it is small and the next two look spatial
+        if arr.ndim >= 3:
+            if arr.shape[0] <= 64 and arr.shape[1] >= 32 and arr.shape[2] >= 32:
+                arr = np.moveaxis(arr, 0, -1)  # (C,H,W[,...]) -> (...,H,W,C) after squeeze
+                arr = np.squeeze(arr)
+                if arr.ndim == 3:
+                    return np.ascontiguousarray(arr)
+
+            # Fallback: squeeze again; if we land on 2D or 3D, accept it
+            arr = np.squeeze(arr)
+            if arr.ndim in (2, 3):
+                return np.ascontiguousarray(arr)
+
+        # Last resort: return contiguous as-is
+        return np.ascontiguousarray(arr)
 
     def _load_raw_image(self, filepath):
         """Load raw image similarly to the viewer pipeline, but without display normalization."""
@@ -6238,55 +6982,87 @@ class ProjectTab(QtWidgets.QWidget):
         return [np.ascontiguousarray(c) for c in chans]
 
 
-    def _map_points_scene_to_image(self, filepath, pts_any, img_shape, *, polygon_data=None):
+    def _map_points_scene_to_image(self, filepath, points, img_shape, polygon_data=None):
         """
-        INSPECTION-STYLE mapping (scene -> pixmap -> image):
-          • If points were saved in image coords, return as-is.
-          • If a live viewer exists, use its _image item's mapFromScene and the
-            pixmap size to scale into the *actual* post-aux image size.
-          • If no viewer, but saved a pixmap_size with the shape, use that.
-          • Otherwise, pass through (best effort).
-
-        
+        Map scene coords -> image pixel coords without requiring the viewer.
+        Priority:
+          1) If viewer exists: map scene->item (pixmap) and scale to image size (floor+clamp).
+          2) Else if polygon_data has 'pixmap_size': scale by (img_w/pixmap_w, img_h/pixmap_h) (floor+clamp).
+          3) Else: assume points are already image coords (floor+clamp).
         """
         from PyQt5 import QtCore
 
-        if not pts_any or img_shape is None:
+        if not points or img_shape is None:
             return []
 
         H = int(img_shape[0])
         W = int(img_shape[1])
 
-        # 1) Already in image pixels?
-        coord_space = (polygon_data or {}).get("coord_space", "scene")
-        if coord_space == "image":
-            return [(float(x), float(y)) for (x, y) in pts_any]
-
-        # 2) Preferred: live viewer → map scene→pixmap, then scale to image size
-        v = self.get_viewer_by_filepath(filepath)
-        if v is not None and getattr(v, "_image", None) is not None:
-            pm = v._image.pixmap()
+        # 1) Try live viewer mapping (scene -> item pixmap -> image pixels)
+        viewer = getattr(self.parent_tab, "get_viewer_by_filepath", lambda _p: None)(filepath)
+        if viewer is not None and getattr(viewer, "_image", None) is not None:
+            pm = viewer._image.pixmap()
             pw = float(max(1, pm.width()))
             ph = float(max(1, pm.height()))
-            out = []
-            for (sx, sy) in pts_any:
-                p_item = v._image.mapFromScene(QtCore.QPointF(float(sx), float(sy)))
-                xi = p_item.x() * (W / pw)
-                yi = p_item.y() * (H / ph)
-                out.append((float(xi), float(yi)))
-            return out
-
-        # 3) Headless export: scale using saved pixmap_size if present
-        pm_size = (polygon_data or {}).get("pixmap_size")
-        if isinstance(pm_size, (list, tuple)) and len(pm_size) == 2:
-            pw = float(max(1, pm_size[0]))
-            ph = float(max(1, pm_size[1]))
             sx = W / pw
             sy = H / ph
-            return [(float(x) * sx, float(y) * sy) for (x, y) in pts_any]
 
-        # 4) Last resort: assume they’re already image pixels
-        return [(float(x), float(y)) for (x, y) in pts_any]
+            out = []
+            for (sx_scene, sy_scene) in points:
+                p_item = viewer._image.mapFromScene(QtCore.QPointF(float(sx_scene), float(sy_scene)))
+                xi = int(p_item.x() * sx)  # floor (no rounding)
+                yi = int(p_item.y() * sy)
+                if xi < 0: xi = 0
+                if yi < 0: yi = 0
+                if xi >= W: xi = W - 1
+                if yi >= H: yi = H - 1
+                out.append((xi, yi))
+            return out
+
+        # If a viewer exists but no _image item, fall back to its helper but still floor+clamp.
+        if viewer is not None:
+            out = []
+            for (x, y) in points:
+                q = self.parent_tab.scene_to_image_coords(viewer, QtCore.QPointF(float(x), float(y)))
+                xi = int(q.x())
+                yi = int(q.y())
+                if xi < 0: xi = 0
+                if yi < 0: yi = 0
+                if xi >= W: xi = W - 1
+                if yi >= H: yi = H - 1
+                out.append((xi, yi))
+            return out
+
+        # 2) Offline mapping using stored pixmap size in polygon payload
+        if polygon_data:
+            pm = polygon_data.get("pixmap_size") or polygon_data.get("pixmap")  # support either key
+            if isinstance(pm, (list, tuple)) and len(pm) == 2:
+                pix_w = float(pm[0]) if pm[0] else 1.0
+                pix_h = float(pm[1]) if pm[1] else 1.0
+                sx = W / pix_w
+                sy = H / pix_h
+                out = []
+                for (x, y) in points:
+                    xi = int(float(x) * sx)  # floor (no rounding)
+                    yi = int(float(y) * sy)
+                    if xi < 0: xi = 0
+                    if yi < 0: yi = 0
+                    if xi >= W: xi = W - 1
+                    if yi >= H: yi = H - 1
+                    out.append((xi, yi))
+                return out
+
+        # 3) Fallback: treat as already in image coords (floor+clamp)
+        out = []
+        for (x, y) in points:
+            xi = int(float(x))
+            yi = int(float(y))
+            if xi < 0: xi = 0
+            if yi < 0: yi = 0
+            if xi >= W: xi = W - 1
+            if yi >= H: yi = H - 1
+            out.append((xi, yi))
+        return out
 
 
     def _paired_trgb_root(self, ms_root: str):
@@ -8351,6 +9127,17 @@ class ProjectTab(QtWidgets.QWidget):
                     coord_space  = (polygon_data.get('coord_space') if isinstance(polygon_data, dict) else None) or 'scene'
                     points_any   = (polygon_data.get('points') if isinstance(polygon_data, dict) else None) or []
 
+                    # --- NEW: persist image_ref_size (backfill from effective size if missing) ---
+                    ref = {}
+                    if isinstance(polygon_data, dict):
+                        ref = polygon_data.get('image_ref_size') or {}
+                    if not (isinstance(ref, dict) and ref.get('w') and ref.get('h')):
+                        try:
+                            eh, ew = self._effective_hw_for_file(filepath)
+                            ref = {'w': int(ew or 0), 'h': int(eh or 0)}
+                        except Exception:
+                            ref = {'w': 0, 'h': 0}
+
                     # Construct output
                     data_to_save = {
                         'points': points_any,
@@ -8358,7 +9145,8 @@ class ProjectTab(QtWidgets.QWidget):
                         'root':   root_id,
                         'coordinates': coords,
                         'type':   poly_type,
-                        'coord_space': coord_space
+                        'coord_space': coord_space,
+                        'image_ref_size': ref,     # <-- ensure basis is saved
                     }
 
                     base_filename     = os.path.splitext(os.path.basename(filepath))[0]
@@ -8444,7 +9232,6 @@ class ProjectTab(QtWidgets.QWidget):
             return None
 
   
-    # ------------------- Polygon Management Methods -------------------
     def on_polygon_drawn(self, polygon_item):
         sender_viewer = self.sender()
         image_id = os.path.splitext(os.path.basename(sender_viewer.image_data.filepath))[0]
@@ -8525,8 +9312,7 @@ class ProjectTab(QtWidgets.QWidget):
         else:
             self.syncAct.setText("Sync Off")
             
-            
-
+         
 
     def go_to_root(self):
         from PyQt5 import QtWidgets

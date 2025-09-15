@@ -239,46 +239,104 @@ class MachineLearningManager(QtWidgets.QDialog):
         Order-agnostic, stack-safe replay of scientific steps:
 
           • Honors optional ax["op_order"] = ["rotate","crop","resize","band_expression"] (any permutation)
-          • If order deviates from the editor's typical "after-rotate" basis, the crop rect
-            is remapped to the correct basis so extracted coordinates remain consistent.
-          • For >4ch TIFF stacks, still works via tifffile path + ensure HWC before cv2 ops.
+          • Supports BOTH percent resize (scale/width/height) and absolute-pixel resize (px_w/px_h)
+          • If the crop rect was saved in a different basis than the order user runs now,
+            the rect is remapped so pixels/coords stay consistent.
+          • For >4ch stacks, resize/rotate are applied per-channel where needed.
 
         Returns (float32 image in HxWxC, C)
         """
+        import numpy as np, cv2, logging
+
         if raw_img is None:
             return None, 0
 
+        # ---- helpers ----
+        def _dims_after_rot(w, h, deg):
+            return (h, w) if (deg % 360) in (90, 270) else (w, h)
+
+        def _rect_after_rot(rect, src_w, src_h, deg):
+            x = int(rect.get("x", 0)); y = int(rect.get("y", 0))
+            w = int(rect.get("width", 0)); h = int(rect.get("height", 0))
+            d = int(deg) % 360
+            if d == 0:
+                return {"x": x, "y": y, "width": w, "height": h}
+            if d == 90:   # CW
+                nx = src_h - (y + h); ny = x
+                return {"x": nx, "y": ny, "width": h, "height": w}
+            if d == 180:
+                nx = src_w - (x + w); ny = src_h - (y + h)
+                return {"x": nx, "y": ny, "width": w, "height": h}
+            if d == 270:  # CW
+                nx = y; ny = src_w - (x + w)
+                return {"x": nx, "y": ny, "width": h, "height": w}
+            return {"x": x, "y": y, "width": w, "height": h}
+
+        def _scale_rect(rect, ref_w, ref_h, to_w, to_h):
+            sx = float(to_w) / float(max(1, ref_w))
+            sy = float(to_h) / float(max(1, ref_h))
+            x = int(round(int(rect.get("x", 0)) * sx))
+            y = int(round(int(rect.get("y", 0)) * sy))
+            w = int(round(int(rect.get("width", 0)) * sx))
+            h = int(round(int(rect.get("height", 0)) * sy))
+            # clamp into target frame
+            x = max(0, min(x, max(0, to_w - 1)))
+            y = max(0, min(y, max(0, to_h - 1)))
+            if x + w > to_w: w = max(0, to_w - x)
+            if y + h > to_h: h = max(0, to_h - y)
+            return {"x": x, "y": y, "width": w, "height": h}
+
+        def _infer_crop_basis(ax_dict, raw_w, raw_h, rot_deg):
+            ref = (ax_dict or {}).get("crop_rect_ref_size") or {}
+            try:
+                rw = int(ref.get("w") or 0); rh = int(ref.get("h") or 0)
+            except Exception:
+                rw = rh = 0
+            aw, ah = _dims_after_rot(raw_w, raw_h, rot_deg)
+            return "after_rotate" if (rw and rh and (rw, rh) == (aw, ah)) else "pre_rotate"
+
+        def _rotate_any_channels(img, rot):
+            if rot not in (90, 180, 270):
+                return img
+            if img.ndim == 2 or (img.ndim == 3 and img.shape[2] <= 4):
+                if rot == 90:  return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+                if rot == 180: return cv2.rotate(img, cv2.ROTATE_180)
+                return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            # C > 4 → per-band via NumPy
+            k = {90: 3, 180: 2, 270: 1}[rot]  # rot90 is CCW: 90° CW == 3×CCW
+            return np.stack([np.rot90(img[:, :, i], k=k) for i in range(img.shape[2])], axis=2)
+
+        def _resize_any_channels(img, new_w, new_h, interpolation):
+            if img.ndim == 2 or (img.ndim == 3 and img.shape[2] <= 4):
+                return cv2.resize(img, (new_w, new_h), interpolation=interpolation)
+            # C > 4 → per-band resize
+            chans = [cv2.resize(img[:, :, i], (new_w, new_h), interpolation=interpolation) for i in range(img.shape[2])]
+            return np.stack(chans, axis=2)
+
+        # ---- start from HWC ----
         img = self._ensure_hwc(raw_img)
 
-        # --- Gather AX parameters ----------------------------------------------------
-        try:
-            rot = int(ax.get("rotate", 0)) % 360
-        except Exception:
-            rot = 0
-
+        # AX params
+        try: rot = int(ax.get("rotate", 0)) % 360
+        except Exception: rot = 0
         crop_rect = ax.get("crop_rect") or None
-        crop_ref = ax.get("crop_rect_ref_size") or None
-        resize = ax.get("resize") or None
-        expr   = (ax.get("band_expression") or "").strip()
+        crop_ref  = ax.get("crop_rect_ref_size") or None
+        resize    = ax.get("resize") or None
+        expr      = (ax.get("band_expression") or "").strip()
 
         op_order = ax.get("op_order")
         if not (isinstance(op_order, (list, tuple)) and all(isinstance(s, str) for s in op_order)):
             op_order = ["rotate", "crop", "resize", "band_expression"]
 
-
         raw_h, raw_w = img.shape[:2]
+        crop_basis = _infer_crop_basis(ax, raw_w, raw_h, rot) if crop_rect else None
 
-        crop_basis = None
-        if crop_rect:
-            crop_basis = _infer_crop_basis(ax, raw_w, raw_h, rot)  # "after_rotate" or "pre_rotate"
-
-        # --- Execute ops in declared order -------------------------------------------
-        # Helper lambdas keep code readable
+        # ---- ops ----
         def _do_rotate():
             nonlocal img
             if rot in (90, 180, 270):
                 try:
-                    img = self._rotate_any_channels(img, rot)
+                    img = _rotate_any_channels(img, rot)
                 except Exception as e:
                     logging.warning(f"Rotation failed ({rot} deg): {e}")
 
@@ -288,80 +346,104 @@ class MachineLearningManager(QtWidgets.QDialog):
                 return
             Hc, Wc = img.shape[:2]
 
-            # Figure out which frame the saved rect lives in (pre- or post-rotate of RAW)
-            # and convert it to the CURRENT pre-crop frame.
-            rect_to_apply = dict(crop_rect)
-
-            # Saved ref dims for the rectangle’s frame (if provided)
+            # saved ref dims for the rectangle’s frame
             if isinstance(crop_ref, dict) and "w" in crop_ref and "h" in crop_ref:
                 ref_w_saved, ref_h_saved = int(crop_ref.get("w", raw_w)), int(crop_ref.get("h", raw_h))
             else:
-                # infer from basis
                 if crop_basis == "after_rotate":
                     ref_w_saved, ref_h_saved = _dims_after_rot(raw_w, raw_h, rot)
                 else:
-                    ref_w_saved, ref_h_saved = (raw_w, raw_h)
+                    ref_w_saved, ref_h_saved = raw_w, raw_h
 
-            # Determine whether rotate has ALREADY been applied in this order:
-            # i.e., was "rotate" listed before "crop"?
-            rotate_applied = False
-            if "rotate" in op_order and "crop" in op_order:
-                rotate_applied = (op_order.index("rotate") < op_order.index("crop"))
+            rotate_applied = ("rotate" in op_order and "crop" in op_order and
+                              op_order.index("rotate") < op_order.index("crop"))
 
-            # If the saved rect is AFTER-ROTATE but rotate is NOT applied yet,
+            rect_to_apply = dict(crop_rect)
             if crop_basis == "after_rotate" and not rotate_applied and rot in (90, 180, 270):
                 rect_to_apply = _rect_after_rot(rect_to_apply, ref_w_saved, ref_h_saved, (360 - rot) % 360)
-                ref_w_use, ref_h_use = (raw_w, raw_h)
-            # If the saved rect is PRE-ROTATE but rotate IS already applied,
-            # rotate the rect into the rotated basis.
+                ref_w_use, ref_h_use = raw_w, raw_h
             elif crop_basis == "pre_rotate" and rotate_applied and rot in (90, 180, 270):
                 rect_to_apply = _rect_after_rot(rect_to_apply, raw_w, raw_h, rot)
                 ref_w_use, ref_h_use = _dims_after_rot(raw_w, raw_h, rot)
             else:
-                ref_w_use, ref_h_use = (ref_w_saved, ref_h_saved)
+                ref_w_use, ref_h_use = ref_w_saved, ref_h_saved
 
-            # Finally, scale the rect from its saved reference size to the CURRENT image size
             rect_scaled = _scale_rect(rect_to_apply, ref_w_use, ref_h_use, Wc, Hc)
-
-            x0 = rect_scaled["x"]
-            y0 = rect_scaled["y"]
-            w  = rect_scaled["width"]
-            h  = rect_scaled["height"]
+            x0, y0 = rect_scaled["x"], rect_scaled["y"]
+            w,  h  = rect_scaled["width"], rect_scaled["height"]
             if w > 0 and h > 0:
-                img = img[y0:y0 + h, x0:x0 + w]
+                img = img[y0:y0+h, x0:x0+w]
             else:
                 logging.warning("Crop rect empty/out of bounds after remapping; skipping crop.")
 
         def _do_resize():
+            """
+            Supports:
+              • px_w / px_h  → absolute target size (preserve aspect if one is missing)
+              • scale        → percent of current size
+              • width/height → percent of current size (legacy)
+            """
             nonlocal img
-            if not resize:
+            if not isinstance(resize, dict) or not resize:
                 return
+
             h0, w0 = img.shape[:2]
-            if "scale" in resize:
-                s = float(resize["scale"]) / 100.0
+            if h0 <= 0 or w0 <= 0:
+                return
+
+            # Absolute pixel size (new in editor)
+            if ("px_w" in resize) or ("px_h" in resize):
+                tw = int(resize.get("px_w", 0) or 0)
+                th = int(resize.get("px_h", 0) or 0)
+                if tw > 0 and th > 0:
+                    new_w, new_h = tw, th
+                elif tw > 0:
+                    s = tw / float(w0)
+                    new_w = tw
+                    new_h = max(1, int(round(h0 * s)))
+                elif th > 0:
+                    s = th / float(h0)
+                    new_h = th
+                    new_w = max(1, int(round(w0 * s)))
+                else:
+                    return
+            # Percent scale (single value)
+            elif "scale" in resize:
+                s = float(resize.get("scale", 100.0)) / 100.0
                 new_w = max(1, int(round(w0 * s)))
                 new_h = max(1, int(round(h0 * s)))
+            # Percent width/height (legacy)
             else:
-                pw = float(resize.get("width", 100)) / 100.0
-                ph = float(resize.get("height", 100)) / 100.0
+                pw = float(resize.get("width", 100.0)) / 100.0
+                ph = float(resize.get("height", 100.0)) / 100.0
                 new_w = max(1, int(round(w0 * pw)))
                 new_h = max(1, int(round(h0 * ph)))
-            img = self._resize_any_channels(img, new_w, new_h, interpolation=cv2.INTER_AREA)
 
+            if new_w == w0 and new_h == h0:
+                return
+
+            sw = new_w / float(w0); sh = new_h / float(h0)
+            if sw < 1.0 or sh < 1.0:
+                interp = cv2.INTER_AREA     # downscale
+            elif max(sw, sh) < 2.0:
+                interp = cv2.INTER_LINEAR   # mild upscale
+            else:
+                interp = cv2.INTER_CUBIC    # larger upscales
+
+            try:
+                img = _resize_any_channels(img, new_w, new_h, interp)
+            except Exception as e:
+                logging.warning(f"Resize failed to {new_w}x{new_h}: {e}")
 
         def _do_band_expr():
             nonlocal img
             if not expr:
                 return
-            # Always compute indices on float32 and append as a new band
             x = img.astype(np.float32, copy=False)
             idx = self._eval_band_expression(x, expr)
-            if idx is not None:
-                img = np.dstack([x, idx.astype(np.float32, copy=False)])
-            else:
-                img = x
+            img = np.dstack([x, idx.astype(np.float32, copy=False)]) if idx is not None else x
 
-        # Dispatch
+        # dispatch in saved order
         ops_map = {
             "rotate": _do_rotate,
             "crop": _do_crop,
@@ -373,7 +455,6 @@ class MachineLearningManager(QtWidgets.QDialog):
             if fn:
                 fn()
 
-        # Ensure float32 output (scientific values) and report channel count
         img = img.astype(np.float32, copy=False)
         C = img.shape[2] if img.ndim == 3 else 1
         return img, C
@@ -519,31 +600,83 @@ class MachineLearningManager(QtWidgets.QDialog):
         """
         Map scene coords -> image pixel coords without requiring the viewer.
         Priority:
-          1) If viewer exists: use ProjectTab.scene_to_image_coords(viewer, ...)
-          2) Else if polygon_data has 'pixmap_size': scale by (img_w/pixmap_w, img_h/pixmap_h)
-          3) Else: assume points are already image coords.
+          1) If viewer exists: map scene->item (pixmap) and scale to image size (floor+clamp).
+          2) Else if polygon_data has 'pixmap_size': scale by (img_w/pixmap_w, img_h/pixmap_h) (floor+clamp).
+          3) Else: assume points are already image coords (floor+clamp).
         """
-        # 1) Try live viewer mapping
+        from PyQt5 import QtCore
+
+        if not points or img_shape is None:
+            return []
+
+        H = int(img_shape[0])
+        W = int(img_shape[1])
+
+        # 1) Try live viewer mapping (scene -> item pixmap -> image pixels)
         viewer = getattr(self.parent_tab, "get_viewer_by_filepath", lambda _p: None)(filepath)
+        if viewer is not None and getattr(viewer, "_image", None) is not None:
+            pm = viewer._image.pixmap()
+            pw = float(max(1, pm.width()))
+            ph = float(max(1, pm.height()))
+            sx = W / pw
+            sy = H / ph
+
+            out = []
+            for (sx_scene, sy_scene) in points:
+                p_item = viewer._image.mapFromScene(QtCore.QPointF(float(sx_scene), float(sy_scene)))
+                xi = int(p_item.x() * sx)  # floor (no rounding)
+                yi = int(p_item.y() * sy)
+                if xi < 0: xi = 0
+                if yi < 0: yi = 0
+                if xi >= W: xi = W - 1
+                if yi >= H: yi = H - 1
+                out.append((xi, yi))
+            return out
+
+        # If a viewer exists but no _image item, fall back to its helper but still floor+clamp.
         if viewer is not None:
             out = []
             for (x, y) in points:
-                q = self.parent_tab.scene_to_image_coords(viewer, QtCore.QPointF(x, y))
-                out.append((int(round(q.x())), int(round(q.y()))))
+                q = self.parent_tab.scene_to_image_coords(viewer, QtCore.QPointF(float(x), float(y)))
+                xi = int(q.x())
+                yi = int(q.y())
+                if xi < 0: xi = 0
+                if yi < 0: yi = 0
+                if xi >= W: xi = W - 1
+                if yi >= H: yi = H - 1
+                out.append((xi, yi))
             return out
 
-        # 2) Offline mapping using stored pixmap size
+        # 2) Offline mapping using stored pixmap size in polygon payload
         if polygon_data:
             pm = polygon_data.get("pixmap_size") or polygon_data.get("pixmap")  # support either key
             if isinstance(pm, (list, tuple)) and len(pm) == 2:
-                pix_w, pix_h = float(pm[0]), float(pm[1])
-                img_h, img_w = img_shape[0], img_shape[1]
-                sx = (img_w / pix_w) if pix_w > 0 else 1.0
-                sy = (img_h / pix_h) if pix_h > 0 else 1.0
-                return [(int(round(x * sx)), int(round(y * sy))) for (x, y) in points]
+                pix_w = float(pm[0]) if pm[0] else 1.0
+                pix_h = float(pm[1]) if pm[1] else 1.0
+                sx = W / pix_w
+                sy = H / pix_h
+                out = []
+                for (x, y) in points:
+                    xi = int(float(x) * sx)  # floor (no rounding)
+                    yi = int(float(y) * sy)
+                    if xi < 0: xi = 0
+                    if yi < 0: yi = 0
+                    if xi >= W: xi = W - 1
+                    if yi >= H: yi = H - 1
+                    out.append((xi, yi))
+                return out
 
-        # 3) Fallback: treat as already in image coords
-        return [(int(round(x)), int(round(y))) for (x, y) in points]
+        # 3) Fallback: treat as already in image coords (floor+clamp)
+        out = []
+        for (x, y) in points:
+            xi = int(float(x))
+            yi = int(float(y))
+            if xi < 0: xi = 0
+            if yi < 0: yi = 0
+            if xi >= W: xi = W - 1
+            if yi >= H: yi = H - 1
+            out.append((xi, yi))
+        return out
 
 
     def populate_polygon_groups(self):
