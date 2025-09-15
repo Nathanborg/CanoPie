@@ -199,6 +199,13 @@ class MainWindow(QMainWindow):
         save_all_thumbnails_action.setStatusTip("Save thumbnails for all polygons in the current project")
         save_all_thumbnails_action.triggered.connect(self.save_all_thumbnails_current_tab)
         file_menu.addAction(save_all_thumbnails_action)
+        # New Action: Export Project Images (below "Save All Thumbnails")
+        export_images_action = QAction("Export Project Images", self)
+        export_images_action.setShortcut("Ctrl+Shift+X")
+        export_images_action.setStatusTip("Export current project's images with .ax applied and copy EXIF")
+        export_images_action.triggered.connect(self.export_project_images_current_tab)
+        file_menu.addAction(export_images_action)
+
         
         file_menu.addSeparator()
 
@@ -208,6 +215,21 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
+       
+       
+    def export_project_images_current_tab(self):
+        current_tab = self.get_current_tab()
+        if not current_tab:
+            QMessageBox.warning(self, "No Tab Selected", "Please select a project tab.")
+            return
+        try:
+            current_tab.export_project_images()
+        except Exception as e:
+            logging.exception("Export failed")
+            QMessageBox.critical(self, "Export Error", f"Failed to export images:\n{e}")
+       
+       
+       
        
     def save_all_thumbnails_current_tab(self):
         current_tab = self.get_current_tab()
