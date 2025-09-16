@@ -1,0 +1,3915 @@
+{
+    "1": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0113_1_radiance.tif",
+                "IMG_0113_2_radiance.tif",
+                "IMG_0113_3_radiance.tif",
+                "IMG_0113_4_radiance.tif",
+                "IMG_0113_5_radiance.tif",
+                "IMG_0113_6_radiance.tif",
+                "IMG_0113_7_radiance.tif",
+                "IMG_0113_8_radiance.tif",
+                "IMG_0113_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103002_751_8b.JPG",
+                "20221212_103002_751_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103002_751_8b.JPG",
+        "thermal": "20221212_103002_751_IR.TIFF"
+    },
+    "2": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0114_0_radiance.tif",
+                "IMG_0114_1_radiance.tif",
+                "IMG_0114_2_radiance.tif",
+                "IMG_0114_3_radiance.tif",
+                "IMG_0114_4_radiance.tif",
+                "IMG_0114_5_radiance.tif",
+                "IMG_0114_6_radiance.tif",
+                "IMG_0114_7_radiance.tif",
+                "IMG_0114_8_radiance.tif",
+                "IMG_0114_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103003_752_8b.JPG",
+                "20221212_103003_752_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103003_752_8b.JPG",
+        "thermal": "20221212_103003_752_IR.TIFF"
+    },
+    "3": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0115_0_radiance.tif",
+                "IMG_0115_1_radiance.tif",
+                "IMG_0115_2_radiance.tif",
+                "IMG_0115_3_radiance.tif",
+                "IMG_0115_4_radiance.tif",
+                "IMG_0115_5_radiance.tif",
+                "IMG_0115_6_radiance.tif",
+                "IMG_0115_7_radiance.tif",
+                "IMG_0115_8_radiance.tif",
+                "IMG_0115_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103004_758_8b.JPG",
+                "20221212_103004_758_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103004_758_8b.JPG",
+        "thermal": "20221212_103004_758_IR.TIFF"
+    },
+    "4": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0116_0_radiance.tif",
+                "IMG_0116_1_radiance.tif",
+                "IMG_0116_2_radiance.tif",
+                "IMG_0116_3_radiance.tif",
+                "IMG_0116_4_radiance.tif",
+                "IMG_0116_5_radiance.tif",
+                "IMG_0116_6_radiance.tif",
+                "IMG_0116_7_radiance.tif",
+                "IMG_0116_8_radiance.tif",
+                "IMG_0116_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103005_759_8b.JPG",
+                "20221212_103005_759_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103005_759_8b.JPG",
+        "thermal": "20221212_103005_759_IR.TIFF"
+    },
+    "5": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0117_0_radiance.tif",
+                "IMG_0117_1_radiance.tif",
+                "IMG_0117_2_radiance.tif",
+                "IMG_0117_3_radiance.tif",
+                "IMG_0117_4_radiance.tif",
+                "IMG_0117_5_radiance.tif",
+                "IMG_0117_6_radiance.tif",
+                "IMG_0117_7_radiance.tif",
+                "IMG_0117_8_radiance.tif",
+                "IMG_0117_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103006_758_8b.JPG",
+                "20221212_103006_758_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103006_758_8b.JPG",
+        "thermal": "20221212_103006_758_IR.TIFF"
+    },
+    "6": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0118_0_radiance.tif",
+                "IMG_0118_1_radiance.tif",
+                "IMG_0118_2_radiance.tif",
+                "IMG_0118_3_radiance.tif",
+                "IMG_0118_4_radiance.tif",
+                "IMG_0118_5_radiance.tif",
+                "IMG_0118_6_radiance.tif",
+                "IMG_0118_7_radiance.tif",
+                "IMG_0118_8_radiance.tif",
+                "IMG_0118_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103007_759_8b.JPG",
+                "20221212_103007_759_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103007_759_8b.JPG",
+        "thermal": "20221212_103007_759_IR.TIFF"
+    },
+    "7": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0119_0_radiance.tif",
+                "IMG_0119_1_radiance.tif",
+                "IMG_0119_2_radiance.tif",
+                "IMG_0119_3_radiance.tif",
+                "IMG_0119_4_radiance.tif",
+                "IMG_0119_5_radiance.tif",
+                "IMG_0119_6_radiance.tif",
+                "IMG_0119_7_radiance.tif",
+                "IMG_0119_8_radiance.tif",
+                "IMG_0119_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103008_758_8b.JPG",
+                "20221212_103008_758_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103008_758_8b.JPG",
+        "thermal": "20221212_103008_758_IR.TIFF"
+    },
+    "8": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0120_0_radiance.tif",
+                "IMG_0120_1_radiance.tif",
+                "IMG_0120_2_radiance.tif",
+                "IMG_0120_3_radiance.tif",
+                "IMG_0120_4_radiance.tif",
+                "IMG_0120_5_radiance.tif",
+                "IMG_0120_6_radiance.tif",
+                "IMG_0120_7_radiance.tif",
+                "IMG_0120_8_radiance.tif",
+                "IMG_0120_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103009_759_8b.JPG",
+                "20221212_103009_759_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103009_759_8b.JPG",
+        "thermal": "20221212_103009_759_IR.TIFF"
+    },
+    "9": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0121_0_radiance.tif",
+                "IMG_0121_1_radiance.tif",
+                "IMG_0121_2_radiance.tif",
+                "IMG_0121_3_radiance.tif",
+                "IMG_0121_4_radiance.tif",
+                "IMG_0121_5_radiance.tif",
+                "IMG_0121_6_radiance.tif",
+                "IMG_0121_7_radiance.tif",
+                "IMG_0121_8_radiance.tif",
+                "IMG_0121_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103010_729_8b.JPG",
+                "20221212_103010_729_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103010_729_8b.JPG",
+        "thermal": "20221212_103010_729_IR.TIFF"
+    },
+    "10": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0122_0_radiance.tif",
+                "IMG_0122_1_radiance.tif",
+                "IMG_0122_2_radiance.tif",
+                "IMG_0122_3_radiance.tif",
+                "IMG_0122_4_radiance.tif",
+                "IMG_0122_5_radiance.tif",
+                "IMG_0122_6_radiance.tif",
+                "IMG_0122_7_radiance.tif",
+                "IMG_0122_8_radiance.tif",
+                "IMG_0122_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103011_728_8b.JPG",
+                "20221212_103011_728_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103011_728_8b.JPG",
+        "thermal": "20221212_103011_728_IR.TIFF"
+    },
+    "11": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0123_0_radiance.tif",
+                "IMG_0123_1_radiance.tif",
+                "IMG_0123_2_radiance.tif",
+                "IMG_0123_3_radiance.tif",
+                "IMG_0123_4_radiance.tif",
+                "IMG_0123_5_radiance.tif",
+                "IMG_0123_6_radiance.tif",
+                "IMG_0123_7_radiance.tif",
+                "IMG_0123_8_radiance.tif",
+                "IMG_0123_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103012_728_8b.JPG",
+                "20221212_103012_728_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103012_728_8b.JPG",
+        "thermal": "20221212_103012_728_IR.TIFF"
+    },
+    "12": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0124_0_radiance.tif",
+                "IMG_0124_1_radiance.tif",
+                "IMG_0124_2_radiance.tif",
+                "IMG_0124_3_radiance.tif",
+                "IMG_0124_4_radiance.tif",
+                "IMG_0124_5_radiance.tif",
+                "IMG_0124_6_radiance.tif",
+                "IMG_0124_7_radiance.tif",
+                "IMG_0124_8_radiance.tif",
+                "IMG_0124_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103013_728_8b.JPG",
+                "20221212_103013_728_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103013_728_8b.JPG",
+        "thermal": "20221212_103013_728_IR.TIFF"
+    },
+    "13": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0125_0_radiance.tif",
+                "IMG_0125_1_radiance.tif",
+                "IMG_0125_2_radiance.tif",
+                "IMG_0125_3_radiance.tif",
+                "IMG_0125_4_radiance.tif",
+                "IMG_0125_5_radiance.tif",
+                "IMG_0125_6_radiance.tif",
+                "IMG_0125_7_radiance.tif",
+                "IMG_0125_8_radiance.tif",
+                "IMG_0125_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103014_729_8b.JPG",
+                "20221212_103014_729_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103014_729_8b.JPG",
+        "thermal": "20221212_103014_729_IR.TIFF"
+    },
+    "14": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0126_0_radiance.tif",
+                "IMG_0126_1_radiance.tif",
+                "IMG_0126_2_radiance.tif",
+                "IMG_0126_3_radiance.tif",
+                "IMG_0126_4_radiance.tif",
+                "IMG_0126_5_radiance.tif",
+                "IMG_0126_6_radiance.tif",
+                "IMG_0126_7_radiance.tif",
+                "IMG_0126_8_radiance.tif",
+                "IMG_0126_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103015_730_8b.JPG",
+                "20221212_103015_730_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103015_730_8b.JPG",
+        "thermal": "20221212_103015_730_IR.TIFF"
+    },
+    "15": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0127_0_radiance.tif",
+                "IMG_0127_1_radiance.tif",
+                "IMG_0127_2_radiance.tif",
+                "IMG_0127_3_radiance.tif",
+                "IMG_0127_4_radiance.tif",
+                "IMG_0127_5_radiance.tif",
+                "IMG_0127_6_radiance.tif",
+                "IMG_0127_7_radiance.tif",
+                "IMG_0127_8_radiance.tif",
+                "IMG_0127_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103016_731_8b.JPG",
+                "20221212_103016_731_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103016_731_8b.JPG",
+        "thermal": "20221212_103016_731_IR.TIFF"
+    },
+    "16": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0128_0_radiance.tif",
+                "IMG_0128_1_radiance.tif",
+                "IMG_0128_2_radiance.tif",
+                "IMG_0128_3_radiance.tif",
+                "IMG_0128_4_radiance.tif",
+                "IMG_0128_5_radiance.tif",
+                "IMG_0128_6_radiance.tif",
+                "IMG_0128_7_radiance.tif",
+                "IMG_0128_8_radiance.tif",
+                "IMG_0128_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103017_738_8b.JPG",
+                "20221212_103017_738_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103017_738_8b.JPG",
+        "thermal": "20221212_103017_738_IR.TIFF"
+    },
+    "17": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0129_0_radiance.tif",
+                "IMG_0129_1_radiance.tif",
+                "IMG_0129_2_radiance.tif",
+                "IMG_0129_3_radiance.tif",
+                "IMG_0129_4_radiance.tif",
+                "IMG_0129_5_radiance.tif",
+                "IMG_0129_6_radiance.tif",
+                "IMG_0129_7_radiance.tif",
+                "IMG_0129_8_radiance.tif",
+                "IMG_0129_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103018_738_8b.JPG",
+                "20221212_103018_738_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103018_738_8b.JPG",
+        "thermal": "20221212_103018_738_IR.TIFF"
+    },
+    "18": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0130_0_radiance.tif",
+                "IMG_0130_1_radiance.tif",
+                "IMG_0130_2_radiance.tif",
+                "IMG_0130_3_radiance.tif",
+                "IMG_0130_4_radiance.tif",
+                "IMG_0130_5_radiance.tif",
+                "IMG_0130_6_radiance.tif",
+                "IMG_0130_7_radiance.tif",
+                "IMG_0130_8_radiance.tif",
+                "IMG_0130_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103019_738_8b.JPG",
+                "20221212_103019_738_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103019_738_8b.JPG",
+        "thermal": "20221212_103019_738_IR.TIFF"
+    },
+    "19": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0131_0_radiance.tif",
+                "IMG_0131_1_radiance.tif",
+                "IMG_0131_2_radiance.tif",
+                "IMG_0131_3_radiance.tif",
+                "IMG_0131_4_radiance.tif",
+                "IMG_0131_5_radiance.tif",
+                "IMG_0131_6_radiance.tif",
+                "IMG_0131_7_radiance.tif",
+                "IMG_0131_8_radiance.tif",
+                "IMG_0131_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103020_738_8b.JPG",
+                "20221212_103020_738_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103020_738_8b.JPG",
+        "thermal": "20221212_103020_738_IR.TIFF"
+    },
+    "20": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0132_0_radiance.tif",
+                "IMG_0132_1_radiance.tif",
+                "IMG_0132_2_radiance.tif",
+                "IMG_0132_3_radiance.tif",
+                "IMG_0132_4_radiance.tif",
+                "IMG_0132_5_radiance.tif",
+                "IMG_0132_6_radiance.tif",
+                "IMG_0132_7_radiance.tif",
+                "IMG_0132_8_radiance.tif",
+                "IMG_0132_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103021_738_8b.JPG",
+                "20221212_103021_738_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103021_738_8b.JPG",
+        "thermal": "20221212_103021_738_IR.TIFF"
+    },
+    "21": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0133_0_radiance.tif",
+                "IMG_0133_1_radiance.tif",
+                "IMG_0133_2_radiance.tif",
+                "IMG_0133_3_radiance.tif",
+                "IMG_0133_4_radiance.tif",
+                "IMG_0133_5_radiance.tif",
+                "IMG_0133_6_radiance.tif",
+                "IMG_0133_7_radiance.tif",
+                "IMG_0133_8_radiance.tif",
+                "IMG_0133_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103022_738_8b.JPG",
+                "20221212_103022_738_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103022_738_8b.JPG",
+        "thermal": "20221212_103022_738_IR.TIFF"
+    },
+    "22": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0134_0_radiance.tif",
+                "IMG_0134_1_radiance.tif",
+                "IMG_0134_2_radiance.tif",
+                "IMG_0134_3_radiance.tif",
+                "IMG_0134_4_radiance.tif",
+                "IMG_0134_5_radiance.tif",
+                "IMG_0134_6_radiance.tif",
+                "IMG_0134_7_radiance.tif",
+                "IMG_0134_8_radiance.tif",
+                "IMG_0134_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103023_738_8b.JPG",
+                "20221212_103023_738_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103023_738_8b.JPG",
+        "thermal": "20221212_103023_738_IR.TIFF"
+    },
+    "23": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0135_0_radiance.tif",
+                "IMG_0135_1_radiance.tif",
+                "IMG_0135_2_radiance.tif",
+                "IMG_0135_3_radiance.tif",
+                "IMG_0135_4_radiance.tif",
+                "IMG_0135_5_radiance.tif",
+                "IMG_0135_6_radiance.tif",
+                "IMG_0135_7_radiance.tif",
+                "IMG_0135_8_radiance.tif",
+                "IMG_0135_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103024_739_8b.JPG",
+                "20221212_103024_739_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103024_739_8b.JPG",
+        "thermal": "20221212_103024_739_IR.TIFF"
+    },
+    "24": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0136_0_radiance.tif",
+                "IMG_0136_1_radiance.tif",
+                "IMG_0136_2_radiance.tif",
+                "IMG_0136_3_radiance.tif",
+                "IMG_0136_4_radiance.tif",
+                "IMG_0136_5_radiance.tif",
+                "IMG_0136_6_radiance.tif",
+                "IMG_0136_7_radiance.tif",
+                "IMG_0136_8_radiance.tif",
+                "IMG_0136_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103025_740_8b.JPG",
+                "20221212_103025_740_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103025_740_8b.JPG",
+        "thermal": "20221212_103025_740_IR.TIFF"
+    },
+    "25": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0137_0_radiance.tif",
+                "IMG_0137_1_radiance.tif",
+                "IMG_0137_2_radiance.tif",
+                "IMG_0137_3_radiance.tif",
+                "IMG_0137_4_radiance.tif",
+                "IMG_0137_5_radiance.tif",
+                "IMG_0137_6_radiance.tif",
+                "IMG_0137_7_radiance.tif",
+                "IMG_0137_8_radiance.tif",
+                "IMG_0137_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103026_741_8b.JPG",
+                "20221212_103026_741_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103026_741_8b.JPG",
+        "thermal": "20221212_103026_741_IR.TIFF"
+    },
+    "26": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0138_0_radiance.tif",
+                "IMG_0138_1_radiance.tif",
+                "IMG_0138_2_radiance.tif",
+                "IMG_0138_3_radiance.tif",
+                "IMG_0138_4_radiance.tif",
+                "IMG_0138_5_radiance.tif",
+                "IMG_0138_6_radiance.tif",
+                "IMG_0138_7_radiance.tif",
+                "IMG_0138_8_radiance.tif",
+                "IMG_0138_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103027_748_8b.JPG",
+                "20221212_103027_748_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103027_748_8b.JPG",
+        "thermal": "20221212_103027_748_IR.TIFF"
+    },
+    "27": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0139_0_radiance.tif",
+                "IMG_0139_1_radiance.tif",
+                "IMG_0139_2_radiance.tif",
+                "IMG_0139_3_radiance.tif",
+                "IMG_0139_4_radiance.tif",
+                "IMG_0139_5_radiance.tif",
+                "IMG_0139_6_radiance.tif",
+                "IMG_0139_7_radiance.tif",
+                "IMG_0139_8_radiance.tif",
+                "IMG_0139_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103028_748_8b.JPG",
+                "20221212_103028_748_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103028_748_8b.JPG",
+        "thermal": "20221212_103028_748_IR.TIFF"
+    },
+    "28": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0140_0_radiance.tif",
+                "IMG_0140_1_radiance.tif",
+                "IMG_0140_2_radiance.tif",
+                "IMG_0140_3_radiance.tif",
+                "IMG_0140_4_radiance.tif",
+                "IMG_0140_5_radiance.tif",
+                "IMG_0140_6_radiance.tif",
+                "IMG_0140_7_radiance.tif",
+                "IMG_0140_8_radiance.tif",
+                "IMG_0140_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103029_748_8b.JPG",
+                "20221212_103029_748_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103029_748_8b.JPG",
+        "thermal": "20221212_103029_748_IR.TIFF"
+    },
+    "29": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0141_0_radiance.tif",
+                "IMG_0141_1_radiance.tif",
+                "IMG_0141_2_radiance.tif",
+                "IMG_0141_3_radiance.tif",
+                "IMG_0141_4_radiance.tif",
+                "IMG_0141_5_radiance.tif",
+                "IMG_0141_6_radiance.tif",
+                "IMG_0141_7_radiance.tif",
+                "IMG_0141_8_radiance.tif",
+                "IMG_0141_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103030_748_8b.JPG",
+                "20221212_103030_748_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103030_748_8b.JPG",
+        "thermal": "20221212_103030_748_IR.TIFF"
+    },
+    "30": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0142_0_radiance.tif",
+                "IMG_0142_1_radiance.tif",
+                "IMG_0142_2_radiance.tif",
+                "IMG_0142_3_radiance.tif",
+                "IMG_0142_4_radiance.tif",
+                "IMG_0142_5_radiance.tif",
+                "IMG_0142_6_radiance.tif",
+                "IMG_0142_7_radiance.tif",
+                "IMG_0142_8_radiance.tif",
+                "IMG_0142_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103031_748_8b.JPG",
+                "20221212_103031_748_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103031_748_8b.JPG",
+        "thermal": "20221212_103031_748_IR.TIFF"
+    },
+    "31": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0143_0_radiance.tif",
+                "IMG_0143_1_radiance.tif",
+                "IMG_0143_2_radiance.tif",
+                "IMG_0143_3_radiance.tif",
+                "IMG_0143_4_radiance.tif",
+                "IMG_0143_5_radiance.tif",
+                "IMG_0143_6_radiance.tif",
+                "IMG_0143_7_radiance.tif",
+                "IMG_0143_8_radiance.tif",
+                "IMG_0143_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103032_748_8b.JPG",
+                "20221212_103032_748_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103032_748_8b.JPG",
+        "thermal": "20221212_103032_748_IR.TIFF"
+    },
+    "32": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0144_0_radiance.tif",
+                "IMG_0144_1_radiance.tif",
+                "IMG_0144_2_radiance.tif",
+                "IMG_0144_3_radiance.tif",
+                "IMG_0144_4_radiance.tif",
+                "IMG_0144_5_radiance.tif",
+                "IMG_0144_6_radiance.tif",
+                "IMG_0144_7_radiance.tif",
+                "IMG_0144_8_radiance.tif",
+                "IMG_0144_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103033_748_8b.JPG",
+                "20221212_103033_748_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103033_748_8b.JPG",
+        "thermal": "20221212_103033_748_IR.TIFF"
+    },
+    "33": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0145_0_radiance.tif",
+                "IMG_0145_1_radiance.tif",
+                "IMG_0145_2_radiance.tif",
+                "IMG_0145_3_radiance.tif",
+                "IMG_0145_4_radiance.tif",
+                "IMG_0145_5_radiance.tif",
+                "IMG_0145_6_radiance.tif",
+                "IMG_0145_7_radiance.tif",
+                "IMG_0145_8_radiance.tif",
+                "IMG_0145_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103034_749_8b.JPG",
+                "20221212_103034_749_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103034_749_8b.JPG",
+        "thermal": "20221212_103034_749_IR.TIFF"
+    },
+    "34": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0146_0_radiance.tif",
+                "IMG_0146_1_radiance.tif",
+                "IMG_0146_2_radiance.tif",
+                "IMG_0146_3_radiance.tif",
+                "IMG_0146_4_radiance.tif",
+                "IMG_0146_5_radiance.tif",
+                "IMG_0146_6_radiance.tif",
+                "IMG_0146_7_radiance.tif",
+                "IMG_0146_8_radiance.tif",
+                "IMG_0146_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103035_750_8b.JPG",
+                "20221212_103035_750_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103035_750_8b.JPG",
+        "thermal": "20221212_103035_750_IR.TIFF"
+    },
+    "35": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0147_0_radiance.tif",
+                "IMG_0147_1_radiance.tif",
+                "IMG_0147_2_radiance.tif",
+                "IMG_0147_3_radiance.tif",
+                "IMG_0147_4_radiance.tif",
+                "IMG_0147_5_radiance.tif",
+                "IMG_0147_6_radiance.tif",
+                "IMG_0147_7_radiance.tif",
+                "IMG_0147_8_radiance.tif",
+                "IMG_0147_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103036_751_8b.JPG",
+                "20221212_103036_751_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103036_751_8b.JPG",
+        "thermal": "20221212_103036_751_IR.TIFF"
+    },
+    "36": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0148_0_radiance.tif",
+                "IMG_0148_1_radiance.tif",
+                "IMG_0148_2_radiance.tif",
+                "IMG_0148_3_radiance.tif",
+                "IMG_0148_4_radiance.tif",
+                "IMG_0148_5_radiance.tif",
+                "IMG_0148_6_radiance.tif",
+                "IMG_0148_7_radiance.tif",
+                "IMG_0148_8_radiance.tif",
+                "IMG_0148_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103037_758_8b.JPG",
+                "20221212_103037_758_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103037_758_8b.JPG",
+        "thermal": "20221212_103037_758_IR.TIFF"
+    },
+    "37": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0149_0_radiance.tif",
+                "IMG_0149_1_radiance.tif",
+                "IMG_0149_2_radiance.tif",
+                "IMG_0149_3_radiance.tif",
+                "IMG_0149_4_radiance.tif",
+                "IMG_0149_5_radiance.tif",
+                "IMG_0149_6_radiance.tif",
+                "IMG_0149_7_radiance.tif",
+                "IMG_0149_8_radiance.tif",
+                "IMG_0149_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103038_758_8b.JPG",
+                "20221212_103038_758_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103038_758_8b.JPG",
+        "thermal": "20221212_103038_758_IR.TIFF"
+    },
+    "38": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0150_0_radiance.tif",
+                "IMG_0150_1_radiance.tif",
+                "IMG_0150_2_radiance.tif",
+                "IMG_0150_3_radiance.tif",
+                "IMG_0150_4_radiance.tif",
+                "IMG_0150_5_radiance.tif",
+                "IMG_0150_6_radiance.tif",
+                "IMG_0150_7_radiance.tif",
+                "IMG_0150_8_radiance.tif",
+                "IMG_0150_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103039_758_8b.JPG",
+                "20221212_103039_758_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103039_758_8b.JPG",
+        "thermal": "20221212_103039_758_IR.TIFF"
+    },
+    "39": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0151_0_radiance.tif",
+                "IMG_0151_1_radiance.tif",
+                "IMG_0151_2_radiance.tif",
+                "IMG_0151_3_radiance.tif",
+                "IMG_0151_4_radiance.tif",
+                "IMG_0151_5_radiance.tif",
+                "IMG_0151_6_radiance.tif",
+                "IMG_0151_7_radiance.tif",
+                "IMG_0151_8_radiance.tif",
+                "IMG_0151_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103040_758_8b.JPG",
+                "20221212_103040_758_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103040_758_8b.JPG",
+        "thermal": "20221212_103040_758_IR.TIFF"
+    },
+    "40": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0152_0_radiance.tif",
+                "IMG_0152_1_radiance.tif",
+                "IMG_0152_2_radiance.tif",
+                "IMG_0152_3_radiance.tif",
+                "IMG_0152_4_radiance.tif",
+                "IMG_0152_5_radiance.tif",
+                "IMG_0152_6_radiance.tif",
+                "IMG_0152_7_radiance.tif",
+                "IMG_0152_8_radiance.tif",
+                "IMG_0152_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103041_758_8b.JPG",
+                "20221212_103041_758_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103041_758_8b.JPG",
+        "thermal": "20221212_103041_758_IR.TIFF"
+    },
+    "41": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0153_0_radiance.tif",
+                "IMG_0153_1_radiance.tif",
+                "IMG_0153_2_radiance.tif",
+                "IMG_0153_3_radiance.tif",
+                "IMG_0153_4_radiance.tif",
+                "IMG_0153_5_radiance.tif",
+                "IMG_0153_6_radiance.tif",
+                "IMG_0153_7_radiance.tif",
+                "IMG_0153_8_radiance.tif",
+                "IMG_0153_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103042_758_8b.JPG",
+                "20221212_103042_758_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103042_758_8b.JPG",
+        "thermal": "20221212_103042_758_IR.TIFF"
+    },
+    "42": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0154_0_radiance.tif",
+                "IMG_0154_1_radiance.tif",
+                "IMG_0154_2_radiance.tif",
+                "IMG_0154_3_radiance.tif",
+                "IMG_0154_4_radiance.tif",
+                "IMG_0154_5_radiance.tif",
+                "IMG_0154_6_radiance.tif",
+                "IMG_0154_7_radiance.tif",
+                "IMG_0154_8_radiance.tif",
+                "IMG_0154_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103043_758_8b.JPG",
+                "20221212_103043_758_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103043_758_8b.JPG",
+        "thermal": "20221212_103043_758_IR.TIFF"
+    },
+    "43": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0155_0_radiance.tif",
+                "IMG_0155_1_radiance.tif",
+                "IMG_0155_2_radiance.tif",
+                "IMG_0155_3_radiance.tif",
+                "IMG_0155_4_radiance.tif",
+                "IMG_0155_5_radiance.tif",
+                "IMG_0155_6_radiance.tif",
+                "IMG_0155_7_radiance.tif",
+                "IMG_0155_8_radiance.tif",
+                "IMG_0155_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103044_729_8b.JPG",
+                "20221212_103044_729_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103044_729_8b.JPG",
+        "thermal": "20221212_103044_729_IR.TIFF"
+    },
+    "44": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0156_0_radiance.tif",
+                "IMG_0156_1_radiance.tif",
+                "IMG_0156_2_radiance.tif",
+                "IMG_0156_3_radiance.tif",
+                "IMG_0156_4_radiance.tif",
+                "IMG_0156_5_radiance.tif",
+                "IMG_0156_6_radiance.tif",
+                "IMG_0156_7_radiance.tif",
+                "IMG_0156_8_radiance.tif",
+                "IMG_0156_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103045_728_8b.JPG",
+                "20221212_103045_728_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103045_728_8b.JPG",
+        "thermal": "20221212_103045_728_IR.TIFF"
+    },
+    "45": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0157_0_radiance.tif",
+                "IMG_0157_1_radiance.tif",
+                "IMG_0157_2_radiance.tif",
+                "IMG_0157_3_radiance.tif",
+                "IMG_0157_4_radiance.tif",
+                "IMG_0157_5_radiance.tif",
+                "IMG_0157_6_radiance.tif",
+                "IMG_0157_7_radiance.tif",
+                "IMG_0157_8_radiance.tif",
+                "IMG_0157_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103046_729_8b.JPG",
+                "20221212_103046_729_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103046_729_8b.JPG",
+        "thermal": "20221212_103046_729_IR.TIFF"
+    },
+    "46": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0158_0_radiance.tif",
+                "IMG_0158_1_radiance.tif",
+                "IMG_0158_2_radiance.tif",
+                "IMG_0158_3_radiance.tif",
+                "IMG_0158_4_radiance.tif",
+                "IMG_0158_5_radiance.tif",
+                "IMG_0158_6_radiance.tif",
+                "IMG_0158_7_radiance.tif",
+                "IMG_0158_8_radiance.tif",
+                "IMG_0158_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103047_729_8b.JPG",
+                "20221212_103047_729_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103047_729_8b.JPG",
+        "thermal": "20221212_103047_729_IR.TIFF"
+    },
+    "47": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0159_0_radiance.tif",
+                "IMG_0159_1_radiance.tif",
+                "IMG_0159_2_radiance.tif",
+                "IMG_0159_3_radiance.tif",
+                "IMG_0159_4_radiance.tif",
+                "IMG_0159_5_radiance.tif",
+                "IMG_0159_6_radiance.tif",
+                "IMG_0159_7_radiance.tif",
+                "IMG_0159_8_radiance.tif",
+                "IMG_0159_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103048_730_8b.JPG",
+                "20221212_103048_730_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103048_730_8b.JPG",
+        "thermal": "20221212_103048_730_IR.TIFF"
+    },
+    "48": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0160_0_radiance.tif",
+                "IMG_0160_1_radiance.tif",
+                "IMG_0160_2_radiance.tif",
+                "IMG_0160_3_radiance.tif",
+                "IMG_0160_4_radiance.tif",
+                "IMG_0160_5_radiance.tif",
+                "IMG_0160_6_radiance.tif",
+                "IMG_0160_7_radiance.tif",
+                "IMG_0160_8_radiance.tif",
+                "IMG_0160_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103049_731_8b.JPG",
+                "20221212_103049_731_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103049_731_8b.JPG",
+        "thermal": "20221212_103049_731_IR.TIFF"
+    },
+    "49": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0161_0_radiance.tif",
+                "IMG_0161_1_radiance.tif",
+                "IMG_0161_2_radiance.tif",
+                "IMG_0161_3_radiance.tif",
+                "IMG_0161_4_radiance.tif",
+                "IMG_0161_5_radiance.tif",
+                "IMG_0161_6_radiance.tif",
+                "IMG_0161_7_radiance.tif",
+                "IMG_0161_8_radiance.tif",
+                "IMG_0161_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103050_732_8b.JPG",
+                "20221212_103050_732_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103050_732_8b.JPG",
+        "thermal": "20221212_103050_732_IR.TIFF"
+    },
+    "50": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0162_0_radiance.tif",
+                "IMG_0162_1_radiance.tif",
+                "IMG_0162_2_radiance.tif",
+                "IMG_0162_3_radiance.tif",
+                "IMG_0162_4_radiance.tif",
+                "IMG_0162_5_radiance.tif",
+                "IMG_0162_6_radiance.tif",
+                "IMG_0162_7_radiance.tif",
+                "IMG_0162_8_radiance.tif",
+                "IMG_0162_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103051_738_8b.JPG",
+                "20221212_103051_738_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103051_738_8b.JPG",
+        "thermal": "20221212_103051_738_IR.TIFF"
+    },
+    "51": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0163_0_radiance.tif",
+                "IMG_0163_1_radiance.tif",
+                "IMG_0163_2_radiance.tif",
+                "IMG_0163_3_radiance.tif",
+                "IMG_0163_4_radiance.tif",
+                "IMG_0163_5_radiance.tif",
+                "IMG_0163_6_radiance.tif",
+                "IMG_0163_7_radiance.tif",
+                "IMG_0163_8_radiance.tif",
+                "IMG_0163_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103052_739_8b.JPG",
+                "20221212_103052_739_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103052_739_8b.JPG",
+        "thermal": "20221212_103052_739_IR.TIFF"
+    },
+    "52": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0164_0_radiance.tif",
+                "IMG_0164_1_radiance.tif",
+                "IMG_0164_2_radiance.tif",
+                "IMG_0164_3_radiance.tif",
+                "IMG_0164_4_radiance.tif",
+                "IMG_0164_5_radiance.tif",
+                "IMG_0164_6_radiance.tif",
+                "IMG_0164_7_radiance.tif",
+                "IMG_0164_8_radiance.tif",
+                "IMG_0164_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103053_738_8b.JPG",
+                "20221212_103053_738_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103053_738_8b.JPG",
+        "thermal": "20221212_103053_738_IR.TIFF"
+    },
+    "53": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0165_0_radiance.tif",
+                "IMG_0165_1_radiance.tif",
+                "IMG_0165_2_radiance.tif",
+                "IMG_0165_3_radiance.tif",
+                "IMG_0165_4_radiance.tif",
+                "IMG_0165_5_radiance.tif",
+                "IMG_0165_6_radiance.tif",
+                "IMG_0165_7_radiance.tif",
+                "IMG_0165_8_radiance.tif",
+                "IMG_0165_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103054_739_8b.JPG",
+                "20221212_103054_739_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103054_739_8b.JPG",
+        "thermal": "20221212_103054_739_IR.TIFF"
+    },
+    "54": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0166_0_radiance.tif",
+                "IMG_0166_1_radiance.tif",
+                "IMG_0166_2_radiance.tif",
+                "IMG_0166_3_radiance.tif",
+                "IMG_0166_4_radiance.tif",
+                "IMG_0166_5_radiance.tif",
+                "IMG_0166_6_radiance.tif",
+                "IMG_0166_7_radiance.tif",
+                "IMG_0166_8_radiance.tif",
+                "IMG_0166_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103055_738_8b.JPG",
+                "20221212_103055_738_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103055_738_8b.JPG",
+        "thermal": "20221212_103055_738_IR.TIFF"
+    },
+    "55": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0167_0_radiance.tif",
+                "IMG_0167_1_radiance.tif",
+                "IMG_0167_2_radiance.tif",
+                "IMG_0167_3_radiance.tif",
+                "IMG_0167_4_radiance.tif",
+                "IMG_0167_5_radiance.tif",
+                "IMG_0167_6_radiance.tif",
+                "IMG_0167_7_radiance.tif",
+                "IMG_0167_8_radiance.tif",
+                "IMG_0167_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103056_739_8b.JPG",
+                "20221212_103056_739_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103056_739_8b.JPG",
+        "thermal": "20221212_103056_739_IR.TIFF"
+    },
+    "56": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0168_0_radiance.tif",
+                "IMG_0168_1_radiance.tif",
+                "IMG_0168_2_radiance.tif",
+                "IMG_0168_3_radiance.tif",
+                "IMG_0168_4_radiance.tif",
+                "IMG_0168_5_radiance.tif",
+                "IMG_0168_6_radiance.tif",
+                "IMG_0168_7_radiance.tif",
+                "IMG_0168_8_radiance.tif",
+                "IMG_0168_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103057_739_8b.JPG",
+                "20221212_103057_739_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103057_739_8b.JPG",
+        "thermal": "20221212_103057_739_IR.TIFF"
+    },
+    "57": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0169_0_radiance.tif",
+                "IMG_0169_1_radiance.tif",
+                "IMG_0169_2_radiance.tif",
+                "IMG_0169_3_radiance.tif",
+                "IMG_0169_4_radiance.tif",
+                "IMG_0169_5_radiance.tif",
+                "IMG_0169_6_radiance.tif",
+                "IMG_0169_7_radiance.tif",
+                "IMG_0169_8_radiance.tif",
+                "IMG_0169_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103058_740_8b.JPG",
+                "20221212_103058_740_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103058_740_8b.JPG",
+        "thermal": "20221212_103058_740_IR.TIFF"
+    },
+    "58": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0170_0_radiance.tif",
+                "IMG_0170_1_radiance.tif",
+                "IMG_0170_2_radiance.tif",
+                "IMG_0170_3_radiance.tif",
+                "IMG_0170_4_radiance.tif",
+                "IMG_0170_5_radiance.tif",
+                "IMG_0170_6_radiance.tif",
+                "IMG_0170_7_radiance.tif",
+                "IMG_0170_8_radiance.tif",
+                "IMG_0170_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103059_741_8b.JPG",
+                "20221212_103059_741_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103059_741_8b.JPG",
+        "thermal": "20221212_103059_741_IR.TIFF"
+    },
+    "59": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0171_0_radiance.tif",
+                "IMG_0171_1_radiance.tif",
+                "IMG_0171_2_radiance.tif",
+                "IMG_0171_3_radiance.tif",
+                "IMG_0171_4_radiance.tif",
+                "IMG_0171_5_radiance.tif",
+                "IMG_0171_6_radiance.tif",
+                "IMG_0171_7_radiance.tif",
+                "IMG_0171_8_radiance.tif",
+                "IMG_0171_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103100_742_8b.JPG",
+                "20221212_103100_742_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103100_742_8b.JPG",
+        "thermal": "20221212_103100_742_IR.TIFF"
+    },
+    "60": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0172_0_radiance.tif",
+                "IMG_0172_1_radiance.tif",
+                "IMG_0172_2_radiance.tif",
+                "IMG_0172_3_radiance.tif",
+                "IMG_0172_4_radiance.tif",
+                "IMG_0172_5_radiance.tif",
+                "IMG_0172_6_radiance.tif",
+                "IMG_0172_7_radiance.tif",
+                "IMG_0172_8_radiance.tif",
+                "IMG_0172_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103101_749_8b.JPG",
+                "20221212_103101_749_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103101_749_8b.JPG",
+        "thermal": "20221212_103101_749_IR.TIFF"
+    },
+    "61": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0173_0_radiance.tif",
+                "IMG_0173_1_radiance.tif",
+                "IMG_0173_2_radiance.tif",
+                "IMG_0173_3_radiance.tif",
+                "IMG_0173_4_radiance.tif",
+                "IMG_0173_5_radiance.tif",
+                "IMG_0173_6_radiance.tif",
+                "IMG_0173_7_radiance.tif",
+                "IMG_0173_8_radiance.tif",
+                "IMG_0173_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103102_750_8b.JPG",
+                "20221212_103102_750_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103102_750_8b.JPG",
+        "thermal": "20221212_103102_750_IR.TIFF"
+    },
+    "62": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0174_0_radiance.tif",
+                "IMG_0174_1_radiance.tif",
+                "IMG_0174_2_radiance.tif",
+                "IMG_0174_3_radiance.tif",
+                "IMG_0174_4_radiance.tif",
+                "IMG_0174_5_radiance.tif",
+                "IMG_0174_6_radiance.tif",
+                "IMG_0174_7_radiance.tif",
+                "IMG_0174_8_radiance.tif",
+                "IMG_0174_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103103_748_8b.JPG",
+                "20221212_103103_748_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103103_748_8b.JPG",
+        "thermal": "20221212_103103_748_IR.TIFF"
+    },
+    "63": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0175_0_radiance.tif",
+                "IMG_0175_1_radiance.tif",
+                "IMG_0175_2_radiance.tif",
+                "IMG_0175_3_radiance.tif",
+                "IMG_0175_4_radiance.tif",
+                "IMG_0175_5_radiance.tif",
+                "IMG_0175_6_radiance.tif",
+                "IMG_0175_7_radiance.tif",
+                "IMG_0175_8_radiance.tif",
+                "IMG_0175_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103104_749_8b.JPG",
+                "20221212_103104_749_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103104_749_8b.JPG",
+        "thermal": "20221212_103104_749_IR.TIFF"
+    },
+    "64": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0176_0_radiance.tif",
+                "IMG_0176_1_radiance.tif",
+                "IMG_0176_2_radiance.tif",
+                "IMG_0176_3_radiance.tif",
+                "IMG_0176_4_radiance.tif",
+                "IMG_0176_5_radiance.tif",
+                "IMG_0176_6_radiance.tif",
+                "IMG_0176_7_radiance.tif",
+                "IMG_0176_8_radiance.tif",
+                "IMG_0176_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103105_748_8b.JPG",
+                "20221212_103105_748_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103105_748_8b.JPG",
+        "thermal": "20221212_103105_748_IR.TIFF"
+    },
+    "65": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0177_0_radiance.tif",
+                "IMG_0177_1_radiance.tif",
+                "IMG_0177_2_radiance.tif",
+                "IMG_0177_3_radiance.tif",
+                "IMG_0177_4_radiance.tif",
+                "IMG_0177_5_radiance.tif",
+                "IMG_0177_6_radiance.tif",
+                "IMG_0177_7_radiance.tif",
+                "IMG_0177_8_radiance.tif",
+                "IMG_0177_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103106_749_8b.JPG",
+                "20221212_103106_749_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103106_749_8b.JPG",
+        "thermal": "20221212_103106_749_IR.TIFF"
+    },
+    "66": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0178_0_radiance.tif",
+                "IMG_0178_1_radiance.tif",
+                "IMG_0178_2_radiance.tif",
+                "IMG_0178_3_radiance.tif",
+                "IMG_0178_4_radiance.tif",
+                "IMG_0178_5_radiance.tif",
+                "IMG_0178_6_radiance.tif",
+                "IMG_0178_7_radiance.tif",
+                "IMG_0178_8_radiance.tif",
+                "IMG_0178_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103107_749_8b.JPG",
+                "20221212_103107_749_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103107_749_8b.JPG",
+        "thermal": "20221212_103107_749_IR.TIFF"
+    },
+    "67": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0179_0_radiance.tif",
+                "IMG_0179_1_radiance.tif",
+                "IMG_0179_2_radiance.tif",
+                "IMG_0179_3_radiance.tif",
+                "IMG_0179_4_radiance.tif",
+                "IMG_0179_5_radiance.tif",
+                "IMG_0179_6_radiance.tif",
+                "IMG_0179_7_radiance.tif",
+                "IMG_0179_8_radiance.tif",
+                "IMG_0179_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103108_750_8b.JPG",
+                "20221212_103108_750_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103108_750_8b.JPG",
+        "thermal": "20221212_103108_750_IR.TIFF"
+    },
+    "68": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0180_0_radiance.tif",
+                "IMG_0180_1_radiance.tif",
+                "IMG_0180_2_radiance.tif",
+                "IMG_0180_3_radiance.tif",
+                "IMG_0180_4_radiance.tif",
+                "IMG_0180_5_radiance.tif",
+                "IMG_0180_6_radiance.tif",
+                "IMG_0180_7_radiance.tif",
+                "IMG_0180_8_radiance.tif",
+                "IMG_0180_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103109_751_8b.JPG",
+                "20221212_103109_751_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103109_751_8b.JPG",
+        "thermal": "20221212_103109_751_IR.TIFF"
+    },
+    "69": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0181_0_radiance.tif",
+                "IMG_0181_1_radiance.tif",
+                "IMG_0181_2_radiance.tif",
+                "IMG_0181_3_radiance.tif",
+                "IMG_0181_4_radiance.tif",
+                "IMG_0181_5_radiance.tif",
+                "IMG_0181_6_radiance.tif",
+                "IMG_0181_7_radiance.tif",
+                "IMG_0181_8_radiance.tif",
+                "IMG_0181_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103110_752_8b.JPG",
+                "20221212_103110_752_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103110_752_8b.JPG",
+        "thermal": "20221212_103110_752_IR.TIFF"
+    },
+    "70": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0182_0_radiance.tif",
+                "IMG_0182_1_radiance.tif",
+                "IMG_0182_2_radiance.tif",
+                "IMG_0182_3_radiance.tif",
+                "IMG_0182_4_radiance.tif",
+                "IMG_0182_5_radiance.tif",
+                "IMG_0182_6_radiance.tif",
+                "IMG_0182_7_radiance.tif",
+                "IMG_0182_8_radiance.tif",
+                "IMG_0182_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103111_758_8b.JPG",
+                "20221212_103111_758_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103111_758_8b.JPG",
+        "thermal": "20221212_103111_758_IR.TIFF"
+    },
+    "71": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0183_0_radiance.tif",
+                "IMG_0183_1_radiance.tif",
+                "IMG_0183_2_radiance.tif",
+                "IMG_0183_3_radiance.tif",
+                "IMG_0183_4_radiance.tif",
+                "IMG_0183_5_radiance.tif",
+                "IMG_0183_6_radiance.tif",
+                "IMG_0183_7_radiance.tif",
+                "IMG_0183_8_radiance.tif",
+                "IMG_0183_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103112_759_8b.JPG",
+                "20221212_103112_759_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103112_759_8b.JPG",
+        "thermal": "20221212_103112_759_IR.TIFF"
+    },
+    "72": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0184_0_radiance.tif",
+                "IMG_0184_1_radiance.tif",
+                "IMG_0184_2_radiance.tif",
+                "IMG_0184_3_radiance.tif",
+                "IMG_0184_4_radiance.tif",
+                "IMG_0184_5_radiance.tif",
+                "IMG_0184_6_radiance.tif",
+                "IMG_0184_7_radiance.tif",
+                "IMG_0184_8_radiance.tif",
+                "IMG_0184_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103113_758_8b.JPG",
+                "20221212_103113_758_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103113_758_8b.JPG",
+        "thermal": "20221212_103113_758_IR.TIFF"
+    },
+    "73": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0185_0_radiance.tif",
+                "IMG_0185_1_radiance.tif",
+                "IMG_0185_2_radiance.tif",
+                "IMG_0185_3_radiance.tif",
+                "IMG_0185_4_radiance.tif",
+                "IMG_0185_5_radiance.tif",
+                "IMG_0185_6_radiance.tif",
+                "IMG_0185_7_radiance.tif",
+                "IMG_0185_8_radiance.tif",
+                "IMG_0185_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": "C:\\Multispect_analyser\\test\\flir",
+            "files": [
+                "20221212_103114_759_8b.JPG",
+                "20221212_103114_759_IR.TIFF"
+            ]
+        },
+        "RGB": "20221212_103114_759_8b.JPG",
+        "thermal": "20221212_103114_759_IR.TIFF"
+    },
+    "74": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0186_0_radiance.tif",
+                "IMG_0186_1_radiance.tif",
+                "IMG_0186_2_radiance.tif",
+                "IMG_0186_3_radiance.tif",
+                "IMG_0186_4_radiance.tif",
+                "IMG_0186_5_radiance.tif",
+                "IMG_0186_6_radiance.tif",
+                "IMG_0186_7_radiance.tif",
+                "IMG_0186_8_radiance.tif",
+                "IMG_0186_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "75": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0187_0_radiance.tif",
+                "IMG_0187_1_radiance.tif",
+                "IMG_0187_2_radiance.tif",
+                "IMG_0187_3_radiance.tif",
+                "IMG_0187_4_radiance.tif",
+                "IMG_0187_5_radiance.tif",
+                "IMG_0187_6_radiance.tif",
+                "IMG_0187_7_radiance.tif",
+                "IMG_0187_8_radiance.tif",
+                "IMG_0187_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "76": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0188_0_radiance.tif",
+                "IMG_0188_1_radiance.tif",
+                "IMG_0188_2_radiance.tif",
+                "IMG_0188_3_radiance.tif",
+                "IMG_0188_4_radiance.tif",
+                "IMG_0188_5_radiance.tif",
+                "IMG_0188_6_radiance.tif",
+                "IMG_0188_7_radiance.tif",
+                "IMG_0188_8_radiance.tif",
+                "IMG_0188_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "77": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0189_0_radiance.tif",
+                "IMG_0189_1_radiance.tif",
+                "IMG_0189_2_radiance.tif",
+                "IMG_0189_3_radiance.tif",
+                "IMG_0189_4_radiance.tif",
+                "IMG_0189_5_radiance.tif",
+                "IMG_0189_6_radiance.tif",
+                "IMG_0189_7_radiance.tif",
+                "IMG_0189_8_radiance.tif",
+                "IMG_0189_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "78": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0190_0_radiance.tif",
+                "IMG_0190_1_radiance.tif",
+                "IMG_0190_2_radiance.tif",
+                "IMG_0190_3_radiance.tif",
+                "IMG_0190_4_radiance.tif",
+                "IMG_0190_5_radiance.tif",
+                "IMG_0190_6_radiance.tif",
+                "IMG_0190_7_radiance.tif",
+                "IMG_0190_8_radiance.tif",
+                "IMG_0190_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "79": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0191_0_radiance.tif",
+                "IMG_0191_1_radiance.tif",
+                "IMG_0191_2_radiance.tif",
+                "IMG_0191_3_radiance.tif",
+                "IMG_0191_4_radiance.tif",
+                "IMG_0191_5_radiance.tif",
+                "IMG_0191_6_radiance.tif",
+                "IMG_0191_7_radiance.tif",
+                "IMG_0191_8_radiance.tif",
+                "IMG_0191_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "80": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0192_0_radiance.tif",
+                "IMG_0192_1_radiance.tif",
+                "IMG_0192_2_radiance.tif",
+                "IMG_0192_3_radiance.tif",
+                "IMG_0192_4_radiance.tif",
+                "IMG_0192_5_radiance.tif",
+                "IMG_0192_6_radiance.tif",
+                "IMG_0192_7_radiance.tif",
+                "IMG_0192_8_radiance.tif",
+                "IMG_0192_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "81": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0193_0_radiance.tif",
+                "IMG_0193_1_radiance.tif",
+                "IMG_0193_2_radiance.tif",
+                "IMG_0193_3_radiance.tif",
+                "IMG_0193_4_radiance.tif",
+                "IMG_0193_5_radiance.tif",
+                "IMG_0193_6_radiance.tif",
+                "IMG_0193_7_radiance.tif",
+                "IMG_0193_8_radiance.tif",
+                "IMG_0193_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "82": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0194_0_radiance.tif",
+                "IMG_0194_1_radiance.tif",
+                "IMG_0194_2_radiance.tif",
+                "IMG_0194_3_radiance.tif",
+                "IMG_0194_4_radiance.tif",
+                "IMG_0194_5_radiance.tif",
+                "IMG_0194_6_radiance.tif",
+                "IMG_0194_7_radiance.tif",
+                "IMG_0194_8_radiance.tif",
+                "IMG_0194_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "83": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0195_0_radiance.tif",
+                "IMG_0195_1_radiance.tif",
+                "IMG_0195_2_radiance.tif",
+                "IMG_0195_3_radiance.tif",
+                "IMG_0195_4_radiance.tif",
+                "IMG_0195_5_radiance.tif",
+                "IMG_0195_6_radiance.tif",
+                "IMG_0195_7_radiance.tif",
+                "IMG_0195_8_radiance.tif",
+                "IMG_0195_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "84": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0196_0_radiance.tif",
+                "IMG_0196_1_radiance.tif",
+                "IMG_0196_2_radiance.tif",
+                "IMG_0196_3_radiance.tif",
+                "IMG_0196_4_radiance.tif",
+                "IMG_0196_5_radiance.tif",
+                "IMG_0196_6_radiance.tif",
+                "IMG_0196_7_radiance.tif",
+                "IMG_0196_8_radiance.tif",
+                "IMG_0196_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "85": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0197_0_radiance.tif",
+                "IMG_0197_1_radiance.tif",
+                "IMG_0197_2_radiance.tif",
+                "IMG_0197_3_radiance.tif",
+                "IMG_0197_4_radiance.tif",
+                "IMG_0197_5_radiance.tif",
+                "IMG_0197_6_radiance.tif",
+                "IMG_0197_7_radiance.tif",
+                "IMG_0197_8_radiance.tif",
+                "IMG_0197_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "86": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0198_0_radiance.tif",
+                "IMG_0198_1_radiance.tif",
+                "IMG_0198_2_radiance.tif",
+                "IMG_0198_3_radiance.tif",
+                "IMG_0198_4_radiance.tif",
+                "IMG_0198_5_radiance.tif",
+                "IMG_0198_6_radiance.tif",
+                "IMG_0198_7_radiance.tif",
+                "IMG_0198_8_radiance.tif",
+                "IMG_0198_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "87": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0199_0_radiance.tif",
+                "IMG_0199_1_radiance.tif",
+                "IMG_0199_2_radiance.tif",
+                "IMG_0199_3_radiance.tif",
+                "IMG_0199_4_radiance.tif",
+                "IMG_0199_5_radiance.tif",
+                "IMG_0199_6_radiance.tif",
+                "IMG_0199_7_radiance.tif",
+                "IMG_0199_8_radiance.tif",
+                "IMG_0199_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "88": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0200_0_radiance.tif",
+                "IMG_0200_1_radiance.tif",
+                "IMG_0200_2_radiance.tif",
+                "IMG_0200_3_radiance.tif",
+                "IMG_0200_4_radiance.tif",
+                "IMG_0200_5_radiance.tif",
+                "IMG_0200_6_radiance.tif",
+                "IMG_0200_7_radiance.tif",
+                "IMG_0200_8_radiance.tif",
+                "IMG_0200_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "89": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0201_0_radiance.tif",
+                "IMG_0201_1_radiance.tif",
+                "IMG_0201_2_radiance.tif",
+                "IMG_0201_3_radiance.tif",
+                "IMG_0201_4_radiance.tif",
+                "IMG_0201_5_radiance.tif",
+                "IMG_0201_6_radiance.tif",
+                "IMG_0201_7_radiance.tif",
+                "IMG_0201_8_radiance.tif",
+                "IMG_0201_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "90": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0202_0_radiance.tif",
+                "IMG_0202_1_radiance.tif",
+                "IMG_0202_2_radiance.tif",
+                "IMG_0202_3_radiance.tif",
+                "IMG_0202_4_radiance.tif",
+                "IMG_0202_5_radiance.tif",
+                "IMG_0202_6_radiance.tif",
+                "IMG_0202_7_radiance.tif",
+                "IMG_0202_8_radiance.tif",
+                "IMG_0202_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "91": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0203_0_radiance.tif",
+                "IMG_0203_1_radiance.tif",
+                "IMG_0203_2_radiance.tif",
+                "IMG_0203_3_radiance.tif",
+                "IMG_0203_4_radiance.tif",
+                "IMG_0203_5_radiance.tif",
+                "IMG_0203_6_radiance.tif",
+                "IMG_0203_7_radiance.tif",
+                "IMG_0203_8_radiance.tif",
+                "IMG_0203_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "92": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0204_0_radiance.tif",
+                "IMG_0204_1_radiance.tif",
+                "IMG_0204_2_radiance.tif",
+                "IMG_0204_3_radiance.tif",
+                "IMG_0204_4_radiance.tif",
+                "IMG_0204_5_radiance.tif",
+                "IMG_0204_6_radiance.tif",
+                "IMG_0204_7_radiance.tif",
+                "IMG_0204_8_radiance.tif",
+                "IMG_0204_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "93": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0205_0_radiance.tif",
+                "IMG_0205_1_radiance.tif",
+                "IMG_0205_2_radiance.tif",
+                "IMG_0205_3_radiance.tif",
+                "IMG_0205_4_radiance.tif",
+                "IMG_0205_5_radiance.tif",
+                "IMG_0205_6_radiance.tif",
+                "IMG_0205_7_radiance.tif",
+                "IMG_0205_8_radiance.tif",
+                "IMG_0205_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "94": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0206_0_radiance.tif",
+                "IMG_0206_1_radiance.tif",
+                "IMG_0206_2_radiance.tif",
+                "IMG_0206_3_radiance.tif",
+                "IMG_0206_4_radiance.tif",
+                "IMG_0206_5_radiance.tif",
+                "IMG_0206_6_radiance.tif",
+                "IMG_0206_7_radiance.tif",
+                "IMG_0206_8_radiance.tif",
+                "IMG_0206_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "95": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0207_0_radiance.tif",
+                "IMG_0207_1_radiance.tif",
+                "IMG_0207_2_radiance.tif",
+                "IMG_0207_3_radiance.tif",
+                "IMG_0207_4_radiance.tif",
+                "IMG_0207_5_radiance.tif",
+                "IMG_0207_6_radiance.tif",
+                "IMG_0207_7_radiance.tif",
+                "IMG_0207_8_radiance.tif",
+                "IMG_0207_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "96": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0208_0_radiance.tif",
+                "IMG_0208_1_radiance.tif",
+                "IMG_0208_2_radiance.tif",
+                "IMG_0208_3_radiance.tif",
+                "IMG_0208_4_radiance.tif",
+                "IMG_0208_5_radiance.tif",
+                "IMG_0208_6_radiance.tif",
+                "IMG_0208_7_radiance.tif",
+                "IMG_0208_8_radiance.tif",
+                "IMG_0208_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "97": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0209_0_radiance.tif",
+                "IMG_0209_1_radiance.tif",
+                "IMG_0209_2_radiance.tif",
+                "IMG_0209_3_radiance.tif",
+                "IMG_0209_4_radiance.tif",
+                "IMG_0209_5_radiance.tif",
+                "IMG_0209_6_radiance.tif",
+                "IMG_0209_7_radiance.tif",
+                "IMG_0209_8_radiance.tif",
+                "IMG_0209_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "98": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0210_0_radiance.tif",
+                "IMG_0210_1_radiance.tif",
+                "IMG_0210_2_radiance.tif",
+                "IMG_0210_3_radiance.tif",
+                "IMG_0210_4_radiance.tif",
+                "IMG_0210_5_radiance.tif",
+                "IMG_0210_6_radiance.tif",
+                "IMG_0210_7_radiance.tif",
+                "IMG_0210_8_radiance.tif",
+                "IMG_0210_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "99": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0211_0_radiance.tif",
+                "IMG_0211_1_radiance.tif",
+                "IMG_0211_2_radiance.tif",
+                "IMG_0211_3_radiance.tif",
+                "IMG_0211_4_radiance.tif",
+                "IMG_0211_5_radiance.tif",
+                "IMG_0211_6_radiance.tif",
+                "IMG_0211_7_radiance.tif",
+                "IMG_0211_8_radiance.tif",
+                "IMG_0211_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "100": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0212_0_radiance.tif",
+                "IMG_0212_1_radiance.tif",
+                "IMG_0212_2_radiance.tif",
+                "IMG_0212_3_radiance.tif",
+                "IMG_0212_4_radiance.tif",
+                "IMG_0212_5_radiance.tif",
+                "IMG_0212_6_radiance.tif",
+                "IMG_0212_7_radiance.tif",
+                "IMG_0212_8_radiance.tif",
+                "IMG_0212_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "101": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0213_0_radiance.tif",
+                "IMG_0213_1_radiance.tif",
+                "IMG_0213_2_radiance.tif",
+                "IMG_0213_3_radiance.tif",
+                "IMG_0213_4_radiance.tif",
+                "IMG_0213_5_radiance.tif",
+                "IMG_0213_6_radiance.tif",
+                "IMG_0213_7_radiance.tif",
+                "IMG_0213_8_radiance.tif",
+                "IMG_0213_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "102": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0214_0_radiance.tif",
+                "IMG_0214_1_radiance.tif",
+                "IMG_0214_2_radiance.tif",
+                "IMG_0214_3_radiance.tif",
+                "IMG_0214_4_radiance.tif",
+                "IMG_0214_5_radiance.tif",
+                "IMG_0214_6_radiance.tif",
+                "IMG_0214_7_radiance.tif",
+                "IMG_0214_8_radiance.tif",
+                "IMG_0214_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "103": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0215_0_radiance.tif",
+                "IMG_0215_1_radiance.tif",
+                "IMG_0215_2_radiance.tif",
+                "IMG_0215_3_radiance.tif",
+                "IMG_0215_4_radiance.tif",
+                "IMG_0215_5_radiance.tif",
+                "IMG_0215_6_radiance.tif",
+                "IMG_0215_7_radiance.tif",
+                "IMG_0215_8_radiance.tif",
+                "IMG_0215_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "104": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0216_0_radiance.tif",
+                "IMG_0216_1_radiance.tif",
+                "IMG_0216_2_radiance.tif",
+                "IMG_0216_3_radiance.tif",
+                "IMG_0216_4_radiance.tif",
+                "IMG_0216_5_radiance.tif",
+                "IMG_0216_6_radiance.tif",
+                "IMG_0216_7_radiance.tif",
+                "IMG_0216_8_radiance.tif",
+                "IMG_0216_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "105": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0217_0_radiance.tif",
+                "IMG_0217_1_radiance.tif",
+                "IMG_0217_2_radiance.tif",
+                "IMG_0217_3_radiance.tif",
+                "IMG_0217_4_radiance.tif",
+                "IMG_0217_5_radiance.tif",
+                "IMG_0217_6_radiance.tif",
+                "IMG_0217_7_radiance.tif",
+                "IMG_0217_8_radiance.tif",
+                "IMG_0217_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "106": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0218_0_radiance.tif",
+                "IMG_0218_1_radiance.tif",
+                "IMG_0218_2_radiance.tif",
+                "IMG_0218_3_radiance.tif",
+                "IMG_0218_4_radiance.tif",
+                "IMG_0218_5_radiance.tif",
+                "IMG_0218_6_radiance.tif",
+                "IMG_0218_7_radiance.tif",
+                "IMG_0218_8_radiance.tif",
+                "IMG_0218_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "107": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0219_0_radiance.tif",
+                "IMG_0219_1_radiance.tif",
+                "IMG_0219_2_radiance.tif",
+                "IMG_0219_3_radiance.tif",
+                "IMG_0219_4_radiance.tif",
+                "IMG_0219_5_radiance.tif",
+                "IMG_0219_6_radiance.tif",
+                "IMG_0219_7_radiance.tif",
+                "IMG_0219_8_radiance.tif",
+                "IMG_0219_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "108": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0220_0_radiance.tif",
+                "IMG_0220_1_radiance.tif",
+                "IMG_0220_2_radiance.tif",
+                "IMG_0220_3_radiance.tif",
+                "IMG_0220_4_radiance.tif",
+                "IMG_0220_5_radiance.tif",
+                "IMG_0220_6_radiance.tif",
+                "IMG_0220_7_radiance.tif",
+                "IMG_0220_8_radiance.tif",
+                "IMG_0220_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "109": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0221_0_radiance.tif",
+                "IMG_0221_1_radiance.tif",
+                "IMG_0221_2_radiance.tif",
+                "IMG_0221_3_radiance.tif",
+                "IMG_0221_4_radiance.tif",
+                "IMG_0221_5_radiance.tif",
+                "IMG_0221_6_radiance.tif",
+                "IMG_0221_7_radiance.tif",
+                "IMG_0221_8_radiance.tif",
+                "IMG_0221_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "110": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0222_0_radiance.tif",
+                "IMG_0222_1_radiance.tif",
+                "IMG_0222_2_radiance.tif",
+                "IMG_0222_3_radiance.tif",
+                "IMG_0222_4_radiance.tif",
+                "IMG_0222_5_radiance.tif",
+                "IMG_0222_6_radiance.tif",
+                "IMG_0222_7_radiance.tif",
+                "IMG_0222_8_radiance.tif",
+                "IMG_0222_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "111": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0223_0_radiance.tif",
+                "IMG_0223_1_radiance.tif",
+                "IMG_0223_2_radiance.tif",
+                "IMG_0223_3_radiance.tif",
+                "IMG_0223_4_radiance.tif",
+                "IMG_0223_5_radiance.tif",
+                "IMG_0223_6_radiance.tif",
+                "IMG_0223_7_radiance.tif",
+                "IMG_0223_8_radiance.tif",
+                "IMG_0223_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "112": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0224_0_radiance.tif",
+                "IMG_0224_1_radiance.tif",
+                "IMG_0224_2_radiance.tif",
+                "IMG_0224_3_radiance.tif",
+                "IMG_0224_4_radiance.tif",
+                "IMG_0224_5_radiance.tif",
+                "IMG_0224_6_radiance.tif",
+                "IMG_0224_7_radiance.tif",
+                "IMG_0224_8_radiance.tif",
+                "IMG_0224_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "113": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0225_0_radiance.tif",
+                "IMG_0225_1_radiance.tif",
+                "IMG_0225_2_radiance.tif",
+                "IMG_0225_3_radiance.tif",
+                "IMG_0225_4_radiance.tif",
+                "IMG_0225_5_radiance.tif",
+                "IMG_0225_6_radiance.tif",
+                "IMG_0225_7_radiance.tif",
+                "IMG_0225_8_radiance.tif",
+                "IMG_0225_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "114": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0226_0_radiance.tif",
+                "IMG_0226_1_radiance.tif",
+                "IMG_0226_2_radiance.tif",
+                "IMG_0226_3_radiance.tif",
+                "IMG_0226_4_radiance.tif",
+                "IMG_0226_5_radiance.tif",
+                "IMG_0226_6_radiance.tif",
+                "IMG_0226_7_radiance.tif",
+                "IMG_0226_8_radiance.tif",
+                "IMG_0226_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "115": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0227_0_radiance.tif",
+                "IMG_0227_1_radiance.tif",
+                "IMG_0227_2_radiance.tif",
+                "IMG_0227_3_radiance.tif",
+                "IMG_0227_4_radiance.tif",
+                "IMG_0227_5_radiance.tif",
+                "IMG_0227_6_radiance.tif",
+                "IMG_0227_7_radiance.tif",
+                "IMG_0227_8_radiance.tif",
+                "IMG_0227_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "116": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0228_0_radiance.tif",
+                "IMG_0228_1_radiance.tif",
+                "IMG_0228_2_radiance.tif",
+                "IMG_0228_3_radiance.tif",
+                "IMG_0228_4_radiance.tif",
+                "IMG_0228_5_radiance.tif",
+                "IMG_0228_6_radiance.tif",
+                "IMG_0228_7_radiance.tif",
+                "IMG_0228_8_radiance.tif",
+                "IMG_0228_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "117": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0229_0_radiance.tif",
+                "IMG_0229_1_radiance.tif",
+                "IMG_0229_2_radiance.tif",
+                "IMG_0229_3_radiance.tif",
+                "IMG_0229_4_radiance.tif",
+                "IMG_0229_5_radiance.tif",
+                "IMG_0229_6_radiance.tif",
+                "IMG_0229_7_radiance.tif",
+                "IMG_0229_8_radiance.tif",
+                "IMG_0229_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "118": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0230_0_radiance.tif",
+                "IMG_0230_1_radiance.tif",
+                "IMG_0230_2_radiance.tif",
+                "IMG_0230_3_radiance.tif",
+                "IMG_0230_4_radiance.tif",
+                "IMG_0230_5_radiance.tif",
+                "IMG_0230_6_radiance.tif",
+                "IMG_0230_7_radiance.tif",
+                "IMG_0230_8_radiance.tif",
+                "IMG_0230_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "119": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0231_0_radiance.tif",
+                "IMG_0231_1_radiance.tif",
+                "IMG_0231_2_radiance.tif",
+                "IMG_0231_3_radiance.tif",
+                "IMG_0231_4_radiance.tif",
+                "IMG_0231_5_radiance.tif",
+                "IMG_0231_6_radiance.tif",
+                "IMG_0231_7_radiance.tif",
+                "IMG_0231_8_radiance.tif",
+                "IMG_0231_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "120": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0232_0_radiance.tif",
+                "IMG_0232_1_radiance.tif",
+                "IMG_0232_2_radiance.tif",
+                "IMG_0232_3_radiance.tif",
+                "IMG_0232_4_radiance.tif",
+                "IMG_0232_5_radiance.tif",
+                "IMG_0232_6_radiance.tif",
+                "IMG_0232_7_radiance.tif",
+                "IMG_0232_8_radiance.tif",
+                "IMG_0232_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "121": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0233_0_radiance.tif",
+                "IMG_0233_1_radiance.tif",
+                "IMG_0233_2_radiance.tif",
+                "IMG_0233_3_radiance.tif",
+                "IMG_0233_4_radiance.tif",
+                "IMG_0233_5_radiance.tif",
+                "IMG_0233_6_radiance.tif",
+                "IMG_0233_7_radiance.tif",
+                "IMG_0233_8_radiance.tif",
+                "IMG_0233_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "122": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0234_0_radiance.tif",
+                "IMG_0234_1_radiance.tif",
+                "IMG_0234_2_radiance.tif",
+                "IMG_0234_3_radiance.tif",
+                "IMG_0234_4_radiance.tif",
+                "IMG_0234_5_radiance.tif",
+                "IMG_0234_6_radiance.tif",
+                "IMG_0234_7_radiance.tif",
+                "IMG_0234_8_radiance.tif",
+                "IMG_0234_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "123": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0235_0_radiance.tif",
+                "IMG_0235_1_radiance.tif",
+                "IMG_0235_2_radiance.tif",
+                "IMG_0235_3_radiance.tif",
+                "IMG_0235_4_radiance.tif",
+                "IMG_0235_5_radiance.tif",
+                "IMG_0235_6_radiance.tif",
+                "IMG_0235_7_radiance.tif",
+                "IMG_0235_8_radiance.tif",
+                "IMG_0235_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "124": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0236_0_radiance.tif",
+                "IMG_0236_1_radiance.tif",
+                "IMG_0236_2_radiance.tif",
+                "IMG_0236_3_radiance.tif",
+                "IMG_0236_4_radiance.tif",
+                "IMG_0236_5_radiance.tif",
+                "IMG_0236_6_radiance.tif",
+                "IMG_0236_7_radiance.tif",
+                "IMG_0236_8_radiance.tif",
+                "IMG_0236_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "125": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0237_0_radiance.tif",
+                "IMG_0237_1_radiance.tif",
+                "IMG_0237_2_radiance.tif",
+                "IMG_0237_3_radiance.tif",
+                "IMG_0237_4_radiance.tif",
+                "IMG_0237_5_radiance.tif",
+                "IMG_0237_6_radiance.tif",
+                "IMG_0237_7_radiance.tif",
+                "IMG_0237_8_radiance.tif",
+                "IMG_0237_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "126": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0238_0_radiance.tif",
+                "IMG_0238_1_radiance.tif",
+                "IMG_0238_2_radiance.tif",
+                "IMG_0238_3_radiance.tif",
+                "IMG_0238_4_radiance.tif",
+                "IMG_0238_5_radiance.tif",
+                "IMG_0238_6_radiance.tif",
+                "IMG_0238_7_radiance.tif",
+                "IMG_0238_8_radiance.tif",
+                "IMG_0238_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "127": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0239_0_radiance.tif",
+                "IMG_0239_1_radiance.tif",
+                "IMG_0239_2_radiance.tif",
+                "IMG_0239_3_radiance.tif",
+                "IMG_0239_4_radiance.tif",
+                "IMG_0239_5_radiance.tif",
+                "IMG_0239_6_radiance.tif",
+                "IMG_0239_7_radiance.tif",
+                "IMG_0239_8_radiance.tif",
+                "IMG_0239_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "128": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0240_0_radiance.tif",
+                "IMG_0240_1_radiance.tif",
+                "IMG_0240_2_radiance.tif",
+                "IMG_0240_3_radiance.tif",
+                "IMG_0240_4_radiance.tif",
+                "IMG_0240_5_radiance.tif",
+                "IMG_0240_6_radiance.tif",
+                "IMG_0240_7_radiance.tif",
+                "IMG_0240_8_radiance.tif",
+                "IMG_0240_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "129": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0241_0_radiance.tif",
+                "IMG_0241_1_radiance.tif",
+                "IMG_0241_2_radiance.tif",
+                "IMG_0241_3_radiance.tif",
+                "IMG_0241_4_radiance.tif",
+                "IMG_0241_5_radiance.tif",
+                "IMG_0241_6_radiance.tif",
+                "IMG_0241_7_radiance.tif",
+                "IMG_0241_8_radiance.tif",
+                "IMG_0241_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "130": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0242_0_radiance.tif",
+                "IMG_0242_1_radiance.tif",
+                "IMG_0242_2_radiance.tif",
+                "IMG_0242_3_radiance.tif",
+                "IMG_0242_4_radiance.tif",
+                "IMG_0242_5_radiance.tif",
+                "IMG_0242_6_radiance.tif",
+                "IMG_0242_7_radiance.tif",
+                "IMG_0242_8_radiance.tif",
+                "IMG_0242_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "131": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0243_0_radiance.tif",
+                "IMG_0243_1_radiance.tif",
+                "IMG_0243_2_radiance.tif",
+                "IMG_0243_3_radiance.tif",
+                "IMG_0243_4_radiance.tif",
+                "IMG_0243_5_radiance.tif",
+                "IMG_0243_6_radiance.tif",
+                "IMG_0243_7_radiance.tif",
+                "IMG_0243_8_radiance.tif",
+                "IMG_0243_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "132": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0244_0_radiance.tif",
+                "IMG_0244_1_radiance.tif",
+                "IMG_0244_2_radiance.tif",
+                "IMG_0244_3_radiance.tif",
+                "IMG_0244_4_radiance.tif",
+                "IMG_0244_5_radiance.tif",
+                "IMG_0244_6_radiance.tif",
+                "IMG_0244_7_radiance.tif",
+                "IMG_0244_8_radiance.tif",
+                "IMG_0244_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "133": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0245_0_radiance.tif",
+                "IMG_0245_1_radiance.tif",
+                "IMG_0245_2_radiance.tif",
+                "IMG_0245_3_radiance.tif",
+                "IMG_0245_4_radiance.tif",
+                "IMG_0245_5_radiance.tif",
+                "IMG_0245_6_radiance.tif",
+                "IMG_0245_7_radiance.tif",
+                "IMG_0245_8_radiance.tif",
+                "IMG_0245_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "134": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0246_0_radiance.tif",
+                "IMG_0246_1_radiance.tif",
+                "IMG_0246_2_radiance.tif",
+                "IMG_0246_3_radiance.tif",
+                "IMG_0246_4_radiance.tif",
+                "IMG_0246_5_radiance.tif",
+                "IMG_0246_6_radiance.tif",
+                "IMG_0246_7_radiance.tif",
+                "IMG_0246_8_radiance.tif",
+                "IMG_0246_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "135": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0247_0_radiance.tif",
+                "IMG_0247_1_radiance.tif",
+                "IMG_0247_2_radiance.tif",
+                "IMG_0247_3_radiance.tif",
+                "IMG_0247_4_radiance.tif",
+                "IMG_0247_5_radiance.tif",
+                "IMG_0247_6_radiance.tif",
+                "IMG_0247_7_radiance.tif",
+                "IMG_0247_8_radiance.tif",
+                "IMG_0247_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "136": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0248_0_radiance.tif",
+                "IMG_0248_1_radiance.tif",
+                "IMG_0248_2_radiance.tif",
+                "IMG_0248_3_radiance.tif",
+                "IMG_0248_4_radiance.tif",
+                "IMG_0248_5_radiance.tif",
+                "IMG_0248_6_radiance.tif",
+                "IMG_0248_7_radiance.tif",
+                "IMG_0248_8_radiance.tif",
+                "IMG_0248_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "137": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0249_0_radiance.tif",
+                "IMG_0249_1_radiance.tif",
+                "IMG_0249_2_radiance.tif",
+                "IMG_0249_3_radiance.tif",
+                "IMG_0249_4_radiance.tif",
+                "IMG_0249_5_radiance.tif",
+                "IMG_0249_6_radiance.tif",
+                "IMG_0249_7_radiance.tif",
+                "IMG_0249_8_radiance.tif",
+                "IMG_0249_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "138": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0250_0_radiance.tif",
+                "IMG_0250_1_radiance.tif",
+                "IMG_0250_2_radiance.tif",
+                "IMG_0250_3_radiance.tif",
+                "IMG_0250_4_radiance.tif",
+                "IMG_0250_5_radiance.tif",
+                "IMG_0250_6_radiance.tif",
+                "IMG_0250_7_radiance.tif",
+                "IMG_0250_8_radiance.tif",
+                "IMG_0250_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "139": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0251_0_radiance.tif",
+                "IMG_0251_1_radiance.tif",
+                "IMG_0251_2_radiance.tif",
+                "IMG_0251_3_radiance.tif",
+                "IMG_0251_4_radiance.tif",
+                "IMG_0251_5_radiance.tif",
+                "IMG_0251_6_radiance.tif",
+                "IMG_0251_7_radiance.tif",
+                "IMG_0251_8_radiance.tif",
+                "IMG_0251_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "140": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0252_0_radiance.tif",
+                "IMG_0252_1_radiance.tif",
+                "IMG_0252_2_radiance.tif",
+                "IMG_0252_3_radiance.tif",
+                "IMG_0252_4_radiance.tif",
+                "IMG_0252_5_radiance.tif",
+                "IMG_0252_6_radiance.tif",
+                "IMG_0252_7_radiance.tif",
+                "IMG_0252_8_radiance.tif",
+                "IMG_0252_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "141": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0253_0_radiance.tif",
+                "IMG_0253_1_radiance.tif",
+                "IMG_0253_2_radiance.tif",
+                "IMG_0253_3_radiance.tif",
+                "IMG_0253_4_radiance.tif",
+                "IMG_0253_5_radiance.tif",
+                "IMG_0253_6_radiance.tif",
+                "IMG_0253_7_radiance.tif",
+                "IMG_0253_8_radiance.tif",
+                "IMG_0253_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "142": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0254_0_radiance.tif",
+                "IMG_0254_1_radiance.tif",
+                "IMG_0254_2_radiance.tif",
+                "IMG_0254_3_radiance.tif",
+                "IMG_0254_4_radiance.tif",
+                "IMG_0254_5_radiance.tif",
+                "IMG_0254_6_radiance.tif",
+                "IMG_0254_7_radiance.tif",
+                "IMG_0254_8_radiance.tif",
+                "IMG_0254_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "143": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0255_0_radiance.tif",
+                "IMG_0255_1_radiance.tif",
+                "IMG_0255_2_radiance.tif",
+                "IMG_0255_3_radiance.tif",
+                "IMG_0255_4_radiance.tif",
+                "IMG_0255_5_radiance.tif",
+                "IMG_0255_6_radiance.tif",
+                "IMG_0255_7_radiance.tif",
+                "IMG_0255_8_radiance.tif",
+                "IMG_0255_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "144": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0256_0_radiance.tif",
+                "IMG_0256_1_radiance.tif",
+                "IMG_0256_2_radiance.tif",
+                "IMG_0256_3_radiance.tif",
+                "IMG_0256_4_radiance.tif",
+                "IMG_0256_5_radiance.tif",
+                "IMG_0256_6_radiance.tif",
+                "IMG_0256_7_radiance.tif",
+                "IMG_0256_8_radiance.tif",
+                "IMG_0256_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "145": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0257_0_radiance.tif",
+                "IMG_0257_1_radiance.tif",
+                "IMG_0257_2_radiance.tif",
+                "IMG_0257_3_radiance.tif",
+                "IMG_0257_4_radiance.tif",
+                "IMG_0257_5_radiance.tif",
+                "IMG_0257_6_radiance.tif",
+                "IMG_0257_7_radiance.tif",
+                "IMG_0257_8_radiance.tif",
+                "IMG_0257_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "146": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0258_0_radiance.tif",
+                "IMG_0258_1_radiance.tif",
+                "IMG_0258_2_radiance.tif",
+                "IMG_0258_3_radiance.tif",
+                "IMG_0258_4_radiance.tif",
+                "IMG_0258_5_radiance.tif",
+                "IMG_0258_6_radiance.tif",
+                "IMG_0258_7_radiance.tif",
+                "IMG_0258_8_radiance.tif",
+                "IMG_0258_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "147": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0259_0_radiance.tif",
+                "IMG_0259_1_radiance.tif",
+                "IMG_0259_2_radiance.tif",
+                "IMG_0259_3_radiance.tif",
+                "IMG_0259_4_radiance.tif",
+                "IMG_0259_5_radiance.tif",
+                "IMG_0259_6_radiance.tif",
+                "IMG_0259_7_radiance.tif",
+                "IMG_0259_8_radiance.tif",
+                "IMG_0259_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "148": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0260_0_radiance.tif",
+                "IMG_0260_1_radiance.tif",
+                "IMG_0260_2_radiance.tif",
+                "IMG_0260_3_radiance.tif",
+                "IMG_0260_4_radiance.tif",
+                "IMG_0260_5_radiance.tif",
+                "IMG_0260_6_radiance.tif",
+                "IMG_0260_7_radiance.tif",
+                "IMG_0260_8_radiance.tif",
+                "IMG_0260_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "149": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0261_0_radiance.tif",
+                "IMG_0261_1_radiance.tif",
+                "IMG_0261_2_radiance.tif",
+                "IMG_0261_3_radiance.tif",
+                "IMG_0261_4_radiance.tif",
+                "IMG_0261_5_radiance.tif",
+                "IMG_0261_6_radiance.tif",
+                "IMG_0261_7_radiance.tif",
+                "IMG_0261_8_radiance.tif",
+                "IMG_0261_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "150": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0262_0_radiance.tif",
+                "IMG_0262_1_radiance.tif",
+                "IMG_0262_2_radiance.tif",
+                "IMG_0262_3_radiance.tif",
+                "IMG_0262_4_radiance.tif",
+                "IMG_0262_5_radiance.tif",
+                "IMG_0262_6_radiance.tif",
+                "IMG_0262_7_radiance.tif",
+                "IMG_0262_8_radiance.tif",
+                "IMG_0262_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "151": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0263_0_radiance.tif",
+                "IMG_0263_1_radiance.tif",
+                "IMG_0263_2_radiance.tif",
+                "IMG_0263_3_radiance.tif",
+                "IMG_0263_4_radiance.tif",
+                "IMG_0263_5_radiance.tif",
+                "IMG_0263_6_radiance.tif",
+                "IMG_0263_7_radiance.tif",
+                "IMG_0263_8_radiance.tif",
+                "IMG_0263_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "152": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0264_0_radiance.tif",
+                "IMG_0264_1_radiance.tif",
+                "IMG_0264_2_radiance.tif",
+                "IMG_0264_3_radiance.tif",
+                "IMG_0264_4_radiance.tif",
+                "IMG_0264_5_radiance.tif",
+                "IMG_0264_6_radiance.tif",
+                "IMG_0264_7_radiance.tif",
+                "IMG_0264_8_radiance.tif",
+                "IMG_0264_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "153": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0265_0_radiance.tif",
+                "IMG_0265_1_radiance.tif",
+                "IMG_0265_2_radiance.tif",
+                "IMG_0265_3_radiance.tif",
+                "IMG_0265_4_radiance.tif",
+                "IMG_0265_5_radiance.tif",
+                "IMG_0265_6_radiance.tif",
+                "IMG_0265_7_radiance.tif",
+                "IMG_0265_8_radiance.tif",
+                "IMG_0265_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "154": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0266_0_radiance.tif",
+                "IMG_0266_1_radiance.tif",
+                "IMG_0266_2_radiance.tif",
+                "IMG_0266_3_radiance.tif",
+                "IMG_0266_4_radiance.tif",
+                "IMG_0266_5_radiance.tif",
+                "IMG_0266_6_radiance.tif",
+                "IMG_0266_7_radiance.tif",
+                "IMG_0266_8_radiance.tif",
+                "IMG_0266_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "155": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0267_0_radiance.tif",
+                "IMG_0267_1_radiance.tif",
+                "IMG_0267_2_radiance.tif",
+                "IMG_0267_3_radiance.tif",
+                "IMG_0267_4_radiance.tif",
+                "IMG_0267_5_radiance.tif",
+                "IMG_0267_6_radiance.tif",
+                "IMG_0267_7_radiance.tif",
+                "IMG_0267_8_radiance.tif",
+                "IMG_0267_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "156": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0268_0_radiance.tif",
+                "IMG_0268_1_radiance.tif",
+                "IMG_0268_2_radiance.tif",
+                "IMG_0268_3_radiance.tif",
+                "IMG_0268_4_radiance.tif",
+                "IMG_0268_5_radiance.tif",
+                "IMG_0268_6_radiance.tif",
+                "IMG_0268_7_radiance.tif",
+                "IMG_0268_8_radiance.tif",
+                "IMG_0268_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "157": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0269_0_radiance.tif",
+                "IMG_0269_1_radiance.tif",
+                "IMG_0269_2_radiance.tif",
+                "IMG_0269_3_radiance.tif",
+                "IMG_0269_4_radiance.tif",
+                "IMG_0269_5_radiance.tif",
+                "IMG_0269_6_radiance.tif",
+                "IMG_0269_7_radiance.tif",
+                "IMG_0269_8_radiance.tif",
+                "IMG_0269_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "158": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0270_0_radiance.tif",
+                "IMG_0270_1_radiance.tif",
+                "IMG_0270_2_radiance.tif",
+                "IMG_0270_3_radiance.tif",
+                "IMG_0270_4_radiance.tif",
+                "IMG_0270_5_radiance.tif",
+                "IMG_0270_6_radiance.tif",
+                "IMG_0270_7_radiance.tif",
+                "IMG_0270_8_radiance.tif",
+                "IMG_0270_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "159": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0271_0_radiance.tif",
+                "IMG_0271_1_radiance.tif",
+                "IMG_0271_2_radiance.tif",
+                "IMG_0271_3_radiance.tif",
+                "IMG_0271_4_radiance.tif",
+                "IMG_0271_5_radiance.tif",
+                "IMG_0271_6_radiance.tif",
+                "IMG_0271_7_radiance.tif",
+                "IMG_0271_8_radiance.tif",
+                "IMG_0271_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "160": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0272_0_radiance.tif",
+                "IMG_0272_1_radiance.tif",
+                "IMG_0272_2_radiance.tif",
+                "IMG_0272_3_radiance.tif",
+                "IMG_0272_4_radiance.tif",
+                "IMG_0272_5_radiance.tif",
+                "IMG_0272_6_radiance.tif",
+                "IMG_0272_7_radiance.tif",
+                "IMG_0272_8_radiance.tif",
+                "IMG_0272_9_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    },
+    "161": {
+        "folder1": {
+            "dir": "C:\\Multispect_analyser\\test\\micasense",
+            "files": [
+                "IMG_0273_0_radiance.tif",
+                "IMG_0273_1_radiance.tif"
+            ]
+        },
+        "folder2": {
+            "dir": null,
+            "files": []
+        },
+        "RGB": null,
+        "thermal": null
+    }
+}

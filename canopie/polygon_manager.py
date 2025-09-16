@@ -1596,6 +1596,9 @@ class PolygonManager(QtWidgets.QDialog):
         export_csv_action = menu.addAction("Export CSV (ML)")
         thumbs_action     = menu.addAction("Generate Thumbnails (ML)")
         masks_action      = menu.addAction("Generate Segmentation Masks (ML)")
+            # NEW: stats
+        menu.addSeparator()
+        stats_action = menu.addAction("Polygon Stats…")  # NEW
 
         action = menu.exec_(self.list_widget.viewport().mapToGlobal(position))
         if action == edit_action:
@@ -1611,7 +1614,6 @@ class PolygonManager(QtWidgets.QDialog):
         elif action == delete_all_action:
             self.delete_all_polygons_for_groups(target_groups)
         elif action == zoom_action:
-            # NEW: perform zoom
             self.zoom_to_groups(target_groups)
         elif action == export_csv_action:
             self._mlm_invoke(target_groups, kind="csv")
@@ -1619,8 +1621,152 @@ class PolygonManager(QtWidgets.QDialog):
             self._mlm_invoke(target_groups, kind="thumbs")
         elif action == masks_action:
             self._mlm_invoke(target_groups, kind="masks")
+        elif action == stats_action: 
+            # If multiple items are selected, use them; otherwise use the clicked item.
+            groups = self.get_selected_polygon_groups() or target_groups
+            self.show_polygon_stats(groups)
+            
+    def show_polygon_stats(self, groups=None):
+        """
+        Scan the project's polygons folder and show counts:
+          - total *_polygons.json files (filtered to selected groups if provided)
+          - total polygons (same as files, one polygon/file by convention)
+          - number of distinct roots present
+          - per-root counts (and resolved root names when possible)
+          - per-group counts
+        """
+        import os, re, json
+        from collections import Counter
 
-    # ---------------- NEW: Zoom helpers ----------------
+        parent = self.parent()
+        # Resolve polygons directory
+        if getattr(parent, "project_folder", None):
+            polygons_dir = os.path.join(parent.project_folder, "polygons")
+        else:
+            polygons_dir = os.path.join(os.getcwd(), "polygons")
+
+        if not os.path.isdir(polygons_dir):
+            QtWidgets.QMessageBox.information(
+                self, "Polygon Stats",
+                f"No polygons directory found:\n{polygons_dir}"
+            )
+            return
+
+        # Compile list of *_polygons.json (optionally filtered by groups)
+        rx = re.compile(r'^(?P<group>.+?)_(?P<base>.+?)_polygons\.json$', re.IGNORECASE)
+        all_files = [f for f in os.listdir(polygons_dir) if f.lower().endswith("_polygons.json")]
+
+        # Keep only files that belong to requested groups (if any)
+        groups_set = set(groups or [])
+        files = []
+        for name in all_files:
+            m = rx.match(name)
+            if not m:
+                continue
+            g = m.group("group")
+            if groups_set and g not in groups_set:
+                continue
+            files.append(name)
+
+        total_files = len(files)
+        if total_files == 0:
+            scope = f"selected groups ({', '.join(groups_set)})" if groups_set else "project"
+            QtWidgets.QMessageBox.information(
+                self, "Polygon Stats",
+                f"No *_polygons.json files found in {scope}.\n\nFolder:\n{polygons_dir}"
+            )
+            return
+
+        # Read each file and aggregate stats
+        per_root = Counter()
+        per_group = Counter()
+        root_examples = {}  # root_label -> a couple of example files
+        broken = 0
+
+        # Resolve root id -> name map if available
+        id_to_root = getattr(parent, "id_to_root", {}) or {}
+
+        def _root_label(root_raw):
+            """
+            Convert stored 'root' value to a human label: 'id (name)' when possible.
+            Accepts ints or strings. Falls back to 'unknown'.
+            """
+            if root_raw is None:
+                return "unknown"
+            # normalize: try as int id
+            try:
+                rid = int(str(root_raw).strip())
+                rname = id_to_root.get(rid)
+                return f"{rid} ({rname})" if rname else str(rid)
+            except Exception:
+                # maybe the json stored a name already
+                s = str(root_raw).strip()
+                return s or "unknown"
+
+        for name in files:
+            path = os.path.join(polygons_dir, name)
+            m = rx.match(name)
+            group_name = m.group("group") if m else "(unknown)"
+            per_group.update([group_name])
+
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                broken += 1
+                continue
+
+            root_raw = data.get("root")
+            label = _root_label(root_raw)
+            per_root.update([label])
+            if label not in root_examples:
+                root_examples[label] = [name]
+            elif len(root_examples[label]) < 2:
+                root_examples[label].append(name)
+
+        # Compose a readable report
+        distinct_roots = len(per_root)
+        scope = f"selected groups: {', '.join(sorted(groups_set))}" if groups_set else "all groups"
+
+        def _format_counter(cntr, title):
+            lines = [title]
+            # sort by count desc, then name
+            items = sorted(cntr.items(), key=lambda kv: (-kv[1], kv[0]))
+            width = max((len(k) for k, _ in items), default=0)
+            for k, v in items:
+                ex = root_examples.get(k, []) if cntr is per_root else []
+                ex_str = f"   e.g. {', '.join(ex)}" if ex else ""
+                lines.append(f"  {k.ljust(width)} : {v}{ex_str}")
+            return "\n".join(lines)
+
+        report = []
+        report.append(f"Polygons directory:\n{polygons_dir}\n")
+        report.append(f"Scope: {scope}")
+        report.append(f"JSON files found: {total_files}")
+        report.append(f"Total polygons:  {total_files}  (1 per file by convention)")
+        report.append(f"Distinct roots:  {distinct_roots}")
+        if broken:
+            report.append(f"Unreadable/invalid files: {broken}")
+        report.append("")  # spacer
+        report.append(_format_counter(per_root, "Per-root counts:"))
+        report.append("")  # spacer
+        report.append(_format_counter(per_group, "Per-group counts:"))
+
+        text = "\n".join(report)
+
+        # Show in a small scrollable dialog
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Polygon Stats")
+        lay = QtWidgets.QVBoxLayout(dlg)
+        edit = QtWidgets.QPlainTextEdit()
+        edit.setReadOnly(True)
+        edit.setPlainText(text)
+        edit.setMinimumSize(640, 420)
+        lay.addWidget(edit)
+        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+        dlg.exec_()
 
     def _iter_viewers(self):
         """
@@ -1756,85 +1902,236 @@ class PolygonManager(QtWidgets.QDialog):
         except Exception as e:
             logging.debug(f"Quick-save after group delete-all failed: {e}")
 
-
     def copy_selected_polygons_to_current_root_viewers(self, groups=None):
         """
-        For each selected group, find any polygon instance *within the current root*
-        and copy that polygon to **every** viewer (image) in the current root.
-        If a group has no instance in the current root, falls back to any instance of that group.
+        Copy ONLY the selected groups' polygons from the inferred SOURCE root
+        into the CURRENT/TARGET root, and show them immediately in the viewers.
         """
-        from PyQt5 import QtGui, QtCore
-        import os
+        from collections import Counter
+        import inspect
 
-        if groups is None:
-            groups = self.get_selected_polygon_groups()
-        if not groups or not self.current_root_filepaths:
+        parent = self.parent()
+        if not parent:
             return
 
-        for group_name in groups:
-            group_map = self.parent().all_polygons.get(group_name, {})
-            if not group_map:
-                continue
+        # 1) resolve selected groups
+        if groups is None:
+            groups = self.get_selected_polygon_groups()
+        if not groups:
+            return
+        groups = list(dict.fromkeys(groups))  # preserve order, unique
 
-            # 1) Try to find a source polygon from the current root
-            source_points = None
-            source_payload = None
-            for fp, payload in group_map.items():
-                if fp in self.current_root_filepaths:
-                    pts = payload.get('points')
-                    if pts:
-                        source_points = pts
-                        source_payload = payload
+        # 2) resolve target (current) ms-root
+        target_root = getattr(parent, "get_current_root_name", lambda: None)()
+        if not target_root:
+            print("No current root selected; aborting copy.")
+            return
+
+        # helper: map a filepath -> ms-root name
+        def _ms_root_for_fp(fp: str):
+            for r, files in (getattr(parent, "multispectral_image_data_groups", {}) or {}).items():
+                try:
+                    if fp in files:
+                        return r
+                except Exception:
+                    pass
+            th_groups = getattr(parent, "thermal_rgb_image_data_groups", {}) or {}
+            th_names  = getattr(parent, "thermal_rgb_root_names", []) or []
+            ms_names  = getattr(parent, "multispectral_root_names", []) or []
+            off       = int(getattr(parent, "root_offset", 0) or 0)
+            for th_root, files in th_groups.items():
+                try:
+                    if fp in files:
+                        if th_root in th_names and ms_names:
+                            th_idx = th_names.index(th_root)
+                            ms_idx = th_idx - off
+                            if 0 <= ms_idx < len(ms_names):
+                                return ms_names[ms_idx]
+                except Exception:
+                    pass
+            return None
+
+        # 3) infer SOURCE ms-root from selected groups’ existing polygons
+        all_polys = getattr(parent, "all_polygons", {}) or {}
+        source_roots = []
+        for g in groups:
+            mapping = all_polys.get(g, {}) or {}
+            for fp in mapping.keys():
+                r = _ms_root_for_fp(fp)
+                if r:
+                    source_roots.append(r)
+
+        if not source_roots:
+            print("Could not infer a source root from the selected groups; aborting.")
+            return
+
+        source_root = Counter(source_roots).most_common(1)[0][0]
+        if source_root == target_root:
+            print(f"Source root equals target root ('{target_root}'); nothing to do.")
+            return
+
+        # keep only groups with polygons under the chosen source_root
+        filtered_groups = []
+        for g in groups:
+            mapping = all_polys.get(g, {}) or {}
+            if any(_ms_root_for_fp(fp) == source_root for fp in mapping.keys()):
+                filtered_groups.append(g)
+        if not filtered_groups:
+            print("Selected groups have no polygons in the inferred source root; aborting.")
+            return
+        groups = filtered_groups
+
+        # helper: paired thermal root for a given ms root
+        def _paired_thermal_root(ms_root):
+            try:
+                ms_names = getattr(parent, "multispectral_root_names", []) or []
+                th_names = getattr(parent, "thermal_rgb_root_names", []) or []
+                off      = int(getattr(parent, "root_offset", 0) or 0)
+                ms_idx   = ms_names.index(ms_root)
+                th_idx   = ms_idx + off
+                if 0 <= th_idx < len(th_names):
+                    return th_names[th_idx]
+            except Exception:
+                pass
+            return None
+
+        # 4) snapshot pre-existing target-root entries so we can prune ONLY new extras
+        tgt_ms_files = set((getattr(parent, "multispectral_image_data_groups", {}) or {}).get(target_root, []))
+        tgt_th_root  = _paired_thermal_root(target_root)
+        tgt_th_files = set((getattr(parent, "thermal_rgb_image_data_groups", {}) or {}).get(tgt_th_root, []))
+        tgt_all_files = tgt_ms_files | tgt_th_files
+
+        pre_existing = set()
+        for g_name, mapping in (getattr(parent, "all_polygons", {}) or {}).items():
+            for fp in mapping.keys():
+                if fp in tgt_all_files:
+                    pre_existing.add((g_name, fp))
+
+        # 5) see if parent.copy_polygons_between_roots supports a whitelist param
+        groups_param_name = None
+        try:
+            sig = inspect.signature(parent.copy_polygons_between_roots)
+            for candidate in ("groups", "restrict_groups", "group_names"):
+                if candidate in sig.parameters:
+                    groups_param_name = candidate
+                    break
+        except Exception:
+            pass
+
+        # IMPORTANT: update viewers immediately only when we can filter by groups.
+        defer_viewer_update = (groups_param_name is None)
+
+        kwargs = dict(
+            source_root=source_root,
+            target_root=target_root,
+            broadcast_if_ambiguous=False,
+            rescale=True,
+            defer_viewer_update=defer_viewer_update,
+            defer_save=True,
+        )
+
+        if groups_param_name:
+            kwargs[groups_param_name] = list(groups)
+            parent.copy_polygons_between_roots(**kwargs)
+        else:
+            # fallback: copy-all (deferred), we will prune + then force refresh
+            parent.copy_polygons_between_roots(**kwargs)
+
+        # 6) prune: if we had to copy-all, remove NEW polygons for groups not selected
+        if not groups_param_name:
+            all_polys = getattr(parent, "all_polygons", {}) or {}
+            selected_set = set(groups)
+            for g_name, mapping in list(all_polys.items()):
+                if g_name in selected_set:
+                    continue
+                for fp in list(mapping.keys()):
+                    if fp in tgt_all_files and (g_name, fp) not in pre_existing:
+                        mapping.pop(fp, None)
+                if not mapping:
+                    all_polys.pop(g_name, None)
+
+        # 7) save if possible
+        if getattr(parent, "project_folder", "") and hasattr(parent, "save_polygons_to_json"):
+            parent.save_polygons_to_json(root_name=target_root)
+        else:
+            print("Skipping polygon save: project not saved yet.")
+
+        # 8) refresh viewers & manager (fast + robust)
+        # keep the manager list in sync
+        if hasattr(parent, "update_polygon_manager"):
+            try:
+                parent.update_polygon_manager()
+            except Exception:
+                pass
+
+        from PyQt5 import QtWidgets, QtCore
+
+        if defer_viewer_update:
+            # heavy path: we deferred; force a reload now
+            for meth in ("reload_polygons_in_open_viewers",
+                         "refresh_all_viewers",
+                         "update_all_viewers",
+                         "refresh_viewer",
+                         "update_viewer"):
+                if hasattr(parent, meth):
+                    try:
+                        getattr(parent, meth)()
                         break
-
-            # 2) Fallback: any polygon for the group
-            if source_points is None:
-                for _fp, payload in group_map.items():
-                    pts = payload.get('points')
-                    if pts:
-                        source_points = pts
-                        source_payload = payload
+                    except Exception:
+                        pass
+            else:
+                # last resort: ping each open viewer lightly
+                viewers = None
+                for attr in ("open_viewers", "viewers", "image_viewers"):
+                    viewers = getattr(parent, attr, None)
+                    if viewers:
                         break
-
-            if source_points is None:
-                continue  # nothing usable
-
-            # Build a canonical payload copy
-            to_store = {
-                'points': source_points,
-                'name': source_payload.get('name', group_name),
-            }
-            # preserve optional fields if present
-            if 'root' in source_payload:
-                to_store['root'] = source_payload['root']
-            if 'coordinates' in source_payload:
-                to_store['coordinates'] = source_payload['coordinates']
-
-            # 3) Copy to all viewers (images) in the current root
-            for target_fp in list(self.current_root_filepaths):
-                # Write/overwrite in memory
-                if group_name not in self.parent().all_polygons:
-                    self.parent().all_polygons[group_name] = {}
-                self.parent().all_polygons[group_name][target_fp] = dict(to_store)
-
-                # Update viewer: remove existing same-name polygon (avoid duplicates), then add fresh
-                viewer = self.parent().get_viewer_by_filepath(target_fp)
-                if viewer:
-                    if hasattr(viewer, "get_all_polygons"):
-                        for item in list(viewer.get_all_polygons()):
-                            if getattr(item, "name", None) == group_name:
-                                try:
-                                    viewer._scene.removeItem(item)
-                                except Exception:
-                                    pass
-                    polygon = QtGui.QPolygonF([QtCore.QPointF(x, y) for x, y in source_points])
-                    viewer.add_polygon(polygon, group_name)
-
-        # Persist & refresh
-        if hasattr(self.parent(), "save_polygons_to_json"):
-            self.parent().save_polygons_to_json()
-        if hasattr(self.parent(), "update_polygon_manager"):
-            self.parent().update_polygon_manager()
+                if viewers:
+                    for v in list(viewers):
+                        try:
+                            if hasattr(v, "reload_polygons"):
+                                v.reload_polygons()
+                        except Exception:
+                            pass
+                        try:
+                            if hasattr(v, "scene") and v.scene():
+                                v.scene().update()
+                        except Exception:
+                            pass
+                        try:
+                            v.update()
+                        except Exception:
+                            pass
+            # flush
+            try:
+                QtWidgets.QApplication.processEvents()
+                QtCore.QTimer.singleShot(0, QtWidgets.QApplication.processEvents)
+            except Exception:
+                pass
+        else:
+            # light path: parent already updated viewers; just repaint scenes
+            try:
+                viewers = None
+                for attr in ("open_viewers", "viewers", "image_viewers"):
+                    viewers = getattr(parent, attr, None)
+                    if viewers:
+                        break
+                if viewers:
+                    for v in list(viewers):
+                        try:
+                            if hasattr(v, "scene") and v.scene():
+                                v.scene().update()
+                        except Exception:
+                            pass
+                        try:
+                            v.update()
+                        except Exception:
+                            pass
+                QtWidgets.QApplication.processEvents()
+                QtCore.QTimer.singleShot(0, QtWidgets.QApplication.processEvents)
+            except Exception:
+                pass
+         
 
     def delete_all_polygons_for_group(self, group_name: str):
         """
@@ -1964,6 +2261,7 @@ class PolygonManager(QtWidgets.QDialog):
 
         # Refresh UI
         self.parent().update_polygon_manager()
+        
 
     def edit_selected_polygons(self, groups=None):
         if groups is None:
@@ -2036,170 +2334,267 @@ class PolygonManager(QtWidgets.QDialog):
 
     def copy_selected_polygons(self, groups=None):
         """
-        Copy selected polygon groups to a target root (chosen by user).
-        Preserves 'root' and 'coordinates' if present in the source payload.
-        Works with multi-select.
+        Copy selected polygon groups from the CURRENT root to a user-chosen TARGET root,
+        using ProjectTab.copy_polygons_between_roots for robust pairing & rescaling.
+        Only the SELECTED groups remain in the target (others are pruned).
         """
-        from PyQt5 import QtGui, QtCore
+        from collections import Counter
         import os
 
-        if groups is None:
-            groups = self.get_selected_polygon_groups()
-        if not groups:
-            return  # Do nothing if no selection
+        parent = self.parent()
+        if not parent:
+            return
 
-        # Select target root from existing roots
+        # --- selection ---
+        groups = groups or self.get_selected_polygon_groups()
+        if not groups:
+            return
+
+        # --- choose target root (robust list) ---
+        roots_list = getattr(parent, "root_names", None) \
+                  or getattr(parent, "multispectral_root_names", None) \
+                  or list((getattr(parent, "image_data_groups", {}) or {}).keys())
+        if not roots_list:
+            return
+
         target_root, ok = QtWidgets.QInputDialog.getItem(
             self, "Select Target Root", "Choose the target root to copy polygons to:",
-            self.parent().root_names, 0, False
+            roots_list, 0, False
         )
         if not ok or not target_root:
             return
 
-        target_filepaths = self.parent().image_data_groups.get(target_root) or []
-        if not target_filepaths:
-            return  # No target images, skip
+        # --- resolve SOURCE root (prefer PolygonManager.current_root / ProjectTab current) ---
+        source_root = getattr(self, "current_root", None) \
+                   or (parent.get_current_root_name() if hasattr(parent, "get_current_root_name") else None)
 
-        for group_name in groups:
-            group_polygons = self.parent().all_polygons.get(group_name, {})
-            if not group_polygons:
-                continue
+        # If still unknown, infer most common MS root from selected groups' filepaths.
+        def _ms_root_for_fp(fp: str):
+            for r, files in (getattr(parent, "multispectral_image_data_groups", {}) or {}).items():
+                if fp in (files or []):
+                    return r
+            # infer from thermal via offset
+            th_groups = getattr(parent, "thermal_rgb_image_data_groups", {}) or {}
+            th_names  = getattr(parent, "thermal_rgb_root_names", []) or []
+            ms_names  = getattr(parent, "multispectral_root_names", []) or []
+            off       = int(getattr(parent, "root_offset", 0) or 0)
+            for th_root, files in th_groups.items():
+                if fp in (files or []):
+                    if th_root in th_names and ms_names:
+                        th_idx = th_names.index(th_root)
+                        ms_idx = th_idx - off
+                        if 0 <= ms_idx < len(ms_names):
+                            return ms_names[ms_idx]
+            return None
 
-            # Take any source payload (first available)
+        if not source_root:
+            src_roots = []
+            for g in groups:
+                for fp in (parent.all_polygons.get(g, {}) or {}).keys():
+                    r = _ms_root_for_fp(fp)
+                    if r:
+                        src_roots.append(r)
+            if not src_roots:
+                QtWidgets.QMessageBox.information(self, "Copy Polygons", "Could not infer a source root from the selected groups.")
+                return
+            source_root = Counter(src_roots).most_common(1)[0][0]
+
+        if source_root == target_root:
+            QtWidgets.QMessageBox.information(self, "Copy Polygons", "Source and target roots are the same.")
+            return
+
+        # --- helpers to gather target-file sets for pruning ---
+        def _paired_thermal_root(ms_root):
             try:
-                sample_payload = next(iter(group_polygons.values()))
-            except StopIteration:
+                ms_names = getattr(parent, "multispectral_root_names", []) or []
+                th_names = getattr(parent, "thermal_rgb_root_names", []) or []
+                off      = int(getattr(parent, "root_offset", 0) or 0)
+                ms_idx   = ms_names.index(ms_root)
+                th_idx   = ms_idx + off
+                if 0 <= th_idx < len(th_names):
+                    return th_names[th_idx]
+            except Exception:
+                pass
+            return None
+
+        tgt_ms_files = set((getattr(parent, "multispectral_image_data_groups", {}) or {}).get(target_root, []) or [])
+        tgt_th_root  = _paired_thermal_root(target_root)
+        tgt_th_files = set((getattr(parent, "thermal_rgb_image_data_groups", {}) or {}).get(tgt_th_root, []) or [])
+        tgt_all_files = tgt_ms_files | tgt_th_files
+
+        # Snapshot target entries that existed BEFORE the copy (so we don't prune them)
+        pre_existing = set()
+        for g_name, mapping in (getattr(parent, "all_polygons", {}) or {}).items():
+            for fp in (mapping or {}).keys():
+                if fp in tgt_all_files:
+                    pre_existing.add((g_name, fp))
+
+        # --- do the copy via ProjectTab API ---
+        parent.copy_polygons_between_roots(
+            source_root,
+            target_root,
+            broadcast_if_ambiguous=True,
+            rescale=True,
+            defer_viewer_update=False,
+            defer_save=True,   # we'll save after pruning
+        )
+
+        # --- prune: keep ONLY selected groups among newly copied target entries ---
+        all_polys = getattr(parent, "all_polygons", {}) or {}
+        for g_name, mapping in list(all_polys.items()):
+            if g_name in groups:
                 continue
+            for fp in list(mapping.keys()):
+                if fp in tgt_all_files and (g_name, fp) not in pre_existing:
+                    mapping.pop(fp, None)
+            if not mapping:
+                all_polys.pop(g_name, None)
 
-            points = sample_payload.get('points')
-            if not points:
-                continue
-
-            to_store = {
-                'points': points,
-                'name': group_name,
-            }
-            if 'root' in sample_payload:
-                to_store['root'] = sample_payload['root']
-            if 'coordinates' in sample_payload:
-                to_store['coordinates'] = sample_payload['coordinates']
-
-            for target_filepath in target_filepaths:
-                # Clone in memory
-                if group_name not in self.parent().all_polygons:
-                    self.parent().all_polygons[group_name] = {}
-                self.parent().all_polygons[group_name][target_filepath] = dict(to_store)
-
-                # Update ImageViewer (replace existing with same name)
-                viewer = self.parent().get_viewer_by_filepath(target_filepath)
-                if viewer:
-                    if hasattr(viewer, "get_all_polygons"):
-                        for item in list(viewer.get_all_polygons()):
-                            if getattr(item, "name", None) == group_name:
-                                try:
-                                    viewer._scene.removeItem(item)
-                                except Exception:
-                                    pass
-                    polygon = QtGui.QPolygonF([QtCore.QPointF(x, y) for x, y in points])
-                    viewer.add_polygon(polygon, group_name)
-
-        # Save changes
-        if hasattr(self.parent(), "save_polygons_to_json"):
-            self.parent().save_polygons_to_json()
-        if hasattr(self.parent(), "update_polygon_manager"):
-            self.parent().update_polygon_manager()
+        # --- save/update ---
+        if getattr(parent, "project_folder", "") and hasattr(parent, "save_polygons_to_json"):
+            parent.save_polygons_to_json(root_name=target_root)
+        if hasattr(parent, "update_polygon_manager"):
+            parent.update_polygon_manager()
 
     def move_selected_polygons(self, groups=None):
         """
-        Move selected polygon groups from the current root to another root.
-        Respects multi-select.
+        Move selected polygon groups FROM the CURRENT root TO a user-chosen TARGET root.
+        Internally: copy via ProjectTab.copy_polygons_between_roots, prune to selected groups,
+        then remove those groups from the SOURCE root (memory + on-disk JSONs).
         """
-        from PyQt5 import QtGui, QtCore
         import os
+        from collections import Counter
 
-        if groups is None:
-            groups = self.get_selected_polygon_groups()
+        parent = self.parent()
+        if not parent:
+            return
+
+        # --- selection ---
+        groups = groups or self.get_selected_polygon_groups()
         if not groups:
-            return  # Do nothing if no selection
+            return
 
-        # Select target root from existing roots
+        # --- choose target root ---
+        roots_list = getattr(parent, "root_names", None) \
+                  or getattr(parent, "multispectral_root_names", None) \
+                  or list((getattr(parent, "image_data_groups", {}) or {}).keys())
+        if not roots_list:
+            return
         target_root, ok = QtWidgets.QInputDialog.getItem(
             self, "Select Target Root", "Choose the target root to move polygons to:",
-            self.parent().root_names, 0, False
+            roots_list, 0, False
         )
         if not ok or not target_root:
             return
 
-        polygons_dir = os.path.join(
-            self.parent().project_folder, 'polygons') if self.parent().project_folder else os.path.join(os.getcwd(), 'polygons')
+        # --- source root = current ---
+        source_root = getattr(self, "current_root", None) \
+                   or (parent.get_current_root_name() if hasattr(parent, "get_current_root_name") else None)
+        if not source_root:
+            QtWidgets.QMessageBox.information(self, "Move Polygons", "No current root selected.")
+            return
+        if source_root == target_root:
+            QtWidgets.QMessageBox.information(self, "Move Polygons", "Source and target roots are the same.")
+            return
 
-        target_filepaths = self.parent().image_data_groups.get(target_root) or []
+        # --- helpers to collect file sets for source/target ---
+        def _paired_thermal_root(ms_root):
+            try:
+                ms_names = getattr(parent, "multispectral_root_names", []) or []
+                th_names = getattr(parent, "thermal_rgb_root_names", []) or []
+                off      = int(getattr(parent, "root_offset", 0) or 0)
+                ms_idx   = ms_names.index(ms_root)
+                th_idx   = ms_idx + off
+                if 0 <= th_idx < len(th_names):
+                    return th_names[th_idx]
+            except Exception:
+                pass
+        src_ms_files = set((getattr(parent, "multispectral_image_data_groups", {}) or {}).get(source_root, []) or [])
+        src_th_root  = _paired_thermal_root(source_root)
+        src_th_files = set((getattr(parent, "thermal_rgb_image_data_groups", {}) or {}).get(src_th_root, []) or [])
+        src_all_files = src_ms_files | src_th_files
 
-        for group_name in groups:
-            group_polygons = self.parent().all_polygons.get(group_name, {}).copy()
-            if not group_polygons:
+        tgt_ms_files = set((getattr(parent, "multispectral_image_data_groups", {}) or {}).get(target_root, []) or [])
+        tgt_th_root  = _paired_thermal_root(target_root)
+        tgt_th_files = set((getattr(parent, "thermal_rgb_image_data_groups", {}) or {}).get(tgt_th_root, []) or [])
+        tgt_all_files = tgt_ms_files | tgt_th_files
+
+        # Snapshot pre-existing target entries (to preserve)
+        pre_existing = set()
+        for g_name, mapping in (getattr(parent, "all_polygons", {}) or {}).items():
+            for fp in (mapping or {}).keys():
+                if fp in tgt_all_files:
+                    pre_existing.add((g_name, fp))
+
+        # --- copy via ProjectTab API ---
+        parent.copy_polygons_between_roots(
+            source_root,
+            target_root,
+            broadcast_if_ambiguous=True,
+            rescale=True,
+            defer_viewer_update=False,
+            defer_save=True,   # save after we prune & delete src
+        )
+
+        # --- prune target: keep only selected groups among newly added entries ---
+        all_polys = getattr(parent, "all_polygons", {}) or {}
+        for g_name, mapping in list(all_polys.items()):
+            if g_name in groups:
+                continue
+            for fp in list(mapping.keys()):
+                if fp in tgt_all_files and (g_name, fp) not in pre_existing:
+                    mapping.pop(fp, None)
+            if not mapping:
+                all_polys.pop(g_name, None)
+
+        # --- remove selected groups from SOURCE root (memory + on-disk files) ---
+        # Resolve polygons directory
+        polygons_dir = os.path.join(parent.project_folder, "polygons") if getattr(parent, "project_folder", None) \
+                       else os.path.join(os.getcwd(), "polygons")
+
+        for g_name in list(groups):
+            mapping = (all_polys.get(g_name, {}) or {})
+            # collect the filepaths to drop (those in source root)
+            to_drop = [fp for fp in list(mapping.keys()) if fp in src_all_files]
+            if not to_drop:
                 continue
 
-            for filepath, polygon_data in list(group_polygons.items()):
-                if filepath not in self.current_root_filepaths:
-                    continue  # Skip if not in current root
+            # drop from memory
+            for fp in to_drop:
+                mapping.pop(fp, None)
 
-                # Remove the polygon from the source viewer
-                viewer = self.parent().get_viewer_by_filepath(filepath)
-                if viewer and hasattr(viewer, "get_all_polygons"):
-                    for item in list(viewer.get_all_polygons()):
-                        if getattr(item, "name", None) == group_name:
-                            try:
-                                viewer._scene.removeItem(item)
-                            except Exception:
-                                pass
-                            break  # Assuming one polygon per group per image
-
-                # Delete the source JSON file
-                base_filename = os.path.splitext(os.path.basename(filepath))[0]
-                polygon_filename = f"{group_name}_{base_filename}_polygons.json"
-                polygon_filepath = os.path.join(polygons_dir, polygon_filename)
-                if os.path.exists(polygon_filepath):
+            # delete per-image JSONs on disk for these (avoid stale files)
+            if os.path.isdir(polygons_dir):
+                for fp in to_drop:
+                    base = os.path.splitext(os.path.basename(fp))[0]
+                    json_path = os.path.join(polygons_dir, f"{g_name}_{base}_polygons.json")
                     try:
-                        os.remove(polygon_filepath)
-                        print(f"Deleted source polygon file: {polygon_filepath}")
-                    except Exception as e:
-                        print(f"Failed to delete source polygon file {polygon_filepath}: {e}")
+                        if os.path.exists(json_path):
+                            os.remove(json_path)
+                    except Exception:
+                        pass
 
-                # Remove the polygon from the in-memory data structure
-                self.parent().all_polygons[group_name].pop(filepath, None)
+            # clean empty group
+            if not mapping:
+                all_polys.pop(g_name, None)
 
-                # Add the polygon to each target image
-                for target_filepath in target_filepaths:
-               
-                    if group_name not in self.parent().all_polygons:
-                        self.parent().all_polygons[group_name] = {}
-                    self.parent().all_polygons[group_name][target_filepath] = {
-                        'points': polygon_data.get('points', []),
-                        'name': group_name,
-                        **({'root': polygon_data['root']} if 'root' in polygon_data else {}),
-                        **({'coordinates': polygon_data['coordinates']} if 'coordinates' in polygon_data else {}),
-                    }
+        # --- save/update ---
+        if getattr(parent, "project_folder", "") and hasattr(parent, "save_polygons_to_json"):
+            parent.save_polygons_to_json(root_name=target_root)
+        if hasattr(parent, "refresh_viewer"):
+            try:
+                # keep user on whatever root is currently visible
+                current_root = parent.get_current_root_name() if hasattr(parent, "get_current_root_name") else None
+                parent.refresh_viewer(root_name=current_root)
+                # If you prefer to refresh the destination too, uncomment:
+                # parent.refresh_viewer(root_name=target_root)
+            except TypeError:
+                # in case refresh_viewer has no root_name param
+                parent.refresh_viewer()
 
-                    target_viewer = self.parent().get_viewer_by_filepath(target_filepath)
-                    if target_viewer:
-                        if hasattr(target_viewer, "get_all_polygons"):
-                            for item in list(target_viewer.get_all_polygons()):
-                                if getattr(item, "name", None) == group_name:
-                                    try:
-                                        target_viewer._scene.removeItem(item)
-                                    except Exception:
-                                        pass
-                        pts = polygon_data.get('points', [])
-                        polygon = QtGui.QPolygonF([QtCore.QPointF(x, y) for x, y in pts])
-                        target_viewer.add_polygon(polygon, group_name)
-
-        # Save changes
-        if hasattr(self.parent(), "save_polygons_to_json"):
-            self.parent().save_polygons_to_json()
-        if hasattr(self.parent(), "update_polygon_manager"):
-            self.parent().update_polygon_manager()
-
+    
+    
+    
     def setup_logging():
         log_directory = os.path.join(os.path.expanduser("~"), "polygon_import_logs")
         os.makedirs(log_directory, exist_ok=True)  # Ensure the log directory exists

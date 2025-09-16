@@ -6175,10 +6175,10 @@ class ProjectTab(QtWidgets.QWidget):
         """
         Export all project images after applying their .ax modifications.
         - Output: <project_folder>/Exported_images_<N> (auto-incremented per run)
-        - Classic TIFF by default (ExifTool-friendly); fallback to BigTIFF only if needed.
-        - JPEG/PNG read via OpenCV are converted from BGR(A) to RGB(A) so colors match viewer.
-        - Multiband stacks keep their original band order (only axes moved to HWC).
-        - Uses your parallel EXIF copier when available; falls back to per-file exiftool.
+        - Classic TIFF by default; fallback to BigTIFF if needed.
+        - JPEG/PNG via OpenCV converted BGR(A)->RGB(A) so colors match viewer.
+        - Multiband stacks keep original band order (axes moved to HWC).
+        - Optional EXIF copy (parallel when available).
         """
         import os, logging, shutil, subprocess
         from contextlib import suppress
@@ -6217,6 +6217,16 @@ class ProjectTab(QtWidgets.QWidget):
         if not filepaths:
             QtWidgets.QMessageBox.information(self, "Export", "No images to export.")
             return
+
+        # ---------- ask user: copy EXIF? (Yes = copy; No = skip) ----------
+        resp = QtWidgets.QMessageBox.question(
+            self,
+            "Export metadata",
+            "Copy EXIF metadata to exported images?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        copy_exif = (resp == QtWidgets.QMessageBox.Yes)
 
         # ---------- destination folder ----------
         def _next_export_dir(root):
@@ -6258,12 +6268,10 @@ class ProjectTab(QtWidgets.QWidget):
                         arr = np.moveaxis(arr, 0, -1)
                     return np.ascontiguousarray(arr)
                 else:
-                    # robust OpenCV read (handles unicode paths)
                     data = np.fromfile(fp, dtype=np.uint8)
                     img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
                     if img is None:
                         return None
-                    # BGR(A) -> RGB(A) exactly once
                     if img.ndim == 3:
                         if img.shape[2] == 3:
                             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -6278,9 +6286,10 @@ class ProjectTab(QtWidgets.QWidget):
             import json
             base = os.path.splitext(os.path.basename(fp))[0] + ".ax"
             cands = []
-            if getattr(self, "project_folder", None):
-                cands.append(os.path.join(self.project_folder, base))
-            cands.append(os.path.join(os.path.dirname(fp), base))
+            pf = getattr(self, "project_folder", None)
+            if pf:
+                cands.append(os.path.join(pf, base))                # project-level .ax
+            cands.append(os.path.join(os.path.dirname(fp), base))   # sidecar next to image
             for axp in cands:
                 try:
                     if os.path.exists(axp):
@@ -6375,28 +6384,22 @@ class ProjectTab(QtWidgets.QWidget):
                     fail += 1
                     continue
 
-                # -------- Smart, minimal rule to match viewer for 8-bit/JPEG sources --------
+                # -------- match viewer for 8-bit/JPEG sources --------
                 ext = os.path.splitext(fp)[1].lower()
                 is_jpeg_src = ext in (".jpg", ".jpeg")
                 is_u8_src   = isinstance(raw, np.ndarray) and raw.dtype == np.uint8
-
                 if is_jpeg_src or is_u8_src:
-                    # If pipeline made it float32, quantize back to uint8 as shown in viewer.
                     if img.dtype != np.uint8:
-                        # If values look 0..1, scale to 0..255 first; else assume 0..255 already.
                         finite = np.isfinite(img)
-                        # Handle all-NaN edge case cleanly
                         if finite.any():
-                            vmax = float(np.nanmax(img[finite]))
-                            vmin = float(np.nanmin(img[finite]))
+                            vmax = float(np.nanmax(img[finite])); vmin = float(np.nanmin(img[finite]))
                         else:
                             vmax = 0.0; vmin = 0.0
                         if vmax <= 1.001 and vmin >= -0.001:
                             img = img * 255.0
-                        # Replace NaN/±Inf, round, clamp, cast
                         img = np.nan_to_num(img, nan=0.0, posinf=255.0, neginf=0.0)
                         img = np.clip(np.rint(img), 0, 255).astype(np.uint8, copy=False)
-                # ---------------------------------------------------------------------------
+                # -----------------------------------------------------
 
                 out_name = _norm_export_name(fp)
                 out_path = _unique_path(export_dir, out_name)
@@ -6408,9 +6411,9 @@ class ProjectTab(QtWidgets.QWidget):
                 target_files.append(out_path)
                 ok += 1
 
-        # ---------- EXIF: skip BigTIFFs; multithread first, fallback single-file ----------
+        # ---------- EXIF copy (user-controlled) ----------
         copied = 0
-        if source_files and target_files:
+        if copy_exif and source_files and target_files:
             src_ok, dst_ok = [], []
             for s, d in zip(source_files, target_files):
                 if d in bigtiff_written:
@@ -6441,18 +6444,18 @@ class ProjectTab(QtWidgets.QWidget):
 
         # ---------- report ----------
         msg = f"Exported {ok} / {len(filepaths)} image(s) to:\n{export_dir}"
-        if copied:
-            msg += f"\nEXIF copied for {copied} file(s)."
-        if bigtiff_written:
-            msg += f"\n{len(bigtiff_written)} file(s) were saved as BigTIFF due to size; EXIF not written to those."
+        if copy_exif:
+            if copied:
+                msg += f"\nEXIF copied for {copied} file(s)."
+            if bigtiff_written:
+                msg += f"\n{len(bigtiff_written)} file(s) were saved as BigTIFF; EXIF not written to those."
+        else:
+            msg += "\nEXIF copy skipped by user."
         if fail:
             msg += f"\nFailed: {fail}"
         logging.info(msg)
         QtWidgets.QMessageBox.information(self, "Export", msg)
 
-    
-    
-    
     
     def _apply_ax_to_raw(self, raw_img, ax):
         """
