@@ -1,6 +1,3 @@
-"""Auto-generated module extracted from original CanoPie code."""
-
-
 import sys
 import os
 import re
