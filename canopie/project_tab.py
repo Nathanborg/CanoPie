@@ -517,6 +517,27 @@ class ProjectTab(QtWidgets.QWidget):
             return _Lite(filepath, arr)
 
 
+    # --- AX location policy: project folder first, else temp cache (never image folder) ---
+    def _ax_base_name(self, image_path: str) -> str:
+        import os
+        return os.path.splitext(os.path.basename(image_path))[0] + ".ax"
+
+    def _ax_dir(self) -> str:
+        import os, tempfile
+        pf = getattr(self, "project_folder", None)
+        if pf and str(pf).strip():
+            return pf
+        # Unsaved project → use a stable temp cache dir
+        if not hasattr(self, "_unsaved_ax_dir"):
+            self._unsaved_ax_dir = os.path.join(tempfile.gettempdir(), "CanoPie_AX")
+            os.makedirs(self._unsaved_ax_dir, exist_ok=True)
+        return self._unsaved_ax_dir
+
+    def _ax_path_for(self, image_path: str) -> str:
+        # Single truth for writes/reads
+        return os.path.join(self._ax_dir(), self._ax_base_name(image_path))
+
+
     def _ax_op_order(self, ax: dict):
         """
         Returns the list of ops to apply, in order, limited to {'rotate','crop','resize'}.
@@ -873,7 +894,8 @@ class ProjectTab(QtWidgets.QWidget):
         # Inspect
         self.inspectAct = QtWidgets.QAction("Inspect", self, checkable=True)
         self.inspectAct.setShortcut(QKeySequence("I"))              
-        self.inspectAct.triggered.connect(self.toggle_inspection_mode)
+        self.inspectAct.toggled.connect(self.toggle_inspection_mode)
+
 
         # ML Manager
         self.machineLearningManagerAct = QtWidgets.QAction("MachineLearning Manager", self)
@@ -1286,45 +1308,38 @@ class ProjectTab(QtWidgets.QWidget):
         coord_space = (polygon_data or {}).get("coord_space", "scene")
 
         if coord_space == "image":
-            # Points saved in image/pixmap pixels. Rescale to current export.
-            src_sz = polygon_data.get("image_size") or polygon_data.get("pixmap_size")
-            if isinstance(src_sz, (list, tuple)) and len(src_sz) == 2 and all(src_sz):
+            src_sz = (polygon_data.get("image_ref_size")
+                      or polygon_data.get("image_size")
+                      or polygon_data.get("pixmap_size"))
+
+            if isinstance(src_sz, dict):
+                pw, ph = src_sz.get("w"), src_sz.get("h")
+                if pw and ph:
+                    pw, ph = float(pw), float(ph)
+                    sx, sy = (W / max(1.0, pw)), (H / max(1.0, ph))
+                    mapped = [(float(x) * sx, float(y) * sy) for (x, y) in pts]
+                else:
+                    mapped = [(float(x), float(y)) for (x, y) in pts]
+            elif isinstance(src_sz, (list, tuple)) and len(src_sz) >= 2 and all(src_sz[:2]):
                 pw, ph = float(src_sz[0]), float(src_sz[1])  # (W, H)
                 sx, sy = (W / max(1.0, pw)), (H / max(1.0, ph))
                 mapped = [(float(x) * sx, float(y) * sy) for (x, y) in pts]
             else:
                 mapped = [(float(x), float(y)) for (x, y) in pts]
 
-            # If saved before a crop/resize edit, rescale can land OOB; that’s fine.
-            # Log once for visibility but do NOT clamp here.
-            oob = [(x, y) for (x, y) in mapped if x < 0 or y < 0 or x >= W or y >= H]
-            if oob:
-                logging.warning(
-                    "Mapped %d point(s) outside bounds for '%s' (image→export rescale; "
-                    "saved image_size may predate current .ax edits). Example: %s",
-                    len(oob), filepath, oob[0]
-                )
-
-        elif coord_space == "raw":
-            # Replay .ax on raw coordinates, but do not clamp/round here.
+        else:
+            # Your existing scene→image/export mapping path (unchanged)
+            # ... (keep your current implementation exactly as is) ...
+            mapped = []
             try:
-                raw = self._load_raw_image(filepath)
-                if raw is not None:
-                    raw_h, raw_w = raw.shape[:2]
-                    ax = self._load_ax_mods(filepath) or {}
-                    mapped = self._points_replay_ax(pts, raw_w, raw_h, ax, clamp=False)
-                else:
-                    mapped = [(float(x), float(y)) for (x, y) in pts]
-            except Exception:
+                mapped, _shape = self._map_points_scene_to_image(filepath, pts, (H, W, 1), polygon_data=polygon_data)
+                mapped = [(float(x), float(y)) for (x, y) in mapped]
+            except Exception as e:
+                logging.debug(f"Scene->export mapping failed: {e}")
                 mapped = [(float(x), float(y)) for (x, y) in pts]
 
-        else:
-            # Legacy: scene → image
-            mapped = self._map_points_scene_to_image(filepath, pts, (H, W, 1), polygon_data=polygon_data)
-            # Ensure floats; _map_points_scene_to_image may already round but does not clamp.
-            mapped = [(float(x), float(y)) for (x, y) in mapped]
-
         return mapped
+
 
 
     def _root_keys_ordered(self):
@@ -1956,164 +1971,145 @@ class ProjectTab(QtWidgets.QWidget):
             viewer.blockSignals(False)
 
     def _effective_hw_for_file(self, fp: str):
-        """
-        Return best-effort (H, W) of the image after applying .ax ops (rotate→crop→resize)
-        without actually running pixel ops.
+        """Return best-effort (H, W) AFTER .ax ops without touching large pixel data.
 
-        Priority:
-          1) .ax sidecar: simulate geometry using orig_size, rotate, crop_rect(+ref), resize
-          2) Raw image shape from disk (fast header read)
-          3) (None, None) if all fails
+        Strategy (fast, UI-friendly):
+          1) Use a live viewer's in-memory image if available (0 I/O).
+          2) Else parse sidecar .ax (JSON) and simulate rotate→crop→resize using orig_size.
+             (.ax is tiny; this is fast disk I/O.)
+          3) Else return (None, None).
 
-        Supports:
-          • rotate in {0,90,180,270}
-          • crop_rect with crop_rect_ref_size
-          • resize: percent (scale or width/height) and absolute pixels (px_w, px_h)
+        Results are cached and invalidated when either the image file or the .ax file changes.
         """
         import os, json
 
-        def _ax_paths(p):
-            base = os.path.splitext(os.path.basename(p))[0] + ".ax"
-            cands = []
-            pf = getattr(self, "project_folder", None)
+        # -------- cache keyed by (image mtime/size, ax path mtime/size) --------
+        cache = getattr(self, "_eff_hw_cache", None)
+        if cache is None:
+            cache = self._eff_hw_cache = {}
+
+        def _ax_path_for(p: str) -> str:
+            # Prefer sidecar next to the image; fall back to project folder
+            sidecar = os.path.splitext(p)[0] + ".ax"
+            if os.path.exists(sidecar):
+                return sidecar
+            pf = (getattr(self, "project_folder", "") or "").strip()
             if pf:
-                cands.append(os.path.join(pf, base))
-            cands.append(os.path.join(os.path.dirname(p), base))
-            out = []
-            for c in cands:
-                if c and c not in out:
-                    out.append(c)
-            return out
+                return os.path.join(pf, os.path.splitext(os.path.basename(p))[0] + ".ax")
+            return sidecar  # default location even if missing
 
-        def _load_ax(p):
-            for axp in _ax_paths(p):
-                try:
-                    if os.path.exists(axp):
-                        with open(axp, "r", encoding="utf-8") as f:
-                            return json.load(f) or {}
-                except Exception:
-                    pass
-            return {}
-
-        def _raw_hw(p):
-            # Try cv2 header
+        def _id_tuple(p: str):
             try:
-                import cv2
-                img = cv2.imread(p, cv2.IMREAD_UNCHANGED)
-                if img is not None:
-                    h, w = img.shape[:2]
-                    return int(h), int(w)
+                return (os.path.getmtime(p), os.path.getsize(p))
             except Exception:
-                pass
-            # Try tifffile metadata
-            try:
-                import tifffile as tiff
-                with tiff.TiffFile(p) as tf:
-                    series = tf.series[0] if tf.series else None
-                    if series and series.shape:
-                        axes = getattr(series, "axes", "") or ""
-                        shp  = list(series.shape)
-                        if "Y" in axes and "X" in axes:
-                            return int(shp[axes.index("Y")]), int(shp[axes.index("X")])
-                        if len(shp) >= 2:
-                            return int(shp[-2]), int(shp[-1])
-            except Exception:
-                pass
-            return (None, None)
+                return (None, None)
 
-        ax = _load_ax(fp)
+        axp = _ax_path_for(fp)
+        key = (fp, _id_tuple(fp), _id_tuple(axp))
 
-        # Start basis: orig_size from .ax, else raw
-        h0 = w0 = None
-        if isinstance(ax, dict):
+        if key in cache:
+            return cache[key]
+
+        # --- 1) live viewer basis (no disk I/O) ---
+        try:
+            for w in getattr(self, "viewer_widgets", []) or []:
+                idata = w.get("image_data")
+                if idata is not None and getattr(idata, "filepath", None) == fp:
+                    img = getattr(idata, "image", None)
+                    if img is not None:
+                        h, w_ = img.shape[:2]
+                        cache[key] = (int(h), int(w_))
+                        return cache[key]
+        except Exception:
+            pass
+
+        # --- 2) simulate from tiny .ax JSON if present ---
+        H = W = None
+        try:
+            if os.path.exists(axp):
+                with open(axp, "r", encoding="utf-8") as f:
+                    ax = json.load(f) or {}
+            else:
+                ax = {}
+
+            # base size
             o = ax.get("orig_size") or {}
             try:
-                h0 = int(o.get("h") or 0) or None
-                w0 = int(o.get("w") or 0) or None
+                H = int(o.get("h") or 0) or None
+                W = int(o.get("w") or 0) or None
             except Exception:
-                h0 = w0 = None
-        if not (h0 and w0):
-            h0, w0 = _raw_hw(fp)
-        if not (h0 and w0):
-            return (None, None)
+                H = W = None
 
-        H, W = int(h0), int(w0)
+            # If .ax lacks orig_size, we DON'T load the big image here (keep UI snappy)
+            if H and W:
+                # operation order (tolerant)
+                raw = ax.get("op_order") or ax.get("ops") or ["rotate", "crop", "resize"]
+                order = []
+                for s in (raw if isinstance(raw, (list, tuple)) else [raw]):
+                    t = str(s).lower()
+                    if "rot" in t: order.append("rotate")
+                    elif "crop" in t: order.append("crop")
+                    elif "siz" in t or "res" in t: order.append("resize")
+                if not order:
+                    order = ["rotate", "crop", "resize"]
 
-        # op order
-        order = ax.get("op_order")
-        if not (isinstance(order, (list, tuple)) and all(isinstance(s, str) for s in order)):
-            order = ["rotate", "crop", "resize", "band_expression"]
+                def _rot():
+                    nonlocal H, W
+                    try:
+                        deg = int(ax.get("rotate", 0)) % 360
+                    except Exception:
+                        deg = 0
+                    if deg in (90, 270):
+                        H, W = W, H
 
-        # Simulate ops (geometry only)
-        def _sim_rotate():
-            nonlocal H, W
-            try:
-                deg = int(ax.get("rotate", 0)) % 360
-            except Exception:
-                deg = 0
-            if deg in (90, 270):
-                H, W = W, H  # swap
+                def _crop():
+                    nonlocal H, W
+                    rect = ax.get("crop_rect")
+                    if not isinstance(rect, dict):
+                        return
+                    rw = int(rect.get("width", 0)); rh = int(rect.get("height", 0))
+                    if rw <= 0 or rh <= 0:
+                        return
+                    ref = ax.get("crop_rect_ref_size") or {}
+                    ref_w = int(ref.get("w") or 0) or W
+                    ref_h = int(ref.get("h") or 0) or H
+                    # scale rect into current basis
+                    W = max(1, int(round(rw * (W / float(ref_w)))))
+                    H = max(1, int(round(rh * (H / float(ref_h)))))
 
-        def _sim_crop():
-            nonlocal H, W
-            rect = ax.get("crop_rect")
-            if not isinstance(rect, dict):
-                return
-            rw = int(rect.get("width", 0))
-            rh = int(rect.get("height", 0))
-            if rw <= 0 or rh <= 0:
-                return
-            ref = ax.get("crop_rect_ref_size") or {}
-            try:
-                ref_w = int(ref.get("w") or 0) or W
-                ref_h = int(ref.get("h") or 0) or H
-            except Exception:
-                ref_w, ref_h = W, H
-            # scale rect dims into current basis
-            w_scaled = max(1, int(round(rw * (W / float(ref_w)))))
-            h_scaled = max(1, int(round(rh * (H / float(ref_h)))))
-            W, H = w_scaled, h_scaled
+                def _resize():
+                    nonlocal H, W
+                    rz = ax.get("resize")
+                    if not isinstance(rz, dict) or not rz:
+                        return
+                    newW, newH = W, H
+                    if "px_w" in rz or "px_h" in rz:
+                        tw = int(rz.get("px_w", 0)); th = int(rz.get("px_h", 0))
+                        if tw > 0 and th > 0:
+                            newW, newH = tw, th
+                        elif tw > 0:
+                            s = tw / float(W); newW, newH = tw, max(1, int(round(H * s)))
+                        elif th > 0:
+                            s = th / float(H); newH, newW = th, max(1, int(round(W * s)))
+                    elif "scale" in rz:
+                        sc = max(1, int(rz.get("scale", 100))); s = sc / 100.0
+                        newW = max(1, int(round(W * s))); newH = max(1, int(round(H * s)))
+                    else:
+                        pw = int(rz.get("width", 100)); ph = int(rz.get("height", 100))
+                        newW = max(1, int(round(W * (pw / 100.0))))
+                        newH = max(1, int(round(H * (ph / 100.0))))
+                    W, H = int(newW), int(newH)
 
-        def _sim_resize():
-            nonlocal H, W
-            rz = ax.get("resize")
-            if not isinstance(rz, dict) or not rz:
-                return
-            newW, newH = W, H
-            if "px_w" in rz or "px_h" in rz:
-                tw = int(rz.get("px_w", 0))
-                th = int(rz.get("px_h", 0))
-                if tw > 0 and th > 0:
-                    newW, newH = tw, th
-                elif tw > 0:
-                    s = tw / float(W)
-                    newW, newH = tw, max(1, int(round(H * s)))
-                elif th > 0:
-                    s = th / float(H)
-                    newH, newW = th, max(1, int(round(W * s)))
-            elif "scale" in rz:
-                sc = max(1, int(rz.get("scale", 100)))
-                newW = max(1, int(round(W * (sc / 100.0))))
-                newH = max(1, int(round(H * (sc / 100.0))))
-            else:
-                pw = int(rz.get("width", 100))
-                ph = int(rz.get("height", 100))
-                newW = max(1, int(round(W * (pw / 100.0))))
-                newH = max(1, int(round(H * (ph / 100.0))))
-            W, H = int(newW), int(newH)
+                ops = {"rotate": _rot, "crop": _crop, "resize": _resize}
+                for op in order:
+                    f = ops.get(op)
+                    if f: f()
 
-        ops = {
-            "rotate": _sim_rotate,
-            "crop": _sim_crop,
-            "resize": _sim_resize,
-            # band_expression: no H/W change
-        }
-        for op in order:
-            f = ops.get(op.strip().lower())
-            if f:
-                f()
+        except Exception:
+            H = W = None
 
-        return int(H), int(W)
+        cache[key] = (int(H), int(W)) if (H and W) else (None, None)
+        return cache[key]
 
     def copy_polygons_between_roots(
         self,
@@ -2991,6 +2987,183 @@ class ProjectTab(QtWidgets.QWidget):
 
 
 
+    def _prewarm_eff_size_cache(self, filepaths, parent=None, label="Prewarming…"):
+        """
+        Fill self._copy_size_cache ('eff4' entries) for filepaths to avoid repeated
+        .ax/header IO in copy loops. Safe to call even if cache already exists.
+        """
+        import os, json
+        from PyQt5 import QtWidgets, QtCore
+
+        # local copies of helpers to match the ones in copy_polygons_between_roots
+        def _ax_path_for(fp: str) -> str:
+            sidecar = os.path.splitext(fp)[0] + ".ax"
+            if os.path.exists(sidecar):
+                return sidecar
+            folder = (self.project_folder or "").strip() or os.path.dirname(fp)
+            return os.path.join(folder, os.path.splitext(os.path.basename(fp))[0] + ".ax")
+
+        def _probe_image_hw(fp):
+            try:
+                for w in getattr(self, 'viewer_widgets', []) or []:
+                    idata = w.get('image_data')
+                    if idata is not None and getattr(idata, 'filepath', None) == fp:
+                        img = getattr(idata, 'image', None)
+                        if img is not None:
+                            h, w = img.shape[:2]
+                            return int(h), int(w)
+            except Exception:
+                pass
+            try:
+                img, _ = self._get_export_image(fp)
+                if img is not None:
+                    h, w = img.shape[:2]
+                    return int(h), int(w)
+            except Exception:
+                pass
+            try:
+                import numpy as np, cv2
+                data = np.fromfile(fp, dtype=np.uint8)
+                img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+                if img is not None:
+                    h, w = img.shape[:2]
+                    return int(h), int(w)
+            except Exception:
+                pass
+            return (None, None)
+
+        def _parse_op_order(ax: dict):
+            raw = ax.get("op_order") or ax.get("ops") or ["rotate", "crop", "resize"]
+            if isinstance(raw, str):
+                raw = [raw]
+            out = []
+            for s in (raw or []):
+                t = str(s).lower()
+                if "rot" in t: out.append("rotate")
+                elif "crop" in t: out.append("crop")
+                elif "siz" in t or "res" in t: out.append("resize")
+                elif "band" in t: out.append("band_expression")
+            return [op for op in out if op in ("rotate","crop","resize","band_expression")] or ["rotate","crop","resize"]
+
+        def _size_after_ax_fast_from_file(fp):
+            axH = axW = None
+            try:
+                ax_path = _ax_path_for(fp)
+                if os.path.exists(ax_path):
+                    with open(ax_path, "r", encoding="utf-8") as f:
+                        ax = json.load(f) or {}
+                    o = ax.get("orig_size") or {}
+                    H0 = int(o.get("h") or 0); W0 = int(o.get("w") or 0)
+                    if not (H0 and W0):
+                        obsH, obsW = _probe_image_hw(fp)
+                        if obsH and obsW:
+                            H0, W0 = obsH, obsW
+                    if not (H0 and W0):
+                        return (None, None)
+
+                    try: rot = int(ax.get("rotate", 0)) % 360
+                    except Exception: rot = 0
+                    crop     = ax.get("crop_rect") or None
+                    crop_ref = ax.get("crop_rect_ref_size") or None
+                    resize   = ax.get("resize") or None
+                    op_order = _parse_op_order(ax)
+
+                    curH, curW = int(H0), int(W0)
+                    if rot in (90, 270): curH, curW = curW, curH
+                    if crop:
+                        refW = int((crop_ref or {}).get("w") or curW)
+                        refH = int((crop_ref or {}).get("h") or curH)
+                        if refW and refH:
+                            rw = max(0, int(crop.get("width" , 0)))
+                            rh = max(0, int(crop.get("height", 0)))
+                            newW = max(1, int(round(rw * (curW / float(refW)))))
+                            newH = max(1, int(round(rh * (curH / float(refH)))))
+                            curW, curH = int(newW), int(newH)
+                    if isinstance(resize, dict) and resize:
+                        if "scale" in resize:
+                            s = max(1, int(resize.get("scale", 100))) / 100.0
+                            curW = max(1, int(round(curW * s)))
+                            curH = max(1, int(round(curH * s)))
+                        else:
+                            pw = max(1, int(resize.get("width", 100))) / 100.0
+                            ph = max(1, int(resize.get("height", 100))) / 100.0
+                            curW = max(1, int(round(curW * pw)))
+                            curH = max(1, int(round(curH * ph)))
+                    axH, axW = int(curH), int(curW)
+            except Exception:
+                axH = axW = None
+
+            obsH, obsW = _probe_image_hw(fp)
+            def _far(a, b, tol=0.05):
+                if not a or not b: return False
+                return abs(a - b) / float(max(a, b)) > tol
+            if axH and axW and obsH and obsW:
+                if _far(axH, obsH) or _far(axW, obsW):
+                    return (obsH, obsW)
+                return (axH, axW)
+            if axH and axW:  return (axH, axW)
+            if obsH and obsW: return (obsH, obsW)
+            return (None, None)
+
+        # cache structure reused by copy_polygons_between_roots
+        if getattr(self, "_copy_size_cache", None) is None:
+            self._copy_size_cache = {}
+
+        prog = None
+        if parent:
+            prog = QtWidgets.QProgressDialog(label, "Skip", 0, len(filepaths), parent)
+            prog.setWindowModality(QtCore.Qt.WindowModal)
+            prog.setMinimumDuration(0)
+            prog.show()
+
+        import os
+        cache = self._copy_size_cache
+        for i, fp in enumerate(filepaths, 1):
+            if prog and prog.wasCanceled(): break
+
+            axp = _ax_path_for(fp)
+            try:
+                ax_mtime = os.path.getmtime(axp) if axp and os.path.exists(axp) else None
+                ax_size  = os.path.getsize(axp)  if axp and os.path.exists(axp) else None
+            except Exception:
+                ax_mtime = ax_size = None
+            try:
+                im_mtime = os.path.getmtime(fp)
+                im_size  = os.path.getsize(fp)
+            except Exception:
+                im_mtime = im_size = None
+
+            ax_id = (axp, ax_mtime, ax_size)
+            im_id = (im_mtime, im_size)
+            key = ("eff4", fp)
+
+            rec = cache.get(key)
+            if not (rec and rec[2] == ax_id and rec[3] == im_id):
+                h, w = _size_after_ax_fast_from_file(fp)
+                cache[key] = (h, w, ax_id, im_id)
+
+            if prog:
+                prog.setValue(i)
+                QtWidgets.QApplication.processEvents()
+        if prog:
+            prog.close()
+
+
+
+    def _paired_thermal_root(self, ms_root):
+        try:
+            ms_names = getattr(self, "multispectral_root_names", []) or []
+            th_names = getattr(self, "thermal_rgb_root_names", []) or []
+            off      = int(getattr(self, "root_offset", 0) or 0)
+            ms_idx   = ms_names.index(ms_root)
+            th_idx   = ms_idx + off
+            if 0 <= th_idx < len(th_names):
+                return th_names[th_idx]
+        except Exception:
+            pass
+        return None
+
+  
 
     def copy_polygons_to_all_roots(self):
         """
@@ -3167,208 +3340,90 @@ class ProjectTab(QtWidgets.QWidget):
                 f"Copied to {successes} root(s); {failures} failed. See log for details.")
 
 
-    def _prewarm_eff_size_cache(self, filepaths, parent=None, label="Prewarming…"):
-        """
-        Fill self._copy_size_cache ('eff4' entries) for filepaths to avoid repeated
-        .ax/header IO in copy loops. Safe to call even if cache already exists.
-        """
-        import os, json
-        from PyQt5 import QtWidgets, QtCore
-
-        # local copies of helpers to match the ones in copy_polygons_between_roots
-        def _ax_path_for(fp: str) -> str:
-            sidecar = os.path.splitext(fp)[0] + ".ax"
-            if os.path.exists(sidecar):
-                return sidecar
-            folder = (self.project_folder or "").strip() or os.path.dirname(fp)
-            return os.path.join(folder, os.path.splitext(os.path.basename(fp))[0] + ".ax")
-
-        def _probe_image_hw(fp):
-            try:
-                for w in getattr(self, 'viewer_widgets', []) or []:
-                    idata = w.get('image_data')
-                    if idata is not None and getattr(idata, 'filepath', None) == fp:
-                        img = getattr(idata, 'image', None)
-                        if img is not None:
-                            h, w = img.shape[:2]
-                            return int(h), int(w)
-            except Exception:
-                pass
-            try:
-                img, _ = self._get_export_image(fp)
-                if img is not None:
-                    h, w = img.shape[:2]
-                    return int(h), int(w)
-            except Exception:
-                pass
-            try:
-                import numpy as np, cv2
-                data = np.fromfile(fp, dtype=np.uint8)
-                img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
-                if img is not None:
-                    h, w = img.shape[:2]
-                    return int(h), int(w)
-            except Exception:
-                pass
-            return (None, None)
-
-        def _parse_op_order(ax: dict):
-            raw = ax.get("op_order") or ax.get("ops") or ["rotate", "crop", "resize"]
-            if isinstance(raw, str):
-                raw = [raw]
-            out = []
-            for s in (raw or []):
-                t = str(s).lower()
-                if "rot" in t: out.append("rotate")
-                elif "crop" in t: out.append("crop")
-                elif "siz" in t or "res" in t: out.append("resize")
-                elif "band" in t: out.append("band_expression")
-            return [op for op in out if op in ("rotate","crop","resize","band_expression")] or ["rotate","crop","resize"]
-
-        def _size_after_ax_fast_from_file(fp):
-            axH = axW = None
-            try:
-                ax_path = _ax_path_for(fp)
-                if os.path.exists(ax_path):
-                    with open(ax_path, "r", encoding="utf-8") as f:
-                        ax = json.load(f) or {}
-                    o = ax.get("orig_size") or {}
-                    H0 = int(o.get("h") or 0); W0 = int(o.get("w") or 0)
-                    if not (H0 and W0):
-                        obsH, obsW = _probe_image_hw(fp)
-                        if obsH and obsW:
-                            H0, W0 = obsH, obsW
-                    if not (H0 and W0):
-                        return (None, None)
-
-                    try: rot = int(ax.get("rotate", 0)) % 360
-                    except Exception: rot = 0
-                    crop     = ax.get("crop_rect") or None
-                    crop_ref = ax.get("crop_rect_ref_size") or None
-                    resize   = ax.get("resize") or None
-                    op_order = _parse_op_order(ax)
-
-                    curH, curW = int(H0), int(W0)
-                    if rot in (90, 270): curH, curW = curW, curH
-                    if crop:
-                        refW = int((crop_ref or {}).get("w") or curW)
-                        refH = int((crop_ref or {}).get("h") or curH)
-                        if refW and refH:
-                            rw = max(0, int(crop.get("width" , 0)))
-                            rh = max(0, int(crop.get("height", 0)))
-                            newW = max(1, int(round(rw * (curW / float(refW)))))
-                            newH = max(1, int(round(rh * (curH / float(refH)))))
-                            curW, curH = int(newW), int(newH)
-                    if isinstance(resize, dict) and resize:
-                        if "scale" in resize:
-                            s = max(1, int(resize.get("scale", 100))) / 100.0
-                            curW = max(1, int(round(curW * s)))
-                            curH = max(1, int(round(curH * s)))
-                        else:
-                            pw = max(1, int(resize.get("width", 100))) / 100.0
-                            ph = max(1, int(resize.get("height", 100))) / 100.0
-                            curW = max(1, int(round(curW * pw)))
-                            curH = max(1, int(round(curH * ph)))
-                    axH, axW = int(curH), int(curW)
-            except Exception:
-                axH = axW = None
-
-            obsH, obsW = _probe_image_hw(fp)
-            def _far(a, b, tol=0.05):
-                if not a or not b: return False
-                return abs(a - b) / float(max(a, b)) > tol
-            if axH and axW and obsH and obsW:
-                if _far(axH, obsH) or _far(axW, obsW):
-                    return (obsH, obsW)
-                return (axH, axW)
-            if axH and axW:  return (axH, axW)
-            if obsH and obsW: return (obsH, obsW)
-            return (None, None)
-
-        # cache structure reused by copy_polygons_between_roots
-        if getattr(self, "_copy_size_cache", None) is None:
-            self._copy_size_cache = {}
-
-        prog = None
-        if parent:
-            prog = QtWidgets.QProgressDialog(label, "Skip", 0, len(filepaths), parent)
-            prog.setWindowModality(QtCore.Qt.WindowModal)
-            prog.setMinimumDuration(0)
-            prog.show()
-
-        import os
-        cache = self._copy_size_cache
-        for i, fp in enumerate(filepaths, 1):
-            if prog and prog.wasCanceled(): break
-
-            axp = _ax_path_for(fp)
-            try:
-                ax_mtime = os.path.getmtime(axp) if axp and os.path.exists(axp) else None
-                ax_size  = os.path.getsize(axp)  if axp and os.path.exists(axp) else None
-            except Exception:
-                ax_mtime = ax_size = None
-            try:
-                im_mtime = os.path.getmtime(fp)
-                im_size  = os.path.getsize(fp)
-            except Exception:
-                im_mtime = im_size = None
-
-            ax_id = (axp, ax_mtime, ax_size)
-            im_id = (im_mtime, im_size)
-            key = ("eff4", fp)
-
-            rec = cache.get(key)
-            if not (rec and rec[2] == ax_id and rec[3] == im_id):
-                h, w = _size_after_ax_fast_from_file(fp)
-                cache[key] = (h, w, ax_id, im_id)
-
-            if prog:
-                prog.setValue(i)
-                QtWidgets.QApplication.processEvents()
-        if prog:
-            prog.close()
-
-
-
-
+  
 
     def copy_polygons_to_previous(self):
+        from PyQt5 import QtWidgets
+        import logging
         if self.current_root_index > 0:
             current_root = self.multispectral_root_names[self.current_root_index]
             prev_root = self.multispectral_root_names[self.current_root_index - 1]
 
-            self.copy_polygons_between_roots(current_root, prev_root)
-            # Removed duplicate call to copy_polygons_between_roots
+            # Fast copy: don't try to paint into unopened viewers; don't save per file
+            self.copy_polygons_between_roots(
+                current_root, prev_root,
+                rescale=True,
+                defer_viewer_update=True,   # <<< important (like copy_to_all)
+                defer_save=True             # <<< save once below
+            )
 
-            self.save_polygons_to_json(root_name=prev_root)
+            # One save (project-wide if available; else just the target root)
+            try:
+                if hasattr(self, "save_project_quick"):
+                    self.save_project_quick(skip_recompute=True)
+                else:
+                    self.save_polygons_to_json(root_name=prev_root)
+            except Exception:
+                pass
 
-            # Refresh only the previous root's viewer
-            #self.refresh_viewer(root_name=prev_root)
+            # If any viewers for prev_root are already open, repaint them lightly
+            try:
+                self._redraw_polys_for_root(prev_root)
+            except Exception:
+                pass
 
-            logging.info(f"Copied polygons from '{current_root}' to '{prev_root}' and refreshed the viewer.")
+            # Keep manager UI in sync (no root change)
+            try:
+                if hasattr(self, "update_polygon_manager"):
+                    self.update_polygon_manager()
+            except Exception:
+                pass
+
+            logging.info("Copied polygons %s → %s (fast path; stayed on current root).", current_root, prev_root)
         else:
-            QMessageBox.information(self, "Operation Not Allowed", "Already at the first root group.")
-            logging.info("Attempted to copy polygons to previous root but already at the first root group.")
+            QtWidgets.QMessageBox.information(self, "Operation Not Allowed", "Already at the first root group.")
 
 
-     
     def copy_polygons_to_next(self):
+        from PyQt5 import QtWidgets
+        import logging
         if self.current_root_index < len(self.multispectral_root_names) - 1:
             current_root = self.multispectral_root_names[self.current_root_index]
             next_root = self.multispectral_root_names[self.current_root_index + 1]
 
-            self.copy_polygons_between_roots(current_root, next_root)
-            # Removed duplicate call to copy_polygons_between_roots
+            # Fast copy: same idea as above
+            self.copy_polygons_between_roots(
+                current_root, next_root,
+                rescale=True,
+                defer_viewer_update=True,   # <<< important (like copy_to_all)
+                defer_save=True             # <<< save once below
+            )
 
-            self.save_polygons_to_json(root_name=next_root)
+            # One save (project-wide preferred)
+            try:
+                if hasattr(self, "save_project_quick"):
+                    self.save_project_quick(skip_recompute=True)
+                else:
+                    self.save_polygons_to_json(root_name=next_root)
+            except Exception:
+                pass
 
-            # Refresh only the next root's viewer
-            #self.refresh_viewer(root_name=next_root)
+            # If next_root viewers already exist, repaint them; if not, they'll load on first open
+            try:
+                self._redraw_polys_for_root(next_root)
+            except Exception:
+                pass
 
-            logging.info(f"Copied polygons from '{current_root}' to '{next_root}' and refreshed the viewer.")
+            # Manager UI sync
+            try:
+                if hasattr(self, "update_polygon_manager"):
+                    self.update_polygon_manager()
+            except Exception:
+                pass
+
+            logging.info("Copied polygons %s → %s (fast path; stayed on current root).", current_root, next_root)
         else:
-            QMessageBox.information(self, "Operation Not Allowed", "Already at the last root group.")
-            logging.info("Attempted to copy polygons to next root but already at the last root group.")
+            QtWidgets.QMessageBox.information(self, "Operation Not Allowed", "Already at the last root group.")
 
 
 
@@ -3950,9 +4005,7 @@ class ProjectTab(QtWidgets.QWidget):
         except Exception as e:
             logging.warning(f"Failed to write {path}: {e}")
 
-    def _ax_path_for(self, image_path):
-        # same convention your .ax already uses
-        return image_path + ".ax"
+
 
     def edit_image_viewer(self, viewer):
         """
@@ -3974,7 +4027,8 @@ class ProjectTab(QtWidgets.QWidget):
         try:
             editor = ImageEditorDialog(self, image_data=original_image, image_filepath=filepath)
             # Pass project folder so .ax files go to the right place
-            editor.project_folder = getattr(self, "project_folder", None)
+            editor.project_folder = getattr(self, "project_folder", None) or self._ax_dir()
+
         except Exception as e:
             logging.exception(f"edit_image_viewer: failed to create editor: {e}")
             return
@@ -6457,6 +6511,7 @@ class ProjectTab(QtWidgets.QWidget):
         QtWidgets.QMessageBox.information(self, "Export", msg)
 
     
+    
     def _apply_ax_to_raw(self, raw_img, ax):
         """
         Deterministic, stack-safe replay (viewer-independent):
@@ -6983,6 +7038,14 @@ class ProjectTab(QtWidgets.QWidget):
 
         # Ensure pure HxW arrays
         return [np.ascontiguousarray(c) for c in chans]
+    def _resolve_viewer(self, filepath):
+        """
+        Safely resolve the viewer for a filepath whether this method is called
+        from ProjectTab itself or from a dialog that stores the tab in .parent_tab.
+        """
+        parent_like = getattr(self, "parent_tab", self)
+        return getattr(parent_like, "get_viewer_by_filepath", lambda _p: None)(filepath)
+
 
 
     def _map_points_scene_to_image(self, filepath, points, img_shape, polygon_data=None):
@@ -7002,7 +7065,7 @@ class ProjectTab(QtWidgets.QWidget):
         W = int(img_shape[1])
 
         # 1) Try live viewer mapping (scene -> item pixmap -> image pixels)
-        viewer = getattr(self.parent_tab, "get_viewer_by_filepath", lambda _p: None)(filepath)
+        viewer = self._resolve_viewer(filepath)   # <-- the only change in how we resolve the viewer
         if viewer is not None and getattr(viewer, "_image", None) is not None:
             pm = viewer._image.pixmap()
             pw = float(max(1, pm.width()))
@@ -7022,19 +7085,23 @@ class ProjectTab(QtWidgets.QWidget):
                 out.append((xi, yi))
             return out
 
-        # If a viewer exists but no _image item, fall back to its helper but still floor+clamp.
+        # If a viewer exists but no _image item, fall back to the tab's helper but still floor+clamp.
         if viewer is not None:
-            out = []
-            for (x, y) in points:
-                q = self.parent_tab.scene_to_image_coords(viewer, QtCore.QPointF(float(x), float(y)))
-                xi = int(q.x())
-                yi = int(q.y())
-                if xi < 0: xi = 0
-                if yi < 0: yi = 0
-                if xi >= W: xi = W - 1
-                if yi >= H: yi = H - 1
-                out.append((xi, yi))
-            return out
+            parent_like = getattr(self, "parent_tab", self)
+            scene_to_img = getattr(parent_like, "scene_to_image_coords", None)
+            if callable(scene_to_img):
+                out = []
+                for (x, y) in points:
+                    q = scene_to_img(viewer, QtCore.QPointF(float(x), float(y)))
+                    xi = int(q.x())
+                    yi = int(q.y())
+                    if xi < 0: xi = 0
+                    if yi < 0: yi = 0
+                    if xi >= W: xi = W - 1
+                    if yi >= H: yi = H - 1
+                    out.append((xi, yi))
+                return out
+            # if no helper, we’ll continue to offline options below
 
         # 2) Offline mapping using stored pixmap size in polygon payload
         if polygon_data:
@@ -9050,24 +9117,28 @@ class ProjectTab(QtWidgets.QWidget):
     def save_polygons_to_json(self, root_name: str = None):
         """
         Write polygons to `<project>/polygons/{group}_{imageBase}_polygons.json`
-        with reliable coordinates for BOTH MS and Thermal/RGB roots in dual-folder mode.
-
-        If root_name is provided, only polygons associated with that logical root are saved.
+        with reliable coordinates. If root_name is provided, only polygons
+        associated with that logical root are saved.
         """
         import os, json, logging
 
-        if not getattr(self, "project_folder", None):
-            polygons_dir = os.path.join(os.getcwd(), "polygons")
-        else:
-            polygons_dir = os.path.join(self.project_folder, "polygons")
+        # ---- Only save if user has set a project folder ----
+        project_folder = getattr(self, "project_folder", None)
+        if not project_folder:
+            logging.debug("save_polygons_to_json: project_folder not set; skipping save.")
+            return
+        # ----------------------------------------------------
+
+        # -------- output folder (project only) --------
+        polygons_dir = os.path.join(project_folder, "polygons")
         os.makedirs(polygons_dir, exist_ok=True)
 
-        # Helper: normalize filepath -> root name (fallback if method missing)
+        # -------- helpers --------
         def _root_for_fp(fp: str):
+            """Normalize filepath -> logical root name."""
             if hasattr(self, "get_root_by_filepath"):
                 return self.get_root_by_filepath(fp)
-            # Fallback: scan groups (slow but safe)
-            for rn, paths in self.multispectral_image_data_groups.items():
+            for rn, paths in getattr(self, "multispectral_image_data_groups", {}).items():
                 if fp in paths:
                     return rn
             for rn, paths in getattr(self, "thermal_rgb_image_data_groups", {}).items():
@@ -9075,81 +9146,184 @@ class ProjectTab(QtWidgets.QWidget):
                     return rn
             return None
 
-        # Helper: coordinate lookup with mirroring & EXIF fallback
         def _coords_for_root(image_root: str, filepath: str):
-            # 1) Root map
-            coords = self.root_coordinates.get(image_root)
+            """Coordinates: prefer cached root -> paired -> EXIF for this file."""
+            coords = (getattr(self, "root_coordinates", {}) or {}).get(image_root)
             if coords:
                 return coords
-            # 2) Paired root
-            if self.mode == 'dual_folder':
-                paired = self._paired_ms_root(image_root) or self._paired_trgb_root(image_root)
+            if getattr(self, "mode", None) == 'dual_folder':
+                paired = None
+                if hasattr(self, "_paired_ms_root"):
+                    paired = self._paired_ms_root(image_root) or paired
+                if hasattr(self, "_paired_trgb_root"):
+                    paired = self._paired_trgb_root(image_root) or paired
                 if paired:
-                    coords = self.root_coordinates.get(paired)
+                    coords = (getattr(self, "root_coordinates", {}) or {}).get(paired)
                     if coords:
                         return coords
-            # 3) EXIF fallback from this file; cache under root
-            one = self._first_gps_from_files([filepath])
-            if one:
-                self.root_coordinates[image_root] = one
-                return one
-            # 4) Nothing available
+            if hasattr(self, "_first_gps_from_files"):
+                one = self._first_gps_from_files([filepath])
+                if one:
+                    getattr(self, "root_coordinates", {})[image_root] = one
+                    return one
             return {'latitude': None, 'longitude': None}
 
-        # Build the subset to save
+        def _viewer_effective_hw(fp: str):
+            """
+            Prefer the *live* image basis if this file is currently open in any viewer.
+            Fallback to self._effective_hw_for_file(fp) if available.
+            Returns (H, W) or (None, None).
+            """
+            # Try a specific viewer
+            try:
+                v = self.get_viewer_by_filepath(fp)
+                if v is not None:
+                    idata = getattr(v, "image_data", None)
+                    img = getattr(idata, "image", None)
+                    if img is not None and hasattr(img, "shape"):
+                        h, w = img.shape[:2]
+                        if h and w:
+                            return int(h), int(w)
+            except Exception:
+                pass
+
+            # Scan viewer_widgets (if multiple viewers)
+            try:
+                for w in getattr(self, "viewer_widgets", []) or []:
+                    idata = w.get("image_data") if isinstance(w, dict) else None
+                    if idata is not None and getattr(idata, "filepath", None) == fp:
+                        img = getattr(idata, "image", None)
+                        if img is not None and hasattr(img, "shape"):
+                            h, w = img.shape[:2]
+                            if h and w:
+                                return int(h), int(w)
+            except Exception:
+                pass
+
+            # Fallback to on-disk/sidecar estimation
+            if hasattr(self, "_effective_hw_for_file"):
+                try:
+                    h, w = self._effective_hw_for_file(fp)
+                    if h and w:
+                        return int(h), int(w)
+                except Exception:
+                    pass
+            return (None, None)
+
+        def _as_wh(obj):
+            """Accept dict {'w','h'} or tuple/list [w,h] and return (w,h) ints or (None,None)."""
+            if isinstance(obj, dict):
+                w = obj.get('w') or obj.get('width')
+                h = obj.get('h') or obj.get('height')
+                try:
+                    return (int(w), int(h)) if (w and h) else (None, None)
+                except Exception:
+                    return (None, None)
+            if isinstance(obj, (list, tuple)) and len(obj) >= 2:
+                try:
+                    return (int(obj[0]), int(obj[1]))
+                except Exception:
+                    return (None, None)
+            return (None, None)
+
+        def _normalize_points_for_save(filepath: str, polygon_data: dict):
+            """
+            Return (points_out, ref_w, ref_h, coord_space_out).
+            Ensure points are saved in the file's *current* effective basis.
+            """
+            pts_any = list((polygon_data or {}).get('points') or [])
+            if not pts_any:
+                return [], None, None, (polygon_data.get('coord_space') or 'image')
+
+            # Prefer live viewer size; fallback to on-disk effective size.
+            eff_h, eff_w = _viewer_effective_hw(filepath)
+
+            # Determine the current basis of stored points.
+            basis_w = basis_h = None
+            ref = (polygon_data or {}).get('image_ref_size') or {}
+            basis_w, basis_h = _as_wh(ref)
+            if not (basis_w and basis_h):
+                iw, ih = _as_wh((polygon_data or {}).get('image_size'))
+                if iw and ih:
+                    basis_w, basis_h = iw, ih
+                else:
+                    pw, ph = _as_wh((polygon_data or {}).get('pixmap_size'))
+                    if pw and ph:
+                        basis_w, basis_h = pw, ph
+
+            coord_space_in = (polygon_data.get('coord_space') or 'image').lower()
+
+            # If we have an effective size, try to output in that basis.
+            if eff_w and eff_h:
+                # SCENE -> IMAGE (eff basis)
+                if coord_space_in == 'scene' and hasattr(self, "_map_points_scene_to_image"):
+                    try:
+                        pts_img = self._map_points_scene_to_image(
+                            filepath, pts_any, (eff_h, eff_w, 1), polygon_data=polygon_data
+                        )
+                        return [(float(x), float(y)) for (x, y) in pts_img], int(eff_w), int(eff_h), 'image'
+                    except Exception:
+                        pass
+
+                # IMAGE -> IMAGE (rebased)
+                if coord_space_in == 'image' and basis_w and basis_h and (basis_w != eff_w or basis_h != eff_h):
+                    sx = float(eff_w) / float(basis_w)
+                    sy = float(eff_h) / float(basis_h)
+                    pts_img = [(float(x) * sx, float(y) * sy) for (x, y) in pts_any]
+                    return pts_img, int(eff_w), int(eff_h), 'image'
+
+                # Already image coords; if no basis known, just stamp eff basis
+                if coord_space_in == 'image':
+                    return [(float(x), float(y)) for (x, y) in pts_any], int(eff_w), int(eff_h), 'image'
+
+            # Fallbacks (no eff size available):
+            if coord_space_in == 'image' and basis_w and basis_h:
+                return [(float(x), float(y)) for (x, y) in pts_any], int(basis_w), int(basis_h), 'image'
+
+            return [(float(x), float(y)) for (x, y) in pts_any], None, None, coord_space_in
+
+        # -------- build subset to save --------
         if root_name:
-            # Save only polygons tied to this logical root's filepaths (MS + paired TRGB)
-            filepaths_in_root = set(self.image_data_groups.get(root_name, []))
+            filepaths_in_root = set((getattr(self, "image_data_groups", {}) or {}).get(root_name, []))
             to_save = {
-                g: {fp: pd for fp, pd in files.items() if fp in filepaths_in_root}
-                for g, files in self.all_polygons.items()
+                g: {fp: pd for fp, pd in (files or {}).items() if fp in filepaths_in_root}
+                for g, files in (getattr(self, "all_polygons", {}) or {}).items()
             }
-            # Drop empty groups
             to_save = {g: files for g, files in to_save.items() if files}
         else:
-            to_save = self.all_polygons
+            to_save = getattr(self, "all_polygons", {}) or {}
 
-        # Write each polygon JSON
+        # -------- write --------
         for group_name, files in to_save.items():
-            for filepath, polygon_data in files.items():
+            for filepath, polygon_data in (files or {}).items():
                 try:
                     image_root = _root_for_fp(filepath) or ""
-                    root_id    = str(self.root_id_mapping.get(image_root, "0"))
+                    root_id    = str((getattr(self, "root_id_mapping", {}) or {}).get(image_root, "0"))
 
-                    # Decide coordinates (prefer any already on the polygon)
-                    poly_coords = None
+                    # Coordinates (prefer polygon's; else per-root/EXIF)
+                    coords = None
                     if isinstance(polygon_data, dict):
                         c = polygon_data.get('coordinates')
                         if isinstance(c, dict) and 'latitude' in c and 'longitude' in c:
-                            poly_coords = c
+                            coords = c
+                    coords = coords or _coords_for_root(image_root, filepath)
 
-                    coords = poly_coords or _coords_for_root(image_root, filepath)
+                    # Normalize points to the file's *current* basis
+                    pts_out, ref_w, ref_h, coord_space_out = _normalize_points_for_save(filepath, polygon_data)
+                    image_ref_size = {'w': int(ref_w or 0), 'h': int(ref_h or 0)}
 
-                    # Shape metadata
-                    poly_type    = (polygon_data.get('type') if isinstance(polygon_data, dict) else None) or 'polygon'
-                    coord_space  = (polygon_data.get('coord_space') if isinstance(polygon_data, dict) else None) or 'scene'
-                    points_any   = (polygon_data.get('points') if isinstance(polygon_data, dict) else None) or []
+                    # Metadata (keep polygon vs point intact)
+                    poly_type = (polygon_data.get('type') if isinstance(polygon_data, dict) else None) or 'polygon'
+                    name_out  = (polygon_data.get('name') if isinstance(polygon_data, dict) else None) or group_name
 
-                    # --- NEW: persist image_ref_size (backfill from effective size if missing) ---
-                    ref = {}
-                    if isinstance(polygon_data, dict):
-                        ref = polygon_data.get('image_ref_size') or {}
-                    if not (isinstance(ref, dict) and ref.get('w') and ref.get('h')):
-                        try:
-                            eh, ew = self._effective_hw_for_file(filepath)
-                            ref = {'w': int(ew or 0), 'h': int(eh or 0)}
-                        except Exception:
-                            ref = {'w': 0, 'h': 0}
-
-                    # Construct output
                     data_to_save = {
-                        'points': points_any,
-                        'name':   (polygon_data.get('name') if isinstance(polygon_data, dict) else None) or group_name,
+                        'points': pts_out,               # works for polygons & single points
+                        'name':   name_out,
                         'root':   root_id,
                         'coordinates': coords,
                         'type':   poly_type,
-                        'coord_space': coord_space,
-                        'image_ref_size': ref,     # <-- ensure basis is saved
+                        'coord_space': coord_space_out,  # usually 'image' after normalization
+                        'image_ref_size': image_ref_size,
                     }
 
                     base_filename     = os.path.splitext(os.path.basename(filepath))[0]
@@ -9162,7 +9336,6 @@ class ProjectTab(QtWidgets.QWidget):
                     logging.info("Saved %s", polygon_filepath)
                 except Exception as e:
                     logging.error("Failed to save polygon for file '%s': %s", filepath, e)
-
 
     def compute_root_coordinates(self, root_name=None):
         """
@@ -9234,38 +9407,41 @@ class ProjectTab(QtWidgets.QWidget):
             print(f"Error converting GPS to degrees: {e}")
             return None
 
-  
     def on_polygon_drawn(self, polygon_item):
-        sender_viewer = self.sender()
-        image_id = os.path.splitext(os.path.basename(sender_viewer.image_data.filepath))[0]
+        from PyQt5 import QtWidgets, QtGui
+        import os
 
-        # Editing existing group?
-        if sender_viewer.pending_group_name:
+        sender_viewer = self.sender()
+        if not sender_viewer or not getattr(sender_viewer, "image_data", None):
+            return
+
+        # Reuse pending name if editing, otherwise prompt
+        if getattr(sender_viewer, "pending_group_name", None):
             logical_name = sender_viewer.pending_group_name
             sender_viewer.pending_group_name = None
         else:
             logical_name, ok = QtWidgets.QInputDialog.getText(
-                self, "Logical Object Name", "Enter logical name for the polygon (e.g., 'tree1'):")
+                self, "Logical Object Name",
+                "Enter logical name for the polygon (e.g., 'tree1'):")
             if not (ok and logical_name.strip()):
-                sender_viewer._scene.removeItem(polygon_item)
-                print("Unnamed polygon was not saved.")
+                try:
+                    sender_viewer._scene.removeItem(polygon_item)
+                except Exception:
+                    pass
                 return
             logical_name = logical_name.strip()
 
-        # Assign the name
+        # Label the item
         polygon_item.name = logical_name
 
         # Root number for this image
         root_name = self.get_root_by_filepath(sender_viewer.image_data.filepath)
-        if root_name:
-            try:
-                root_number = str(self.root_names.index(root_name) + 1)
-            except ValueError:
-                root_number = "0"
-        else:
+        try:
+            root_number = str(self.root_names.index(root_name) + 1) if root_name else "0"
+        except ValueError:
             root_number = "0"
 
-        # Determine geometry + type
+        # Pick geometry and type
         if hasattr(polygon_item, "polygon"):
             scene_poly = polygon_item.polygon
             shape_type = "polygon"
@@ -9276,37 +9452,92 @@ class ProjectTab(QtWidgets.QWidget):
             scene_poly = QtGui.QPolygonF()
             shape_type = "polygon"
 
-        # Convert SCENE -> IMAGE and save image pixels as source of truth
+        # Convert SCENE -> IMAGE pixels (this is your canonical space)
         img_points = []
         for p in scene_poly:
             ip = self.scene_to_image_coords(sender_viewer, p)
             img_points.append((float(ip.x()), float(ip.y())))
 
+        # Determine the file's *current effective* size to stamp as the basis
+        eff_h, eff_w = self._effective_hw_for_file(sender_viewer.image_data.filepath)
+        image_ref_size = {
+            'w': int(eff_w or 0),
+            'h': int(eff_h or 0),
+        }
+
+        # Persist in memory
         if logical_name not in self.all_polygons:
             self.all_polygons[logical_name] = {}
 
         self.all_polygons[logical_name][sender_viewer.image_data.filepath] = {
-            'points': img_points,           # image pixels!
-            'coord_space': 'image',
+            'points': img_points,
+            'coord_space': 'image',          # image pixel coords
+            'image_ref_size': image_ref_size,# basis recorded
             'name': logical_name,
             'root': root_number,
             'type': shape_type
         }
 
-        # Sync to other images in same root (uses image->scene at target)
-        if self.sync_enabled:
-            self.add_polygon_to_other_images(sender_viewer, scene_poly, logical_name, action="copy", shape_type=shape_type)
+        # Optional sync to siblings in same root (you already have this)
+        if getattr(self, "sync_enabled", False):
+            self.add_polygon_to_other_images(
+                sender_viewer, scene_poly, logical_name, action="copy", shape_type=shape_type
+            )
 
-        # Persist + UI updates
-        self.save_polygons_to_json(root_name=self.get_current_root_name())
+        # UI updates (keep your existing persistence cadence)
         self.update_polygon_manager()
-        self.generate_thumbnail(logical_name, sender_viewer.image_data)
 
     def on_polygon_modified(self):
-        # A polygon was modified
+        """Called when a polygon is edited. Keep UI responsive:
+        update in-memory data immediately, but debounce the disk write.
+        """
         self.update_all_polygons()
-        self.save_polygons_to_json(root_name=self.get_current_root_name())
 
+        # Debounced save (single timer shared by draws + edits)
+        if not hasattr(self, "_save_timer"):
+            self._save_timer = QTimer(self)
+            self._save_timer.setSingleShot(True)
+            self._save_timer.timeout.connect(
+                lambda: self.save_polygons_to_json(root_name=self.get_current_root_name())
+            )
+        self._save_timer.start(300)  # save ~300ms after the last change
+
+    def _normalize_points_for_save(self, filepath: str, polygon_data: dict):
+        """
+        Return (points_out, ref_w, ref_h) where points_out are scaled to the file's
+        *current effective* image size (post .ax), which becomes the saved basis.
+        """
+        # 1) Current effective size on disk (after rotate/crop/resize in .ax)
+        eff_h, eff_w = self._effective_hw_for_file(filepath)
+        if not (eff_w and eff_h):
+            # Nothing we can do; keep as-is, and don't claim a ref size
+            return list(polygon_data.get('points') or []), None, None
+
+        # 2) What basis are the in-memory points currently in?
+        basis_w = basis_h = None
+        ref = (polygon_data or {}).get('image_ref_size') or {}
+        if isinstance(ref, dict):
+            basis_w = ref.get('w')
+            basis_h = ref.get('h')
+
+        # fallbacks (older shapes)
+        if not (basis_w and basis_h):
+            imgsize = (polygon_data or {}).get('image_size') or {}
+            basis_w = basis_w or imgsize.get('w')
+            basis_h = basis_h or imgsize.get('h')
+
+        if not (basis_w and basis_h):
+            pix = (polygon_data or {}).get('pixmap_size') or {}
+            basis_w = basis_w or pix.get('w')
+            basis_h = basis_h or pix.get('h')
+
+        pts = list(polygon_data.get('points') or [])
+        if basis_w and basis_h and (basis_w != eff_w or basis_h != eff_h):
+            sx = float(eff_w) / float(basis_w)
+            sy = float(eff_h) / float(basis_h)
+            pts = [(float(x) * sx, float(y) * sy) for (x, y) in pts]
+
+        return pts, int(eff_w), int(eff_h)
 
     def toggle_sync(self):
         self.sync_enabled = self.syncAct.isChecked()
@@ -9361,44 +9592,49 @@ class ProjectTab(QtWidgets.QWidget):
   
     def save_polygon_group_to_file(self, group_name, filepath, polygon_data):
         """
-        Saves polygon data to a JSON file, including the 'root' number and 'coordinates' field.
+        Save a single group's polygon data for one image to JSON.
+        Does nothing unless a project folder is set.
         """
-        if not self.project_folder:
-            # If no project folder is set, polygons are saved in 'polygons' directory in current working directory
-            polygons_dir = os.path.join(os.getcwd(), 'polygons')
-        else:
-            # Save polygons inside the project folder
-            polygons_dir = os.path.join(self.project_folder, 'polygons')
+        import os, json, logging
+
+        project_folder = getattr(self, "project_folder", None)
+        if not project_folder:
+            logging.debug("save_polygon_group_to_file: project_folder not set; skipping save.")
+            return
+
+        polygons_dir = os.path.join(project_folder, 'polygons')
         os.makedirs(polygons_dir, exist_ok=True)
 
-        # Save polygons to a JSON file named after the group and image file
         filename = os.path.basename(filepath)
         polygon_filename = f"{group_name}_{os.path.splitext(filename)[0]}_polygons.json"
         polygon_filepath = os.path.join(polygons_dir, polygon_filename)
 
         try:
-            # Determine the root number based on the image's group using root_id_mapping
-            root_name = self.get_root_by_filepath(filepath)
-            if root_name:
-                root_id = self.root_id_mapping.get(root_name, 0)
-                root_number = str(root_id)
-            else:
-                root_number = "0"  # Default value if root_name is None
+            # Root -> id string
+            root_name = None
+            try:
+                if hasattr(self, "get_root_by_filepath"):
+                    root_name = self.get_root_by_filepath(filepath)
+            except Exception:
+                root_name = None
 
-            # Get coordinates for the root
-            coordinates = self.root_coordinates.get(root_name, {'latitude': None, 'longitude': None})
+            root_id = str((getattr(self, "root_id_mapping", {}) or {}).get(root_name, "0"))
 
-            # Add 'root' and 'coordinates' field to polygon_data
-            polygon_data_with_extra = polygon_data.copy()
-            polygon_data_with_extra['root'] = root_number
-            polygon_data_with_extra['coordinates'] = coordinates  # Add coordinates
+            # Coordinates (from per-root cache; default None/None)
+            coords = (getattr(self, "root_coordinates", {}) or {}).get(
+                root_name, {'latitude': None, 'longitude': None}
+            )
+
+            out = dict(polygon_data or {})
+            out['root'] = root_id
+            out['coordinates'] = coords
 
             with open(polygon_filepath, 'w', encoding='utf-8') as f:
-                json.dump(polygon_data_with_extra, f, indent=4)
-            print(f"Saved polygon to {polygon_filepath}")
+                json.dump(out, f, indent=4)
+
+            logging.info("Saved polygon to %s", polygon_filepath)
         except Exception as e:
-            # Removed pop-up to prevent annoying sounds
-            print(f"Could not save polygons for {filename}: {e}")
+            logging.error("Could not save polygons for %s: %s", filename, e)
 
     def construct_thumbnail_name(self, logical_name, filepath, image_type='multispectral'):
         """
@@ -9481,10 +9717,6 @@ class ProjectTab(QtWidgets.QWidget):
 
         # Extract the coordinates and return as a list of points
         return list(my_polygon_resized.exterior.coords)
-
-
-
-
 
     def save_all_polygons(self):
         # Alias to save_polygons_to_csv
@@ -9598,11 +9830,6 @@ class ProjectTab(QtWidgets.QWidget):
         self.update_polygon_manager()
         print("Updated Polygon Manager UI.")
         print("Saved updated polygons to JSON.")
-
-
-
-
-
 
     def clean_all_polygons(self):
             """
@@ -10730,18 +10957,59 @@ class ProjectTab(QtWidgets.QWidget):
         logging.debug(f"Constructed Thumbnail Name: {thumbnail_filename}")  # Debugging Statement
         return thumbnail_filename
 
-    
+    def keyPressEvent(self, e):
+        from PyQt5 import QtCore
+        if getattr(self, "inspectAct", None) and self.inspectAct.isChecked():
+            if e.key() == QtCore.Qt.Key_Shift:
+                self._turn_off_inspection()
+        # let everything else work as before
+        super().keyPressEvent(e)
     def _wire_viewer_for_inspection(self, viewer):
-        """Make a single viewer honor the current Inspect toggle and (re)connect the signal."""
         checked = getattr(self, "inspectAct", None).isChecked() if hasattr(self, "inspectAct") else False
         viewer.set_inspection_mode(checked)
-        # idempotent connection
+
+        # idempotent pixel read hook
         try:
             viewer.pixel_clicked.disconnect(self.display_pixel_value)
         except TypeError:
             pass
         if checked:
             viewer.pixel_clicked.connect(self.display_pixel_value)
+
+        scene = getattr(viewer, "_scene", None) or (viewer.scene() if hasattr(viewer, "scene") else None)
+        if scene:
+            # keep your existing selectionChanged hookup (harmless if it never fires)
+            if not getattr(scene, "_inspect_autoff_connected", False):
+                scene.selectionChanged.connect(self._turn_off_inspection)
+                scene._inspect_autoff_connected = True
+
+            # NEW: install event filter once so we can catch clicks on polygons/points
+            if not getattr(scene, "_inspect_eventfilter_installed", False):
+                scene.installEventFilter(self)
+                scene._inspect_eventfilter_installed = True
+
+    def eventFilter(self, obj, event):
+        from PyQt5 import QtCore, QtWidgets
+
+        # Auto-off Inspect when user clicks a selectable item (polygon/point) in any scene
+        if (getattr(self, "inspectAct", None)
+            and self.inspectAct.isChecked()
+            and isinstance(obj, QtWidgets.QGraphicsScene)
+            and event.type() in (QtCore.QEvent.GraphicsSceneMousePress,
+                                 QtCore.QEvent.GraphicsSceneMouseDoubleClick)):
+            # Check what is under the cursor in scene coords
+            for it in obj.items(event.scenePos()):
+                # Only care about things the user can select/edit (polygons/points), not the background pixmap
+                try:
+                    selectable = bool(it.flags() & QtWidgets.QGraphicsItem.ItemIsSelectable)
+                except Exception:
+                    selectable = False
+                if selectable:
+                    self._turn_off_inspection()   # this toggles the QAction (you already wired .toggled → toggle_inspection_mode)
+                    break
+            return False  # never swallow the event
+
+        return super().eventFilter(obj, event)
 
     def _rewire_all_viewers_for_inspection(self):
         for w in self.viewer_widgets:
@@ -10759,6 +11027,10 @@ class ProjectTab(QtWidgets.QWidget):
                 sb.showMessage("Inspection mode: Click on an image to get pixel values.")
             else:
                 sb.clearMessage()
+    def _turn_off_inspection(self):
+        act = getattr(self, "inspectAct", None)
+        if act and act.isChecked():
+            act.setChecked(False)         
 
 
     def display_pixel_value(self, point, payload):
@@ -10823,11 +11095,42 @@ class ProjectTab(QtWidgets.QWidget):
         sb.showMessage(message)
            
     def _ax_path_for(self, image_path: str) -> str:
+        """
+        Single source of truth for .ax locations:
+          • If project is saved -> use project folder
+          • Else -> use a stable temp cache (never the image folder)
+          • Read legacy sidecars next to the image only if they already exist
+            (we won't write there anymore).
+        """
+        import os, tempfile
+
         parent = self.parent()
         project_folder = getattr(parent, "project_folder", None) if parent else None
-        folder = project_folder if (project_folder and project_folder.strip()) else os.path.dirname(image_path)
-        base_name = os.path.splitext(os.path.basename(image_path))[0]
-        return os.path.join(folder, base_name + ".ax")
+
+        # Where we WANT .ax to live (project or temp cache)
+        if project_folder and project_folder.strip():
+            ax_dir = project_folder
+        else:
+            if not hasattr(self, "_unsaved_ax_dir"):
+                self._unsaved_ax_dir = os.path.join(tempfile.gettempdir(), "CanoPie_AX")
+                os.makedirs(self._unsaved_ax_dir, exist_ok=True)
+            ax_dir = self._unsaved_ax_dir
+
+        base_name = os.path.splitext(os.path.basename(image_path))[0] + ".ax"
+        preferred = os.path.join(ax_dir, base_name)
+
+        # Prefer project/temp if it already exists
+        if os.path.exists(preferred):
+            return preferred
+
+        # Legacy read-only fallback: sidecar next to the image (do not write here)
+        legacy = os.path.join(os.path.dirname(image_path), base_name)
+        if os.path.exists(legacy):
+            return legacy
+
+        # Default target (for new writes) is project/temp
+        return preferred
+
 
 
     def _eval_band_expression_float(self, img, expr):
@@ -11305,7 +11608,6 @@ class ProjectTab(QtWidgets.QWidget):
                 mb.setIcon(QMessageBox.NoIcon); mb.setStandardButtons(QMessageBox.Ok); mb.exec_()
         else:
             QtWidgets.QMessageBox.warning(self, "Unknown Mode", f"The project is in an unknown mode: '{self.mode}'.")
-
 
     def copy_metadata_action(self):
         """

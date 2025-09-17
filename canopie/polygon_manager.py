@@ -1,6 +1,3 @@
-"""Auto-generated module extracted from original CanoPie code."""
-
-
 import sys
 import os
 import re
@@ -2034,7 +2031,7 @@ class PolygonManager(QtWidgets.QDialog):
             kwargs[groups_param_name] = list(groups)
             parent.copy_polygons_between_roots(**kwargs)
         else:
-            # fallback: copy-all (deferred), we will prune + then force refresh
+            # fallback: copy-all (deferred), we will prune then repaint
             parent.copy_polygons_between_roots(**kwargs)
 
         # 6) prune: if we had to copy-all, remove NEW polygons for groups not selected
@@ -2056,82 +2053,36 @@ class PolygonManager(QtWidgets.QDialog):
         else:
             print("Skipping polygon save: project not saved yet.")
 
-        # 8) refresh viewers & manager (fast + robust)
-        # keep the manager list in sync
-        if hasattr(parent, "update_polygon_manager"):
-            try:
+        # 8) LIGHT repaint — no root switch, no full refresh:
+        #    immediately draw overlays into any already-open viewers for the current root.
+        try:
+            if hasattr(parent, "_redraw_polys_for_root"):
+                parent._redraw_polys_for_root(target_root)
+            # keep the manager list in sync
+            if hasattr(parent, "update_polygon_manager"):
                 parent.update_polygon_manager()
-            except Exception:
-                pass
-
-        from PyQt5 import QtWidgets, QtCore
-
-        if defer_viewer_update:
-            # heavy path: we deferred; force a reload now
-            for meth in ("reload_polygons_in_open_viewers",
-                         "refresh_all_viewers",
-                         "update_all_viewers",
-                         "refresh_viewer",
-                         "update_viewer"):
-                if hasattr(parent, meth):
+                current_root = parent.get_current_root_name() if hasattr(parent, "get_current_root_name") else None
+                parent.refresh_viewer(root_name=current_root)
+        except Exception:
+            # make best-effort to nudge a repaint even if helper is missing
+            viewers = None
+            for attr in ("viewer_widgets", "open_viewers", "viewers", "image_viewers"):
+                viewers = getattr(parent, attr, None)
+                if viewers:
+                    break
+            if viewers:
+                for vdict in (viewers if isinstance(viewers, list) else []):
+                    v = vdict.get("viewer") if isinstance(vdict, dict) else vdict
+                    if not v:
+                        continue
                     try:
-                        getattr(parent, meth)()
-                        break
+                        if hasattr(v, "scene") and v.scene():
+                            v.scene().update()
+                        v.update()
                     except Exception:
                         pass
-            else:
-                # last resort: ping each open viewer lightly
-                viewers = None
-                for attr in ("open_viewers", "viewers", "image_viewers"):
-                    viewers = getattr(parent, attr, None)
-                    if viewers:
-                        break
-                if viewers:
-                    for v in list(viewers):
-                        try:
-                            if hasattr(v, "reload_polygons"):
-                                v.reload_polygons()
-                        except Exception:
-                            pass
-                        try:
-                            if hasattr(v, "scene") and v.scene():
-                                v.scene().update()
-                        except Exception:
-                            pass
-                        try:
-                            v.update()
-                        except Exception:
-                            pass
-            # flush
-            try:
-                QtWidgets.QApplication.processEvents()
-                QtCore.QTimer.singleShot(0, QtWidgets.QApplication.processEvents)
-            except Exception:
-                pass
-        else:
-            # light path: parent already updated viewers; just repaint scenes
-            try:
-                viewers = None
-                for attr in ("open_viewers", "viewers", "image_viewers"):
-                    viewers = getattr(parent, attr, None)
-                    if viewers:
-                        break
-                if viewers:
-                    for v in list(viewers):
-                        try:
-                            if hasattr(v, "scene") and v.scene():
-                                v.scene().update()
-                        except Exception:
-                            pass
-                        try:
-                            v.update()
-                        except Exception:
-                            pass
-                QtWidgets.QApplication.processEvents()
-                QtCore.QTimer.singleShot(0, QtWidgets.QApplication.processEvents)
-            except Exception:
-                pass
-         
+                        
+
 
     def delete_all_polygons_for_group(self, group_name: str):
         """
@@ -2261,6 +2212,8 @@ class PolygonManager(QtWidgets.QDialog):
 
         # Refresh UI
         self.parent().update_polygon_manager()
+        
+
         
 
     def edit_selected_polygons(self, groups=None):
