@@ -10417,36 +10417,47 @@ class ProjectTab(QtWidgets.QWidget):
     def generate_thumbnail(self, logical_name, image_data):
         """
         Generate and save a low-res JPG thumbnail for a given polygon.
-        Works for RGB, thermal, and multispectral stacks (including >4 channels).
+        Matches the CSV/export pipeline by replaying .ax (rotate->crop->resize->expr)
+        before cropping around the polygon. Points are rescaled from their saved
+        image_ref_size to the edited image basis to ensure perfect alignment.
         """
         import os, cv2, numpy as np
 
-        # --- robust access to path & pixel data (Lite-safe) ---
-        filepath = getattr(image_data, "filepath", "")
-        image = getattr(image_data, "image", None)
-        if image is None:
-            print(f"Failed to load image for thumbnail: {filepath}")
+        # --- robust path ---
+        filepath = getattr(image_data, "filepath", "") if image_data is not None else ""
+        if not filepath:
+            print(f"[thumb] Missing filepath for {logical_name}")
             return
 
-        # If TIFF stack came channels-first (C,H,W), convert to H,W,C
-        if image.ndim == 3 and image.shape[0] <= 16 and image.shape[0] < min(image.shape[1], image.shape[2]):
-            # likely channels-first
-            image = np.transpose(image, (1, 2, 0))
+        # --- 1) Load *edited* image exactly like export/CSV (applies .ax if present) ---
+        try:
+            img, meta = self._get_export_image(filepath)  # returns HxWxC, dtype preserved
+        except Exception as e:
+            print(f"[thumb] _get_export_image failed for {filepath}: {e}")
+            return
+        if img is None or getattr(img, "size", 0) == 0:
+            print(f"[thumb] Empty image after _get_export_image for {filepath}")
+            return
 
-        H, W = image.shape[:2]
+        # Normalize to HWC for safety (tolerant to CHW stacks)
+        if img.ndim == 2:
+            img = img[..., None]
+        elif img.ndim == 3 and img.shape[0] <= 32 and img.shape[0] not in (img.shape[1], img.shape[2]):
+            img = np.moveaxis(img, 0, -1)
+        img = np.ascontiguousarray(img)
+        H, W = img.shape[:2]
 
-        # --- safe flags (Lite-friendly) ---
+        # --- 2) Determine type flags (informative only) ---
         is_rgb = bool(getattr(image_data, "is_rgb", False))
         is_thermal = bool(getattr(image_data, "is_thermal", False))
         if not (is_rgb or is_thermal):
-            # Minimal inference
             name_upper = os.path.splitext(os.path.basename(filepath))[0].upper()
-            if image.ndim == 3 and image.shape[2] == 3 and image.dtype != np.uint16:
+            if img.ndim == 3 and img.shape[2] == 3 and img.dtype != np.uint16:
                 is_rgb = True
-            elif image.dtype == np.uint16 and (name_upper.endswith("_IR") or "THERM" in name_upper):
+            elif img.dtype == np.uint16 and (name_upper.endswith("_IR") or "THERM" in name_upper):
                 is_thermal = True
 
-        # --- root/band info if available (kept as-is; harmless if missing) ---
+        # --- 3) Root/band info (unchanged; used for filename only) ---
         root_name = self.get_root_by_filepath(filepath) if hasattr(self, "get_root_by_filepath") else None
         root_id = self.root_id_mapping.get(root_name, 0) if hasattr(self, "root_id_mapping") and root_name else 0
         band_index = 0
@@ -10457,96 +10468,90 @@ class ProjectTab(QtWidgets.QWidget):
             except Exception:
                 band_index = 0
 
-        # --- fetch polygon points stored in IMAGE coordinates ---
-        poly_entry = self.all_polygons.get(logical_name, {}).get(filepath, {})
+        # --- 4) Fetch polygon points & SCALE them from saved ref-size to edited image size ---
+        poly_entry = (self.all_polygons.get(logical_name, {}) or {}).get(filepath, {}) or {}
         points = poly_entry.get("points", [])
         if not points:
-            print(f"No polygon points found for {logical_name} in {filepath}")
+            print(f"[thumb] No polygon points for {logical_name} in {filepath}")
             return
 
-        # Ensure proper shape for OpenCV (N,1,2) int32
-        pts = np.asarray(points, dtype=np.float32)
-        pts_i32 = pts.astype(np.int32).reshape(-1, 1, 2)
+        ref = poly_entry.get("image_ref_size") or {}
+        ref_w = int(ref.get("w") or ref.get("width") or 0)
+        ref_h = int(ref.get("h") or ref.get("height") or 0)
+        if not (ref_w and ref_h):
+            # Conservative fallback: use fast post-AX effective dims if known; else assume current img
+            try:
+                eh, ew = self._effective_hw_for_file(filepath)
+            except Exception:
+                eh = ew = None
+            ref_w = int(ew or W)
+            ref_h = int(eh or H)
 
-        # --- bounding rect with small zoom-out ---
+        sx = float(W) / float(ref_w) if ref_w else 1.0
+        sy = float(H) / float(ref_h) if ref_h else 1.0
+
+        pts = np.asarray(points, dtype=np.float32)
+        pts_scaled = pts * np.array([sx, sy], dtype=np.float32)
+
+        # --- 5) Compute a padded crop around the scaled polygon ---
+        pts_i32 = pts_scaled.astype(np.int32).reshape(-1, 1, 2)
         x, y, w, h = cv2.boundingRect(pts_i32)
         zoom = 1.4
-        cx = x + w / 2.0
-        cy = y + h / 2.0
+        cx, cy = x + w / 2.0, y + h / 2.0
         new_w = int(round(w * zoom))
         new_h = int(round(h * zoom))
-
-        # clamp size to image bounds
         new_w = max(1, min(new_w, W))
         new_h = max(1, min(new_h, H))
-
         x_new = int(round(cx - new_w / 2.0))
         y_new = int(round(cy - new_h / 2.0))
         x_new = max(0, min(x_new, W - new_w))
         y_new = max(0, min(y_new, H - new_h))
 
-        cropped = image[y_new:y_new + new_h, x_new:x_new + new_w]
+        cropped = img[y_new:y_new + new_h, x_new:x_new + new_w]
         if cropped.size == 0:
-            print(f"Empty crop for {logical_name} in {filepath}")
+            print(f"[thumb] Empty crop for {logical_name} in {filepath}")
             return
 
-        # --- helpers (local, surgical) ---
+        # --- 6) Helpers to make a displayable preview from any dtype/C ---
         def _norm_to_u8(a):
             a = a.astype(np.float32, copy=False)
-            mn = float(a.min())
-            mx = float(a.max())
+            mn = float(np.nanmin(a)) if np.isfinite(a).any() else 0.0
+            mx = float(np.nanmax(a)) if np.isfinite(a).any() else 0.0
             if mx > mn:
                 return np.clip(((a - mn) * (255.0 / (mx - mn))).round(), 0, 255).astype(np.uint8)
             return np.zeros_like(a, dtype=np.uint8)
 
         def _to_bgr_preview(arr):
-            """
-            Return a 3-channel uint8 BGR image suitable for drawing/saving, from:
-            - 1-channel
-            - 3-channel
-            - 4-channel (drops alpha)
-            - >4 channels (takes first 3 bands as quicklook)
-            Handles uint16 by normalizing per channel.
-            """
+            # Handle 1/3/4/>4 channels, normalize u16/float to u8, and ensure contiguous BGR for OpenCV drawing
             if arr.ndim == 2:
                 return cv2.cvtColor(_norm_to_u8(arr), cv2.COLOR_GRAY2BGR)
-
             C = arr.shape[2]
-            # reduce to exactly 3 channels for OpenCV drawing
             if C == 3:
                 out = arr
             elif C >= 4:
-                out = arr[:, :, :3]  # drop alpha or extra bands
-            else:  # C == 2 (rare) -> pad third channel with first
+                out = arr[:, :, :3]  # first 3 bands as quicklook
+            else:  # C == 1 (already handled) or C == 2 → pad
                 out = np.dstack([arr, arr[:, :, :1]])
-
             if out.dtype == np.uint16:
-                # per-channel normalization
-                chans = [ _norm_to_u8(out[:, :, i]) for i in range(3) ]
+                chans = [_norm_to_u8(out[:, :, i]) for i in range(3)]
                 out8 = cv2.merge(chans)
             elif out.dtype != np.uint8:
-                out8 = _norm_to_u8(out)  # fallback
+                out8 = _norm_to_u8(out)
             else:
                 out8 = out
-
             return np.ascontiguousarray(out8)
 
-        # --- make BGR preview and draw polygon ---
         cropped_bgr = _to_bgr_preview(cropped)
 
-        adjusted = (pts - np.array([x_new, y_new], dtype=np.float32)).astype(np.int32).reshape(-1, 1, 2)
+        # --- 7) Draw polygon (scaled, then shifted by crop origin)
+        adjusted = (pts_scaled - np.array([x_new, y_new], dtype=np.float32)).astype(np.int32).reshape(-1, 1, 2)
         color = (255, 0, 0) if is_rgb else ((0, 255, 255) if is_thermal else (0, 255, 0))
-        thickness = 2
+        cv2.polylines(cropped_bgr, [adjusted], isClosed=True, color=color, thickness=2)
 
-        cv2.polylines(cropped_bgr, [adjusted], isClosed=True, color=color, thickness=thickness)
-
-        # --- resize to thumbnail, save to project/thumbnails ---
+        # --- 8) Resize to thumbnail & save
         thumbnail = cv2.resize(cropped_bgr, (200, 200), interpolation=cv2.INTER_AREA)
-
-        if getattr(self, "project_folder", None):
-            thumbnails_dir = os.path.join(self.project_folder, "thumbnails")
-        else:
-            thumbnails_dir = os.path.join(os.getcwd(), "thumbnails")
+        thumbnails_dir = os.path.join(self.project_folder, "thumbnails") if getattr(self, "project_folder", None) \
+                         else os.path.join(os.getcwd(), "thumbnails")
         os.makedirs(thumbnails_dir, exist_ok=True)
 
         image_type = "rgb" if is_rgb else ("thermal" if is_thermal else "multispectral")
@@ -10561,8 +10566,7 @@ class ProjectTab(QtWidgets.QWidget):
             cv2.imwrite(outpath, thumbnail)
             print(f"Thumbnail saved: {outpath}")
         except Exception as e:
-            print(f"Failed to save thumbnail for {logical_name} in {filepath}: {e}")
-
+            print(f"[thumb] Failed to save thumbnail for {logical_name} in {filepath}: {e}")
 
     def generate_all_thumbnails(self):
         """
@@ -10586,23 +10590,21 @@ class ProjectTab(QtWidgets.QWidget):
     def process_thumbnail(self, logical_name, filepath):
         """
         Processes a single thumbnail generation task.
+        Forces the path to go through _get_export_image (AX-aware), rather than a viewer's copy.
         """
-        import cv2
+        from .image_data import ImageData  # if needed in your module structure
         print(f"Generating thumbnail for Logical Name: {logical_name}, Filepath: {filepath}")
 
-        # try to reuse an already loaded viewer image, else load from disk
-        viewer = self.get_viewer_by_filepath(filepath) if hasattr(self, "get_viewer_by_filepath") else None
-        if viewer and hasattr(viewer, "image_data") and getattr(viewer.image_data, "image", None) is not None:
-            image_data = viewer.image_data
-        else:
-            try:
-                image_data = ImageData(filepath, mode=getattr(self, "mode", "dual_folder"))
-                print(f"Loaded image data for {filepath} outside of viewers.")
-            except Exception as e:
-                print(f"Failed to load image data for {filepath}: {e}")
-                return
+        # We only need the filepath; generate_thumbnail will call _get_export_image.
+        # Still pass an ImageData stub so the signature stays the same.
+        try:
+            image_data = ImageData(filepath, mode=getattr(self, "mode", "dual_folder"))
+        except Exception:
+            # Create a tiny shim with just .filepath so generate_thumbnail works
+            class _Shim: pass
+            image_data = _Shim()
+            image_data.filepath = filepath
 
-        # generate thumbnail
         self.generate_thumbnail(logical_name, image_data)
 
 

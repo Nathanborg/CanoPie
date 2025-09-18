@@ -79,6 +79,11 @@ class PolygonManager(QtWidgets.QDialog):
         self.layout.addWidget(self.list_widget)
         self.list_widget.itemDoubleClicked.connect(self.on_item_double_clicked)
 
+        self.list_widget.itemClicked.connect(self._on_list_item_clicked)
+        self.list_widget.itemSelectionChanged.connect(self._on_list_selection_changed)
+
+
+
         # === Import buttons ===
         self.import_button = QtWidgets.QPushButton("Import Polygons")
         self.layout.addWidget(self.import_button)
@@ -159,6 +164,49 @@ class PolygonManager(QtWidgets.QDialog):
         self.delete_all_polygons_button.setStyleSheet("background:#c62828; color:white; font-weight:600;")
         self.layout.addWidget(self.delete_all_polygons_button)
         self.delete_all_polygons_button.clicked.connect(self.on_delete_all_polygons)
+
+   
+    def _on_list_item_clicked(self, item):
+        group_name = item.data(QtCore.Qt.UserRole)
+
+        # If user is NOT holding multi-select modifiers, keep old "single select" behavior.
+        modifiers = QtWidgets.QApplication.keyboardModifiers()
+        is_multi = bool(modifiers & (QtCore.Qt.ControlModifier |
+                                     QtCore.Qt.ShiftModifier  |
+                                     QtCore.Qt.MetaModifier))  # Cmd on macOS
+
+        if not is_multi:
+            self.list_widget.blockSignals(True)
+            try:
+                self.list_widget.clearSelection()
+                item.setSelected(True)
+            finally:
+                self.list_widget.blockSignals(False)
+
+        self._on_list_selection_changed()
+    
+    def _on_list_selection_changed(self):
+        selected_groups = set(self.get_selected_polygon_groups())
+
+        for _vw_widget, viewer in self._iter_viewers():
+            # clear any prior selection
+            try:
+                viewer._scene.clearSelection()
+            except Exception:
+                if hasattr(viewer, "get_all_polygons"):
+                    for it in viewer.get_all_polygons():
+                        try:
+                            it.setSelected(False)
+                        except Exception:
+                            pass
+
+            # select items whose .name is in the selected group set
+            if hasattr(viewer, "get_all_polygons") and selected_groups:
+                for it in viewer.get_all_polygons():
+                    try:
+                        it.setSelected(getattr(it, "name", None) in selected_groups)
+                    except Exception:
+                        pass
 
     def _infer_image_type_from_group(self, group_name: str, default: str = "RGB") -> str:
         """
@@ -2784,16 +2832,27 @@ class PolygonManager(QtWidgets.QDialog):
     def on_item_double_clicked(self, item):
         group_name = item.data(QtCore.Qt.UserRole)
         if group_name:
-            # Switch to the root group associated with the group_name
             self.parent().switch_to_group(group_name)
-            # Then, select and center the polygons
             for widget in self.parent().viewer_widgets:
                 viewer = widget['viewer']
+
+                # NEW: clear any previous selections first
+                try:
+                    viewer._scene.clearSelection()
+                except Exception:
+                    if hasattr(viewer, "get_all_polygons"):
+                        for it in viewer.get_all_polygons():
+                            try:
+                                it.setSelected(False)
+                            except Exception:
+                                pass
+
                 for polygon_item in viewer.get_all_polygons():
                     if polygon_item.name == group_name:
                         polygon_item.setSelected(True)
                         viewer.centerOn(polygon_item)
                         viewer.setFocus()
         else:
-            pass  # Handle cases where group_name is invalid if necessary
+            pass
+
 

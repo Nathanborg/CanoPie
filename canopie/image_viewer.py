@@ -1082,14 +1082,84 @@ class ImageViewer(QtWidgets.QGraphicsView):
         else:
             super(ImageViewer, self).mouseDoubleClickEvent(event)
 
+    def _find_project_owner(self):
+        """
+        Walk up parents to find the object that owns project_folder + all_polygons.
+        Returns that owner or None.
+        """
+        w = self
+        # Avoid sip.isdeleted surprises; stop if any parent disappears
+        while w is not None:
+            try:
+                if hasattr(w, "project_folder") and hasattr(w, "all_polygons"):
+                    return w
+            except Exception:
+                pass
+            w = w.parent()
+        return None
+
+
     def keyPressEvent(self, event):
-        if event.key() == QtCore.Qt.Key_Delete:
-            for item in self._scene.selectedItems():
-                if isinstance(item, EditablePolygonItem) or isinstance(item, EditablePointItem):
+        if event.key() in (QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace):
+            selected = list(self._scene.selectedItems())
+            if not selected:
+                event.accept()
+                return
+
+            # We delete only the first selected item (keeps your original behavior)
+            item = selected[0]
+            if isinstance(item, (EditablePolygonItem, EditablePointItem)):
+                group_name = getattr(item, "name", "") or ""
+                fp = getattr(getattr(self, "image_data", None), "filepath", None)
+
+                # 1) remove from scene + viewer memory
+                try:
                     self._scene.removeItem(item)
-                    self.polygons = [p for p in self.polygons if p['item'] != item]
-                    self.polygon_changed.emit()
-                    break
+                except Exception:
+                    pass
+                self.polygons = [p for p in self.polygons if p.get('item') is not item]
+
+                # 2) remove JSON + parent map (robust owner lookup)
+                owner = self._find_project_owner()
+                if owner and fp and group_name:
+                    try:
+                        import os, logging
+                        polygons_dir = os.path.join(owner.project_folder, "polygons")
+                        base = os.path.splitext(os.path.basename(fp))[0]
+                        json_path = os.path.join(polygons_dir, f"{group_name}_{base}_polygons.json")
+
+                        # Delete file on disk (if present)
+                        if os.path.exists(json_path):
+                            os.remove(json_path)
+
+                        # Prune in-memory map
+                        ap = getattr(owner, "all_polygons", None)
+                        if isinstance(ap, dict):
+                            mapping = ap.get(group_name, {})
+                            mapping.pop(fp, None)
+                            if not mapping:
+                                ap.pop(group_name, None)
+
+                        # Persist + refresh UI
+                        if hasattr(owner, "save_polygons_to_json"):
+                            try:
+                                owner.save_polygons_to_json()
+                            except Exception:
+                                pass
+                        if hasattr(owner, "update_polygon_manager"):
+                            try:
+                                owner.update_polygon_manager()
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        logging.error(f"Delete polygon JSON failed for '{group_name}': {e}")
+
+                # 3) notify
+                self.polygon_changed.emit()
+                event.accept()
+                return
+
+            # Not a polygon/point item -> fall through
             event.accept()
         else:
             super(ImageViewer, self).keyPressEvent(event)
