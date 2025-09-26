@@ -2,6 +2,7 @@
 
 ## Project Description
 CanoPie is an image analysis tool for RGB, multispectral, and multitemporal data, designed for forest and agricultural canopy studies. With an intuitive PyQt5-based GUI, it enables researchers to process UAV and phenocam imagery (multispectral, thermal, and RGB), draw and manage polygons for data extraction, compute image statistics, and retrieve metadata directly via ExifTool,  all without relying on heavy photogrammetry pipelines.
+Canopie's core functionality relies on libraries such as OpenCV, tiffile, and PyQt5.
 
 Unlike orthomosaics, which can distort radiometry and demand large storage and computing resources, CanoPie provides fast, direct access to raw image data while preserving metadata and maintaining spectral integrity.
 <img width="800" height="800" alt="Canopie_fig1" src="https://github.com/user-attachments/assets/02aac60c-c71c-42b0-8d3c-acd9f4233f0d" />
