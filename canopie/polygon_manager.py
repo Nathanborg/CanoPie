@@ -65,11 +65,54 @@ from .utils import *
 class PolygonManager(QtWidgets.QDialog):
     clear_all_polygons_signal = QtCore.pyqtSignal()  # Signal to clear all polygons across all images
     edit_group_signal = QtCore.pyqtSignal(str)       # Signal to initiate editing of a specific group
+    polygons_visibility_changed = QtCore.pyqtSignal(bool)  # Signal when Show Polys checkbox is toggled
 
     def __init__(self, parent=None):
         super(PolygonManager, self).__init__(parent)
         self.setWindowTitle(f"{getattr(self.parent(), 'project_name', 'Project')}")
+        
+        # Remove standard Help (?) button from title bar
+        self.setWindowFlags(self.windowFlags() & ~QtCore.Qt.WindowContextHelpButtonHint)
+
         self.layout = QtWidgets.QVBoxLayout(self)
+
+        # === Show Polygons & Labels Checkboxes (at the very top) ===
+        self.top_controls_layout = QtWidgets.QHBoxLayout()
+        self.layout.addLayout(self.top_controls_layout)
+
+        self.show_polys_checkbox = QtWidgets.QCheckBox("Show Polys")
+        self.show_polys_checkbox.setStyleSheet("""
+            QCheckBox::indicator:checked {
+                background-color: #FFD700; 
+                border: 1px solid #006400;
+            }
+            QCheckBox::indicator:unchecked {
+                background-color: white; 
+                border: 1px solid gray;
+            }
+        """)
+        self.show_polys_checkbox.setChecked(True)  # Default: polygons visible
+        self.show_polys_checkbox.setToolTip("Toggle visibility of all polygons in viewers")
+        self.show_polys_checkbox.stateChanged.connect(self._on_show_polys_changed)
+        self.top_controls_layout.addWidget(self.show_polys_checkbox)
+
+        # Show Labels Checkbox
+        self.show_labels_checkbox = QtWidgets.QCheckBox("Show Labels")
+        self.show_labels_checkbox.setStyleSheet("""
+            QCheckBox::indicator:checked {
+                background-color: #FFD700; 
+                border: 1px solid #006400;
+            }
+            QCheckBox::indicator:unchecked {
+                background-color: white; 
+                border: 1px solid gray;
+            }
+        """)
+        self.show_labels_checkbox.setChecked(True)
+        self.show_labels_checkbox.setToolTip("Toggle visibility of polygon labels")
+        self.show_labels_checkbox.stateChanged.connect(self._on_show_labels_changed)
+        self.top_controls_layout.addWidget(self.show_labels_checkbox)
+        self.top_controls_layout.addStretch()
 
         # === List ===
         self.list_widget = QtWidgets.QListWidget()
@@ -79,13 +122,9 @@ class PolygonManager(QtWidgets.QDialog):
         self.layout.addWidget(self.list_widget)
         self.list_widget.itemDoubleClicked.connect(self.on_item_double_clicked)
 
-        self.list_widget.itemClicked.connect(self._on_list_item_clicked)
-        self.list_widget.itemSelectionChanged.connect(self._on_list_selection_changed)
-
-
-
         # === Import buttons ===
         self.import_button = QtWidgets.QPushButton("Import Polygons")
+        self.import_button.setStyleSheet("background:#2e7d32; color:white; font-weight:600; padding:8px; border-radius:4px;")
         self.layout.addWidget(self.import_button)
         self.import_button.clicked.connect(self.import_polygons)
 
@@ -130,6 +169,7 @@ class PolygonManager(QtWidgets.QDialog):
         self.correct_polygons_button.clicked.connect(self.correct_polygons)
 
         self.import_project_button = QtWidgets.QPushButton("Import Polygons from Project")
+        self.import_project_button.setStyleSheet("background:#2e7d32; color:white; font-weight:600; padding:8px; border-radius:4px;")
         self.import_project_button.setToolTip(
             "Pick a folder with polygon JSONs; I'll find nearest images, correct & fan-out, then import them."
         )
@@ -142,10 +182,12 @@ class PolygonManager(QtWidgets.QDialog):
 
         # === Misc buttons ===
         self.clear_all_button = QtWidgets.QPushButton("Clear All Groups")
+        self.clear_all_button.setStyleSheet("background:#424242; color:white; font-weight:600; padding:8px; border-radius:4px;")
         self.layout.addWidget(self.clear_all_button)
         self.clear_all_button.clicked.connect(self.on_clear_all_polygons)
 
         self.close_button = QtWidgets.QPushButton("Close")
+        self.close_button.setStyleSheet("background:#424242; color:white; font-weight:600; padding:8px; border-radius:4px;")
         self.layout.addWidget(self.close_button)
         self.close_button.clicked.connect(self.close)
 
@@ -164,49 +206,184 @@ class PolygonManager(QtWidgets.QDialog):
         self.delete_all_polygons_button.setStyleSheet("background:#c62828; color:white; font-weight:600;")
         self.layout.addWidget(self.delete_all_polygons_button)
         self.delete_all_polygons_button.clicked.connect(self.on_delete_all_polygons)
+        self.list_widget.itemClicked.connect(self.on_item_clicked_select_in_viewers)
+        
+    def _on_show_labels_changed(self):
+        """
+        Called when 'Show Labels' checkbox is toggled.
+        Updates label visibility in all viewers.
+        """
+        checked = self.show_labels_checkbox.isChecked()
+        for vw_widget, viewer in self._iter_viewers():
+            if hasattr(viewer, "set_labels_visible"):
+                viewer.set_labels_visible(checked)
 
-   
-    def _on_list_item_clicked(self, item):
-        group_name = item.data(QtCore.Qt.UserRole)
-
-        # If user is NOT holding multi-select modifiers, keep old "single select" behavior.
-        modifiers = QtWidgets.QApplication.keyboardModifiers()
-        is_multi = bool(modifiers & (QtCore.Qt.ControlModifier |
-                                     QtCore.Qt.ShiftModifier  |
-                                     QtCore.Qt.MetaModifier))  # Cmd on macOS
-
-        if not is_multi:
-            self.list_widget.blockSignals(True)
-            try:
-                self.list_widget.clearSelection()
-                item.setSelected(True)
-            finally:
-                self.list_widget.blockSignals(False)
-
-        self._on_list_selection_changed()
-    
-    def _on_list_selection_changed(self):
-        selected_groups = set(self.get_selected_polygon_groups())
-
-        for _vw_widget, viewer in self._iter_viewers():
-            # clear any prior selection
-            try:
-                viewer._scene.clearSelection()
-            except Exception:
-                if hasattr(viewer, "get_all_polygons"):
+    def _select_group_in_viewers(self, group_name: str, additive: bool = False, center: bool = True):
+        """
+        Select only the polygons named `group_name` in all viewers.
+        If additive is False, clear any previous polygon selections first.
+        If center is True, perform "Zoom to Polygon" logic (Fit + Padding)
+        and then ZOOM OUT by 10% (scale 0.9) as requested.
+        """
+        if not group_name:
+            return
+            
+        # First pass: select the polygon items
+        for vw_widget, viewer in self._iter_viewers():
+            # Clear previous selections (only polygon items) unless additive
+            if not additive and hasattr(viewer, "get_all_polygons"):
+                try:
                     for it in viewer.get_all_polygons():
                         try:
                             it.setSelected(False)
                         except Exception:
                             pass
+                except Exception:
+                    pass
 
-            # select items whose .name is in the selected group set
-            if hasattr(viewer, "get_all_polygons") and selected_groups:
+            # Select the requested group
+            if hasattr(viewer, "get_all_polygons"):
                 for it in viewer.get_all_polygons():
+                    if getattr(it, "name", None) == group_name:
+                        try:
+                            it.setSelected(True)
+                        except Exception:
+                            pass
+        
+        # Second pass: "Zoom to Polygon" + 10% Zoom Out
+        if center:
+            for vw_widget, viewer in self._iter_viewers():
+                r = self._get_polygon_scene_rect(vw_widget, viewer, group_name)
+                logging.debug(f"_select_group_in_viewers: group={group_name}, rect={r}")
+                if r and r.isValid():
                     try:
-                        it.setSelected(getattr(it, "name", None) in selected_groups)
-                    except Exception:
-                        pass
+                        # 1. Enforce Minimum Size (same as zoom_to_groups)
+                        min_dim = 100.0
+                        if r.width() < min_dim:
+                            cx = r.center().x()
+                            r.setLeft(cx - min_dim/2)
+                            r.setRight(cx + min_dim/2)
+                        if r.height() < min_dim:
+                            cy = r.center().y()
+                            r.setTop(cy - min_dim/2)
+                            r.setBottom(cy + min_dim/2)
+
+                        # 2. Standard Padding (same as zoom_to_groups: 20%)
+                        pad_x = max(50.0, r.width() * 0.20)
+                        pad_y = max(50.0, r.height() * 0.20)
+                        
+                        view_rect = r.adjusted(-pad_x, -pad_y, pad_x, pad_y)
+                        
+                        # 3. Fit in View (The "Zoom to Polygon" step)
+                        viewer.fitInView(view_rect, QtCore.Qt.KeepAspectRatio)
+                        viewer.centerOn(view_rect.center())
+                        
+                        # 4. Zoom Out 10% ("redies the zoom 10%")
+                        # scale(0.9, 0.9) shrinks the view matrix, effectively zooming OUT
+                        viewer.scale(0.9, 0.9)
+                        
+                        viewer.setFocus()
+                    except Exception as e:
+                        logging.debug(f"_select_group_in_viewers: fit+scale failed: {e}")
+
+    def _get_polygon_scene_rect(self, viewer_widget, viewer, group_name):
+        """
+        Compute the BOUNDING RECT of the polygon geometry in scene coordinates.
+        
+        Uses robust coordinate mapping (via _ZoomBar logic) to handle:
+        - Resize (scaling)
+        - Crop (translation + scaling)
+        - Rotation
+        
+        Returns a QRectF covering the polygon geometry (NOT the label).
+        """
+        # Get viewer info
+        idata = viewer_widget.get("image_data") if isinstance(viewer_widget, dict) else None
+        fp = getattr(idata, "filepath", None) if idata is not None else None
+        ax_config = getattr(idata, "ax_config", {}) if idata else {}
+        
+        if not fp:
+            return None
+        
+        # Get stored polygon data
+        parent = self.parent()
+        payload = (parent.all_polygons.get(group_name, {}) or {}).get(fp, {})
+        pts = payload.get("points") or []
+        
+        if not pts:
+            return None
+        
+        # Get stored reference size
+        ref_size = payload.get("image_ref_size") or {}
+        ref_w = int(ref_size.get("w") or 0)
+        ref_h = int(ref_size.get("h") or 0)
+        
+        # Fallback to raw shape if ref size missing
+        if not ref_w or not ref_h:
+            if idata and hasattr(idata, 'raw_shape') and idata.raw_shape:
+                ref_h, ref_w = idata.raw_shape[:2]
+        
+        # Get current Scene dimensions (this is what we map TO)
+        scene_w, scene_h = 100, 100
+        try:
+            sr = viewer.sceneRect()
+            scene_w, scene_h = sr.width(), sr.height()
+        except Exception:
+            pass
+            
+        scene_pts = []
+        
+        # Import mapper
+        try:
+            from .image_viewer import _ZoomBar
+            
+            for (x, y) in pts:
+                if ref_w > 0 and ref_h > 0:
+                    # Normalize raw (0..1)
+                    nx = float(x) / float(ref_w)
+                    ny = float(y) / float(ref_h)
+                    
+                    # Map to Scene Normalized (0..1) handling Crop/Resize/Rot
+                    nsx, nsy = _ZoomBar._map_point_raw_to_scene(
+                        nx, ny, ref_w, ref_h, scene_w, scene_h, ax_config
+                    )
+                    
+                    # Map to Absolute Scene
+                    sx = nsx * scene_w
+                    sy = nsy * scene_h
+                    scene_pts.append(QtCore.QPointF(sx, sy))
+                else:
+                    # No ref dims? Just assume direct mapping?
+                    scene_pts.append(QtCore.QPointF(x, y))
+
+        except ImportError:
+            # Fallback to simple scaling if _ZoomBar unavailable
+            logging.warning("Could not import _ZoomBar for polygon rect")
+            # Get pixmap dims
+            pixitem = getattr(viewer, '_image', None)
+            if pixitem and pixitem.pixmap() and not pixitem.pixmap().isNull():
+                vw, vh = pixitem.pixmap().width(), pixitem.pixmap().height()
+                if ref_w > 0 and ref_h > 0:
+                    sx = float(vw) / float(ref_w)
+                    sy = float(vh) / float(ref_h)
+                    for (x, y) in pts:
+                        scene_pts.append(QtCore.QPointF(x * sx, y * sy))
+        
+        if scene_pts:
+            poly = QtGui.QPolygonF(scene_pts)
+            return poly.boundingRect()
+        
+        return None
+
+    def on_item_clicked_select_in_viewers(self, item: QtWidgets.QListWidgetItem):
+        """
+        Single click in the list -> select ONLY that polygon in viewers,
+        unless Ctrl/Shift are held (additive selection).
+        """
+        group_name = item.data(QtCore.Qt.UserRole)
+        mods = QtWidgets.QApplication.keyboardModifiers()
+        additive = bool(mods & (Qt.ControlModifier | Qt.ShiftModifier))
+        self._select_group_in_viewers(group_name, additive=additive)
 
     def _infer_image_type_from_group(self, group_name: str, default: str = "RGB") -> str:
         """
@@ -227,10 +404,11 @@ class PolygonManager(QtWidgets.QDialog):
     def import_polygons_from_files(self, file_paths):
         """
         Import a provided list of *_polygons.json files with viewer-aware scaling.
-        Persists polygons in IMAGE coords at the target's EFFECTIVE size
-        (post-.ax) and draws via target->viewer->scene mapping.
+        Persists polygons in IMAGE coords at the target's EFFECTIVE size (post-.ax)
+        and draws via target->viewer->scene mapping.
         """
         import os, re, json, logging
+        import numpy as np
         from PyQt5 import QtCore, QtGui
         logger = logging.getLogger(__name__)
         logger.info(f"Starting direct import for {len(file_paths)} corrected polygon file(s).")
@@ -239,22 +417,43 @@ class PolygonManager(QtWidgets.QDialog):
             logger.warning("No files provided to import_polygons_from_files().")
             return
 
-        # ---------- parent helpers / wrappers ----------
         parent = self.parent()
 
+        # -------- helpers --------
         def _all_viewers_for_filepath(fp):
             out = []
-            for w in getattr(parent, 'viewer_widgets', []) or []:
+            viewer_widgets = getattr(parent, 'viewer_widgets', []) or []
+            # Normalize the search path for comparison
+            fp_norm = os.path.normpath(fp).lower() if fp else ""
+            logger.info(f"[_all_viewers_for_filepath] Looking for fp={fp} (normalized: {fp_norm})")
+            logger.info(f"[_all_viewers_for_filepath] Total viewer_widgets: {len(viewer_widgets)}")
+            for i, w in enumerate(viewer_widgets):
                 idata = w.get('image_data')
-                if idata is not None and getattr(idata, 'filepath', None) == fp:
-                    out.append(w.get('viewer'))
+                idata_fp = getattr(idata, 'filepath', None) if idata is not None else None
+                # Normalize widget path for comparison
+                idata_fp_norm = os.path.normpath(idata_fp).lower() if idata_fp else ""
+                logger.info(f"[_all_viewers_for_filepath] Widget {i}: filepath={idata_fp} (normalized: {idata_fp_norm})")
+                if idata_fp_norm and idata_fp_norm == fp_norm:
+                    v = w.get('viewer')
+                    if v:
+                        out.append(v)
+                        logger.info(f"[_all_viewers_for_filepath] Found matching viewer at widget {i}")
             v = parent.get_viewer_by_filepath(fp)
             if v and v not in out:
                 out.append(v)
-            return [x for x in out if x]
+                logger.info(f"[_all_viewers_for_filepath] Found via get_viewer_by_filepath")
+            logger.info(f"[_all_viewers_for_filepath] Total viewers found: {len(out)}")
+            return out
 
         def _eff_size(fp):
-            # Prefer parent's fast .ax-aware size if available
+            """
+            Try in order:
+              1) parent's .ax-aware fast size
+              2) any open viewer image size
+              3) disk header (cv2.imdecode)
+              4) unknown -> (None, None)
+            """
+            # 1) post-.ax fast path
             try:
                 if hasattr(parent, "_size_after_ax_fast_from_file"):
                     h, w = parent._size_after_ax_fast_from_file(fp)
@@ -262,7 +461,7 @@ class PolygonManager(QtWidgets.QDialog):
                         return int(h), int(w)
             except Exception:
                 pass
-            # fallback to a live viewer image size
+            # 2) viewer image size
             vlist = _all_viewers_for_filepath(fp)
             if vlist:
                 try:
@@ -272,10 +471,20 @@ class PolygonManager(QtWidgets.QDialog):
                         return int(h), int(w)
                 except Exception:
                     pass
+            # 3) disk header
+            try:
+                import cv2
+                im = cv2.imdecode(np.fromfile(fp, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+                if im is not None:
+                    h, w = im.shape[:2]
+                    return int(h), int(w)
+            except Exception:
+                pass
+            # 4) give up
             return (None, None)
 
         def _viewer_basis_hw(viewer, fallback_hw):
-            # Use parent's helper if present, else fallback to viewer image or provided
+            # Prefer parent helper; else viewer image; else fallback
             try:
                 if hasattr(parent, "_viewer_basis_hw"):
                     return parent._viewer_basis_hw(viewer, fallback_hw=fallback_hw)
@@ -291,26 +500,60 @@ class PolygonManager(QtWidgets.QDialog):
             th, tw = fallback_hw
             return (int(th or 0), int(tw or 0))
 
-        def _scene_pts_for_viewer(viewer, img_pts):
-            # If parent can map image->scene, use it; else assume viewer.add_polygon accepts image coords
-            if hasattr(parent, "image_to_scene_coords"):
-                return [ parent.image_to_scene_coords(viewer, QtCore.QPointF(x, y)) for (x, y) in img_pts ]
-            return [ QtCore.QPointF(x, y) for (x, y) in img_pts ]
+        def _scene_pts_for_viewer(viewer, img_pts, img_size_hw=None):
+            """
+            Convert image coordinates to scene coordinates.
+            img_pts: list of (x, y) tuples in IMAGE coordinates
+            img_size_hw: (height, width) of the image basis for img_pts, or None to use viewer.image_data
+            """
+            if viewer is None or not hasattr(viewer, '_image') or viewer._image is None:
+                return [QtCore.QPointF(x, y) for (x, y) in img_pts]
+            
+            pixitem = viewer._image
+            pixmap = pixitem.pixmap()
+            if pixmap is None or pixmap.isNull():
+                return [QtCore.QPointF(x, y) for (x, y) in img_pts]
+            
+            pw, ph = max(1, pixmap.width()), max(1, pixmap.height())
+            
+            # Determine the image basis size
+            if img_size_hw and img_size_hw[0] and img_size_hw[1]:
+                img_h, img_w = img_size_hw
+            elif hasattr(viewer, 'image_data') and viewer.image_data is not None:
+                img = getattr(viewer.image_data, 'image', None)
+                if img is not None:
+                    img_h, img_w = img.shape[:2]
+                else:
+                    img_h, img_w = ph, pw
+            else:
+                img_h, img_w = ph, pw
+            
+            result = []
+            for (x, y) in img_pts:
+                # Scale from image coords to pixmap coords
+                x_pix = float(x) * (pw / float(img_w))
+                y_pix = float(y) * (ph / float(img_h))
+                # Map pixmap coords to scene coords
+                scene_pt = pixitem.mapToScene(QtCore.QPointF(x_pix, y_pix))
+                result.append(scene_pt)
+            return result
 
+        # id → root_name
         try:
             id_to_root = parent.id_to_root
         except AttributeError:
             logger.critical("Internal error: 'id_to_root' attribute not found in MainWindow.")
             return
 
+        # Collect all known image paths
         all_image_filepaths = []
         for _gn, fps in getattr(parent, "multispectral_image_data_groups", {}).items():
             all_image_filepaths.extend(fps or [])
         for _gn, fps in getattr(parent, "thermal_rgb_image_data_groups", {}).items():
             all_image_filepaths.extend(fps or [])
-
         possible_exts = ['.tif', '.tiff', '.jpg', '.jpeg', '.png']
 
+        # Optional root mapping
         root_mapping_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'root_mapping.json')
         try:
             with open(root_mapping_path, 'r', encoding='utf-8') as rm_file:
@@ -318,6 +561,7 @@ class PolygonManager(QtWidgets.QDialog):
         except Exception:
             root_mapping = {}
 
+        # Canonical index
         canon_to_paths = {}
         for fp in all_image_filepaths:
             base = os.path.splitext(os.path.basename(fp))[0].lower()
@@ -361,7 +605,7 @@ class PolygonManager(QtWidgets.QDialog):
                 logger.warning(f"[{idx}] Skipping invalid polygon (no points): {file_path}")
                 continue
 
-            # normalize root
+            # normalize root from JSON
             if isinstance(root_raw, int):
                 root_str = str(root_raw)
             elif isinstance(root_raw, str):
@@ -373,16 +617,16 @@ class PolygonManager(QtWidgets.QDialog):
             except Exception:
                 root_num = None
 
+            # Verify root exists in current project, fall back to current root if not
             root_name = id_to_root.get(root_num) if root_num is not None else None
             if not root_name:
                 fb_root_id, fb_root_name, _ = self._fallback_current_root_and_first_viewer()
                 logger.warning(f"[{idx}] Unknown root '{root_raw}'. Falling back to current '{fb_root_name}' (id {fb_root_id}).")
                 root_str = fb_root_id
-                try:
-                    root_num = int(fb_root_id)
-                except Exception:
-                    root_num = 0
+                root_num = int(fb_root_id) if fb_root_id else 0
                 root_name = fb_root_name
+            
+            logger.info(f"[{idx}] Using root: {root_str} (name: {root_name})")
 
             # parse filename: <group>_<imgbase>_polygons.json
             base_name = os.path.basename(file_path)
@@ -398,6 +642,8 @@ class PolygonManager(QtWidgets.QDialog):
 
             # resolve image
             image_fp = _search_image(imgbase)
+            logger.info(f"[{idx}] Searching for image base '{imgbase}' -> found: {image_fp}")
+            
             if not image_fp and root_mapping:
                 # last-chance map by type
                 b = base_name.lower()
@@ -407,15 +653,17 @@ class PolygonManager(QtWidgets.QDialog):
                     img_type = 'thermal'
                 else:
                     img_type = self._infer_image_type_from_group(group_name, default='RGB')
-                entry = root_mapping.get(str(root_num))
+                entry = root_mapping.get(str(root_num)) if root_num is not None else None
                 if isinstance(entry, dict):
                     mapped = entry.get(img_type)
                     if isinstance(mapped, str) and mapped:
                         image_fp = _search_image(os.path.splitext(mapped)[0])
+                        logger.info(f"[{idx}] Root mapping fallback for {img_type} -> {image_fp}")
 
             if not image_fp:
                 fb_root_id, fb_root_name, fb_fp = self._fallback_current_root_and_first_viewer()
                 image_fp = fb_fp
+                logger.info(f"[{idx}] No image found, using fallback viewer filepath: {image_fp}")
                 if not image_fp:
                     logger.warning(f"[{idx}] No resolvable image & no viewer; skipping '{base_name}'.")
                     continue
@@ -423,41 +671,43 @@ class PolygonManager(QtWidgets.QDialog):
 
             # ---------- scale to TARGET EFFECTIVE basis ----------
             th, tw = _eff_size(image_fp)
-            # fall back to a viewer if needed
+
+            # Try adopting a live viewer basis if unknown
             if not (th and tw):
-                vlist = _all_viewers_for_filepath(image_fp)
-                if vlist:
+                vlist_for_fp = _all_viewers_for_filepath(image_fp)
+                if vlist_for_fp:
                     try:
-                        img = getattr(vlist[0], "image_data", None)
-                        if img is not None and getattr(img, "image", None) is not None:
-                            th, tw = img.image.shape[:2]
+                        vimg = getattr(vlist_for_fp[0], "image_data", None)
+                        if vimg is not None and getattr(vimg, "image", None) is not None:
+                            th, tw = vimg.image.shape[:2]
                     except Exception:
                         pass
+
             if not (th and tw):
-                logger.warning(f"[{idx}] Could not determine effective size for '{image_fp}'. Using raw points.")
+                logger.warning(f"[{idx}] Could not determine effective size for '{image_fp}'. Falling back at draw time.")
                 th, tw = 0, 0
 
-            # Convert incoming to IMAGE coords first if stored as scene
+            # Convert to IMAGE coords if needed
             pts_image = pts_in
             if coord_space == "scene" and hasattr(parent, "_map_points_scene_to_image"):
                 try:
-                    pts_image = parent._map_points_scene_to_image(image_fp, pts_in, (th, tw, 1), polygon_data=polygon_data)
+                    size_hint = (th or 0, tw or 0, 1)
+                    pts_image = parent._map_points_scene_to_image(image_fp, pts_in, size_hint, polygon_data=polygon_data)
                 except Exception:
-                    pts_image = pts_in  # best effort
+                    pts_image = pts_in
 
-            # If source had a different image_ref_size, scale to target effective
+            # Scale from source image_ref_size to target effective basis
             src_w = int(image_ref.get('w') or 0)
             src_h = int(image_ref.get('h') or 0)
-            if src_w > 0 and src_h > 0 and tw and th and (src_w != tw or src_h != th):
+            if src_w > 0 and src_h > 0 and (tw and th) and (src_w != tw or src_h != th):
                 sx, sy = float(tw) / float(src_w), float(th) / float(src_h)
                 pts_image = [(float(x) * sx, float(y) * sy) for (x, y) in pts_image]
             else:
-                # If no ref size given, assume already in target basis; just cast to float
                 pts_image = [(float(x), float(y)) for (x, y) in pts_image]
 
             # ---------- persist (IMAGE coords @ target effective) ----------
-            self.parent().all_polygons.setdefault(group_name, {})
-            self.parent().all_polygons[group_name][image_fp] = {
+            parent.all_polygons.setdefault(group_name, {})
+            parent.all_polygons[group_name][image_fp] = {
                 'points': pts_image,
                 'coord_space': 'image',
                 'image_ref_size': {'w': int(tw or 0), 'h': int(th or 0)},
@@ -466,14 +716,25 @@ class PolygonManager(QtWidgets.QDialog):
                 'coordinates': coordinates,
                 'type': polygon_data.get('type', 'polygon'),
             }
+            # Mark this polygon as dirty for incremental save
+            if hasattr(parent, '_mark_polygon_dirty'):
+                parent._mark_polygon_dirty(group_name, image_fp)
+            logger.info(f"[ImportPolygons] Persisted polygon '{name}' for file: {image_fp}")
+            logger.info(f"[ImportPolygons] Points: {pts_image[:3]}... (total {len(pts_image)} points)")
+            logger.info(f"[ImportPolygons] Image ref size: w={tw}, h={th}")
 
             # ---------- draw on ALL viewers for that filepath ----------
-            for viewer in _all_viewers_for_filepath(image_fp):
+            viewers_found = _all_viewers_for_filepath(image_fp)
+            logger.info(f"[ImportPolygons] Found {len(viewers_found)} viewers for file: {image_fp}")
+            
+            for viewer in viewers_found:
                 vh, vw = _viewer_basis_hw(viewer, fallback_hw=(th, tw))
-                pts_view = pts_image
-                if all((tw, th, vw, vh)) and (tw != vw or th != vh):
-                    sx_v, sy_v = float(vw) / float(tw), float(vh) / float(th)
-                    pts_view = [(x * sx_v, y * sy_v) for (x, y) in pts_image]
+                logger.info(f"[ImportPolygons] Viewer basis: vw={vw}, vh={vh}")
+
+                # adopt viewer basis if effective unknown
+                tw_eff, th_eff = (tw, th)
+                if not (tw_eff and th_eff) and (vw and vh):
+                    tw_eff, th_eff = vw, vh
 
                 # remove existing same-name polygon (avoid dups)
                 if hasattr(viewer, "get_all_polygons"):
@@ -484,18 +745,27 @@ class PolygonManager(QtWidgets.QDialog):
                             except Exception:
                                 pass
 
-                scene_pts = _scene_pts_for_viewer(viewer, pts_view)
+                # Convert IMAGE coords (in effective basis) to SCENE coords
+                # Pass the effective image size so scaling is correct
+                scene_pts = _scene_pts_for_viewer(viewer, pts_image, img_size_hw=(th_eff, tw_eff))
+                logger.info(f"[ImportPolygons] Scene points: {[(p.x(), p.y()) for p in scene_pts[:3]]}... (total {len(scene_pts)})")
+                
                 qpoly = QtGui.QPolygonF(scene_pts)
                 if hasattr(viewer, "add_polygon_to_scene"):
                     viewer.add_polygon_to_scene(qpoly, name)
+                    logger.info(f"[ImportPolygons] Added polygon '{name}' to scene via add_polygon_to_scene")
                 else:
                     viewer.add_polygon(qpoly, name)
+                    logger.info(f"[ImportPolygons] Added polygon '{name}' to scene via add_polygon")
 
             imported += 1
 
-        # persist + refresh
+        # persist + refresh UI using fast incremental save
         try:
-            parent.save_polygons_to_json()
+            if hasattr(parent, 'save_incremental'):
+                parent.save_incremental()
+            else:
+                parent.save_polygons_to_json()
         except Exception as e:
             logger.error(f"Saving polygons failed: {e}")
         try:
@@ -672,6 +942,9 @@ class PolygonManager(QtWidgets.QDialog):
             source_project_name = poly_base
         results_dir = os.path.join(jsons_output_folder, f"JSONs_nearest_distance_Poly_{source_project_name}")
         os.makedirs(results_dir, exist_ok=True)
+        
+        # Get target project name
+        target_project_name = os.path.basename(os.path.normpath(project_folder)) if project_folder else "unknown"
 
         # Compute nearest and write results
         done, failed = 0, 0
@@ -689,21 +962,19 @@ class PolygonManager(QtWidgets.QDialog):
         self.corrected_dir = os.path.join(project_folder, "imported_polygons")
         os.makedirs(self.corrected_dir, exist_ok=True)
 
-        # Run correction/fan-out
+        # Run correction/fan-out with project names for metadata
         try:
-            self.run_correction_process()
+            corrected_files = self.run_correction_process(
+                source_project=source_project_name,
+                target_project=target_project_name
+            )
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Correction Error", f"Correction failed:\n{e}")
             return
 
-        corrected_files = [
-            os.path.join(self.corrected_dir, f)
-            for f in os.listdir(self.corrected_dir)
-            if f.lower().endswith("_polygons.json")
-        ]
         if not corrected_files:
             QtWidgets.QMessageBox.warning(self, "Nothing to Import",
-                                          "No corrected polygons were created in 'imported_polygons'.")
+                                          "No corrected polygons were created.")
             return
 
         self.import_polygons_from_files(corrected_files)
@@ -955,74 +1226,43 @@ class PolygonManager(QtWidgets.QDialog):
     def on_delete_all_polygons(self):
         """
         Permanently deletes ALL project polygon files and clears every viewer & in-memory structure.
-        Looks in <project_folder>/polygons (or ./polygons if no project folder).
+        Uses UndoStack for reversibility.
         """
         import os, logging
+        from canopie.project_tab import DeletePolygonCommand
 
         resp = QtWidgets.QMessageBox.question(
             self,
             "Delete ALL Polygons",
-            "This will permanently delete ALL saved polygon files for the entire project and remove overlays from every image. Continue?",
+            "This will delete ALL saved polygon files for the entire project. This action can be Undone. Continue?",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.No,
         )
         if resp != QtWidgets.QMessageBox.Yes:
             return
 
-        # Resolve polygons directory
-        if getattr(self.parent(), "project_folder", None):
-            polygons_dir = os.path.join(self.parent().project_folder, "polygons")
-        else:
-            polygons_dir = os.path.join(os.getcwd(), "polygons")
+        parent = self.parent()
+        if not parent:
+            return
 
-        deleted = 0
-        if os.path.isdir(polygons_dir):
-            for name in os.listdir(polygons_dir):
-                # only wipe files created by this app’s convention
-                if name.lower().endswith("_polygons.json"):
-                    fp = os.path.join(polygons_dir, name)
-                    try:
-                        os.remove(fp)
-                        deleted += 1
-                    except Exception as e:
-                        logging.error(f"Failed to delete polygon file {fp}: {e}")
-        else:
-            logging.info(f"Polygons directory not found: {polygons_dir}")
-
-        # Clear overlays from all viewers
+        parent.undo_stack.beginMacro("Delete ALL Polygons")
         try:
-            for widget in getattr(self.parent(), "viewer_widgets", []):
-                viewer = widget.get("viewer") if isinstance(widget, dict) else None
-                if viewer and hasattr(viewer, "clear_polygons"):
-                    viewer.clear_polygons()
-        except Exception as e:
-            logging.debug(f"Clearing viewer overlays failed: {e}")
+             # Iterate over a copy of group names since we might remove them
+             groups = list(parent.all_polygons.keys())
+             for group_name in groups:
+                 # Iterate over copy of filepaths
+                 filepaths = list(parent.all_polygons[group_name].keys())
+                 for filepath in filepaths:
+                     cmd = DeletePolygonCommand(parent, group_name, filepath)
+                     parent.undo_stack.push(cmd)
+                     
+             # Note: We do NOT delete orphaned files (files not in memory) to keep Undo consistent.
+             
+        finally:
+             parent.undo_stack.endMacro()
 
-        # Clear in-memory structures
-        try:
-            if hasattr(self.parent(), "all_polygons"):
-                self.parent().all_polygons.clear()
-        except Exception as e:
-            logging.debug(f"Clearing in-memory polygons failed: {e}")
+        logging.info("[PolygonManager] Deleted all polygons via UndoStack.")
 
-        # Refresh manager UI (and any other dependent views)
-        try:
-            if hasattr(self.parent(), "update_polygon_manager"):
-                self.parent().update_polygon_manager()
-            else:
-                self.set_polygons({})
-        except Exception as e:
-            logging.debug(f"Refreshing polygon manager failed: {e}")
-
-        QtWidgets.QMessageBox.information(
-            self, "Delete ALL Polygons", f"Deleted {deleted} file(s). All polygon overlays cleared."
-        )
-                # Quick-save the project state (no recompute)
-        try:
-            if hasattr(self.parent(), "save_project_quick"):
-                self.parent().save_project_quick(skip_recompute=True)
-        except Exception as e:
-            logging.debug(f"Quick-save after delete-all failed: {e}")
   
 
     def update_title(self):
@@ -1144,7 +1384,7 @@ class PolygonManager(QtWidgets.QDialog):
 
         return None
 
-    def run_correction_process(self):
+    def run_correction_process(self, source_project=None, target_project=None):
         """
         Correct polygons by retargeting each original polygon JSON to ALL images
         in the same root as the chosen closest image (fan-out across dual folders).
@@ -1157,6 +1397,8 @@ class PolygonManager(QtWidgets.QDialog):
         - Writes corrected polygons into self.corrected_dir:
             <group>_<dest_base>_polygons.json
         - Sets: poly["name"] = <group>, poly["root"] = <root-id as string>
+        - Adds: poly["import_metadata"] with source/target project info and distance
+        - Returns: list of created file paths
         """
         import os, re, json, logging
 
@@ -1164,6 +1406,9 @@ class PolygonManager(QtWidgets.QDialog):
         POLYGONS_DIR = self.polygons_dir
         CORRECTED_DIR = self.corrected_dir
         os.makedirs(CORRECTED_DIR, exist_ok=True)
+        
+        # Track files created in this run
+        created_files = []
 
         # ---- Load root_mapping.json (same convention as import_polygons) ----
         try:
@@ -1342,16 +1587,36 @@ class PolygonManager(QtWidgets.QDialog):
 
             poly["name"] = group
             poly["root"] = str(root_id) if root_id is not None else ""
+            
+            # Add import metadata with distance and source/target info
+            distance_meters = best.get("distance_meters", None)
+            target_coords = best.get("target_coordinates", {})
+            poly["import_metadata"] = {
+                "source_project": source_project or "unknown",
+                "source_polygon": group,
+                "source_image": src_base,
+                "target_project": target_project or "unknown",
+                "target_image": target_base,
+                "distance_meters": distance_meters,
+                "source_coordinates": target_coords,  # The original polygon's coordinates
+                "closest_image_path": closest_image,
+            }
 
             wrote_here = 0
             for dest_base in uniq_dest_bases:
                 out_name = f"{group}_{dest_base}_polygons.json"
                 out_path = os.path.join(CORRECTED_DIR, out_name)
+                
+                # Update target_image in metadata for each destination
+                poly_copy = copy.deepcopy(poly)
+                poly_copy["import_metadata"]["target_image"] = dest_base
+                
                 try:
                     with open(out_path, "w", encoding="utf-8") as f:
-                        json.dump(poly, f, indent=4)
+                        json.dump(poly_copy, f, indent=4)
                     logging.info(f"[CorrectPolygons] Wrote: {out_path}")
                     wrote_here += 1
+                    created_files.append(out_path)  # Track created file
                 except Exception as e:
                     logging.error(f"[CorrectPolygons] Failed to write {out_path}: {e}")
                     skipped += 1
@@ -1363,6 +1628,9 @@ class PolygonManager(QtWidgets.QDialog):
         logging.info(f"[CorrectPolygons] Done. Results files processed: {processed}, "
                      f"skipped: {skipped}, missing source: {missing_src}, "
                      f"extra fan-out files created: {fanout_count}")
+        
+        # Return the list of files created in this run
+        return created_files
 
     def _collect_group_dicts(self):
         """
@@ -1575,13 +1843,26 @@ class PolygonManager(QtWidgets.QDialog):
         return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
 
     def set_polygons(self, polygon_groups):
-        self.list_widget.clear()
-        for group_name in sorted(polygon_groups.keys(), key=self.natural_sort_key):
-            display_name = group_name or "Unnamed Group"
-            item = QtWidgets.QListWidgetItem(display_name)
-            # Store the group name in UserRole
-            item.setData(QtCore.Qt.UserRole, group_name)
-            self.list_widget.addItem(item)
+        """
+        PERFORMANCE OPTIMIZED: Only rebuild list if groups actually changed.
+        Caches group names and builds reverse index for fast root-based selection.
+        """
+        # Build set of current group names
+        new_groups = set(polygon_groups.keys()) if polygon_groups else set()
+        old_groups = getattr(self, '_cached_group_names', None)
+        
+        # Only rebuild list widget if groups changed
+        if old_groups is None or new_groups != old_groups:
+            self.list_widget.clear()
+            for group_name in sorted(polygon_groups.keys(), key=self.natural_sort_key):
+                display_name = group_name or "Unnamed Group"
+                item = QtWidgets.QListWidgetItem(display_name)
+                item.setData(QtCore.Qt.UserRole, group_name)
+                self.list_widget.addItem(item)
+            self._cached_group_names = new_groups
+            # Invalidate the reverse index since groups changed
+            self._groups_by_filepath = None
+        
         # After setting polygons, update the selection based on current_root
         self.update_selection_based_on_root()
 
@@ -1594,22 +1875,58 @@ class PolygonManager(QtWidgets.QDialog):
         self.current_root = current_root
         self.current_root_filepaths = set(image_data_groups.get(current_root, []))
         self.update_selection_based_on_root()
+    
+    def _build_reverse_index(self):
+        """Build reverse index: filepath -> set of group names (for fast selection lookup)."""
+        self._groups_by_filepath = {}
+        parent = self.parent()
+        if parent and hasattr(parent, 'all_polygons') and parent.all_polygons:
+            for group_name, file_dict in parent.all_polygons.items():
+                if isinstance(file_dict, dict):
+                    for fp in file_dict.keys():
+                        if fp not in self._groups_by_filepath:
+                            self._groups_by_filepath[fp] = set()
+                        self._groups_by_filepath[fp].add(group_name)
 
     def update_selection_based_on_root(self):
         """
+        PERFORMANCE OPTIMIZED: Uses reverse index for O(files_in_root) lookups.
         Automatically selects polygons associated with the current root.
         """
         if not self.current_root:
             return
-        self.list_widget.clearSelection()
-        for index in range(self.list_widget.count()):
-            item = self.list_widget.item(index)
-            group_name = item.data(QtCore.Qt.UserRole)
-            # Check if the group has any polygons in the current root
-            group_polygons = self.parent().all_polygons.get(group_name, {})
-            associated = any(fp in self.current_root_filepaths for fp in group_polygons.keys())
-            if associated:
-                item.setSelected(True)
+        
+        # Lazily build reverse index if needed
+        if not hasattr(self, '_groups_by_filepath') or self._groups_by_filepath is None:
+            self._build_reverse_index()
+        
+        groups_by_fp = self._groups_by_filepath
+        
+        if groups_by_fp is not None and hasattr(self, 'current_root_filepaths'):
+            # FAST PATH: O(files_in_root) instead of O(all_groups × all_files)
+            # Find all groups that have polygons on files in current root
+            groups_in_root = set()
+            for fp in self.current_root_filepaths:
+                if fp in groups_by_fp:
+                    groups_in_root.update(groups_by_fp[fp])
+            
+            # Now select only items whose group is in groups_in_root
+            self.list_widget.clearSelection()
+            for index in range(self.list_widget.count()):
+                item = self.list_widget.item(index)
+                group_name = item.data(QtCore.Qt.UserRole)
+                if group_name in groups_in_root:
+                    item.setSelected(True)
+        else:
+            # FALLBACK: Original O(N²) behavior if index build failed
+            self.list_widget.clearSelection()
+            for index in range(self.list_widget.count()):
+                item = self.list_widget.item(index)
+                group_name = item.data(QtCore.Qt.UserRole)
+                group_polygons = self.parent().all_polygons.get(group_name, {})
+                associated = any(fp in self.current_root_filepaths for fp in group_polygons.keys())
+                if associated:
+                    item.setSelected(True)
 
 
     def get_selected_polygon_groups(self):
@@ -1626,17 +1943,15 @@ class PolygonManager(QtWidgets.QDialog):
         target_groups = selected_groups if clicked_group in selected_groups else [clicked_group]
 
         menu = QtWidgets.QMenu(self)
+       
+        zoom_action = menu.addAction("Zoom to Polygon Points")
+        menu.addSeparator()
         edit_action = menu.addAction("Edit")
         delete_action = menu.addAction("Delete")
         copy_action = menu.addAction("Copy")
         move_action = menu.addAction("Move")
         copy_to_viewers_action = menu.addAction("Copy to Viewers (This Root)")
         delete_all_action = menu.addAction("Delete All Polygons")
-
-        # NEW: Zoom action
-        menu.addSeparator()
-        zoom_action = menu.addAction("Zoom to Polygon Points")
-
         menu.addSeparator()
         export_csv_action = menu.addAction("Export CSV (ML)")
         thumbs_action     = menu.addAction("Generate Thumbnails (ML)")
@@ -1672,147 +1987,154 @@ class PolygonManager(QtWidgets.QDialog):
             self.show_polygon_stats(groups)
             
     def show_polygon_stats(self, groups=None):
-        """
-        Scan the project's polygons folder and show counts:
-          - total *_polygons.json files (filtered to selected groups if provided)
-          - total polygons (same as files, one polygon/file by convention)
-          - number of distinct roots present
-          - per-root counts (and resolved root names when possible)
-          - per-group counts
-        """
-        import os, re, json
-        from collections import Counter
-
-        parent = self.parent()
-        # Resolve polygons directory
-        if getattr(parent, "project_folder", None):
-            polygons_dir = os.path.join(parent.project_folder, "polygons")
-        else:
-            polygons_dir = os.path.join(os.getcwd(), "polygons")
-
-        if not os.path.isdir(polygons_dir):
-            QtWidgets.QMessageBox.information(
-                self, "Polygon Stats",
-                f"No polygons directory found:\n{polygons_dir}"
-            )
-            return
-
-        # Compile list of *_polygons.json (optionally filtered by groups)
-        rx = re.compile(r'^(?P<group>.+?)_(?P<base>.+?)_polygons\.json$', re.IGNORECASE)
-        all_files = [f for f in os.listdir(polygons_dir) if f.lower().endswith("_polygons.json")]
-
-        # Keep only files that belong to requested groups (if any)
-        groups_set = set(groups or [])
-        files = []
-        for name in all_files:
-            m = rx.match(name)
-            if not m:
-                continue
-            g = m.group("group")
-            if groups_set and g not in groups_set:
-                continue
-            files.append(name)
-
-        total_files = len(files)
-        if total_files == 0:
-            scope = f"selected groups ({', '.join(groups_set)})" if groups_set else "project"
-            QtWidgets.QMessageBox.information(
-                self, "Polygon Stats",
-                f"No *_polygons.json files found in {scope}.\n\nFolder:\n{polygons_dir}"
-            )
-            return
-
-        # Read each file and aggregate stats
-        per_root = Counter()
-        per_group = Counter()
-        root_examples = {}  # root_label -> a couple of example files
-        broken = 0
-
-        # Resolve root id -> name map if available
-        id_to_root = getattr(parent, "id_to_root", {}) or {}
-
-        def _root_label(root_raw):
             """
-            Convert stored 'root' value to a human label: 'id (name)' when possible.
-            Accepts ints or strings. Falls back to 'unknown'.
+            Show counts based on the loaded project data (all_polygons) in memory.
+            Calculates:
+              - Total Polygons vs Point Sets
+              - For Point Sets: counts total individual dots
+              - Breakdowns per Root and per Group
             """
-            if root_raw is None:
-                return "unknown"
-            # normalize: try as int id
-            try:
-                rid = int(str(root_raw).strip())
-                rname = id_to_root.get(rid)
-                return f"{rid} ({rname})" if rname else str(rid)
-            except Exception:
-                # maybe the json stored a name already
-                s = str(root_raw).strip()
-                return s or "unknown"
+            import os
+            from collections import Counter
 
-        for name in files:
-            path = os.path.join(polygons_dir, name)
-            m = rx.match(name)
-            group_name = m.group("group") if m else "(unknown)"
-            per_group.update([group_name])
+            parent = self.parent()
+            # Access the in-memory dictionary loaded from project.json
+            all_polygons = getattr(parent, "all_polygons", {})
+            if not all_polygons:
+                 QtWidgets.QMessageBox.information(self, "Polygon Stats", "No polygons found in project data.")
+                 return
 
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception:
-                broken += 1
-                continue
+            # Resolve root id -> name map if available
+            id_to_root = getattr(parent, "id_to_root", {}) or {}
 
-            root_raw = data.get("root")
-            label = _root_label(root_raw)
-            per_root.update([label])
-            if label not in root_examples:
-                root_examples[label] = [name]
-            elif len(root_examples[label]) < 2:
-                root_examples[label].append(name)
+            def _root_label(root_raw):
+                """Helper to make root IDs readable (e.g. '0 (RGB)')"""
+                if root_raw is None or root_raw == "":
+                    return "No Root ID"
+                try:
+                    # Handle int/string conversions
+                    rid = int(float(str(root_raw).strip()))
+                    rname = id_to_root.get(rid)
+                    return f"{rid} ({rname})" if rname else str(rid)
+                except Exception:
+                    return str(root_raw).strip()
 
-        # Compose a readable report
-        distinct_roots = len(per_root)
-        scope = f"selected groups: {', '.join(sorted(groups_set))}" if groups_set else "all groups"
+            # --- Aggregation Logic ---
+            per_root = Counter()
+            per_group = Counter()
+            root_examples = {} # Store a filepath example for each root
+            
+            stats = {
+                'total_objects': 0,
+                'polygons': 0,
+                'point_sets': 0,
+                'total_individual_dots': 0
+            }
+            
+            groups_set = set(groups) if groups else set()
 
-        def _format_counter(cntr, title):
-            lines = [title]
-            # sort by count desc, then name
-            items = sorted(cntr.items(), key=lambda kv: (-kv[1], kv[0]))
-            width = max((len(k) for k, _ in items), default=0)
-            for k, v in items:
-                ex = root_examples.get(k, []) if cntr is per_root else []
-                ex_str = f"   e.g. {', '.join(ex)}" if ex else ""
-                lines.append(f"  {k.ljust(width)} : {v}{ex_str}")
-            return "\n".join(lines)
+            # Iterate: Group Name -> { FilePath: PolygonData }
+            for group_name, file_map in all_polygons.items():
+                # Filter if specific groups were requested
+                if groups_set and group_name not in groups_set:
+                    continue
+                
+                if not isinstance(file_map, dict):
+                    continue
+                    
+                # Iterate individual objects
+                for filepath, poly_data in file_map.items():
+                    if not isinstance(poly_data, dict):
+                        continue
+                    
+                    stats['total_objects'] += 1
+                    per_group[group_name] += 1
 
-        report = []
-        report.append(f"Polygons directory:\n{polygons_dir}\n")
-        report.append(f"Scope: {scope}")
-        report.append(f"JSON files found: {total_files}")
-        report.append(f"Total polygons:  {total_files}  (1 per file by convention)")
-        report.append(f"Distinct roots:  {distinct_roots}")
-        if broken:
-            report.append(f"Unreadable/invalid files: {broken}")
-        report.append("")  # spacer
-        report.append(_format_counter(per_root, "Per-root counts:"))
-        report.append("")  # spacer
-        report.append(_format_counter(per_group, "Per-group counts:"))
+                    # Check Type: Polygon or Point?
+                    # Default to 'polygon' if key is missing
+                    obj_type = poly_data.get('type', 'polygon')
+                    points_list = poly_data.get('points', [])
 
-        text = "\n".join(report)
+                    if obj_type == 'point':
+                        stats['point_sets'] += 1
+                        # Count how many [x,y] coordinates are in this point set
+                        num_dots = len(points_list)
+                        stats['total_individual_dots'] += num_dots
+                    else:
+                        stats['polygons'] += 1
 
-        # Show in a small scrollable dialog
-        dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("Polygon Stats")
-        lay = QtWidgets.QVBoxLayout(dlg)
-        edit = QtWidgets.QPlainTextEdit()
-        edit.setReadOnly(True)
-        edit.setPlainText(text)
-        edit.setMinimumSize(640, 420)
-        lay.addWidget(edit)
-        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
-        btns.rejected.connect(dlg.reject)
-        lay.addWidget(btns)
-        dlg.exec_()
+                    # Root Stats
+                    root_val = poly_data.get('root')
+                    label = _root_label(root_val)
+                    per_root[label] += 1
+                    
+                    # Capture an example filename for this root if we don't have one
+                    if label not in root_examples:
+                        root_examples[label] = [os.path.basename(filepath)]
+                    elif len(root_examples[label]) < 2:
+                        root_examples[label].append(os.path.basename(filepath))
 
+            # --- Formatting the Report ---
+            distinct_roots = len(per_root)
+            scope = f"selected groups ({len(groups_set)})" if groups_set else "ENTIRE PROJECT"
+
+            def _format_counter(cntr, title):
+                lines = [title]
+                if not cntr:
+                    lines.append("  (none)")
+                    return "\n".join(lines)
+                
+                # Sort by Count (descending), then Name
+                items = sorted(cntr.items(), key=lambda kv: (-kv[1], kv[0]))
+                width = max((len(str(k)) for k, _ in items), default=0)
+                
+                for k, v in items:
+                    # Add filename examples for Root stats
+                    ex_str = ""
+                    if cntr is per_root:
+                        ex = root_examples.get(k, [])
+                        if ex:
+                            short_ex = [e[:30]+"..." if len(e)>30 else e for e in ex]
+                            ex_str = f"   (e.g. {', '.join(short_ex)})"
+                    
+                    lines.append(f"  {str(k).ljust(width)} : {v}{ex_str}")
+                return "\n".join(lines)
+
+            report = []
+            report.append(f"Source: Project Data (Memory)")
+            report.append(f"Scope:  {scope}")
+            report.append("-" * 40)
+            report.append(f"TOTAL OBJECTS:      {stats['total_objects']}")
+            report.append(f"  - Polygons:       {stats['polygons']}")
+            report.append(f"  - Point Sets:     {stats['point_sets']}")
+            if stats['point_sets'] > 0:
+                report.append(f"    (containing {stats['total_individual_dots']} individual dots)")
+            report.append("-" * 40)
+            report.append(f"Active Roots:       {distinct_roots}")
+            report.append("")
+            report.append(_format_counter(per_root, "--- Counts by Root ID ---"))
+            report.append("")
+            report.append(_format_counter(per_group, "--- Counts by Group ---"))
+
+            text = "\n".join(report)
+
+            # --- Display Dialog ---
+            dlg = QtWidgets.QDialog(self)
+            dlg.setWindowTitle("Project Polygon Stats")
+            dlg.resize(700, 500)
+            lay = QtWidgets.QVBoxLayout(dlg)
+
+            edit = QtWidgets.QPlainTextEdit()
+            edit.setReadOnly(True)
+            edit.setFont(QtGui.QFont("Courier New", 10))
+            edit.setPlainText(text)
+            lay.addWidget(edit)
+
+            btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+            btns.rejected.connect(dlg.reject)
+            lay.addWidget(btns)
+
+            dlg.exec_()
     def _iter_viewers(self):
         """
         Yield (viewer_widget_dict, viewer) for all known viewers.
@@ -1824,80 +2146,73 @@ class PolygonManager(QtWidgets.QDialog):
             if viewer is not None:
                 yield (w, viewer)
 
+    def _on_show_polys_changed(self, state):
+        """Handle Show Polys checkbox state change."""
+        visible = (state == QtCore.Qt.Checked)
+        # Emit signal for ProjectTab to handle
+        self.polygons_visibility_changed.emit(visible)
+        # Also directly update all current viewers
+        self._set_all_polygons_visible(visible)
+
+    def _set_all_polygons_visible(self, visible):
+        """Set visibility of all polygons in all viewers."""
+        for _, viewer in self._iter_viewers():
+            if hasattr(viewer, "set_polygons_visible"):
+                viewer.set_polygons_visible(visible)
+
+    def are_polygons_visible(self):
+        """Return current state of Show Polys checkbox."""
+        return self.show_polys_checkbox.isChecked()
+
     def _scene_rect_for_group_on_viewer(self, viewer_widget, viewer, group_name):
         """
-        Compute a QRectF in scene coordinates covering all items/points for group_name
-        on the specified viewer. Falls back to stored points if items are not present.
+        DEPRECATED: Use _get_polygon_scene_rect instead.
+        This is kept for backwards compatibility - redirects to the new implementation.
         """
-        # 1) Try live scene items
-        combined_rect = None
-        if hasattr(viewer, "get_all_polygons"):
-            for it in viewer.get_all_polygons():
-                if getattr(it, "name", None) == group_name:
-                    try:
-                        r = it.mapToScene(it.boundingRect()).boundingRect()
-                    except Exception:
-                        # fallback if mapToScene fails
-                        r = it.boundingRect()
-                    combined_rect = r if combined_rect is None else combined_rect.united(r)
-
-        # 2) Fall back to stored points for this viewer's image (if available)
-        if combined_rect is None:
-            # try to get current image filepath from the viewer widget dict
-            idata = viewer_widget.get("image_data") if isinstance(viewer_widget, dict) else None
-            fp = getattr(idata, "filepath", None) if idata is not None else None
-            if fp:
-                payload = (self.parent().all_polygons.get(group_name, {}) or {}).get(fp, {})
-                pts = payload.get("points") or []
-                if pts:
-                    # Map to scene if parent provides a mapper, else treat as scene coords
-                    if hasattr(self.parent(), "image_to_scene_coords"):
-                        pts_scene = [ self.parent().image_to_scene_coords(viewer, QtCore.QPointF(x, y)) for (x, y) in pts ]
-                    else:
-                        pts_scene = [ QtCore.QPointF(x, y) for (x, y) in pts ]
-                    poly = QtGui.QPolygonF(pts_scene)
-                    combined_rect = poly.boundingRect()
-
-        # 3) pad a little so the view is tight but comfortable
-        if combined_rect and combined_rect.isValid():
-            pad = 30.0
-            combined_rect = combined_rect.adjusted(-pad, -pad, pad, pad)
-        return combined_rect
+        return self._get_polygon_scene_rect(viewer_widget, viewer, group_name)
 
     def zoom_to_groups(self, groups):
         """
-        Zoom every open viewer to tightly frame the polygons/points belonging to the given groups.
-        Uses fitInView, then applies a small extra zoom for a closer look.
+        Zoom every open viewer to frame the polygons/points belonging to the given groups.
+        Shows the polygon with surrounding image context for better orientation.
         """
         if not groups:
             return
         for vw_widget, viewer in self._iter_viewers():
             combined = None
             for g in groups:
-                r = self._scene_rect_for_group_on_viewer(vw_widget, viewer, g)
+                r = self._get_polygon_scene_rect(vw_widget, viewer, g)
+                logging.info(f"zoom_to_groups: group={g}, rect={r}")
                 if r and r.isValid():
                     combined = r if combined is None else combined.united(r)
 
-            if combined and combined.isValid() and combined.width() > 0 and combined.height() > 0:
-                # Prefer fitInView if available (typical QGraphicsView method)
+            if combined and combined.isValid():
+                logging.info(f"zoom_to_groups: combined rect center=({combined.center().x():.1f}, {combined.center().y():.1f})")
+                # Add extra context padding (show more of the surrounding image)
+                # Use 20% of the rect size as additional padding
+                pad_x = max(50.0, combined.width() * 0.20)
+                pad_y = max(50.0, combined.height() * 0.20)
+                view_rect = combined.adjusted(-pad_x, -pad_y, pad_x, pad_y)
+                
+                # Handle single-point or very small polygons - ensure minimum view size
+                min_size = 100.0
+                if view_rect.width() < min_size:
+                    expand_x = (min_size - view_rect.width()) / 2
+                    view_rect.adjust(-expand_x, 0, expand_x, 0)
+                if view_rect.height() < min_size:
+                    expand_y = (min_size - view_rect.height()) / 2
+                    view_rect.adjust(0, -expand_y, 0, expand_y)
+                
                 try:
-                    viewer.fitInView(combined, QtCore.Qt.KeepAspectRatio)
-                    # Tiny additional zoom-in (20%) for a closer look
-                    try:
-                        viewer.scale(1.2, 1.2)
-                    except Exception:
-                        pass
+                    viewer.fitInView(view_rect, QtCore.Qt.KeepAspectRatio)
+                    viewer.setFocus()
                 except Exception:
                     # Fallback: ensureVisible
                     try:
-                        viewer.ensureVisible(combined, 20, 20)
+                        viewer.ensureVisible(combined, 50, 50)
+                        viewer.centerOn(combined.center())
                     except Exception:
                         pass
-                try:
-                    viewer.centerOn(combined.center())
-                    viewer.setFocus()
-                except Exception:
-                    pass
 
 
     def _mlm_invoke(self, groups, kind: str):
@@ -1941,11 +2256,11 @@ class PolygonManager(QtWidgets.QDialog):
         for group_name in list(group_names or []):
             self.delete_all_polygons_for_group(group_name)
                     # Persist project.json too (no recompute)
-        try:
-            if hasattr(self.parent(), "save_project_quick"):
-                self.parent().save_project_quick(skip_recompute=True)
-        except Exception as e:
-            logging.debug(f"Quick-save after group delete-all failed: {e}")
+        #try:
+            #if hasattr(self.parent(), "save_project_quick"):
+              #  self.parent().save_project_quick(skip_recompute=True)
+       # except Exception as e:
+            #logging.debug(f"Quick-save after group delete-all failed: {e}")
 
     def copy_selected_polygons_to_current_root_viewers(self, groups=None):
         """
@@ -2069,7 +2384,7 @@ class PolygonManager(QtWidgets.QDialog):
         kwargs = dict(
             source_root=source_root,
             target_root=target_root,
-            broadcast_if_ambiguous=False,
+            broadcast_if_ambiguous=True,
             rescale=True,
             defer_viewer_update=defer_viewer_update,
             defer_save=True,
@@ -2109,6 +2424,7 @@ class PolygonManager(QtWidgets.QDialog):
             # keep the manager list in sync
             if hasattr(parent, "update_polygon_manager"):
                 parent.update_polygon_manager()
+                  # keep user on whatever root is currently visible
                 current_root = parent.get_current_root_name() if hasattr(parent, "get_current_root_name") else None
                 parent.refresh_viewer(root_name=current_root)
         except Exception:
@@ -2129,81 +2445,34 @@ class PolygonManager(QtWidgets.QDialog):
                         v.update()
                     except Exception:
                         pass
-                        
 
 
     def delete_all_polygons_for_group(self, group_name: str):
         """
-        Deletes EVERY polygon associated with the given group name across the whole project:
-          - removes overlays from all ImageViewers
-          - deletes *_polygons.json files for that group
-          - clears from in-memory self.parent().all_polygons[group_name]
-          - refreshes the manager UI
-        No confirmation popups here by design.
+        Deletes EVERY polygon associated with the given group name across the whole project.
+        Uses UndoStack.
         """
         import os, logging
-
-        # Resolve polygons directory
-        if getattr(self.parent(), "project_folder", None):
-            polygons_dir = os.path.join(self.parent().project_folder, "polygons")
-        else:
-            polygons_dir = os.path.join(os.getcwd(), "polygons")
+        from canopie.project_tab import DeletePolygonCommand
+        
+        parent = self.parent()
+        if not parent: return
 
         # Nothing to do if group absent
-        group_map = self.parent().all_polygons.get(group_name)
+        group_map = parent.all_polygons.get(group_name)
         if not group_map:
-            logging.info(f"[PolygonManager] No polygons stored for group '{group_name}'. Nothing to delete.")
             return
 
-        # 1) Remove overlays from all viewers for this group, on every filepath
-        for filepath in list(group_map.keys()):
-            viewer = self.parent().get_viewer_by_filepath(filepath)
-            if viewer and hasattr(viewer, "get_all_polygons"):
-                for item in list(viewer.get_all_polygons()):
-                    if getattr(item, "name", None) == group_name:
-                        try:
-                            viewer._scene.removeItem(item)
-                        except Exception:
-                            pass
-
-        # 2) Delete JSON files for this group across ALL images
-        deleted_files = 0
-        if os.path.isdir(polygons_dir):
-            for filepath in list(group_map.keys()):
-                base_filename = os.path.splitext(os.path.basename(filepath))[0]
-                polygon_filename = f"{group_name}_{base_filename}_polygons.json"
-                polygon_filepath = os.path.join(polygons_dir, polygon_filename)
-                if os.path.exists(polygon_filepath):
-                    try:
-                        os.remove(polygon_filepath)
-                        deleted_files += 1
-                    except Exception as e:
-                        logging.error(f"[PolygonManager] Failed to delete polygon file {polygon_filepath}: {e}")
-        else:
-            logging.debug(f"[PolygonManager] Polygons directory not found: {polygons_dir}")
-
-        # 3) Clear from in-memory map
+        parent.undo_stack.beginMacro(f"Delete Group '{group_name}'")
         try:
-            del self.parent().all_polygons[group_name]
-        except Exception:
-            self.parent().all_polygons.pop(group_name, None)
+            filepaths = list(group_map.keys())
+            for filepath in filepaths:
+                cmd = DeletePolygonCommand(parent, group_name, filepath)
+                parent.undo_stack.push(cmd)
+        finally:
+            parent.undo_stack.endMacro()
 
-        # 4) Refresh UI 
-        try:
-            if hasattr(self.parent(), "save_polygons_to_json"):
-                self.parent().save_polygons_to_json()
-        except Exception as e:
-            logging.debug(f"[PolygonManager] save_polygons_to_json failed after delete-all: {e}")
-
-        try:
-            if hasattr(self.parent(), "update_polygon_manager"):
-                self.parent().update_polygon_manager()
-            else:
-                self.set_polygons(self.parent().all_polygons)
-        except Exception as e:
-            logging.debug(f"[PolygonManager] update_polygon_manager failed after delete-all: {e}")
-
-        logging.info(f"[PolygonManager] Deleted all polygons for group '{group_name}'. Files removed: {deleted_files}")
+        logging.info(f"[PolygonManager] Deleted group '{group_name}' via UndoStack.")
 
     def delete_selected_polygons(self, groups=None):
         if groups is None:
@@ -2211,58 +2480,32 @@ class PolygonManager(QtWidgets.QDialog):
         if not groups:
             return  # Do nothing if no selection
 
+        parent = self.parent()
+        if not parent: return
+        
+        from canopie.project_tab import DeletePolygonCommand
+
         # Determine the polygons to delete
         groups_to_delete = set(groups)
-
-        # Determine the polygons directory
-        polygons_dir = os.path.join(
-            self.parent().project_folder, 'polygons') if self.parent().project_folder else os.path.join(os.getcwd(), 'polygons')
-
-        for group_name in groups_to_delete:
-            if group_name not in self.parent().all_polygons:
-                continue
-            # Iterate over all filepaths associated with the group
-            for filepath in list(self.parent().all_polygons[group_name].keys()):
-                if filepath not in self.current_root_filepaths:
-                    continue  # Skip if not in current root
-
-                viewer = self.parent().get_viewer_by_filepath(filepath)
-                if viewer:
-                    # Remove the polygon from the viewer
-                    if hasattr(viewer, "get_all_polygons"):
-                        for item in list(viewer.get_all_polygons()):
-                            if getattr(item, "name", None) == group_name:
-                                try:
-                                    viewer._scene.removeItem(item)
-                                except Exception:
-                                    pass
-                                break  # Assuming one polygon per group per image
-
-                # Determine the JSON file path
-                base_filename = os.path.splitext(os.path.basename(filepath))[0]
-                polygon_filename = f"{group_name}_{base_filename}_polygons.json"
-                polygon_filepath = os.path.join(polygons_dir, polygon_filename)
-
-                # Delete the JSON file if it exists
-                if os.path.exists(polygon_filepath):
-                    try:
-                        os.remove(polygon_filepath)
-                        print(f"Deleted polygon file: {polygon_filepath}")
-                    except Exception as e:
-                        print(f"Failed to delete polygon file {polygon_filepath}: {e}")
-
-                # Remove the polygon from the in-memory data structure
-                self.parent().all_polygons[group_name].pop(filepath, None)
-
-            # If the group has no more polygons, remove it from the dictionary
-            if not self.parent().all_polygons.get(group_name):
-                self.parent().all_polygons.pop(group_name, None)
-
-        # Refresh UI
-        self.parent().update_polygon_manager()
         
-
+        parent.undo_stack.beginMacro("Delete Selected Polygons")
+        try:
+            for group_name in groups_to_delete:
+                if group_name not in parent.all_polygons:
+                    continue
+                # Iterate over all filepaths associated with the group
+                filepaths = list(parent.all_polygons[group_name].keys())
+                for filepath in filepaths:
+                    if filepath not in self.current_root_filepaths:
+                        continue  # Skip if not in current root
+                    
+                    cmd = DeletePolygonCommand(parent, group_name, filepath)
+                    parent.undo_stack.push(cmd)
+        finally:
+            parent.undo_stack.endMacro()
         
+        # UI update is handled by commands
+
 
     def edit_selected_polygons(self, groups=None):
         if groups is None:
@@ -2615,215 +2858,251 @@ class PolygonManager(QtWidgets.QDialog):
 
     def import_polygons(self):
         """
-        Imports polygons from user-picked JSON files and adds them to the viewers.
-        Fallbacks:
-          - Unknown root -> use current root (and write that root into payload)
-          - Unresolvable image -> first viewer’s image
-          - Polygon 'name' forced to the group name (from filename) for viewer compatibility
+        Import user-picked polygon JSONs and apply them to the CURRENT viewers (both sides in dual mode).
+        Behavior:
+          • Force polygon 'name' = <group> (from filename).
+          • Force polygon 'root' = current root (id), regardless of what's in the file.
+          • Target images = images currently shown in viewers that belong to the current root.
+            Fallback: all images in that root (MS + paired Thermal by offset).
+          • Rescale using source image_ref_size -> target effective basis, then viewer-basis for drawing.
         """
-        import os, re, json, logging
+        import os, re, json, logging, numpy as np
+        from PyQt5 import QtCore, QtGui
         logger = logging.getLogger(__name__)
-        logger.info("Starting polygon import process.")
 
+        parent = self.parent()
         file_paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self, "Import Polygons", os.path.expanduser("~"), "JSON Files (*.json)"
         )
-        logger.info(f"Selected {len(file_paths)} JSON file(s) for import.")
         if not file_paths:
             return
 
-        # id -> root_name map
-        try:
-            id_to_root = self.parent().id_to_root
-        except AttributeError:
-            logger.critical("Internal error: 'id_to_root' attribute not found in MainWindow.")
-            return
-
-        # all images across groups
-        all_image_filepaths = []
-        for _group_name, filepaths in getattr(self.parent(), "multispectral_image_data_groups", {}).items():
-            all_image_filepaths.extend(filepaths or [])
-        for _group_name, filepaths in getattr(self.parent(), "thermal_rgb_image_data_groups", {}).items():
-            all_image_filepaths.extend(filepaths or [])
-        possible_extensions = ['.tif', '.tiff', '.jpg', '.jpeg', '.png']
-
-        # optional root_mapping
-        root_mapping_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'root_mapping.json')
-        try:
-            with open(root_mapping_path, 'r', encoding='utf-8') as rm_file:
-                root_mapping = json.load(rm_file)
-        except Exception:
-            root_mapping = {}
-
-        # canonical base -> [paths]
-        canon_to_paths = {}
-        for fp in all_image_filepaths:
-            base = os.path.splitext(os.path.basename(fp))[0].lower()
-            c = self._canonicalize_base(base)
-            canon_to_paths.setdefault(c, []).append(fp)
-
-        def search_image(filename_no_ext: str):
-            """Try exact basename (with known extensions), then canonicalized match."""
-            fn_lower = (filename_no_ext or "").lower()
-            # exact
-            for ext in possible_extensions:
-                expected_filename = fn_lower + ext
-                for fp in all_image_filepaths:
-                    if os.path.basename(fp).lower() == expected_filename:
-                        return os.path.abspath(fp)
-            # canonical
-            canon_q = self._canonicalize_base(fn_lower)
-            candidates = canon_to_paths.get(canon_q, [])
-            if candidates:
-                for fp in candidates:
-                    if fn_lower in os.path.splitext(os.path.basename(fp))[0].lower():
-                        return os.path.abspath(fp)
-                return os.path.abspath(candidates[0])
+        # ---- helpers -----------------------------------------------------------
+        def _current_root_name():
+            if hasattr(parent, "get_current_root_name"):
+                return parent.get_current_root_name()
+            # fallback to ms root by index
+            try:
+                idx = getattr(parent, "current_root_index", None)
+                if idx is not None:
+                    return (getattr(parent, "multispectral_root_names", []) or [])[idx]
+            except Exception:
+                pass
             return None
 
+        def _paired_thermal_root(ms_root):
+            try:
+                ms_names = getattr(parent, "multispectral_root_names", []) or []
+                th_names = getattr(parent, "thermal_rgb_root_names", []) or []
+                off      = int(getattr(parent, "root_offset", 0) or 0)
+                ms_idx   = ms_names.index(ms_root)
+                th_idx   = ms_idx + off
+                if 0 <= th_idx < len(th_names):
+                    return th_names[th_idx]
+            except Exception:
+                pass
+            return None
+
+        def _effective_size(fp):
+            # 1) post-.ax
+            try:
+                if hasattr(parent, "_size_after_ax_fast_from_file"):
+                    h, w = parent._size_after_ax_fast_from_file(fp)
+                    if h and w: return int(h), int(w)
+            except Exception:
+                pass
+            # 2) live viewer
+            v = parent.get_viewer_by_filepath(fp)
+            if v and getattr(v, "image_data", None) and getattr(v.image_data, "image", None) is not None:
+                h, w = v.image_data.image.shape[:2]
+                return int(h), int(w)
+            # 3) disk header
+            try:
+                import cv2
+                im = cv2.imdecode(np.fromfile(fp, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+                if im is not None:
+                    h, w = im.shape[:2]
+                    return int(h), int(w)
+            except Exception:
+                pass
+            return (None, None)
+
+        def _viewer_hw(fp, fallback):
+            v = parent.get_viewer_by_filepath(fp)
+            if v and getattr(v, "image_data", None) and getattr(v.image_data, "image", None) is not None:
+                h, w = v.image_data.image.shape[:2]
+                return int(h), int(w)
+            th, tw = fallback
+            return int(th or 0), int(tw or 0)
+
+        def _open_viewer_filepaths_for_root(ms_root):
+            """All *currently shown* image filepaths that belong to ms_root (and its paired thermal)."""
+            show = []
+            th_root = _paired_thermal_root(ms_root)
+            ms_files = set((getattr(parent, "multispectral_image_data_groups", {}) or {}).get(ms_root, []) or [])
+            th_files = set((getattr(parent, "thermal_rgb_image_data_groups", {}) or {}).get(th_root, []) or [])
+            valid = ms_files | th_files
+            for w in getattr(parent, "viewer_widgets", []) or []:
+                idata = w.get("image_data") if isinstance(w, dict) else None
+                fp = getattr(idata, "filepath", None) if idata is not None else None
+                if fp and fp in valid:
+                    show.append(fp)
+            return list(dict.fromkeys(show))  # unique, keep order
+
+        def _all_filepaths_for_root(ms_root):
+            th_root = _paired_thermal_root(ms_root)
+            ms_files = list((getattr(parent, "multispectral_image_data_groups", {}) or {}).get(ms_root, []) or [])
+            th_files = list((getattr(parent, "thermal_rgb_image_data_groups", {}) or {}).get(th_root, []) or [])
+            return ms_files + th_files
+
+        # ---- resolve current root + its id ------------------------------------
+        ms_root = _current_root_name()
+        if not ms_root:
+            QtWidgets.QMessageBox.information(self, "Import Polygons", "No current root selected.")
+            return
+        id_to_root = getattr(parent, "id_to_root", {}) or {}
+        rootname_to_id = {v: k for k, v in id_to_root.items()}
+        root_id_str = str(rootname_to_id.get(ms_root, 0))
+
+        # ---- decide targets: prefer what the user is *currently looking at* ----
+        target_filepaths = _open_viewer_filepaths_for_root(ms_root)
+        if not target_filepaths:
+            # fallback to *all* images in that root (MS + Thermal)
+            target_filepaths = _all_filepaths_for_root(ms_root)
+            if not target_filepaths:
+                QtWidgets.QMessageBox.information(self, "Import Polygons", f"No images found in root '{ms_root}'.")
+                return
+
+        # ---- process each picked polygon file ---------------------------------
         imported = 0
+        rx = re.compile(r'^(?P<group>.*?)_(?P<imgbase>.*?)_polygons\.json$', re.IGNORECASE)
+
         for idx, file_path in enumerate(file_paths, start=1):
-            logger.info(f"Processing file {idx}/{len(file_paths)}: {file_path}")
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
-                    polygon_data = json.load(f)
+                    data = json.load(f)
             except Exception as e:
-                logger.error(f"JSON read error '{file_path}': {e}")
+                logging.error(f"[{idx}] JSON read error '{file_path}': {e}")
                 continue
 
-            points = polygon_data.get('points', [])
-            json_name = (polygon_data.get('name') or '').strip()
-            root_number_raw = polygon_data.get('root', '')
-            coordinates = polygon_data.get('coordinates', {})
+            pts_in      = data.get('points', []) or []
+            coord_space = (data.get('coord_space') or 'image').lower()
+            image_ref   = data.get('image_ref_size') or {}
+            coordinates = data.get('coordinates', {})  # may be absent (your case)
 
-            if not points:
-                logger.warning(f"Skipping invalid polygon (missing points): {file_path}")
+            if not pts_in:
+                logging.warning(f"[{idx}] Skipping (no points): {os.path.basename(file_path)}")
                 continue
 
-            # Normalize/parse root
-            if isinstance(root_number_raw, int):
-                root_number_str = str(root_number_raw)
-            elif isinstance(root_number_raw, str):
-                root_number_str = root_number_raw.strip()
-            else:
-                root_number_str = ""
-
-            try:
-                root_number = int(root_number_str)
-            except Exception:
-                root_number = None
-
-            root_name = id_to_root.get(root_number) if root_number is not None else None
-            if not root_name:
-                fb_root_id, fb_root_name, _fb_fp = self._fallback_current_root_and_first_viewer()
-                logger.warning(f"No root_name for root '{root_number_raw}' in {file_path}. "
-                               f"Falling back to current root '{fb_root_name}' (id {fb_root_id}).")
-                root_number_str = fb_root_id
-                try:
-                    root_number = int(fb_root_id)
-                except Exception:
-                    root_number = 0
-                root_name = fb_root_name
-
-            # "<group>_<imagebase>_polygons.json"
-            base_filename = os.path.basename(file_path)
-            match = re.match(r'^(?P<group>.*?)_(?P<imgbase>.*?)_polygons\.json$', base_filename, re.IGNORECASE)
-            if not match:
-                logger.warning(f"Filename '{base_filename}' does not match expected pattern. Skipping.")
+            # Enforce viewer-friendly 'name' = <group> (from filename)
+            base = os.path.basename(file_path)
+            m = rx.match(base)
+            if not m:
+                logging.warning(f"[{idx}] Unexpected filename (needs <group>_<base>_polygons.json): {base}")
                 continue
-
-            group_name = match.group('group')
-            imgbase = match.group('imgbase')
-
-            # Force the polygon name to group name (viewer expects this)
+            group_name = m.group('group')
             name = group_name
-            if json_name and json_name != group_name:
-                logger.debug(f"Overriding polygon 'name' from '{json_name}' -> '{group_name}' for viewer consistency.")
 
-            # Resolve image (as-is, then try adding/removing root prefix, then mapping)
-            image_filepath = search_image(imgbase)
+            # Force root id to CURRENT root
+            root_str = root_id_str
 
-            if not image_filepath:
-                if imagebase := imgbase:
-                    # try removing root prefix
-                    if root_name and imagebase.startswith(root_name + "_"):
-                        cand = imagebase[len(root_name) + 1:]
-                        image_filepath = search_image(cand)
-                    # try adding root prefix
-                    if not image_filepath and root_name:
-                        image_filepath = search_image(f"{root_name}_{imagebase}")
+            # For each target file (every currently visible image in this root) …
+            for image_fp in target_filepaths:
+                # 1) effective basis
+                th, tw = _effective_size(image_fp)
+                # if unknown, borrow viewer basis later
+                if not (th and tw):
+                    th, tw = 0, 0
 
-            if not image_filepath and root_mapping:
-                base_lower = base_filename.lower()
-                if '8b' in base_lower:
-                    image_type = 'RGB'
-                elif 'ir' in base_lower:
-                    image_type = 'thermal'
+                # 2) map scene->image if needed (rare here, but keep parity with folder importer)
+                pts_image = pts_in
+                if coord_space == "scene" and hasattr(parent, "_map_points_scene_to_image"):
+                    try:
+                        size_hint = (th or 0, tw or 0, 1)
+                        pts_image = parent._map_points_scene_to_image(image_fp, pts_in, size_hint, polygon_data=data)
+                    except Exception:
+                        pts_image = pts_in
+
+                # 3) rescale from source ref -> target effective
+                src_w = int(image_ref.get('w') or 0)
+                src_h = int(image_ref.get('h') or 0)
+                if src_w > 0 and src_h > 0 and (tw and th):
+                    sx, sy = float(tw) / float(src_w), float(th) / float(src_h)
+                    pts_image = [(float(x) * sx, float(y) * sy) for (x, y) in pts_image]
                 else:
-                    image_type = self._infer_image_type_from_group(group_name, default='RGB')
+                    pts_image = [(float(x), float(y)) for (x, y) in pts_image]
 
-                mapping_entry = root_mapping.get(root_number_str)
-                if isinstance(mapping_entry, dict):
-                    mapped_filename = mapping_entry.get(image_type)
-                    if isinstance(mapped_filename, str) and mapped_filename:
-                        image_filepath = search_image(os.path.splitext(mapped_filename)[0])
+                # 4) persist (IMAGE coords @ effective)
+                parent.all_polygons.setdefault(group_name, {})
+                parent.all_polygons[group_name][image_fp] = {
+                    'points': pts_image,
+                    'coord_space': 'image',
+                    'image_ref_size': {'w': int(tw or 0), 'h': int(th or 0)},
+                    'name': name,
+                    'root': root_str,
+                    'coordinates': coordinates,
+                    'type': data.get('type', 'polygon'),
+                }
+                # Mark this polygon as dirty for incremental save
+                if hasattr(parent, '_mark_polygon_dirty'):
+                    parent._mark_polygon_dirty(group_name, image_fp)
 
-            # Final fallback to first viewer
-            if not image_filepath:
-                fb_root_id, fb_root_name, fb_target_fp = self._fallback_current_root_and_first_viewer()
-                image_filepath = fb_target_fp
-                if not image_filepath:
-                    logger.warning(f"Associated image for '{base_filename}' not found and no viewer available. Skipping.")
-                    continue
-                # align root to fallback
-                root_number_str = fb_root_id
+                # 5) draw (map image coords to scene coords via pixmap)
+                viewer = parent.get_viewer_by_filepath(image_fp)
+                if viewer:
+                    vh, vw = _viewer_hw(image_fp, (th, tw))
+                    tw_eff, th_eff = (tw or vw, th or vh)  # adopt viewer if effective unknown
 
-            # Store
-            if group_name not in self.parent().all_polygons:
-                self.parent().all_polygons[group_name] = {}
-            self.parent().all_polygons[group_name][image_filepath] = {
-                'points': points,
-                'name': name,                 # forced group name
-                'root': root_number_str,      # corrected if needed
-                'coordinates': coordinates
-            }
-            logger.info(f"Added polygon '{name}' to group '{group_name}' for image '{image_filepath}'.")
+                    # de-dup by name on this viewer
+                    if hasattr(viewer, "get_all_polygons"):
+                        for item in list(viewer.get_all_polygons()):
+                            if getattr(item, "name", None) == name:
+                                try:
+                                    viewer._scene.removeItem(item)
+                                except Exception:
+                                    pass
 
-            # Draw on viewer
-            viewer = self.parent().get_viewer_by_filepath(image_filepath)
-            if viewer:
-                from PyQt5 import QtGui, QtCore
-                polygon = QtGui.QPolygonF([QtCore.QPointF(x, y) for x, y in points])
-                # remove any existing polygon with same name to avoid duplicates
-                if hasattr(viewer, "get_all_polygons"):
-                    for item in list(viewer.get_all_polygons()):
-                        if getattr(item, "name", None) == name:
-                            try:
-                                viewer._scene.removeItem(item)
-                            except Exception:
-                                pass
-                            break
-                viewer.add_polygon(polygon, name)
-            else:
-                logger.warning(f"Viewer for image '{image_filepath}' not found. Skipping overlay.")
+                    # Map image coords to scene coords through the pixmap
+                    scene_pts = []
+                    pixitem = getattr(viewer, '_image', None)
+                    if pixitem is not None:
+                        pixmap = pixitem.pixmap()
+                        if pixmap and not pixmap.isNull():
+                            pw, ph = max(1, pixmap.width()), max(1, pixmap.height())
+                            img_h, img_w = th_eff or ph, tw_eff or pw
+                            for (x, y) in pts_image:
+                                x_pix = float(x) * (pw / float(img_w))
+                                y_pix = float(y) * (ph / float(img_h))
+                                scene_pt = pixitem.mapToScene(QtCore.QPointF(x_pix, y_pix))
+                                scene_pts.append(scene_pt)
+                    
+                    if not scene_pts:
+                        # Fallback: use image coords directly
+                        scene_pts = [QtCore.QPointF(x, y) for (x, y) in pts_image]
+                    
+                    qpoly = QtGui.QPolygonF(scene_pts)
+                    if hasattr(viewer, "add_polygon_to_scene"):
+                        viewer.add_polygon_to_scene(qpoly, name)
+                    else:
+                        viewer.add_polygon(qpoly, name)
 
             imported += 1
 
-        # Save & refresh
-        logger.info("Saving all polygons to JSON files.")
+        # Save & refresh UI using fast incremental save
         try:
-            self.parent().save_polygons_to_json()
+            if hasattr(parent, 'save_incremental'):
+                parent.save_incremental()
+            else:
+                parent.save_polygons_to_json(root_name=ms_root)
         except Exception as e:
-            logger.exception(f"Failed to save polygons to JSON: {e}")
-
-        logger.info("Updating the Polygon Manager UI.")
+            logging.error(f"Saving polygons failed: {e}")
         try:
-            self.parent().update_polygon_manager()
+            parent.update_polygon_manager()
         except Exception as e:
-            logger.exception(f"Failed to update Polygon Manager UI: {e}")
+            logging.error(f"Updating Polygon Manager failed: {e}")
 
-        logger.info("Completed importing polygons from selected files.")
-
+        QtWidgets.QMessageBox.information(self, "Import Complete",
+            f"Imported {imported} polygon file(s) onto the current viewers of root '{ms_root}'.")
 
     def on_clear_all_polygons(self):
         # Perform clearing without confirmation pop-up
@@ -2831,28 +3110,23 @@ class PolygonManager(QtWidgets.QDialog):
 
     def on_item_double_clicked(self, item):
         group_name = item.data(QtCore.Qt.UserRole)
+        print(f"[PolygonManager] Double-clicked group: {group_name}")
         if group_name:
-            self.parent().switch_to_group(group_name)
-            for widget in self.parent().viewer_widgets:
-                viewer = widget['viewer']
-
-                # NEW: clear any previous selections first
-                try:
-                    viewer._scene.clearSelection()
-                except Exception:
-                    if hasattr(viewer, "get_all_polygons"):
-                        for it in viewer.get_all_polygons():
-                            try:
-                                it.setSelected(False)
-                            except Exception:
-                                pass
-
-                for polygon_item in viewer.get_all_polygons():
-                    if polygon_item.name == group_name:
-                        polygon_item.setSelected(True)
-                        viewer.centerOn(polygon_item)
-                        viewer.setFocus()
+            parent = self.parent()
+            # Debug: show what filepaths exist for this group
+            if hasattr(parent, 'all_polygons') and group_name in parent.all_polygons:
+                fps = list(parent.all_polygons[group_name].keys())
+                print(f"[PolygonManager] Group '{group_name}' has {len(fps)} filepath(s):")
+                for fp in fps:
+                    root_data = parent.all_polygons[group_name][fp].get('root', '?')
+                    root_via_fp = parent.get_root_by_filepath(fp) if hasattr(parent, 'get_root_by_filepath') else '(no method)'
+                    print(f"  -> {fp}  root_field={root_data}  root_via_filepath={root_via_fp}")
+            
+            # Switch to the root group associated with the group_name
+            parent.switch_to_group(group_name)
+            # Use proper zoom_to_groups for zoom and fit
+            self.zoom_to_groups([group_name])
+            # Select the polygons (without re-centering since zoom already did it)
+            self._select_group_in_viewers(group_name, additive=False, center=False)
         else:
-            pass
-
-
+            pass  # Handle cases where group_name is invalid if necessary

@@ -15,4 +15,34 @@ from .image_data import ImageData
 from .polygon_manager import PolygonManager
 from .project_tab import ProjectTab
 from .main_window import MainWindow
-__all__ = ["_LoaderSignals", "_ImageLoadRunnable", "ImageProcessor", "ImageLoaderWorker", "MachineLearningManager", "RootOffsetDialog", "AnalysisOptionsDialog", "EditablePolygonItem", "EditablePointItem", "ImageViewer", "ImageEditorDialog", "ImageData", "PolygonManager", "ProjectTab", "MainWindow"]
+
+# High-performance computation module (optional)
+try:
+    from .performance import (
+        FastBandMathEngine,
+        FastSklearnPredictor,
+        fast_safe_predict,
+        fast_eval_band_expression,
+        fast_polygon_mask,
+        fast_extract_roi_pixels,
+        fast_stats,
+        get_band_math_engine,
+        BatchPolygonProcessor,
+        numexpr_available,
+        numba_available,
+    )
+    _PERF_EXPORTS = [
+        "FastBandMathEngine", "FastSklearnPredictor", "fast_safe_predict",
+        "fast_eval_band_expression", "fast_polygon_mask", "fast_extract_roi_pixels",
+        "fast_stats", "get_band_math_engine", "BatchPolygonProcessor",
+        "numexpr_available", "numba_available"
+    ]
+except ImportError:
+    _PERF_EXPORTS = []
+
+__all__ = [
+    "_LoaderSignals", "_ImageLoadRunnable", "ImageProcessor", "ImageLoaderWorker",
+    "MachineLearningManager", "RootOffsetDialog", "AnalysisOptionsDialog",
+    "EditablePolygonItem", "EditablePointItem", "ImageViewer",
+    "ImageEditorDialog", "ImageData", "PolygonManager", "ProjectTab", "MainWindow"
+] + _PERF_EXPORTS
