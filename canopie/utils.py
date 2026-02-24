@@ -1,11 +1,15 @@
 import os
+import sys
 import json
 import tempfile
 import subprocess
 import logging
 import numpy as np
 import cv2
+import re
 
+# Windows subprocess flag to hide console window
+_SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
 
 STRETCH_LOW_P = 0.5
 STRETCH_HIGH_P = 99.5
@@ -93,55 +97,102 @@ def _rotate_point_in_rect(x, y, w, h, rot):
     if r == 3:  return (y, w - 1 - x)        # 270 CW
     return (x, y)
 
-def resize_safe(arr, new_w, new_h, interp=cv2.INTER_LINEAR):
+def resize_safe(img, new_w, new_h, interp=cv2.INTER_LINEAR):
     """
-    Resize an array to new_w x new_h.  Supports arbitrary channel counts.
-    Preserves dtype and handles 2D or HxWxC arrays.  Unknown ranks are returned unchanged.
-    """
-    if arr is None:
-        return None
-    if arr.ndim == 2:
-        return cv2.resize(arr, (new_w, new_h), interpolation=interp)
-    if arr.ndim == 3:
-        h, w, c = arr.shape
-        if c <= 4:
-            return cv2.resize(arr, (new_w, new_h), interpolation=interp)
-        # per‑channel path
-        out = np.empty((new_h, new_w, c), dtype=arr.dtype)
-        for i in range(c):
-            out[..., i] = cv2.resize(arr[..., i], (new_w, new_h), interpolation=interp)
-        return out
-    # Unknown rank; return as‑is
-    return arr
-
-def _normalize_for_display(img, low_p=STRETCH_LOW_P, high_p=STRETCH_HIGH_P,
-                           per_channel=STRETCH_PER_CHANNEL, clip=STRETCH_CLIP,
-                           sample_max=STRETCH_SAMPLE_MAX):
-    """
-    Normalise an image for display by stretching its pixel values between low_p and high_p percentiles.
-    Supports grayscale and RGB images and works on any numeric dtype.
-    Returns an 8‑bit image suitable for display (max 3 channels).
+    Robust resize for 2D and HxWxC images with ANY number of channels.
+    Falls back to per-channel resize when cn > 4 or when OpenCV's fast path fails.
+    Preserves dtype.
     """
     if img is None:
         return None
 
-    if img.dtype == np.uint8 and img.ndim in (2, 3):
-        disp = img
+    h, w = img.shape[:2]
+    if h == 0 or w == 0 or (new_w == w and new_h == h):
+        return img
+
+    # 2D (single band)
+    if img.ndim == 2:
+        return cv2.resize(img, (new_w, new_h), interpolation=interp)
+
+    # 3D (multi-band)
+    c = img.shape[2]
+    try:
+        # Fast path for <=4 channels
+        if c <= 4:
+            return cv2.resize(img, (new_w, new_h), interpolation=interp)
+
+        # Per-channel path for cn > 4
+        out = np.empty((new_h, new_w, c), dtype=img.dtype)
+        for i in range(c):
+            out[..., i] = cv2.resize(img[..., i], (new_w, new_h), interpolation=interp)
+        return out
+
+    except Exception as e:
+        # Absolute fallback (e.g., if OpenCV still complains for exotic dtypes)
+        logging.warning(f"resize_safe: per-channel fallback due to error: {e}")
+        out = np.empty((new_h, new_w, c), dtype=img.dtype)
+        for i in range(c):
+            out[..., i] = cv2.resize(img[..., i], (new_w, new_h), interpolation=cv2.INTER_AREA)
+        return out
+
+def _normalize_for_display(
+    img,
+    low_p=STRETCH_LOW_P,
+    high_p=STRETCH_HIGH_P,
+    per_channel=STRETCH_PER_CHANNEL,
+    clip=STRETCH_CLIP,
+    sample_max=STRETCH_SAMPLE_MAX,
+    *,
+    input_is_rgb=None,   # None=assume raw cv2 BGR, True=already RGB (post-aux/tifffile), False=BGR
+    return_bgr=True      # True -> return BGR for Qt fast path; False -> return RGB
+):
+    """
+    Normalize an image for display by stretching pixel values between low_p and high_p percentiles.
+    Supports grayscale and RGB images and works on any numeric dtype.
+
+    Parameters
+    ----------
+    input_is_rgb : {None, bool}
+        For ≤3-channel inputs: if True, treat as RGB (e.g., post-apply_aux_modifications).
+        If False, treat as BGR (e.g., raw cv2.imread). If None, defaults to BGR.
+    return_bgr : bool
+        If True, return BGR (ideal for QImage::Format_BGR888). If False, return RGB.
+
+    Returns
+    -------
+    disp : uint8 (H,W) or (H,W,3)
+        8-bit image suitable for display (max 3 channels), with channel order per return_bgr.
+    """
+    import numpy as np
+    import cv2
+
+    if img is None:
+        return None
+
+    # --- Fast path: already uint8 image (we'll only correct channel order later) ---
+    if isinstance(img, np.ndarray) and img.dtype == np.uint8 and img.ndim in (2, 3):
+        disp = img.copy()
     else:
-        x = np.nan_to_num(img.astype(np.float32, copy=False))
+        # Convert to float32 for stretching, replace NaNs/Infs
+        x = np.nan_to_num(np.asarray(img).astype(np.float32, copy=False))
+
         def _sample(a):
             h, w = a.shape[:2]
             m = max(h, w)
             if m <= sample_max:
                 return a
             s = sample_max / float(m)
-            return cv2.resize(a, (max(1, int(round(w*s))), max(1, int(round(h*s)))), interpolation=cv2.INTER_AREA)
+            return cv2.resize(
+                a,
+                (max(1, int(round(w * s))), max(1, int(round(h * s)))),
+                interpolation=cv2.INTER_AREA,
+            )
 
         if x.ndim == 2:
             s = _sample(x)
             lo = np.percentile(s, low_p)
             hi = np.percentile(s, high_p)
-            n = np.full_like(x, 0.5, dtype=np.float32) if hi <= lo else (x - lo) / max(hi - lo, 1e-12)
+            n = (x - lo) / max(hi - lo, 1e-12) if hi > lo else np.full_like(x, 0.5, dtype=np.float32)
             if clip:
                 n = np.clip(n, 0.0, 1.0)
             disp = (n * 255.0).astype(np.uint8)
@@ -150,7 +201,7 @@ def _normalize_for_display(img, low_p=STRETCH_LOW_P, high_p=STRETCH_HIGH_P,
             C = x.shape[2]
             use = x[:, :, :max(1, min(C, 3))]  # take up to 3 channels for preview
             s = _sample(use)
-            if per_channel:
+            if per_channel and use.ndim == 3 and use.shape[2] > 1:
                 flat = s.reshape(-1, use.shape[2])
                 lo = np.percentile(flat, low_p, axis=0)
                 hi = np.percentile(flat, high_p, axis=0)
@@ -159,36 +210,58 @@ def _normalize_for_display(img, low_p=STRETCH_LOW_P, high_p=STRETCH_HIGH_P,
             else:
                 lo = np.percentile(s, low_p)
                 hi = np.percentile(s, high_p)
-                n = np.full_like(use, 0.5, dtype=np.float32) if hi <= lo else (use - lo) / max(hi - lo, 1e-12)
+                n = (use - lo) / max(hi - lo, 1e-12) if hi > lo else np.full_like(use, 0.5, dtype=np.float32)
             if clip:
                 n = np.clip(n, 0.0, 1.0)
             disp = (n * 255.0).astype(np.uint8)
+
             # If only 1 or 2 channels, pad to 3 for display
-            if disp.shape[2] == 1:
-                disp = np.repeat(disp, 3, axis=2)
-            elif disp.shape[2] == 2:
-                disp = np.concatenate([disp, disp[:, :, :1]], axis=2)
+            if disp.ndim == 3:
+                if disp.shape[2] == 1:
+                    disp = np.repeat(disp, 3, axis=2)
+                elif disp.shape[2] == 2:
+                    disp = np.concatenate([disp, disp[:, :, :1]], axis=2)
         else:
             return None
 
-    # Ensure max 3 channels for QImage
+    # --- Keep to max 3 channels ---
     if disp.ndim == 3 and disp.shape[2] > 3:
         disp = disp[:, :, :3].copy()
+
+    # --- Channel-order fix (only for 3-channel images) ---
+    if disp.ndim == 3 and disp.shape[2] == 3:
+        # Default assumption: raw cv2 → BGR input
+        rgb_in = False if input_is_rgb is None else bool(input_is_rgb)
+
+        # We want to return BGR for Qt fast path by default
+        if return_bgr:
+            # If input is RGB, flip to BGR; if input already BGR, keep as-is
+            if rgb_in:
+                disp = disp[:, :, ::-1].copy()
+        else:
+            # Caller wants RGB back; if input is BGR, flip; if RGB, keep as-is
+            if not rgb_in:
+                disp = disp[:, :, ::-1].copy()
+
     return disp
 
+# utils.py
 def _sample_for_stats(arr, sample_max=STRETCH_SAMPLE_MAX):
     """
-    Return a downsampled copy of the input array such that its largest dimension does not
-    exceed sample_max.  This is used to compute statistics on large images.
+    Downsample so the largest dim ≤ sample_max. Works for 2D or HxWxC (any C).
     """
+    import numpy as np
     h, w = arr.shape[:2]
     m = max(h, w)
     if m <= sample_max:
         return arr
-    scale = sample_max / float(m)
+
+    scale = float(sample_max) / float(m)
     new_w = max(1, int(round(w * scale)))
     new_h = max(1, int(round(h * scale)))
-    return cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    # Use the stack-safe resizer you already ship
+    return resize_safe(arr, new_w, new_h, interp=cv2.INTER_AREA)
 
 def process_band_expression(image, expr):
     """
@@ -230,128 +303,34 @@ def process_band_expression(image, expr):
         scalar_value = np.clip(result, 0, 255)
         return np.full(image.shape[:2], scalar_value, dtype=np.uint8)
 
+
+
+_COMPARISON_RE = re.compile(
+    r'(\b(?:b\d+|\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?)\b)\s*'
+    r'(==|!=|<=|>=|<|>)\s*'
+    r'(\b(?:b\d+|\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?)\b)'
+)
+
+
+
 def process_band_expression_float(image, expr):
     """
-    Evaluate a 'b1..bN' expression on FLOAT32.
-    Only 'b1..bN' names are allowed (case‑insensitive).  If the expression
-    requests bands not present, the original image is returned unchanged.
-    Division is rewritten to safe_div(x, y) to avoid division by zero.
-    NaN/Inf values are sanitised to 0.  Returns a 2D float32 array on success.
+    Back-compat wrapper: evaluate band expression on FLOAT32 and return float32.
+    Supports functions (mean, sum, std, ...), global reducers, safe '/', logicals, etc.
     """
-    import re, ast
+    import numpy as np
     if image is None or not expr:
         return image
-    # Work in float32 and sanitise any preexisting NaN/Inf
-    x = np.nan_to_num(np.asarray(image, dtype=np.float32),
-                      nan=0.0, posinf=0.0, neginf=0.0)
-    # Determine band count
-    if x.ndim == 2:
-        H, W = x.shape
-        C = 1
-    elif x.ndim == 3:
-        H, W, C = x.shape
-    else:
-        return image
-    # Case‑insensitive band references
-    expr_norm = str(expr).strip()
-    # Bands requested by the expression (case‑insensitive)
-    req = sorted({int(b) for b in re.findall(r'\bb(\d+)\b', expr_norm, flags=re.IGNORECASE)})
-    if any(b > C for b in req):
-        logging.warning(
-            "Band expression '%s' requests b%d but image has only %d band(s); skipping.",
-            expr, max(req) if req else 1, C
-        )
-        return image
-    # Build mapping {b1: plane0, ...}
-    if C == 1:
-        mapping = {'b1': x}
-    else:
-        mapping = {f"b{i+1}": x[:, :, i] for i in range(C)}
-    # Also allow upper‑case references transparently by mirroring keys
-    mapping.update({k.upper(): v for k, v in mapping.items()})
-    # Safe divider (no warnings; 0 where denom==0)
-    def safe_div(a, b):
-        a = np.asarray(a, dtype=np.float32)
-        b = np.asarray(b, dtype=np.float32)
-        out = np.zeros(np.broadcast(a, b).shape, dtype=np.float32)
-        np.divide(a, b, out=out, where=(b != 0))
-        return out
-    # AST parsing with LRU caching on the function object
-    if not hasattr(process_band_expression_float, "_compiled_cache"):
-        process_band_expression_float._compiled_cache = {}
-    cache = process_band_expression_float._compiled_cache
-    compiled = cache.get(expr_norm)
-    if compiled is None:
-        class _DivFix(ast.NodeTransformer):
-            def visit_BinOp(self, node):
-                node = self.generic_visit(node)
-                if isinstance(node.op, ast.Div):
-                    return ast.Call(func=ast.Name(id="safe_div", ctx=ast.Load()),
-                                    args=[node.left, node.right],
-                                    keywords=[])
-                return node
-        # Parse
-        try:
-            tree = ast.parse(expr_norm, mode="eval")
-        except SyntaxError as e:
-            logging.warning(f"Band expression syntax error ('{expr}'): {e}")
-            return image
-        # Security/validation: only allow a small set of nodes
-        allowed_nodes = (
-            ast.Expression, ast.BinOp, ast.UnaryOp,
-            ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.Mod, ast.FloorDiv,
-            ast.USub, ast.UAdd, ast.Load, ast.Name, ast.Constant, ast.Tuple, ast.List,
-            ast.Call  # but only safe_div after transform
-        )
-        class _Validator(ast.NodeVisitor):
-            def __init__(self):
-                self.ok = True
-            def generic_visit(self, node):
-                if not isinstance(node, allowed_nodes):
-                    self.ok = False
-                super().generic_visit(node)
-        v = _Validator()
-        v.visit(tree)
-        if not v.ok:
-            logging.warning("Illegal syntax/nodes in band expression '%s'; skipping.", expr)
-            return image
-        # Replace divisions
-        tree = _DivFix().visit(tree)
-        ast.fix_missing_locations(tree)
-        # Collect names and ensure they are permitted identifiers
-        class _Names(ast.NodeVisitor):
-            def __init__(self):
-                self.names = set()
-            def visit_Name(self, node):
-                self.names.add(node.id)
-        names = _Names()
-        names.visit(tree)
-        for name in names.names:
-            if name not in mapping and name != "safe_div":
-                logging.warning("Illegal name '%s' in band expr '%s' (float); skipping index.", name, expr)
-                return image
-        compiled = compile(tree, "<string>", "eval")
-        cache[expr_norm] = compiled
-    # --- Evaluate safely --------------------------------------------------------
-    try:
-        with np.errstate(all='ignore'):
-            res = eval(compiled, {"__builtins__": {}, "safe_div": safe_div}, mapping)
-    except Exception as e:
-        logging.warning(f"Band expression failed ('{expr}'): {e}")
-        return image
-    # Normalise output type/shape to 2D float32
-    if not isinstance(res, np.ndarray):
-        res = np.full((H, W), float(res), dtype=np.float32)
-    else:
-        res = np.asarray(res, dtype=np.float32)
-        if res.ndim == 3 and res.shape[-1] == 1:
-            res = res[..., 0]
-        elif res.ndim != 2:
-            # Defensive: reduce unexpected ranks
-            res = np.mean(res, axis=tuple(range(res.ndim - 2)), dtype=np.float32)
-    # Final sanitise
-    res = np.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
-    return res
+    return eval_band_expression(np.asarray(image, dtype=np.float32), expr)
+
+def _eval_band_expression_float(self, img, expr):
+    """
+    Back-compat wrapper used by ProjectTab: same as process_band_expression_float.
+    """
+    import numpy as np
+    if img is None or not expr:
+        return None
+    return eval_band_expression(np.asarray(img, dtype=np.float32), expr)
 
 def get_exif_data_exiftool_multiple(filepaths):
     """
@@ -369,7 +348,8 @@ def get_exif_data_exiftool_multiple(filepaths):
                 tmp_file.write(f"{filepath}\n")
             tmp_file_path = tmp_file.name
         command = [exiftool_cmd, '-j', '-@', tmp_file_path]
-        result = subprocess.run(command, capture_output=True, text=True, check=True)
+        result = subprocess.run(command, capture_output=True, text=True, check=True,
+                                creationflags=_SUBPROCESS_FLAGS)
         exif_json = json.loads(result.stdout)
         exif_dict = {os.path.abspath(item['SourceFile']): item for item in exif_json}
     except Exception as e:
@@ -428,6 +408,332 @@ def calculate_shd(red, green, blue):
     Simple Sum Index (SHD): sums red, green and blue bands; used as a simple brightness measure.
     """
     return red + green + blue
+# utils.py
+import re, ast
+import numpy as np
+
+_ALLOWED_NODES = (
+    ast.Expression, ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare,
+    ast.Name, ast.Load, ast.Constant,
+    # arithmetic
+    ast.Add, ast.Sub, ast.Mult, ast.Div,
+    # unary
+    ast.Invert, ast.UAdd, ast.USub,
+    # boolean / bitwise
+    ast.And, ast.Or, ast.BitAnd, ast.BitOr,
+    # comparisons
+    ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+)
+
+def _ensure_bool(arr):
+    a = np.asarray(arr)
+    if a.dtype == bool:
+        return a
+    raise TypeError("Logical operators (&, |, not/~) must combine comparisons (boolean arrays). "
+                    "Add parentheses or make each side a comparison, e.g. (b1<133) & (b2>323).")
+ 
+
+import re, ast
+import numpy as np
+
+def normalize_band_expr(expr: str) -> str:
+    s = expr or ""
+    s = re.sub(r'\bAND\b', '&', s, flags=re.IGNORECASE)
+    s = re.sub(r'\bOR\b',  '|', s, flags=re.IGNORECASE)
+    s = re.sub(r'\bNOT\b', '~', s, flags=re.IGNORECASE)
+    return s
+
+def eval_band_expression(image: np.ndarray, expr: str) -> np.ndarray:
+    """
+    Evaluate a band expression on an image and return float32 HxW.
+    Supports + - * /, comparisons, &,|,~, and these functions:
+      sum, mean/avg, min, max, std, median, clip(x,lo,hi), where(cond,a,b), abs, sqrt, log, exp.
+    Single-arg reducers (e.g., mean(b1)) are GLOBAL over the band (scalar),
+    multi-arg reducers (e.g., mean(b1,b2)) are PIXELWISE across args.
+    """
+    if image is None or getattr(image, "size", 0) == 0:
+        raise ValueError("Empty image.")
+    expr = (expr or "").strip()
+    if not expr:
+        raise ValueError("Empty expression.")
+
+    import numpy as _np
+    x = _np.nan_to_num(_np.asarray(image, dtype=_np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    H, W = x.shape[:2]
+    C = 1 if x.ndim == 2 else x.shape[2]
+
+    # Map bands b1..bN
+    mapping = {'b1': x} if C == 1 else {f"b{i+1}": x[:, :, i] for i in range(C)}
+    mapping.update({k.upper(): v for k, v in mapping.items()})
+
+    # Helpers
+    def _to_arr(v): return _np.asarray(v, dtype=_np.float32)
+    def _stack(args): return _np.stack([_to_arr(a) for a in args], axis=0)
+    def _global_reduce(fn, a): return float(fn(_to_arr(a)))
+
+    # Elementwise + reducers
+    def _psum(*args):   return _np.add.reduce([_to_arr(a) for a in args])
+    def _pmean(*args):  return _psum(*args) / max(len(args), 1)
+    def _pmin(*args):   return _np.minimum.reduce([_to_arr(a) for a in args])
+    def _pmax(*args):   return _np.maximum.reduce([_to_arr(a) for a in args])
+    def _pstd(*args):   return _np.std(_stack(args), axis=0)
+    def _pmedian(*args):return _np.median(_stack(args), axis=0)
+
+    def _SUM(*args):    return _global_reduce(_np.sum,    args[0]) if len(args)==1 else _psum(*args)
+    def _MEAN(*args):   return _global_reduce(_np.mean,   args[0]) if len(args)==1 else _pmean(*args)
+    def _MIN(*args):    return _global_reduce(_np.min,    args[0]) if len(args)==1 else _pmin(*args)
+    def _MAX(*args):    return _global_reduce(_np.max,    args[0]) if len(args)==1 else _pmax(*args)
+    def _STD(*args):    return _global_reduce(_np.std,    args[0]) if len(args)==1 else _pstd(*args)
+    def _MEDIAN(*args): return _global_reduce(_np.median, args[0]) if len(args)==1 else _pmedian(*args)
+
+    allowed_funcs = {
+        # global (1 arg) or pixelwise (2+)
+        "sum": _SUM, "mean": _MEAN, "avg": _MEAN,
+        "min": _MIN, "max": _MAX, "std": _STD, "median": _MEDIAN,
+        # explicit pixelwise variants if you ever need them
+        "psum": _psum, "pmean": _pmean, "pmin": _pmin, "pmax": _pmax, "pstd": _pstd, "pmedian": _pmedian,
+        # elementwise utilities
+        "clip":   lambda x, lo, hi: _np.clip(_to_arr(x), float(lo), float(hi)),
+        "where":  lambda c, a, b: _np.where(_np.asarray(c, dtype=bool), _to_arr(a), _to_arr(b)),
+        "abs":    lambda x: _np.abs(_to_arr(x)),
+        "sqrt":   lambda x: _np.sqrt(_np.maximum(_to_arr(x), 0.0)),
+        "log":    lambda x: _np.log(_np.maximum(_to_arr(x), 1e-12)),
+        "exp":    lambda x: _np.exp(_to_arr(x)),
+    }
+    allowed_funcs.update({k.upper(): v for k, v in allowed_funcs.items()})
+
+    # Safe divide
+    def safe_div(a, b):
+        a = _to_arr(a); b = _to_arr(b)
+        out = _np.zeros(_np.broadcast(a, b).shape, dtype=_np.float32)
+        _np.divide(a, b, out=out, where=(b != 0))
+        return out
+
+    # AST transform: whitelist names/calls; / -> safe_div; &,|,~ -> np.logical_*
+    expr_norm = normalize_band_expr(expr)
+
+    if not re.fullmatch(r"[0-9eE\.\s\+\-\*/\(\)<>!=&|~A-Za-z_,]+", expr_norm):
+        raise ValueError("Disallowed characters in band expression.")
+
+    class _X(ast.NodeTransformer):
+        def __init__(self, band_keys, func_keys):
+            self._bands = set(band_keys)
+            self._funcs = set(func_keys)
+
+        def visit_BinOp(self, node):
+            node = self.generic_visit(node)
+            if isinstance(node.op, ast.Div):
+                return ast.Call(func=ast.Name(id="safe_div", ctx=ast.Load()),
+                                args=[node.left, node.right], keywords=[])
+            if isinstance(node.op, ast.BitAnd):
+                return ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()),
+                                                   attr="logical_and", ctx=ast.Load()),
+                                args=[node.left, node.right], keywords=[])
+            if isinstance(node.op, ast.BitOr):
+                return ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()),
+                                                   attr="logical_or", ctx=ast.Load()),
+                                args=[node.left, node.right], keywords=[])
+            return node
+
+        def visit_UnaryOp(self, node):
+            node = self.generic_visit(node)
+            if isinstance(node.op, ast.Invert):
+                return ast.Call(func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()),
+                                                   attr="logical_not", ctx=ast.Load()),
+                                args=[node.operand], keywords=[])
+            return node
+
+        def visit_Call(self, node):
+            if not isinstance(node.func, ast.Name) or node.func.id not in self._funcs:
+                raise SyntaxError("Allowed functions: " + ", ".join(sorted(self._funcs)))
+            if node.keywords:
+                raise SyntaxError("Keyword arguments not allowed in band functions.")
+            node.args = [self.visit(a) for a in node.args]
+            return node
+
+        def visit_Name(self, node):
+            if node.id in self._bands or node.id in self._funcs or node.id in ("np","safe_div"):
+                return node
+            raise NameError(f"Use only b1..b{len(self._bands)} or allowed functions.")
+
+    tree = ast.parse(expr_norm, mode="eval")
+    tree = _X(mapping.keys() | {k.upper() for k in mapping.keys()}, allowed_funcs.keys()).visit(tree)
+    ast.fix_missing_locations(tree)
+    code = compile(tree, "<band-expr>", "eval")
+
+    res = eval(code, {"__builtins__": {}, "np": np, "safe_div": safe_div, **allowed_funcs}, mapping)
+
+    # ndarray → float32; bool → 0/1; scalar → broadcast
+    if isinstance(res, np.ndarray):
+        out = res.astype(np.float32, copy=False) if res.dtype != np.bool_ else res.astype(np.float32)
+        return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    out = np.full((H, W), float(res), dtype=np.float32)
+    return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+# =============================================================================
+# NoData Utilities - Support both numeric literals and boolean expressions
+# =============================================================================
+
+# Pattern for threshold expressions: b1<123, b2>=50, B3>100, etc.
+_NODATA_EXPR_RE = re.compile(
+    r'^([bB]\d+)\s*(<=|>=|<|>|==|!=)\s*(-?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?)$'
+)
+
+def parse_nodata_text(text: str):
+    """
+    Parse comma-separated NoData values from user input.
+    Supports:
+      - Numeric literals: 0, -9999, 255
+      - Boolean expressions: b1<123, b2>=50, B3>100
+    
+    Returns list of (float | str), where strings are threshold expressions.
+    """
+    if not text or not text.strip():
+        return []
+    
+    # Remove curly braces if present (allow {-9999, 0} format)
+    text = text.strip().strip('{}')
+    
+    result = []
+    seen = set()
+    
+    for part in text.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        
+        # Check if it's a threshold expression like b1<123
+        if _NODATA_EXPR_RE.match(part):
+            # Normalize case: b1 -> b1, B1 -> b1
+            normalized = re.sub(r'^[bB]', 'b', part)
+            if normalized not in seen:
+                seen.add(normalized)
+                result.append(normalized)
+            continue
+        
+        # Try parsing as numeric literal
+        try:
+            if '.' not in part and 'e' not in part.lower():
+                val = int(part)
+            else:
+                val = float(part)
+            if val not in seen:
+                seen.add(val)
+                result.append(val)
+        except ValueError:
+            logging.warning(f"Could not parse NoData value: {part}")
+    
+    return result
+
+
+def build_nodata_mask(img, nd_vals, *, bgr_input=True):
+    """
+    Build boolean mask where True = NoData pixel.
+    
+    Supports:
+      - Numeric literals: Match any channel within tolerance
+      - Threshold expressions: b1<123 evaluates on specific band
+    
+    Parameters
+    ----------
+    img : ndarray (H, W) or (H, W, C)
+        Image array (any dtype, converted to float32 internally).
+    nd_vals : list
+        List of numeric values or expression strings from parse_nodata_text.
+    bgr_input : bool
+        If True, input is BGR (OpenCV default): b1=Red(ch2), b2=Green(ch1), b3=Blue(ch0).
+        If False, input is RGB: b1=ch0, b2=ch1, b3=ch2.
+    
+    Returns
+    -------
+    mask : ndarray (H, W) of bool, or None if no valid values
+    """
+    if not nd_vals or img is None:
+        return None
+    
+    x = np.asarray(img, dtype=np.float32)
+    if x.ndim == 2:
+        x = x[..., None]
+    H, W = x.shape[:2]
+    C = x.shape[2] if x.ndim == 3 else 1
+    
+    mask = np.zeros((H, W), dtype=bool)
+    
+    # Build band index mapping (b1, b2, b3... -> channel index)
+    # For BGR input (OpenCV): b1=Red=ch2, b2=Green=ch1, b3=Blue(ch0)
+    # For RGB input: b1=ch0, b2=ch1, b3=ch2
+    def _get_channel_idx(band_num):
+        """Convert band number (1-based) to channel index."""
+        if C == 1:
+            return 0  # Single channel - all band references go to channel 0
+        if C == 2:
+            # 2-channel: b1->0, b2->1, b3+ out of bounds
+            return band_num - 1 if band_num <= 2 else band_num - 1
+        if bgr_input and C == 3 and band_num <= 3:
+            # BGR (3-channel only): b1->2 (Red), b2->1 (Green), b3->0 (Blue)
+            return 2 - (band_num - 1)  # b1->2, b2->1, b3->0
+        else:
+            # RGB or multispectral (C>3) or C==3 with RGB input: direct indexing
+            return band_num - 1
+    
+    for v in nd_vals:
+        if isinstance(v, str):
+            # Threshold expression: parse and evaluate
+            m = _NODATA_EXPR_RE.match(v)
+            if m:
+                band_name, op, threshold = m.groups()
+                band_num = int(band_name[1:])  # b1 -> 1, b2 -> 2, etc.
+                ch_idx = _get_channel_idx(band_num)
+                
+                if ch_idx >= C:
+                    logging.warning(f"NoData expression {v}: band {band_num} exceeds image channels ({C})")
+                    continue
+                
+                ch = x[..., ch_idx]
+                threshold_val = float(threshold)
+                
+                # Apply comparison operator
+                if op == '<':
+                    mask |= (ch < threshold_val)
+                elif op == '<=':
+                    mask |= (ch <= threshold_val)
+                elif op == '>':
+                    mask |= (ch > threshold_val)
+                elif op == '>=':
+                    mask |= (ch >= threshold_val)
+                elif op == '==':
+                    mask |= np.isclose(ch, threshold_val, rtol=0.0, atol=1e-6)
+                elif op == '!=':
+                    mask |= ~np.isclose(ch, threshold_val, rtol=0.0, atol=1e-6)
+        else:
+            # Numeric literal: match any channel within tolerance
+            try:
+                fv = float(v)
+                abs_fv = abs(fv)
+                # Use appropriate tolerance based on value magnitude
+                if abs_fv > 1e+30:
+                    tol = abs_fv * 0.01
+                elif abs_fv > 1e+10:
+                    tol = abs_fv * 0.001
+                elif abs_fv > 100:
+                    tol = abs_fv * 0.001
+                else:
+                    tol = 0.01
+                for c in range(C):
+                    ch = x[..., c]
+                    mask |= np.isclose(ch, fv, rtol=0.0, atol=tol)
+            except Exception:
+                pass
+    
+    # Also check for NaN/Inf (always masked)
+    for c in range(C):
+        ch = x[..., c]
+        mask |= np.isnan(ch)
+        mask |= np.isinf(ch)
+    
+    return mask
+
 
 __all__ = [
     'STRETCH_LOW_P',
@@ -452,4 +758,6 @@ __all__ = [
     'calculate_gbd',
     'calculate_wdx',
     'calculate_shd',
+    'parse_nodata_text',
+    'build_nodata_mask',
 ]

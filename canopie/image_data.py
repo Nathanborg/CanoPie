@@ -1,5 +1,3 @@
-"""Auto-generated module extracted from original CanoPie code."""
-
 
 import sys
 import os
@@ -64,7 +62,27 @@ from .utils import *
 class ImageData:
     def __init__(self, filepath, mode='dual_folder'):
         self.filepath = filepath
-        self.image = cv2.imread(filepath, cv2.IMREAD_UNCHANGED)
+        # PERF FIX: cv2.imread is faster (uses libtiff directly for TIFFs).
+        # Only use np.fromfile+imdecode for paths with non-ASCII chars (Windows Unicode fix).
+        try:
+            if filepath.isascii():
+                self.image = cv2.imread(filepath, cv2.IMREAD_UNCHANGED)
+            else:
+                file_data = np.fromfile(filepath, dtype=np.uint8)
+                self.image = cv2.imdecode(file_data, cv2.IMREAD_UNCHANGED)
+        except Exception:
+            self.image = None
+
+        # Fallback chain
+        if self.image is None:
+            try:
+                file_data = np.fromfile(filepath, dtype=np.uint8)
+                self.image = cv2.imdecode(file_data, cv2.IMREAD_UNCHANGED)
+            except Exception:
+                self.image = None
+        if self.image is None:
+            self.image = cv2.imread(filepath, cv2.IMREAD_UNCHANGED)
+
         if self.image is None:
             raise ValueError(f"Could not read image file: {filepath}")
 
@@ -98,4 +116,6 @@ class ImageData:
         if (self.is_rgb or self.is_thermal) and mode == 'dual_folder':
             self.image = self.image
             print(f"Rotated image: {filepath} by 180 degrees.")
+        
+
 

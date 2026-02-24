@@ -1,6 +1,3 @@
-"""Auto-generated module extracted from original CanoPie code."""
-
-
 import sys
 import os
 import re
@@ -59,6 +56,9 @@ def _no_file_basicConfig(*args, **kwargs):
     return _original_basicConfig(*args, **kwargs)
 logging.basicConfig = _no_file_basicConfig
 
+# Silence noisy tifffile warnings (e.g. GDAL_NODATA)
+logging.getLogger("tifffile").setLevel(logging.ERROR)
+
 from .utils import *
 
 class _LoaderSignals(QtCore.QObject):
@@ -87,7 +87,8 @@ class _ImageLoadRunnable(QtCore.QRunnable):
     def run(self):
         # If cancel requested before starting, just count down and go.
         if self._stop.is_set():
-            self.signals.done_one.emit()
+            try: self.signals.done_one.emit()
+            except RuntimeError: pass
             return
 
         try:
@@ -104,7 +105,8 @@ class _ImageLoadRunnable(QtCore.QRunnable):
             imgd = self._tab._imagedata_or_fallback(self._filepath)
 
             if self._stop.is_set():
-                self.signals.done_one.emit()
+                try: self.signals.done_one.emit()
+                except RuntimeError: pass
                 return
 
             # 2) Apply aux mods (no UI here)
@@ -114,11 +116,13 @@ class _ImageLoadRunnable(QtCore.QRunnable):
             )
 
             if self._stop.is_set():
-                self.signals.done_one.emit()
+                try: self.signals.done_one.emit()
+                except RuntimeError: pass
                 return
 
-            # 3) Success
-            self.signals.result.emit(self._index, imgd)
+            # 4) Success
+            try: self.signals.result.emit(self._index, imgd)
+            except RuntimeError: pass
 
         except Exception as e:
             # Make sure 'os' is imported; else this path would fail.
@@ -126,10 +130,12 @@ class _ImageLoadRunnable(QtCore.QRunnable):
                 base = os.path.basename(self._filepath)
             except Exception:
                 base = str(self._filepath)
-            self.signals.error.emit(self._index, f"{base}: {e}")
+            try: self.signals.error.emit(self._index, f"{base}: {e}")
+            except RuntimeError: pass
 
         finally:
-            self.signals.done_one.emit()
+            try: self.signals.done_one.emit()
+            except RuntimeError: pass
 
 
 class ImageProcessor:
@@ -563,6 +569,8 @@ class ImageProcessor:
         or {'latitude': None, 'longitude': None} if not found.
         """
         try:
+            # Suppress exifread warnings
+            logging.getLogger("exifread").setLevel(logging.ERROR)
             with open(filepath, 'rb') as f:
                 tags = exifread.process_file(f, details=False)
            
