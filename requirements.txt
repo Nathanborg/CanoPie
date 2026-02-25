@@ -2,11 +2,13 @@ ExifRead
 folium==0.19.3
 geopy==2.4.1
 joblib==1.4.2
+matplotlib
 numpy==1.24.4
 opencv_python==4.10.0.84
 Pillow
 PyQt5==5.15.11
 PyQt5_sip
+pystackreg
 scikit_learn==1.6.1
 scipy
 Shapely
