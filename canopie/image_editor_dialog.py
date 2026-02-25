@@ -3051,51 +3051,49 @@ class ImageEditorDialog(QDialog):
         control_layout.addWidget(geo_group)
 
         # ==========================================================
-        # GROUP 1.5: Registration (New)
+        # GROUP 1.5: Registration (New) - TEMPORARILY DISABLED
         # ==========================================================
-        # ==========================================================
-        # GROUP 1.5: Registration (New)
-        # ==========================================================
-        reg_group = CollapsibleBox("Registration")
-        reg_group.toggle_button.setProperty("class", "collapsible-toggle")
-        reg_layout = reg_group.content_layout
-        
-        if not HAS_PYSTACKREG:
-            warn_lbl = QtWidgets.QLabel("pystackreg library missing.\nPlease pip install pystackreg.")
-            warn_lbl.setStyleSheet("color: red; font-weight: bold;")
-            reg_layout.addWidget(warn_lbl)
-        
-        row_reg = QtWidgets.QHBoxLayout()
-        reg_label = QtWidgets.QLabel("Mode:")
-        
-        self.reg_mode_combo = QtWidgets.QComboBox()
-        self.reg_mode_combo.addItems([
-            "None", "Translation", "Rigid Body", 
-            "Scaled Rotation", "Affine", "Bilinear"
-        ])
-        if not HAS_PYSTACKREG:
-            self.reg_mode_combo.setEnabled(False)
-        self.reg_mode_combo.currentIndexChanged.connect(self._on_reg_mode_changed)
-        
-        self.reg_enabled_checkbox = QtWidgets.QCheckBox("Use")
-        self.reg_enabled_checkbox.setToolTip("Align images to the current image (Reference) when clicking 'Apply All'.")
-        self.reg_enabled_checkbox.setChecked(False)
-        if not HAS_PYSTACKREG:
-            self.reg_enabled_checkbox.setEnabled(False)
-        self.reg_enabled_checkbox.stateChanged.connect(self._on_reg_enabled_changed)
-        
-        row_reg.addWidget(reg_label)
-        row_reg.addWidget(self.reg_mode_combo, 1)
-        row_reg.addWidget(self.reg_enabled_checkbox)
-        
-        reg_layout.addLayout(row_reg)
-        
-        # Info label
-        reg_info = QtWidgets.QLabel("Apply All to register others to this image.")
-        reg_info.setStyleSheet("color: gray; font-style: italic;")
-        reg_layout.addWidget(reg_info)
-        
-        control_layout.addWidget(reg_group)
+        if False:
+            reg_group = CollapsibleBox("Registration")
+            reg_group.toggle_button.setProperty("class", "collapsible-toggle")
+            reg_layout = reg_group.content_layout
+            
+            if not HAS_PYSTACKREG:
+                warn_lbl = QtWidgets.QLabel("pystackreg library missing.\nPlease pip install pystackreg.")
+                warn_lbl.setStyleSheet("color: red; font-weight: bold;")
+                reg_layout.addWidget(warn_lbl)
+            
+            row_reg = QtWidgets.QHBoxLayout()
+            reg_label = QtWidgets.QLabel("Mode:")
+            
+            self.reg_mode_combo = QtWidgets.QComboBox()
+            self.reg_mode_combo.addItems([
+                "None", "Translation", "Rigid Body", 
+                "Scaled Rotation", "Affine", "Bilinear"
+            ])
+            if not HAS_PYSTACKREG:
+                self.reg_mode_combo.setEnabled(False)
+            self.reg_mode_combo.currentIndexChanged.connect(self._on_reg_mode_changed)
+            
+            self.reg_enabled_checkbox = QtWidgets.QCheckBox("Use")
+            self.reg_enabled_checkbox.setToolTip("Align images to the current image (Reference) when clicking 'Apply All'.")
+            self.reg_enabled_checkbox.setChecked(False)
+            if not HAS_PYSTACKREG:
+                self.reg_enabled_checkbox.setEnabled(False)
+            self.reg_enabled_checkbox.stateChanged.connect(self._on_reg_enabled_changed)
+            
+            row_reg.addWidget(reg_label)
+            row_reg.addWidget(self.reg_mode_combo, 1)
+            row_reg.addWidget(self.reg_enabled_checkbox)
+            
+            reg_layout.addLayout(row_reg)
+            
+            # Info label
+            reg_info = QtWidgets.QLabel("Apply All to register others to this image.")
+            reg_info.setStyleSheet("color: gray; font-style: italic;")
+            reg_layout.addWidget(reg_info)
+            
+            control_layout.addWidget(reg_group)
 
         # ==========================================================
         # GROUP 2: Masking (Now includes NoData)
