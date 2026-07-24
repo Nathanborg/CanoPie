@@ -2606,52 +2606,71 @@ class ImageViewer(QtWidgets.QGraphicsView):
         self.temp_drawing_item.setPen(pen)
 
     def _generate_random_points(self):
-        """Generate random points across the image after asking the user for the count."""
+        """
+        Generate random points across the image after asking the user for the count.
+
+        Each point becomes its OWN item with its OWN unique group name (one
+        all_polygons[group][filepath] entry per point) -- exactly like manually clicking one
+        point at a time. Previously all N points were bundled into a single EditablePointItem
+        with ONE polygon_drawn emission, so they all landed in ONE all_polygons entry: moving
+        or deleting any point moved/deleted the whole batch, and Polygon Manager showed one
+        row for all of them. Emitting once per point (via the existing on_polygon_drawn path)
+        makes each point individually selectable, movable, and deletable, and gives it its own
+        row in Polygon Manager -- the same mechanism used by manual drawing.
+        """
         import random
-        
+
         # Get image dimensions
         if not self._image or not self._image.pixmap():
             QtWidgets.QMessageBox.warning(self, "No Image", "No image loaded.")
             return
-        
+
         pm = self._image.pixmap()
         img_w, img_h = pm.width(), pm.height()
-        
+
         # Ask user for number of points
         num_points, ok = QtWidgets.QInputDialog.getInt(
             self, "Random Points",
             "How many random points to generate?",
             value=10, min=1, max=10000, step=1
         )
-        
+
         if not ok:
             return
-        
-        # Generate random points
-        group_name = self.pending_group_name if self.pending_group_name else "random_points"
-        
+
+        base_name = self.pending_group_name if self.pending_group_name else "random_point"
+
         # Get pixmap position offset
         off = self._image.pos()
-        
-        # Create points as a QPolygonF
-        random_polygon = QtGui.QPolygonF()
-        for _ in range(num_points):
+
+        created = 0
+        for i in range(num_points):
             x = random.uniform(0, img_w - 1)
             y = random.uniform(0, img_h - 1)
             # Convert to scene coordinates
             scene_x = off.x() + x
             scene_y = off.y() + y
-            random_polygon.append(QtCore.QPointF(scene_x, scene_y))
-        
-        # Add as point item (individual points)
-        self.currentPolygon = random_polygon
-        point_item = self.add_point_to_scene(random_polygon, group_name)
-        if not self.programmatically_adding_polygon:
-            self.polygon_drawn.emit(point_item)
-        
+
+            single_point = QtGui.QPolygonF()
+            single_point.append(QtCore.QPointF(scene_x, scene_y))
+
+            # Unique per-point group name so on_polygon_drawn creates a SEPARATE
+            # all_polygons entry for this point (consumed immediately below, same as a
+            # manual click would set it once per drawn shape).
+            self.pending_group_name = f"{base_name}_{i + 1}"
+
+            self.currentPolygon = single_point
+            point_item = self.add_point_to_scene(single_point, self.pending_group_name)
+            if not self.programmatically_adding_polygon:
+                self.polygon_drawn.emit(point_item)
+            created += 1
+
         self.pending_group_name = None
         self.currentPolygon = QtGui.QPolygonF()
-        logging.info(f"[ImageViewer] Generated {num_points} random points for group '{group_name}'")
+        logging.info(
+            f"[ImageViewer] Generated {created} individual random points "
+            f"(groups '{base_name}_1'..'{base_name}_{created}')"
+        )
 
     def handle_undoable_move_batch(self, changes):
         """

@@ -201,7 +201,11 @@ def _normalize_for_display(
             C = x.shape[2]
             use = x[:, :, :max(1, min(C, 3))]  # take up to 3 channels for preview
             s = _sample(use)
-            if per_channel and use.ndim == 3 and use.shape[2] > 1:
+            # Always stretch multi-channel imagery PER CHANNEL. Pooling all bands into a
+            # single distribution (the old `per_channel`-gated else branch) blows out the
+            # brightest band and crushes the others on multi-band images; grayscale (1 band)
+            # is unaffected. `per_channel` now governs only Absolute per-band ranges elsewhere.
+            if use.ndim == 3 and use.shape[2] > 1:
                 flat = s.reshape(-1, use.shape[2])
                 lo = np.percentile(flat, low_p, axis=0)
                 hi = np.percentile(flat, high_p, axis=0)
