@@ -1954,7 +1954,6 @@ class PolygonManager(QtWidgets.QDialog):
         delete_all_action = menu.addAction("Delete All Polygons")
         menu.addSeparator()
         export_csv_action = menu.addAction("Export CSV (ML)")
-        export_shp_action = menu.addAction("Export Shapefile (.shp)")
         thumbs_action     = menu.addAction("Generate Thumbnails (ML)")
         masks_action      = menu.addAction("Generate Segmentation Masks (ML)")
             # NEW: stats
@@ -1978,8 +1977,6 @@ class PolygonManager(QtWidgets.QDialog):
             self.zoom_to_groups(target_groups)
         elif action == export_csv_action:
             self._mlm_invoke(target_groups, kind="csv")
-        elif action == export_shp_action:
-            self._export_shapefile(target_groups)
         elif action == thumbs_action:
             self._mlm_invoke(target_groups, kind="thumbs")
         elif action == masks_action:
@@ -2216,80 +2213,6 @@ class PolygonManager(QtWidgets.QDialog):
                         viewer.centerOn(combined.center())
                     except Exception:
                         pass
-
-
-    def _export_shapefile(self, groups):
-        """
-        Export selected polygon groups as an ESRI Shapefile.
-        Uses GeoTIFF transforms when available, falls back to EXIF GPS.
-        """
-        import os, logging
-        parent = self.parent()
-        if not parent:
-            return
-
-        all_polygons = getattr(parent, 'all_polygons', {})
-        if not all_polygons:
-            QtWidgets.QMessageBox.warning(self, "No Polygons", "No polygons available to export.")
-            return
-
-        # Filter to selected groups only
-        selected_polys = {g: all_polygons[g] for g in groups if g in all_polygons}
-        if not selected_polys:
-            QtWidgets.QMessageBox.warning(self, "No Polygons", "Selected groups have no polygon data.")
-            return
-
-        # Ask user for save location
-        save_path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Export Shapefile", "", "Shapefiles (*.shp)"
-        )
-        if not save_path:
-            return
-
-        try:
-            from .shapefile_io import json_polygons_to_features, write_shapefile
-
-            project_folder = getattr(parent, 'project_folder', '') or ''
-            features, crs_wkt, warnings = json_polygons_to_features(
-                selected_polys, project_folder,
-                get_ax_path_fn=getattr(parent, "_ax_path_for", None),
-            )
-
-            if not features:
-                warn_msg = "No features could be converted."
-                if warnings:
-                    warn_msg += "\n\n" + "\n".join(warnings[:10])
-                QtWidgets.QMessageBox.warning(self, "Shapefile Export", warn_msg)
-                return
-
-            # write_shapefile expects path WITHOUT extension
-            shp_stem = os.path.splitext(save_path)[0]
-            write_shapefile(features, shp_stem, crs_wkt=crs_wkt)
-
-            # Summary
-            methods = {}
-            for feat in features:
-                m = feat['properties'].get('georef', 'none')
-                methods[m] = methods.get(m, 0) + 1
-            summary_parts = [f"{cnt} via {meth}" for meth, cnt in methods.items()]
-            summary = ", ".join(summary_parts)
-
-            msg = (f"Shapefile exported successfully!\n\n"
-                   f"Features: {len(features)}\n"
-                   f"Georeferencing: {summary}\n"
-                   f"Path: {shp_stem}.shp")
-            if warnings:
-                msg += f"\n\nWarnings ({len(warnings)}):\n"
-                msg += "\n".join(warnings[:5])
-
-            logging.info(f"[Shapefile export] {msg}")
-            QtWidgets.QMessageBox.information(self, "Shapefile Exported", msg)
-
-        except Exception as e:
-            logging.error(f"[Shapefile export] Failed: {e}")
-            QtWidgets.QMessageBox.critical(
-                self, "Shapefile Export Error", f"Export failed:\n{e}"
-            )
 
 
     def _mlm_invoke(self, groups, kind: str):

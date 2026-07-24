@@ -905,16 +905,13 @@ class ProjectImagesExportWorker(QtCore.QThread):
                         img, _ = self.project_tab._apply_ax_to_raw(img, ax, filepath=filepath)
                     
                     # 4. Save Logic (Standardized)
-                    source_ext = os.path.splitext(filepath)[1].lower()
-                    actual_format = 'jpg' if source_ext in ('.jpg', '.jpeg') else self.export_format
-                    
                     stem = os.path.splitext(basename)[0]
-                    out_path = os.path.join(self.output_dir, f"{stem}.{actual_format}")
+                    out_path = os.path.join(self.output_dir, f"{stem}.{self.export_format}")
 
                     # Deduplicate filenames
                     c = 1
                     while os.path.exists(out_path):
-                        out_path = os.path.join(self.output_dir, f"{stem}_{c}.{actual_format}")
+                        out_path = os.path.join(self.output_dir, f"{stem}_{c}.{self.export_format}")
                         c += 1
 
                     # Check if we have band expressions/appended bands (need float preservation)
@@ -924,8 +921,8 @@ class ProjectImagesExportWorker(QtCore.QThread):
                     needs_float = has_band_expr or has_appended_bands or has_classification
 
                     # Convert RGB/BGR if needed and save
-                    if actual_format == 'jpg':
-                        cv2.imwrite(out_path, img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    if self.export_format == 'jpg':
+                        cv2.imwrite(out_path, img[..., ::-1] if img.ndim==3 else img, [cv2.IMWRITE_JPEG_QUALITY, 95])
                     elif self.export_format in ('tif', 'tiff') and (needs_float or img.dtype not in (np.uint8, np.uint16)):
                         # Use tifffile for float data or multiband to preserve precision
                         import tifffile
@@ -1431,66 +1428,35 @@ class ImageStretchDialog(QtWidgets.QDialog):
         self.sp_min.setValue(self._init.min_val if self._init.min_val is not None else self._real_min)
         self.sp_max.setValue(self._init.max_val if self._init.max_val is not None else self._real_max)
 
-        # Global Abs Min/Max sliders (used for single-band and non-per-channel Absolute).
-        # Range is mapped to the current data range [_real_min, _real_max]; kept in sync in
-        # _global_slider_range(). Requested so single-band images get sliders too.
-        self.sl_min = QtWidgets.QSlider(QtCore.Qt.Horizontal); self.sl_min.setRange(0, self._SLIDER_RES if hasattr(self, "_SLIDER_RES") else 1000)
-        self.sl_max = QtWidgets.QSlider(QtCore.Qt.Horizontal); self.sl_max.setRange(0, self.sl_min.maximum())
-        _fixw(self.sl_min, 120); _fixw(self.sl_max, 120)
-
         # Per-channel (Absolute) UI
-        # NOTE: real per-channel ranges + labels are (re)computed in
-        # _recompute_and_seed_per_channel_boxes(), which always samples the CURRENTLY
-        # SELECTED display bands (not just the first 3 raw bands) -- see that method
-        # for why the old seeding (always from bands[0:3], pooled min/max) was wrong.
         self._per_band_channels = 3
-        self._SLIDER_RES = 1000
         self.sp_min_ch = []; self.sp_max_ch = []
-        self.sl_min_ch = []; self.sl_max_ch = []
-        self._per_band_labels = []
-        self._ch_real_range = [(0.0, 1.0)] * self._per_band_channels
         self._per_band_row = QtWidgets.QWidget()
         per_band_layout = QtWidgets.QGridLayout(self._per_band_row)
         per_band_layout.setContentsMargins(0, 0, 0, 0)
         per_band_layout.setSpacing(4)
         for c in range(self._per_band_channels):
             lbl = QtWidgets.QLabel(f"Ch {c+1}:")
-            sp_lo = QtWidgets.QDoubleSpinBox(); sp_lo.setRange(-1e12, 1e12); sp_lo.setDecimals(6)
-            sp_hi = QtWidgets.QDoubleSpinBox(); sp_hi.setRange(-1e12, 1e12); sp_hi.setDecimals(6)
-            _fixw(sp_lo, 78); _fixw(sp_hi, 78)
-            sl_lo = QtWidgets.QSlider(QtCore.Qt.Horizontal); sl_lo.setRange(0, self._SLIDER_RES)
-            sl_hi = QtWidgets.QSlider(QtCore.Qt.Horizontal); sl_hi.setRange(0, self._SLIDER_RES)
-            _fixw(sl_lo, 70); _fixw(sl_hi, 70)
+            sp_lo = QtWidgets.QDoubleSpinBox(); sp_lo.setRange(-1e12, 1e12); sp_lo.setDecimals(6); sp_lo.setValue(self._real_min)
+            sp_hi = QtWidgets.QDoubleSpinBox(); sp_hi.setRange(-1e12, 1e12); sp_hi.setDecimals(6); sp_hi.setValue(self._real_max)
+            _fixw(sp_lo, 70); _fixw(sp_hi, 70)
             self.sp_min_ch.append(sp_lo); self.sp_max_ch.append(sp_hi)
-            self.sl_min_ch.append(sl_lo); self.sl_max_ch.append(sl_hi)
-            self._per_band_labels.append(lbl)
             per_band_layout.addWidget(lbl,   c, 0)
             per_band_layout.addWidget(sp_lo, c, 1)
-            per_band_layout.addWidget(sl_lo, c, 2)
-            per_band_layout.addWidget(QtWidgets.QLabel("→"), c, 3)
-            per_band_layout.addWidget(sp_hi, c, 4)
-            per_band_layout.addWidget(sl_hi, c, 5)
-
-            sp_lo.valueChanged.connect(partial(self._on_channel_spin_changed, c, "lo"))
-            sp_hi.valueChanged.connect(partial(self._on_channel_spin_changed, c, "hi"))
-            sl_lo.valueChanged.connect(partial(self._on_channel_slider_moved, c, "lo"))
-            sl_hi.valueChanged.connect(partial(self._on_channel_slider_moved, c, "hi"))
+            per_band_layout.addWidget(QtWidgets.QLabel("→"), c, 2)
+            per_band_layout.addWidget(sp_hi, c, 3)
 
         stretch_form.addRow("Mode:", modes_row)
         stretch_form.addRow("Low P%:", self.sp_low)
         stretch_form.addRow("High P%:", self.sp_high)
         stretch_form.addRow("±σ:", self.cb_k)
         stretch_form.addRow(self.lb_range)
-        _abs_min_row = QtWidgets.QHBoxLayout(); _abs_min_row.setContentsMargins(0, 0, 0, 0); _abs_min_row.setSpacing(4)
-        _abs_min_row.addWidget(self.sp_min); _abs_min_row.addWidget(self.sl_min)
-        _abs_max_row = QtWidgets.QHBoxLayout(); _abs_max_row.setContentsMargins(0, 0, 0, 0); _abs_max_row.setSpacing(4)
-        _abs_max_row.addWidget(self.sp_max); _abs_max_row.addWidget(self.sl_max)
-        stretch_form.addRow("Abs Min:", _abs_min_row)
-        stretch_form.addRow("Abs Max:", _abs_max_row)
+        stretch_form.addRow("Abs Min:", self.sp_min)
+        stretch_form.addRow("Abs Max:", self.sp_max)
         stretch_form.addRow("Per Channel (Abs):", self._per_band_row)
         stretch_layout.addLayout(stretch_form)
 
-        self.cb_perch = QtWidgets.QCheckBox("Per channel (Absolute overrides)"); self.cb_perch.setChecked(self._init.per_channel)
+        self.cb_perch = QtWidgets.QCheckBox("Per channel"); self.cb_perch.setChecked(self._init.per_channel)
         self.cb_clip  = QtWidgets.QCheckBox("Clip to [0,1]"); self.cb_clip.setChecked(self._init.clip)
         stretch_layout.addWidget(self.cb_perch)
         stretch_layout.addWidget(self.cb_clip)
@@ -1543,40 +1509,9 @@ class ImageStretchDialog(QtWidgets.QDialog):
 
         self.cb_disp_mode.currentIndexChanged.connect(self._on_display_mode_changed)
         self.cb_band.currentIndexChanged.connect(self._on_band_changed)
-        self.cb_r.currentIndexChanged.connect(self._on_rgb_band_changed)
-        self.cb_g.currentIndexChanged.connect(self._on_rgb_band_changed)
-        self.cb_b.currentIndexChanged.connect(self._on_rgb_band_changed)
-
-        # Global Abs Min/Max slider <-> spinbox sync
-        self.sp_min.valueChanged.connect(lambda _v: self._sync_global_slider_from_spin("lo"))
-        self.sp_max.valueChanged.connect(lambda _v: self._sync_global_slider_from_spin("hi"))
-        self.sl_min.valueChanged.connect(lambda pos: self._on_global_slider_moved("lo", pos))
-        self.sl_max.valueChanged.connect(lambda pos: self._on_global_slider_moved("hi", pos))
-        self._sync_global_slider_from_spin("lo")
-        self._sync_global_slider_from_spin("hi")
-
-        # ---- Live preview (debounced) ----
-        # Dragging the sliders / editing any value now updates the preview automatically via a
-        # single debounced apply, instead of the user clicking "Apply" repeatedly (which is what
-        # made the stretcher appear to "stop working"). The timer coalesces rapid changes so we
-        # never flood the render pipeline.
-        self._live_ready = False
-        self._live_timer = QtCore.QTimer(self)
-        self._live_timer.setSingleShot(True)
-        self._live_timer.setInterval(120)
-        self._live_timer.timeout.connect(self._emit_live_apply)
-        for _w in (self.sp_low, self.sp_high, self.sp_min, self.sp_max):
-            _w.valueChanged.connect(self._schedule_live_apply)
-        for _w in (list(self.sp_min_ch) + list(self.sp_max_ch)):
-            _w.valueChanged.connect(self._schedule_live_apply)
-        self.cb_k.currentIndexChanged.connect(self._schedule_live_apply)
-        self.cb_perch.toggled.connect(self._schedule_live_apply)
-        self.cb_clip.toggled.connect(self._schedule_live_apply)
-        self.mode_percent.toggled.connect(self._schedule_live_apply)
-        self.mode_sigma.toggled.connect(self._schedule_live_apply)
-        self.mode_abs.toggled.connect(self._schedule_live_apply)
-        for _w in (self.cb_disp_mode, self.cb_band, self.cb_r, self.cb_g, self.cb_b):
-            _w.currentIndexChanged.connect(self._schedule_live_apply)
+        self.cb_r.currentIndexChanged.connect(self._refresh_stats_for_display)
+        self.cb_g.currentIndexChanged.connect(self._refresh_stats_for_display)
+        self.cb_b.currentIndexChanged.connect(self._refresh_stats_for_display)
 
         # Initial state
         self._apply_initial_state()
@@ -1595,34 +1530,20 @@ class ImageStretchDialog(QtWidgets.QDialog):
             and bool(getattr(self._init, "band_maxs", None))
         )
 
-        # Seed the per-channel Absolute boxes/sliders from the CURRENTLY selected display
-        # bands (now that display mode/band pickers have been restored above), falling back
-        # to saved band_mins/band_maxs when present. See _recompute_and_seed_per_channel_boxes.
-        self._recompute_and_seed_per_channel_boxes(seed_from_init=True)
+        if self._has_user_saved_per_channel:
+            # Only 3 rows are shown; take first 3 values safely
+            bm = list(self._init.band_mins or [])[:3]
+            bx = list(self._init.band_maxs or [])[:3]
+            for i in range(min(3, len(self.sp_min_ch))):
+                try:
+                    if i < len(bm) and bm[i] is not None:
+                        self.sp_min_ch[i].setValue(float(bm[i]))
+                    if i < len(bx) and bx[i] is not None:
+                        self.sp_max_ch[i].setValue(float(bx[i]))
+                except Exception:
+                    pass
 
         self._refresh_stats_for_display()
-
-        # All widgets are seeded — safe to start live previews now.
-        self._live_ready = True
-
-    # ---------- live preview (debounced) ----------
-    def _schedule_live_apply(self, *args):
-        if not getattr(self, "_live_ready", False):
-            return
-        try:
-            self._live_timer.start()
-        except Exception:
-            pass
-
-    def _emit_live_apply(self):
-        try:
-            params = self.get_params()
-        except Exception:
-            return
-        try:
-            self.applyRequested.emit(params)
-        except Exception:
-            pass
 
     # ---------- helpers ----------
     def _current_display_array(self):
@@ -1652,168 +1573,6 @@ class ImageStretchDialog(QtWidgets.QDialog):
         # Per-channel controls only make sense when a 3-channel composite is displayed
         mode = self.cb_disp_mode.currentData()
         return (self._channels >= 3) and (mode in ("rgb", "auto"))
-
-    # ---------- per-channel Absolute boxes/sliders ----------
-    def _current_display_band_indices(self):
-        """Raw-band index feeding each of the (up to 3) current display planes."""
-        C = self._channels
-        mode = self.cb_disp_mode.currentData()
-        if mode == "single":
-            b = int(self.cb_band.currentData() or 0)
-            b = max(0, min(C - 1, b))
-            return [b, b, b]
-        if mode == "rgb":
-            r = int(self.cb_r.currentData() or 0)
-            g = int(self.cb_g.currentData() or 1)
-            b = int(self.cb_b.currentData() or 2)
-            r = max(0, min(C - 1, r)); g = max(0, min(C - 1, g)); b = max(0, min(C - 1, b))
-            return [r, g, b]
-        # auto -> first up to 3 bands
-        idxs = list(range(min(3, C)))
-        while len(idxs) < 3:
-            idxs.append(idxs[-1] if idxs else 0)
-        return idxs
-
-    def _current_per_channel_range(self):
-        """
-        Real (native-scale) min/max for EACH of the up-to-3 currently displayed bands.
-        Always derived from the actual selected display stack (_current_display_array),
-        never from a fixed bands[0:3] slice -- that was the root cause of the per-channel
-        Absolute boxes showing a different band's (sometimes low-precision/preview-like)
-        range instead of the real range of the band the user actually selected.
-        """
-        import numpy as np
-        arr = np.asarray(self._current_display_array())
-
-        def _sample(a, k=400):
-            if a.ndim == 3:
-                H, W, _ = a.shape
-                stride = max(1, int(np.sqrt((H * W) / float(max(1, k)))))
-                return a[::stride, ::stride, :]
-            H, W = a.shape[:2]
-            stride = max(1, int(np.sqrt((H * W) / float(max(1, k)))))
-            return a[::stride, ::stride]
-
-        s = _sample(arr)
-        if s.ndim == 3:
-            C = s.shape[2]
-            flat = s.reshape(-1, C)
-            lo = [float(v) for v in np.nanmin(flat, axis=0)]
-            hi = [float(v) for v in np.nanmax(flat, axis=0)]
-            lo = (lo + [0.0] * 3)[:3]
-            hi = (hi + [1.0] * 3)[:3]
-            return lo, hi
-        v_lo = float(np.nanmin(s)); v_hi = float(np.nanmax(s))
-        return [v_lo, v_lo, v_lo], [v_hi, v_hi, v_hi]
-
-    def _recompute_and_seed_per_channel_boxes(self, seed_from_init=False):
-        """
-        Refresh the 3 per-channel Absolute rows (labels, slider ranges, values) to match
-        the CURRENTLY selected display bands. On first open (seed_from_init=True), a
-        previously-saved per-band Absolute range (self._init.band_mins/band_maxs) wins;
-        otherwise each row resets to that band's real min/max, since a mode/band change
-        means "Ch i" now refers to a different physical band entirely.
-        """
-        lo_real, hi_real = self._current_per_channel_range()
-        band_idxs = self._current_display_band_indices()
-        self._real_min_ch = lo_real
-        self._real_max_ch = hi_real
-
-        bm = bx = None
-        if seed_from_init and getattr(self, "_has_user_saved_per_channel", False):
-            bm = list(self._init.band_mins or [])[:3]
-            bx = list(self._init.band_maxs or [])[:3]
-
-        for i in range(self._per_band_channels):
-            lo_i, hi_i = float(lo_real[i]), float(hi_real[i])
-            if hi_i <= lo_i:
-                hi_i = lo_i + 1e-6
-            self._ch_real_range[i] = (lo_i, hi_i)
-
-            val_lo = float(bm[i]) if (bm and i < len(bm) and bm[i] is not None) else lo_i
-            val_hi = float(bx[i]) if (bx and i < len(bx) and bx[i] is not None) else hi_i
-
-            self.sp_min_ch[i].blockSignals(True)
-            self.sp_max_ch[i].blockSignals(True)
-            self.sp_min_ch[i].setValue(val_lo)
-            self.sp_max_ch[i].setValue(val_hi)
-            self.sp_min_ch[i].blockSignals(False)
-            self.sp_max_ch[i].blockSignals(False)
-
-            self._sync_slider_from_spin(i, "lo")
-            self._sync_slider_from_spin(i, "hi")
-
-            if i < len(band_idxs):
-                self._per_band_labels[i].setText(f"Band {band_idxs[i] + 1}:")
-
-    def _slider_pos_from_value(self, ch_idx, value):
-        lo, hi = self._ch_real_range[ch_idx]
-        if hi <= lo:
-            return 0
-        frac = (float(value) - lo) / (hi - lo)
-        frac = max(0.0, min(1.0, frac))
-        return int(round(frac * self._SLIDER_RES))
-
-    def _value_from_slider_pos(self, ch_idx, pos):
-        lo, hi = self._ch_real_range[ch_idx]
-        frac = float(pos) / float(self._SLIDER_RES)
-        return lo + frac * (hi - lo)
-
-    def _sync_slider_from_spin(self, ch_idx, which):
-        slider = self.sl_min_ch[ch_idx] if which == "lo" else self.sl_max_ch[ch_idx]
-        spin = self.sp_min_ch[ch_idx] if which == "lo" else self.sp_max_ch[ch_idx]
-        pos = self._slider_pos_from_value(ch_idx, spin.value())
-        slider.blockSignals(True)
-        slider.setValue(pos)
-        slider.blockSignals(False)
-
-    def _on_channel_slider_moved(self, ch_idx, which, pos):
-        spin = self.sp_min_ch[ch_idx] if which == "lo" else self.sp_max_ch[ch_idx]
-        val = self._value_from_slider_pos(ch_idx, pos)
-        spin.blockSignals(True)
-        spin.setValue(val)
-        spin.blockSignals(False)
-        self._schedule_live_apply()
-
-    def _on_channel_spin_changed(self, ch_idx, which, _value=None):
-        self._sync_slider_from_spin(ch_idx, which)
-
-    def _on_rgb_band_changed(self, *args):
-        self._refresh_stats_for_display()
-        self._recompute_and_seed_per_channel_boxes(seed_from_init=False)
-
-    # ---------- global Abs Min/Max slider (single-band & non-per-channel) ----------
-    def _global_slider_range(self):
-        lo = float(getattr(self, "_real_min", 0.0))
-        hi = float(getattr(self, "_real_max", 1.0))
-        if hi <= lo:
-            hi = lo + 1e-6
-        return lo, hi
-
-    def _global_value_from_pos(self, pos):
-        lo, hi = self._global_slider_range()
-        frac = float(pos) / float(self._SLIDER_RES)
-        return lo + frac * (hi - lo)
-
-    def _global_pos_from_value(self, value):
-        lo, hi = self._global_slider_range()
-        frac = (float(value) - lo) / (hi - lo)
-        frac = max(0.0, min(1.0, frac))
-        return int(round(frac * self._SLIDER_RES))
-
-    def _sync_global_slider_from_spin(self, which):
-        slider = self.sl_min if which == "lo" else self.sl_max
-        spin = self.sp_min if which == "lo" else self.sp_max
-        slider.blockSignals(True)
-        slider.setValue(self._global_pos_from_value(spin.value()))
-        slider.blockSignals(False)
-
-    def _on_global_slider_moved(self, which, pos):
-        spin = self.sp_min if which == "lo" else self.sp_max
-        spin.blockSignals(True)
-        spin.setValue(self._global_value_from_pos(pos))
-        spin.blockSignals(False)
-        self._schedule_live_apply()
 
     def _is_single_abs_active(self):
         return (self.cb_disp_mode.currentData() == "single") and self.mode_abs.isChecked()
@@ -1875,14 +1634,10 @@ class ImageStretchDialog(QtWidgets.QDialog):
         self.sp_low.setEnabled(p); self.sp_high.setEnabled(p)
         self.cb_k.setEnabled(s)
         self.sp_min.setEnabled(a); self.sp_max.setEnabled(a)
-        if hasattr(self, "sl_min"):
-            self.sl_min.setEnabled(a); self.sl_max.setEnabled(a)
 
     def _on_display_mode_changed(self, *args):
         self._apply_display_policy()
         self._refresh_stats_for_display()
-        # "Ch i" now refers to a (possibly) different physical band -- reseed.
-        self._recompute_and_seed_per_channel_boxes(seed_from_init=False)
 
         # If we just entered Single+Absolute, mirror the selected band's values into global
         if self._is_single_abs_active():
@@ -1894,18 +1649,15 @@ class ImageStretchDialog(QtWidgets.QDialog):
                 self.sp_min.blockSignals(False); self.sp_max.blockSignals(False)
 
     def _on_band_changed(self, *args):
-        # A single-band change points "the display" at a different physical band, so the
-        # sliders / data range must re-map to THAT band's real values.
-        self._refresh_stats_for_display()
-        self._recompute_and_seed_per_channel_boxes(seed_from_init=False)
-        # Keep the global Abs boxes synced to the newly selected band's range.
+        # When Single band, keep global min/max synced to that band
         if self._is_single_abs_active():
-            self.sp_min.blockSignals(True); self.sp_max.blockSignals(True)
-            self.sp_min.setValue(self._real_min)
-            self.sp_max.setValue(self._real_max)
-            self.sp_min.blockSignals(False); self.sp_max.blockSignals(False)
-            self._sync_global_slider_from_spin("lo")
-            self._sync_global_slider_from_spin("hi")
+            idx = int(self.cb_band.currentData() or 0)
+            if 0 <= idx < len(self.sp_min_ch):
+                self.sp_min.blockSignals(True); self.sp_max.blockSignals(True)
+                self.sp_min.setValue(self.sp_min_ch[idx].value())
+                self.sp_max.setValue(self.sp_max_ch[idx].value())
+                self.sp_min.blockSignals(False); self.sp_max.blockSignals(False)
+        self._refresh_stats_for_display()
 
     def _refresh_stats_for_display(self):
         import numpy as np
@@ -1920,24 +1672,9 @@ class ImageStretchDialog(QtWidgets.QDialog):
             stride = max(1, int(np.sqrt((H * W) / float(max(1, k)))))
             return a[::stride, ::stride]
 
-        # Compute the real value range of the CURRENT display bands. Wrapped so a bad slice /
-        # all-NaN band can never leave the sliders stuck on a stale (or default 0..255-looking)
-        # range — the sliders must always map to the real values of the band(s) in view.
-        try:
-            s = _sample_for_stats_local(self._current_display_array())
-            with np.errstate(all="ignore"):
-                rmin = float(np.nanmin(s)) if s is not None and s.size else 0.0
-                rmax = float(np.nanmax(s)) if s is not None and s.size else 1.0
-        except Exception:
-            rmin, rmax = 0.0, 1.0
-        if not np.isfinite(rmin):
-            rmin = 0.0
-        if not np.isfinite(rmax):
-            rmax = rmin + 1.0
-        if rmax <= rmin:
-            rmax = rmin + (abs(rmin) * 1e-3 + 1e-6)  # keep a usable, non-degenerate span
-        self._real_min = rmin
-        self._real_max = rmax
+        s = _sample_for_stats_local(self._current_display_array())
+        self._real_min = float(np.nanmin(s)) if s is not None else 0.0
+        self._real_max = float(np.nanmax(s)) if s is not None else 1.0
         # Label text adapts
         if self.cb_disp_mode.currentData() == "single":
             idx = int(self.cb_band.currentData() or 0)
@@ -1952,59 +1689,10 @@ class ImageStretchDialog(QtWidgets.QDialog):
             self.sp_max.setValue(self._real_max)
             self.sp_min.blockSignals(False); self.sp_max.blockSignals(False)
 
-        # Re-map the global Abs sliders to the (possibly changed) data range.
-        if hasattr(self, "sl_min"):
-            self._sync_global_slider_from_spin("lo")
-            self._sync_global_slider_from_spin("hi")
-
     # Initial state
     def _apply_initial_state(self):
         m = (self._init.mode or "percentile").lower()
         (self.mode_percent if m=="percentile" else self.mode_sigma if m=="stddev" else self.mode_abs).setChecked(True)
-
-        # Restore the Display & Bands selection from the saved params. These widgets were
-        # previously never seeded, so the dialog always reopened at "Auto (default)" and
-        # clicking OK re-read the defaulted widgets and OVERWROTE the saved visualization
-        # config. Seed them here (with signals blocked to avoid premature stat refreshes).
-        init = self._init
-        C = int(getattr(self, "_channels", 1) or 1)
-
-        def _select_data(combo, value):
-            """Select the combo entry whose userData == value; no-op if not found."""
-            if value is None:
-                return
-            idx = combo.findData(value)
-            if idx < 0 and isinstance(value, float):
-                idx = combo.findData(int(value))
-            if idx >= 0:
-                combo.setCurrentIndex(idx)
-
-        combos = (self.cb_disp_mode, self.cb_band, self.cb_r, self.cb_g, self.cb_b)
-        for w in combos:
-            w.blockSignals(True)
-        try:
-            dm = str(getattr(init, "display_mode", "auto") or "auto").lower()
-            # A saved "rgb" mode that no longer fits the image falls back to auto.
-            if dm == "rgb" and C < 3:
-                dm = "auto"
-            _select_data(self.cb_disp_mode, dm)
-
-            db = getattr(init, "display_band", None)
-            if db is not None:
-                _select_data(self.cb_band, max(0, min(C - 1, int(db))))
-
-            for combo, attr, default in (
-                (self.cb_r, "r_band", 0),
-                (self.cb_g, "g_band", 1),
-                (self.cb_b, "b_band", 2),
-            ):
-                val = getattr(init, attr, None)
-                val = default if val is None else max(0, min(C - 1, int(val)))
-                _select_data(combo, val)
-        finally:
-            for w in combos:
-                w.blockSignals(False)
-
         self._update_enabled()
 
     # ---------- API ----------
@@ -2894,12 +2582,8 @@ class ProjectTab(QtWidgets.QWidget):
             else:
                 x_masked = x
             
-            # Percentile / stddev are ALWAYS per-channel for a multi-band display stack.
-            # (Pooling bands into one distribution blows out the brightest band and crushes
-            # the rest — it only looked fine on single-band grayscale. `per_channel` now
-            # gates only the Absolute per-band ranges below.)
             if (p.mode or "percentile") == "percentile":
-                if x_masked.ndim == 3:
+                if x_masked.ndim == 3 and p.per_channel:
                     lo = np.nanpercentile(x_masked, p.low_p, axis=(0, 1))
                     hi = np.nanpercentile(x_masked, p.high_p, axis=(0, 1))
                 else:
@@ -2907,7 +2591,7 @@ class ProjectTab(QtWidgets.QWidget):
                     hi = np.nanpercentile(x_masked, p.high_p)
                 return lo, hi
             elif p.mode in ("stddev", "std"):
-                if x_masked.ndim == 3:
+                if x_masked.ndim == 3 and p.per_channel:
                     mu = np.nanmean(x_masked, axis=(0, 1))
                     sd = np.nanstd(x_masked, axis=(0, 1))
                 else:
@@ -2928,21 +2612,13 @@ class ProjectTab(QtWidgets.QWidget):
         def _apply_stretch_uint8(x, lo, hi, clip=True):
             if x is None:
                 return None
-            x = np.asarray(x)
-            if x.dtype != np.float32:
-                x = x.astype(np.float32, copy=False)
-            # Robustness: sliders can produce reversed (min>max), equal, or NaN bounds for any
-            # dtype (categorical uint8, uint16, float). Normalize so the stretch NEVER dies:
-            # NaN-fill, order min<=max, and clamp the denominator away from zero.
-            lo_a = np.nan_to_num(np.asarray(lo, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
-            hi_a = np.nan_to_num(np.asarray(hi, dtype=np.float32), nan=1.0, posinf=1.0, neginf=1.0)
-            lo_f = np.minimum(lo_a, hi_a)
-            hi_f = np.maximum(lo_a, hi_a)
-            denom = np.maximum(1e-12, hi_f - lo_f)
-            if lo_f.ndim == 0:
-                y = (x - float(lo_f)) / float(denom)
+            x = x.astype(np.float32, copy=False)
+            if np.ndim(lo) == 0:
+                y = (x - float(lo)) / max(1e-12, (float(hi) - float(lo)))
             else:
-                y = (x - lo_f.reshape((1, 1, -1))) / denom.reshape((1, 1, -1))
+                lo = np.asarray(lo, dtype=np.float32).reshape((1, 1, -1))
+                hi = np.asarray(hi, dtype=np.float32).reshape((1, 1, -1))
+                y = (x - lo) / np.maximum(1e-12, hi - lo)
             if clip:
                 y = np.clip(y, 0.0, 1.0)
             y = np.nan_to_num(y, nan=0.0, posinf=1.0, neginf=0.0)
@@ -2961,22 +2637,8 @@ class ProjectTab(QtWidgets.QWidget):
         except Exception:
             pass
 
-        # The stretch math must survive ANY dtype / degenerate bounds (categorical uint8,
-        # uint16, float, all-NaN, min>max from sliders). If anything unexpected happens, fall
-        # back to a plain min-max normalization so the stretcher keeps working instead of
-        # silently going dead after repeated applies.
-        try:
-            lo, hi = _minmax_from_mode(disp, params, mask)
-            out = _apply_stretch_uint8(disp, lo, hi, clip=params.clip)
-        except Exception:
-            logging.exception("_compute_stretched_preview: stretch math failed; using min-max fallback")
-            try:
-                d = np.asarray(disp, dtype=np.float32)
-                mn = float(np.nanmin(d)); mx = float(np.nanmax(d))
-                out = _apply_stretch_uint8(d, mn, mx, clip=True)
-            except Exception:
-                logging.exception("_compute_stretched_preview: min-max fallback also failed")
-                return None
+        lo, hi = _minmax_from_mode(disp, params, mask)
+        out = _apply_stretch_uint8(disp, lo, hi, clip=params.clip)
 
         if out is None:
             return None
@@ -2990,16 +2652,11 @@ class ProjectTab(QtWidgets.QWidget):
         return out
 
 
-    def _stretch_apply_preview(self, params, viewer, root_name):
+    @QtCore.pyqtSlot(object)
+    def _on_stretch_apply(self, params, viewer, root_name):
         """
-        Live-apply: compute a uint8 preview via _compute_stretched_preview (which correctly
-        honors the selected display bands and works for ANY dtype — categorical uint8, uint16,
-        float) and swap ONLY the pixmap. Scope honored via params.scope: 'viewer'|'root'|'project'.
-
-        This is the single source of truth for BOTH the live "Apply" and the committed "OK" render
-        (the real `_on_stretch_apply` below delegates here). Using this instead of
-        `_render_with_viewer_stretch` avoids the >3-band / prefer_last_band heuristics that made the
-        image flip to a single grayscale band and made the sliders appear not to update.
+        Live-apply: compute a uint8 preview and swap ONLY the pixmap.
+        Scope honored via params.scope: 'viewer' | 'root' | 'project'.
         """
         scope = (getattr(params, "scope", "viewer") or "viewer").lower()
 
@@ -3080,39 +2737,25 @@ class ProjectTab(QtWidgets.QWidget):
                 if base_img is None:
                     return
                 # Get mask for stretch stats (nodata + mask polygons)
-                try:
-                    mask = _get_stretch_mask(v, base_img)
-                except Exception:
-                    mask = None  # a mask failure must never stop the stretch from applying
+                mask = _get_stretch_mask(v, base_img)
                 preview = self._compute_stretched_preview(base_img, params, mask)
                 if preview is None:
                     return
                 # remember params per-viewer for consistency
                 setattr(v, "stretch_params", params)
                 v.show_preview_array(preview)  # swaps pixmap only; overlays intact
-            except Exception as e:
-                # Do NOT swallow silently — a hidden exception here is exactly what makes the
-                # stretcher look like it "stopped working" after repeated applies.
-                logging.exception(f"_on_stretch_apply: apply to viewer failed: {e}")
+            except Exception:
+                pass
 
-        # NOTE: there is no `_all_open_viewers()` method on ProjectTab (that call only ever
-        # existed in a shadowed/dead copy of this method, so it was never actually exercised
-        # until the duplicate-method fix made this the live code path). The rest of the class
-        # enumerates open viewers via `self.viewer_widgets` (list of dicts with 'viewer' /
-        # 'image_data'), same as `open_stretch_dialog`'s project/root targeting below.
         if scope == "project":
-            for rec in (self.viewer_widgets or []):
-                v = rec.get("viewer")
-                if v is not None:
-                    _apply_to_viewer(v)
+            for v in self._all_open_viewers():
+                _apply_to_viewer(v)
             return
 
         if scope == "root" and root_name:
             target_files = set(self._filepaths_for_loaded_root(root_name))
-            for rec in (self.viewer_widgets or []):
-                v = rec.get("viewer")
-                if v is None:
-                    continue
+            for v in self._all_open_viewers():
+                # try both attributes to be safe
                 fp = getattr(v, "filepath", None) or getattr(getattr(v, "image_data", None), "filepath", None)
                 if fp and fp in target_files:
                     _apply_to_viewer(v)
@@ -4570,15 +4213,12 @@ class ProjectTab(QtWidgets.QWidget):
 
         # Lightweight shim that looks like ImageData
         class _Lite:
-            __slots__ = ("filepath", "image", "raw_shape", "ax_config", "channel_order")
-            def __init__(self, fp, im, raw_shape=None, ax_config=None, channel_order="bgr"):
+            __slots__ = ("filepath", "image", "raw_shape", "ax_config")
+            def __init__(self, fp, im, raw_shape=None, ax_config=None):
                 self.filepath = fp
                 self.image = im
                 self.raw_shape = raw_shape  # (H, W, C) or (H, W) of raw image
                 self.ax_config = ax_config  # .ax dict for this image
-                # 'rgb' = native band order (tifffile); 'bgr' = OpenCV order (cv2.imread).
-                # Drives whether the viewer/stretch renders bands 0,1,2 as R,G,B or B,G,R.
-                self.channel_order = channel_order
 
         def _tifffile_is_stack(path):
             """Quick metadata probe: does this TIFF represent a stack (>3 bands or >3 pages)?"""
@@ -4640,7 +4280,7 @@ class ProjectTab(QtWidgets.QWidget):
                 if arr is not None and getattr(arr, "size", 0) > 0:
                     self._last_loader = "tifffile-preflight"
                     self._cache_raw_for_editor(filepath, arr)  # Cache for faster editor opening
-                    return _Lite(filepath, arr, raw_shape=arr.shape, ax_config=ax_config, channel_order="rgb")
+                    return _Lite(filepath, arr, raw_shape=arr.shape, ax_config=ax_config)
             except Exception as e:
                 logging.warning(f"tifffile stack load failed for '{filepath}', will try ImageData: {e}")
 
@@ -4660,7 +4300,7 @@ class ProjectTab(QtWidgets.QWidget):
                                 if arr is not None and getattr(arr, "size", 0) > 0:
                                     self._last_loader = "tifffile-override-cv"
                                     self._cache_raw_for_editor(filepath, arr)  # Cache for faster editor opening
-                                    return _Lite(filepath, arr, raw_shape=arr.shape, ax_config=ax_config, channel_order="rgb")
+                                    return _Lite(filepath, arr, raw_shape=arr.shape, ax_config=ax_config)
                     except Exception as e:
                         logging.debug(f"cv override check failed for '{filepath}': {e}")
 
@@ -4670,7 +4310,6 @@ class ProjectTab(QtWidgets.QWidget):
                 # Add raw_shape and ax_config to the ImageData object
                 imgd.raw_shape = img.shape
                 imgd.ax_config = ax_config
-                imgd.channel_order = "bgr"  # cv2.imread returns BGR
                 return imgd
 
             raise ValueError("ImageData returned empty image")
@@ -4680,13 +4319,9 @@ class ProjectTab(QtWidgets.QWidget):
             arr = self._load_raw_image(filepath)
             if arr is None or getattr(arr, "size", 0) == 0:
                 raise
-            # _load_raw_image prefers tifffile for TIFFs (native/RGB order) and only uses cv2 (BGR)
-            # for non-TIFF or as a last resort; tag accordingly.
-            ll = getattr(self, "_last_loader", "")
-            ch_order = "rgb" if ll == "tifffile" else "bgr"
             self._last_loader = "fallback"
             self._cache_raw_for_editor(filepath, arr)  # Cache for faster editor opening
-            return _Lite(filepath, arr, raw_shape=arr.shape, ax_config=ax_config, channel_order=ch_order)
+            return _Lite(filepath, arr, raw_shape=arr.shape, ax_config=ax_config)
 
     def _cache_raw_for_editor(self, filepath, image):
         """
@@ -5254,9 +4889,6 @@ class ProjectTab(QtWidgets.QWidget):
         self.machineLearningManagerAct.setShortcut("Ctrl+Shift+M")
         self.machineLearningManagerAct.triggered.connect(self.show_machine_learning_manager)
 
-        self.randomShapesAct = QtWidgets.QAction("Random Shapes...", self)
-        self.randomShapesAct.triggered.connect(self.open_random_shapes_dialog)
-
         # Refresh viewer
         self.refreshViewerAct = QtWidgets.QAction("Refresh Viewer", self)
         self.refreshViewerAct.setShortcut("E")
@@ -5557,7 +5189,6 @@ class ProjectTab(QtWidgets.QWidget):
         modules_menu = QtWidgets.QMenu(self)
         modules_menu.addAction(self.showMapAct)
         modules_menu.addAction(self.machineLearningManagerAct)
-        modules_menu.addAction(self.randomShapesAct)
         modules_menu.addSeparator()
         modules_menu.addAction(self.setRootOffsetAct)
         modules_menu.addAction(self.openImageFoldersAct)              # ✅ moved into Modules
@@ -8774,282 +8405,6 @@ class ProjectTab(QtWidgets.QWidget):
             logging.info(f"[_redraw_polys_for_root] No active viewers for root '{root_name}' - polygons saved but will display when navigating to that root")
         else:
             logging.info(f"[_redraw_polys_for_root] Redrawn polygons for {redrawn_count}/{viewers_found} viewers in root '{root_name}'")
-
-    def open_random_shapes_dialog(self):
-        from .random_shapes_dialog import RandomShapesDialog
-        from .random_shapes_generator import generate_random_shapes
-        import os, logging, math
-        from PyQt5 import QtCore, QtGui
-
-        # ------------------------------------------------------------------ #
-        # 1. Find the ACTIVE viewer (first one with a loaded image)           #
-        # ------------------------------------------------------------------ #
-        active_viewer = None
-        image_path = None
-        if hasattr(self, 'viewer_widgets'):
-            for rec in self.viewer_widgets:
-                v = rec.get("viewer") if isinstance(rec, dict) else None
-                if v:
-                    fp = getattr(getattr(v, "image_data", None), "filepath", None)
-                    if fp:
-                        image_path = fp
-                        active_viewer = v
-                        break
-
-        if not image_path or not os.path.exists(image_path):
-            QtWidgets.QMessageBox.warning(self, "No Image", "No active image to sample from.")
-            return
-
-        # ------------------------------------------------------------------ #
-        # 2. GeoTIFF / GSD detection                                          #
-        # ------------------------------------------------------------------ #
-        is_georeferenced = False
-        gsd = None
-        try:
-            from .shapefile_io import get_geotiff_transform
-            transform, crs = get_geotiff_transform(image_path)
-            if transform:
-                is_georeferenced = True
-                scale_x, scale_y = abs(transform[1]), abs(transform[5])
-                gsd = ((scale_x + scale_y) / 2.0) * (111320.0 if scale_x < 0.01 else 1.0)
-        except Exception as e:
-            logging.debug(f"Could not read GeoTIFF transform for random shapes: {e}")
-
-        # ------------------------------------------------------------------ #
-        # 3. Show dialog                                                       #
-        # ------------------------------------------------------------------ #
-        dialog = RandomShapesDialog(self, is_georeferenced=is_georeferenced, gsd=gsd)
-        if dialog.exec_() != QtWidgets.QDialog.Accepted:
-            return
-
-        params = dialog.get_parameters()
-        scope  = params["scope"]
-        poly_type = 'point' if params.get("shape_type") == "Point" else 'polygon'
-        shape_type_str = params.get("shape_type", "polygon")
-
-        # ------------------------------------------------------------------ #
-        # 4. Collect target images                                             #
-        # ------------------------------------------------------------------ #
-        target_images = []
-        if scope == "Current Image Only":
-            target_images.append(image_path)
-        elif scope == "All Images in Current Root":
-            rn = self.get_current_root_name() if hasattr(self, "get_current_root_name") else None
-            if not rn and 0 <= self.current_root_index < len(self.multispectral_root_names):
-                rn = self.multispectral_root_names[self.current_root_index]
-            if rn:
-                files = self._filepaths_for_loaded_root(rn) if hasattr(self, "_filepaths_for_loaded_root") else []
-                if not files:
-                    files = list((self.multispectral_image_data_groups or {}).get(rn, []))
-                target_images.extend(files)
-        elif scope == "All Images in Project":
-            for _rn, files in (self.multispectral_image_data_groups or {}).items():
-                target_images.extend(files)
-            for _rn, files in (self.thermal_rgb_image_data_groups or {}).items():
-                target_images.extend(files)
-
-        # Normalize + deduplicate
-        seen, uniq = set(), []
-        for fp in target_images:
-            if not fp: continue
-            key = os.path.normcase(os.path.abspath(fp))
-            if key not in seen:
-                seen.add(key); uniq.append(fp)
-        target_images = uniq
-
-        if not target_images:
-            return
-
-        # ------------------------------------------------------------------ #
-        # 5. Determine starting counter so repeated runs don't collide        #
-        # ------------------------------------------------------------------ #
-        def _next_shape_index():
-            mx = 0
-            for g in self.all_polygons.keys():
-                if isinstance(g, str) and g.startswith("random_shape_"):
-                    tail = g.rsplit("_", 1)[-1]
-                    if tail.isdigit():
-                        mx = max(mx, int(tail))
-            return mx + 1
-
-        shape_counter = _next_shape_index()
-
-        # ------------------------------------------------------------------ #
-        # 6. Helper: get the displayed (modified) image for a filepath        #
-        # ------------------------------------------------------------------ #
-        def _image_for(fp_):
-            """Return (image_array, live_viewer_or_None).
-            For live viewers the image is already in modified/displayed space.
-            For background images we load raw pixels; the generator's NaN/border
-            heuristic handles the exclusion correctly for unmodified images too."""
-            # 1. Try a loaded viewer first (preserves any .ax modifications)
-            try:
-                for rec in (self.viewer_widgets or []):
-                    v = rec.get("viewer") if isinstance(rec, dict) else None
-                    idata = getattr(v, "image_data", None) if v else None
-                    if idata and getattr(idata, "filepath", None) == fp_ \
-                            and getattr(idata, "image", None) is not None:
-                        return idata.image, v
-            except Exception:
-                pass
-            
-            # 2. Fall back to raw disk load
-            try:
-                img = self._load_image_simple(fp_)
-                if img is not None:
-                    return img, None
-            except Exception:
-                pass
-            return None, None
-
-        # ------------------------------------------------------------------ #
-        # 7. Progress dialog                                                   #
-        # ------------------------------------------------------------------ #
-        progress = QtWidgets.QProgressDialog(
-            "Generating random shapes...", "Cancel", 0, len(target_images), self)
-        progress.setWindowModality(Qt.WindowModal)
-
-        shapes_generated = 0
-        processed_count  = 0
-        touched_roots    = set()
-
-        for i, fp in enumerate(target_images):
-            if progress.wasCanceled():
-                break
-            progress.setValue(i)
-            QtWidgets.QApplication.processEvents()
-
-            try:
-                img_data, live_viewer = _image_for(fp)
-                if img_data is None:
-                    continue
-
-                # NoData mask from .ax
-                nodata_mask = None
-                try:
-                    ax = self._load_ax_json(fp) if hasattr(self, "_load_ax_json") else {}
-                    if ax and ax.get("nodata_enabled", True):
-                        nd_vals = list(ax.get("nodata_values", []) or [])
-                        if nd_vals:
-                            from .utils import build_nodata_mask
-                            nodata_mask = build_nodata_mask(img_data, nd_vals, bgr_input=True)
-                except Exception:
-                    nodata_mask = None
-
-                polygons = generate_random_shapes(img_data, nodata_mask, params, gsd)
-                if not polygons:
-                    continue
-
-                H, W = img_data.shape[:2]
-                ref_size = {'w': int(W), 'h': int(H)}
-
-                processed_count += 1
-
-                # ----------------------------------------------------------
-                # Per-shape loop — mirrors _generate_random_points exactly:
-                #   • For the ACTIVE viewer: set pending_group_name, add item,
-                #     emit polygon_drawn → on_polygon_drawn stores to all_polygons
-                #     and registers the item as individually movable/deletable.
-                #   • For BACKGROUND images (no live viewer): write directly to
-                #     all_polygons so save_polygons_to_json can persist them.
-                # ----------------------------------------------------------
-                for poly in polygons:
-                    if not poly or poly.count() == 0:
-                        continue
-
-                    group_name = f"random_shape_{shape_counter}"
-                    shape_counter += 1
-                    shapes_generated += 1
-
-                    if live_viewer is not None:
-                        # ---- Active viewer path (same as _generate_random_points) ----
-                        # pts in poly are already in IMAGE pixel coords (from generator).
-                        # We must convert them to SCENE coords before adding to viewer.
-                        pixitem = (getattr(live_viewer, "_image", None) or
-                                   getattr(live_viewer, "pixmap_item", None))
-                        off = pixitem.pos() if pixitem else QtCore.QPointF(0, 0)
-                        idata = live_viewer.image_data
-                        ih, iw = idata.image.shape[:2] if idata and idata.image is not None else (H, W)
-                        pm_w = pixitem.pixmap().width()  if pixitem else iw
-                        pm_h = pixitem.pixmap().height() if pixitem else ih
-
-                        sx = pm_w / float(max(iw, 1))
-                        sy = pm_h / float(max(ih, 1))
-
-                        scene_poly = QtGui.QPolygonF()
-                        for k in range(poly.count()):
-                            p = poly.at(k)
-                            # IMAGE px → pixmap-item local px → scene
-                            local = QtCore.QPointF(p.x() * sx, p.y() * sy)
-                            scene_pt = pixitem.mapToScene(local) if pixitem else (local + off)
-                            scene_poly.append(scene_pt)
-
-                        live_viewer.pending_group_name = group_name
-
-                        if poly_type == 'point':
-                            item = live_viewer.add_point_to_scene(scene_poly, group_name)
-                        else:
-                            item = live_viewer.add_polygon_to_scene(scene_poly, group_name)
-
-                        if item and not live_viewer.programmatically_adding_polygon:
-                            live_viewer.polygon_drawn.emit(item)
-
-                        live_viewer.pending_group_name = None
-
-                    else:
-                        # ---- Background image path (no live viewer) ----
-                        pts = [[float(poly.at(k).x()), float(poly.at(k).y())]
-                               for k in range(poly.count())]
-                        self.all_polygons.setdefault(group_name, {})
-                        self.all_polygons[group_name][fp] = {
-                            'points': pts,
-                            'name': group_name,
-                            'type': poly_type,
-                            'coord_space': 'image',
-                            'image_ref_size': ref_size,
-                        }
-                        if hasattr(self, "_add_to_polygon_index"):
-                            try:
-                                self._add_to_polygon_index(group_name, fp)
-                            except Exception:
-                                pass
-
-                rn = self.get_root_by_filepath(fp) if hasattr(self, "get_root_by_filepath") else None
-                if rn:
-                    touched_roots.add(rn)
-
-            except Exception as e:
-                logging.error(f"Error generating random shapes for {fp}: {e}")
-
-        progress.setValue(len(target_images))
-
-        # ------------------------------------------------------------------ #
-        # 8. Save, refresh polygon manager & viewer                           #
-        # ------------------------------------------------------------------ #
-        if shapes_generated <= 0:
-            QtWidgets.QMessageBox.information(
-                self, "Random Shapes",
-                "No shapes were generated (no valid pixels for the given parameters).")
-            return
-
-        # Mark dirty roots so save picks them up
-        self._poly_norm_index_invalid = True
-        if not hasattr(self, "_dirty_polygon_roots") or self._dirty_polygon_roots is None:
-            self._dirty_polygon_roots = set()
-        self._dirty_polygon_roots.update(touched_roots)
-
-        self.save_polygons_to_json()
-
-        # Force-refresh polygon manager (bypass visibility / cache checks)
-        if hasattr(self, 'polygon_manager'):
-            self.polygon_manager._cached_group_names = None
-            self.polygon_manager.set_polygons(self.all_polygons)
-
-        logging.info(f"Random Shapes: generated {shapes_generated} shape(s) across {processed_count} image(s).")
-        QtWidgets.QMessageBox.information(
-            self, "Complete",
-            f"Generated {shapes_generated} shapes across {processed_count} images.")
-
 
     def update_current_polygons_pixmap_size(self, viewer):
         """
@@ -14246,61 +13601,6 @@ class ProjectTab(QtWidgets.QWidget):
         else:
             logging.info("Skipping modified polygons JSON export per user option.")
 
-        # ===== SHAPEFILE EXPORT (optional) ================================
-        if opts.get("export_shapefile", False):
-            try:
-                from .shapefile_io import json_polygons_to_features, write_shapefile
-                logging.info("[CSV export] Starting Shapefile export…")
-
-                features, crs_wkt, shp_warnings = json_polygons_to_features(
-                    self.all_polygons,
-                    getattr(self, 'project_folder', '') or '',
-                    get_ax_path_fn=getattr(self, "_ax_path_for", None),
-                )
-
-                if features:
-                    shp_base = os.path.splitext(save_path)[0]
-                    shp_out = _next_available_path(shp_base + ".shp")
-                    # write_shapefile expects path WITHOUT extension
-                    shp_stem = os.path.splitext(shp_out)[0]
-                    write_shapefile(features, shp_stem, crs_wkt=crs_wkt)
-
-                    # Summarise georeferencing methods used
-                    methods = {}
-                    for feat in features:
-                        m = feat['properties'].get('georef', 'none')
-                        methods[m] = methods.get(m, 0) + 1
-                    summary_parts = [f"{cnt} via {meth}" for meth, cnt in methods.items()]
-                    summary = ", ".join(summary_parts)
-
-                    msg = (f"Shapefile exported: {len(features)} feature(s)\n"
-                           f"Georeferencing: {summary}")
-                    if shp_warnings:
-                        msg += f"\n\nWarnings ({len(shp_warnings)}):\n"
-                        msg += "\n".join(shp_warnings[:10])
-                        if len(shp_warnings) > 10:
-                            msg += f"\n…and {len(shp_warnings) - 10} more."
-                    logging.info(f"[CSV export] Shapefile: {msg}")
-                    QtWidgets.QMessageBox.information(
-                        self, "Shapefile Exported", msg
-                    )
-                else:
-                    warn_msg = "No features could be converted for shapefile export."
-                    if shp_warnings:
-                        warn_msg += "\n\n" + "\n".join(shp_warnings[:10])
-                    logging.warning(f"[CSV export] Shapefile: {warn_msg}")
-                    QtWidgets.QMessageBox.warning(
-                        self, "Shapefile Export", warn_msg
-                    )
-
-            except Exception as e:
-                logging.error(f"[CSV export] Shapefile export failed: {e}")
-                QtWidgets.QMessageBox.warning(
-                    self, "Shapefile Export Error",
-                    f"Shapefile export failed:\n{e}\n\nCSV was saved successfully."
-                )
-        # ==================================================================
-
         total_duration = time.perf_counter() - total_start_time
         logging.info(f"Total time to execute save_polygons_to_csv: {total_duration:.2f} seconds")
 
@@ -16204,9 +15504,6 @@ class ProjectTab(QtWidgets.QWidget):
             return cand
 
         def _norm_export_name(fp):
-            ext = os.path.splitext(fp)[1].lower()
-            if ext in ('.jpg', '.jpeg'):
-                return os.path.splitext(os.path.basename(fp))[0] + ext
             return os.path.splitext(os.path.basename(fp))[0] + ".tif"
 
         def _read_raw_any(fp):
@@ -16454,13 +15751,9 @@ class ProjectTab(QtWidgets.QWidget):
 
                 out_name = _norm_export_name(fp)
                 out_path = _unique_path(export_dir, out_name)
-                
-                if out_name.lower().endswith(('.jpg', '.jpeg')):
-                    cv2.imwrite(out_path, img, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                else:
-                    if not _save_tiff(out_path, img):
-                        fail += 1
-                        continue
+                if not _save_tiff(out_path, img):
+                    fail += 1
+                    continue
 
                 source_files.append(fp)
                 target_files.append(out_path)
@@ -18765,20 +18058,26 @@ class ProjectTab(QtWidgets.QWidget):
 
             if x.ndim == 3:
                 C = x.shape[2]
-                # Base lo/hi per mode.
-                # Percentile / stddev are ALWAYS computed per channel for multi-band imagery.
-                # The old `per_ch`-gated else branch pooled every band into a single cut, which
-                # blew out the brightest band and crushed the rest (fine for 1-band grayscale,
-                # broken for multi-band). `per_ch` now gates only the Absolute per-band overrides.
+                # Base lo/hi per mode
                 if mode == "percentile":
-                    lo = np.percentile(s, params.low_p,  axis=0).astype(np.float32, copy=False)
-                    hi = np.percentile(s, params.high_p, axis=0).astype(np.float32, copy=False)
+                    if per_ch:
+                        lo = np.percentile(s, params.low_p,  axis=0).astype(np.float32, copy=False)
+                        hi = np.percentile(s, params.high_p, axis=0).astype(np.float32, copy=False)
+                    else:
+                        lo_s = float(np.percentile(s, params.low_p))
+                        hi_s = float(np.percentile(s, params.high_p))
+                        lo = _as_vec(lo_s, C); hi = _as_vec(hi_s, C)
 
                 elif mode == "stddev":
-                    mu = np.mean(s, axis=0).astype(np.float32, copy=False)
-                    sd = np.std(s,  axis=0).astype(np.float32, copy=False)
-                    lo = mu - float(params.k_sigma)*sd
-                    hi = mu + float(params.k_sigma)*sd
+                    if per_ch:
+                        mu = np.mean(s, axis=0).astype(np.float32, copy=False)
+                        sd = np.std(s,  axis=0).astype(np.float32, copy=False)
+                        lo = mu - float(params.k_sigma)*sd
+                        hi = mu + float(params.k_sigma)*sd
+                    else:
+                        mu = float(np.mean(s)); sd = float(np.std(s))
+                        lo = _as_vec(mu - float(params.k_sigma)*sd, C)
+                        hi = _as_vec(mu + float(params.k_sigma)*sd, C)
 
                 elif mode == "absolute":
                     # Start from global or sampled, but always as vectors so band overrides can blend in.
@@ -18888,22 +18187,18 @@ class ProjectTab(QtWidgets.QWidget):
                         chs = cv2.split(x[:, :, :Ceff])
                         disp = cv2.merge([cv2.LUT(chs[i], luts[i]) for i in range(Ceff)])
             else:
-                # Float/uint16 to uint8 stretch.
-                # CRITICAL CORRECTNESS FIX: `preview` is frequently a VIEW into the viewer's
-                # raw scientific array (image_data.image) — e.g. `base[..., :3]` or a single
-                # `base[..., band]` display slice. The previous code used
-                # `.astype(np.float32, copy=False)` (which returns the SAME array when the input
-                # is already float32) followed by in-place `np.subtract(..., out=...)`, which
-                # rewrote the raw pixels to 0..255. That is exactly why the Inspect tool showed
-                # 0..255 after a stretch and only recovered the real values after a viewer refresh
-                # (which reloads the file from disk). We now ALWAYS stretch into a fresh float
-                # buffer (per-channel, so peak RAM stays low) and never touch the input.
-                if x.dtype.kind == 'f' and np.isnan(x).any():
-                    x = np.nan_to_num(x, copy=True)  # copy=True: don't mutate the caller's array
+                # Float/uint16 to uint8 stretch
+                # OPTIMIZATION: Process per-channel to minimalize peak RAM usage (avoiding full float32 copy).
+                
+                # Check for NaNs first? Only if float.
+                if x.dtype.kind == 'f':
+                     if np.isnan(np.min(x)): 
+                         x = np.nan_to_num(x, copy=False)
 
                 if x.ndim == 2:
                     scale = 255.0 / max(1e-12, float(hi) - float(lo))
-                    t = x.astype(np.float32, copy=True)  # copy=True: work on our own buffer
+                    # Single channel: convert to float, math, clip
+                    t = x.astype(np.float32, copy=False)
                     t = np.subtract(t, float(lo), out=t)
                     np.multiply(t, scale, out=t)
                     np.clip(t, 0, 255, out=t)
@@ -18912,11 +18207,11 @@ class ProjectTab(QtWidgets.QWidget):
                 else:
                     Ceff = min(3, x.shape[2])
                     out_chs = []
-
+                    
                     if np.isscalar(hi):
                         scale = 255.0 / max(1e-12, float(hi) - float(lo))
                         for i in range(Ceff):
-                             ch = x[..., i].astype(np.float32, copy=True)  # copy=True: never mutate input
+                             ch = x[..., i].astype(np.float32, copy=False)
                              ch = np.subtract(ch, float(lo), out=ch)
                              np.multiply(ch, scale, out=ch)
                              np.clip(ch, 0, 255, out=ch)
@@ -18926,12 +18221,12 @@ class ProjectTab(QtWidgets.QWidget):
                         hi_v = hi.reshape(-1)[:Ceff]
                         for i in range(Ceff):
                              scale = 255.0 / max(1e-12, hi_v[i] - lo_v[i])
-                             ch = x[..., i].astype(np.float32, copy=True)  # copy=True: never mutate input
+                             ch = x[..., i].astype(np.float32, copy=False)
                              ch = np.subtract(ch, float(lo_v[i]), out=ch)
                              np.multiply(ch, scale, out=ch)
                              np.clip(ch, 0, 255, out=ch)
                              out_chs.append(ch.astype(np.uint8))
-
+                    
                     disp = np.stack(out_chs, axis=2)
 
             # Ensure at most 3 channels for preview
@@ -19232,23 +18527,6 @@ class ProjectTab(QtWidgets.QWidget):
                 except Exception as e:
                     logging.warning(f"_render_with_viewer_stretch: Failed to generate auto-stretch: {e}")
 
-        # ROOT-LEVEL fallback (was MISSING entirely): this function had no way to know which
-        # root a viewer belongs to, so a stretch applied with "Apply to this root" was NEVER
-        # consulted here -- only the per-file .ax and the project-wide default were checked.
-        # Any render path that doesn't go through display_image_group's own inline resolve
-        # (e.g. refresh_single_viewer / _reload_image_into_viewer, used after editing a single
-        # image or refreshing just one viewer) silently dropped root-scoped stretches back to
-        # the project default or the generic auto default. Resolve root_name from the filepath
-        # and check self._root_stretch_map before falling through to the project default.
-        if sp is None and fp and not force_auto:
-            try:
-                root_name = self.get_root_by_filepath(fp) if hasattr(self, "get_root_by_filepath") else None
-                if root_name:
-                    self._ensure_cached_stretch_defaults()
-                    sp = (self._root_stretch_map or {}).get(root_name)
-            except Exception as e:
-                logging.debug(f"_render_with_viewer_stretch: root-stretch lookup failed: {e}")
-
         # If still None, fall back to "smart auto" mechanism (percentile)
         # CRITICAL FIX: Skip project default if force_auto was set - this prevents
         # display_mode="single" from a previous session causing grayscale display
@@ -19263,29 +18541,6 @@ class ProjectTab(QtWidgets.QWidget):
                 min_val=None, max_val=None, per_channel=True, clip=True, scope="viewer",
                 display_mode="auto"  # CRITICAL: Ensure RGB display, not single-band
             )
-
-        # ---------- C0) Native-RGB consistency: render via the SAME path as the dialog ----------
-        # For images in native band order (tifffile stacks / RGB — channel_order == "rgb"), the
-        # legacy path below (_apply_viewer_stretch_numpy + Format_BGR888) produced BOTH an R/B swap
-        # AND a coarse ~200-sample percentile, so a committed stretch looked "odd" after a refresh
-        # vs the dialog preview (full-image percentile + Format_RGB888). Route these through the
-        # exact code the dialog uses (_compute_stretched_preview) and flip RGB->BGR so
-        # _pixmap_from_uint8's BGR888 shows the same colors the dialog did. cv2 BGR images
-        # (channel_order == "bgr") are left entirely on the legacy path — unchanged.
-        try:
-            _ch_order = getattr(getattr(viewer, "image_data", None), "channel_order", "bgr")
-            _mode = (getattr(sp, "mode", "") or "").lower()
-            _normal = _mode in ("percentile", "stddev", "std", "absolute")
-            _has_nodata = bool((ax or {}).get("nodata_values")) or (mask is not None)
-            if (_ch_order == "rgb") and _normal and (not prefer_last_band) and (not _has_nodata) \
-               and base is not None and hasattr(base, "ndim"):
-                disp = self._compute_stretched_preview(base, sp, mask=None)
-                if disp is not None:
-                    if disp.ndim == 3 and disp.shape[2] == 3:
-                        disp = np.ascontiguousarray(disp[..., ::-1])  # RGB -> BGR for _pixmap_from_uint8
-                    return disp if _as_array else _pixmap_from_uint8(disp)
-        except Exception as e:
-            logging.debug(f"_render_with_viewer_stretch: native-RGB delegate skipped: {e}")
 
         # ---------- C) Display mapping BEFORE preview/stretch (unchanged behavior) ----------
         if sp is not None and base is not None and hasattr(base, "ndim"):
@@ -19640,18 +18895,49 @@ class ProjectTab(QtWidgets.QWidget):
         setattr(dlg, "_did_reset", True)
 
 
-    @QtCore.pyqtSlot(object)
     def _on_stretch_apply(self, params, viewer, root_name):
         """
-        Live-apply stretch from the dialog (also used for the committed OK render).
-
-        IMPORTANT: this used to render via `_render_with_viewer_stretch` and wrap everything in a
-        bare `except: pass`, which meant any failure (or a >3-band/prefer_last_band fallback to a
-        single grayscale band) silently produced no update — i.e. "Apply does nothing / the sliders
-        don't update the real values." It now delegates to `_stretch_apply_preview`, the display-band
-        aware, all-dtype-robust path that logs failures instead of hiding them.
+        Live-apply stretch from the dialog without closing it or persisting.
+        We update the in-memory params on the intended targets and re-render now.
         """
-        self._stretch_apply_preview(params, viewer, root_name)
+        try:
+            scope = (getattr(params, "scope", "viewer") or "viewer").lower()
+
+            if scope == "project":
+                targets = [rec.get("viewer") for rec in (self.viewer_widgets or [])]
+            elif scope == "root":
+                root_files = set(self._filepaths_for_loaded_root(root_name))
+                targets = []
+                for rec in (self.viewer_widgets or []):
+                    v = rec.get("viewer")
+                    imgd = rec.get("image_data")
+                    if v is None or imgd is None:
+                        continue
+                    if getattr(imgd, "filepath", None) in root_files:
+                        targets.append(v)
+            else:
+                targets = [viewer]
+
+            for v in targets:
+                if v is None or sip.isdeleted(v):
+                    continue
+
+                # keep it in memory so _render_with_viewer_stretch sees it
+                v.stretch_params = params
+
+                base = getattr(getattr(v, "image_data", None), "image", None)
+                if base is None:
+                    continue
+
+                pm = self._render_with_viewer_stretch(base, v)
+                if pm is not None:
+                    # Schedule safely to avoid repaint clashes during dialog events
+                    QtCore.QTimer.singleShot(
+                        0,
+                        lambda v=v, pm=pm: (None if sip.isdeleted(v) else v.update_pixmap_only(pm))
+                    )
+        except Exception:
+            pass
 
 
     def open_stretch_dialog(self, viewer, root_name):
@@ -19710,13 +18996,22 @@ class ProjectTab(QtWidgets.QWidget):
                 self._save_file_stretch(fp, params)
             targets = [viewer]
 
-        # Render the COMMITTED (OK) result with the SAME code path the live "Apply" uses, so
-        # what the user previewed is exactly what they get. The old OK path went through
-        # _render_with_viewer_stretch, whose >3-band / prefer_last_band heuristics could fall
-        # back to a single grayscale band and ignore the user's band selection (the "becomes a
-        # grayscale image on OK" bug). _on_stretch_apply honors params.display_mode / r,g,b via
-        # _compute_stretched_preview and also sets viewer.stretch_params on each target.
-        self._on_stretch_apply(params, viewer, root_name)
+        # Apply to targets now
+        for v in targets:
+            if v is None or sip.isdeleted(v):
+                continue
+
+            v.stretch_params = params
+            base = getattr(getattr(v, "image_data", None), "image", None)
+            if base is None:
+                continue
+
+            pm = self._render_with_viewer_stretch(base, v)
+            if pm is not None:
+                QtCore.QTimer.singleShot(
+                    0,
+                    lambda v=v, pm=pm: (None if sip.isdeleted(v) else v.update_pixmap_only(pm))
+                )
 
     def _stretch_to_dict(self, sp):
         if sp is None:

@@ -4432,20 +4432,10 @@ class AnalysisOptionsDialog(QtWidgets.QDialog):
         self.chk_custom_save.toggled.connect(self.le_save_path.setEnabled)
         self.chk_custom_save.toggled.connect(self.btn_browse_save.setEnabled)
         
-        self.chk_shapefile = QtWidgets.QCheckBox("Also export as Shapefile (.shp)")
-        self.chk_shapefile.setToolTip(
-            "Export polygons as an ESRI Shapefile alongside the CSV.\n"
-            "GeoTIFF images → exact georeferencing from raster transform.\n"
-            "EXIF GPS images → approximate georeferencing from flight metadata.\n"
-            "Plain images → pixel coordinates (no .prj file)."
-        )
-        self.chk_shapefile.setChecked(False)
-
-        save_layout.addWidget(self.chk_shapefile, 0, 0, 1, 2)
-        save_layout.addWidget(self.chk_custom_save, 1, 0, 1, 2)
-        save_layout.addWidget(QtWidgets.QLabel("Save Path:"), 2, 0)
-        save_layout.addWidget(self.le_save_path, 2, 1)
-        save_layout.addWidget(self.btn_browse_save, 2, 2)
+        save_layout.addWidget(self.chk_custom_save, 0, 0, 1, 2)
+        save_layout.addWidget(QtWidgets.QLabel("Save Path:"), 1, 0)
+        save_layout.addWidget(self.le_save_path, 1, 1)
+        save_layout.addWidget(self.btn_browse_save, 1, 2)
         
         vbox.addWidget(save_group)
 
@@ -4616,8 +4606,5 @@ class AnalysisOptionsDialog(QtWidgets.QDialog):
             
             # NEW: Custom Export Path
             "custom_save_path": custom_save_path,
-
-            # Shapefile export option
-            "export_shapefile": self.chk_shapefile.isChecked(),
         }
         return opts
