@@ -35,7 +35,8 @@ main.py
               ├── image_data.py           ImageData — reads one image file, classifies rgb/thermal/multispectral
               ├── performance.py          optional accelerators (NumExpr/Numba/joblib) with NumPy fallback
               ├── utils.py                shared helpers: band math, veg indices, crop/rotate geom, exiftool
-              ├── image_pipeline.py       apply_pipeline(): crop→rotate→hist/CLAHE→resize→band_expression
+              (image_pipeline.py was REMOVED — it was a dead, divergent copy of the .ax replay;
+               the live implementations are ProjectTab.apply_aux_modifications + _apply_ax_to_raw)
               ├── phenocam_filter.py      filter images by similarity to a reference image
               ├── similarity_dialog.py    threaded thumbnail chooser for the similarity filter
               ├── patch_dialog.py         dev utility (not core runtime)
@@ -85,9 +86,15 @@ Every image edit (crop, rotate, brightness/contrast via histogram matching, resi
 **band-math expression**, false color, registration matrix, per-pixel classification) is
 stored as JSON in a sidecar `<image>.ax` (or in the project folder). Nothing is written
 back to the raw image. The canonical application order is
-**crop → rotate → histogram/CLAHE → resize → band_expression** (see `image_pipeline.apply_pipeline`
-and `ProjectTab.apply_aux_modifications`). `.ax` edits can be applied to one image, a group,
-or all images.
+**crop → rotate → histogram/CLAHE → resize → band_expression** (see
+`ProjectTab.apply_aux_modifications` for the display path and `ProjectTab._apply_ax_to_raw`
+for the export path). `.ax` edits can be applied to one image, a group, or all images.
+
+**Histogram matching is applied EXACTLY ONCE per image**, inside those two functions.
+Renderers must never re-apply it: `_render_with_viewer_stretch` receives arrays that have
+already been through the replay, and a second pass there used to make the viewer disagree
+with CSV/ML export (it also dropped the NoData mask). `ProjectTab._apply_hist_match` is the
+single canonical implementation — the editor and `MachineLearningManager` delegate to it.
 
 ### Band-math expressions
 User expressions like `(b4-b3)/(b4+b3)` (NDVI) or named indices (`GCC=b2/(b1+b2+b3)`) are
@@ -177,7 +184,7 @@ the dual-folder offset.
 | Add a menu action / global command | `main_window.py` `setup_menu` / `setup_main_toolbar`, then a delegate method on `ProjectTab` |
 | Change how images are grouped into roots | `ProjectTab.open_folder` / `load_*_images_from_folder`, root offset logic |
 | Change polygon drawing/editing UX | `image_viewer.py` (`EditablePolygonItem`, `start_drawing_with_group_name`, mouse events) |
-| Add/adjust an image edit | `image_editor_dialog.py` + `image_pipeline.apply_pipeline` + `.ax` schema |
+| Add/adjust an image edit | `image_editor_dialog.py` + `ProjectTab.apply_aux_modifications` / `_apply_ax_to_raw` + `.ax` schema |
 | Add a vegetation index / band function | `utils.py` (add helper + expose in `__all__`) and/or `performance.FastBandMathEngine` |
 | Change CSV/EXIF/thumbnail export | export worker classes + `save_polygons_to_csv` / `extract_exif_to_csv` / `save_all_thumbnails` in `project_tab.py` |
 | ML training/prediction | `machine_learning_manager.py`, `performance.FastSklearnPredictor` |

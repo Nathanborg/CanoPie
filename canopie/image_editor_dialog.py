@@ -273,15 +273,6 @@ class ImageEditorDialog(QDialog):
         s = json.dumps(key, sort_keys=True, separators=(",", ":")).encode("utf-8", "ignore")
         return hashlib.sha1(s).hexdigest()
 
-    def _cdf_from_hist(self, flat, lo, hi, bins):
-        """Build (xs, cdf) from histogram instead of sorting every pixel."""
-        import numpy as np
-        if hi <= lo:
-            hi = lo + 1.0
-        hist, edges = np.histogram(flat, bins=int(bins), range=(lo, hi))
-        cdf = np.cumsum(hist, dtype=np.float32) / max(1, flat.size)
-        xs = 0.5 * (edges[:-1] + edges[1:])  # bin centers
-        return xs.astype(np.float32, copy=False), cdf.astype(np.float32, copy=False)
 
     # ---------- helpers for .ax paths ----------
     def _auto_refresh_after_reset(self, root_name=None):
@@ -1302,6 +1293,102 @@ class ImageEditorDialog(QDialog):
         except Exception as e:
             logging.error(f"Failed to save modifications to {mod_filename}: {e}")
 
+    #: Byte ceiling for the editor's working image on large rasters.
+    _EDITOR_PREVIEW_BYTES = 256 * 1024 * 1024
+
+    def _load_editor_preview(self, all_bands=False):
+        """Decimated working image for a large raster, or None if not applicable.
+
+        The editor is non-destructive -- it only writes .ax parameters -- so it
+        does not need full resolution to do its job. Crop rectangles are stored
+        with `crop_rect_ref_size`, and both replay paths scale the rect from that
+        basis, so a decimated editor image still produces a pixel-exact crop at
+        export time.
+
+        By default only the bands needed for display are read. On a
+        band-sequential file that is 3 of 284 planes instead of the whole cube,
+        which is the difference between opening instantly and decoding 3.88 GB.
+        Features that genuinely need every band (band expressions, classification)
+        call this again with all_bands=True.
+        """
+        import logging, time
+        try:
+            from .raster_reader import probe, open_reader
+        except Exception:
+            return None
+
+        try:
+            profile = probe(self.image_filepath)
+            if profile is None or not profile.is_windowable:
+                return None
+            if profile.bytes_if_fully_loaded <= self._EDITOR_PREVIEW_BYTES:
+                return None            # small enough to load whole, keep old path
+
+            reader = open_reader(self.image_filepath, profile)
+            if reader is None:
+                return None
+
+            if all_bands:
+                bands = list(range(profile.count))
+            else:
+                parent = self.parent()
+                getter = getattr(parent, "get_display_bands", None)
+                bands = (getter(self.image_filepath, profile) if callable(getter)
+                         else [b for b in (0, 1, 2) if b < profile.count]) or [0]
+
+            budget = self._EDITOR_PREVIEW_BYTES
+            level = reader.level_for_bytes(len(bands), budget, decode_budget=budget * 4)
+            step = reader.step_for_bytes(len(bands), budget, level)
+            t0 = time.time()
+            arr = reader.read_bands_full(bands, level=level, step=step)
+
+            self._editor_full_shape = (profile.height, profile.width, profile.count)
+            self._editor_bands = list(bands)
+            self._editor_all_bands = bool(all_bands)
+            self._editor_profile = profile
+            logging.info("[Editor] Preview %s: %s from %dx%dx%d (level %d, step %d, "
+                         "%d of %d bands) in %.2fs",
+                         os.path.basename(self.image_filepath), arr.shape,
+                         profile.width, profile.height, profile.count,
+                         level, step, len(bands), profile.count, time.time() - t0)
+            return arr
+        except Exception as e:
+            logging.warning("[Editor] Preview load failed for %s: %s",
+                            self.image_filepath, e)
+            return None
+
+    def ensure_all_bands_loaded(self):
+        """Reload the working image with every band, if it currently has a subset.
+
+        Band expressions reference b1..bN and classification feeds all bands to
+        the model, so both need the full stack. Returns True when the working
+        image holds every band.
+        """
+        import logging
+        from PyQt5 import QtWidgets, QtCore
+
+        if not getattr(self, "_editor_full_shape", None):
+            return True                      # never was a preview
+        if getattr(self, "_editor_all_bands", False):
+            return True
+        total = self._editor_full_shape[2]
+        if len(getattr(self, "_editor_bands", []) or []) >= total:
+            return True
+
+        logging.info("[Editor] Loading all %d bands for band math / classification...", total)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            arr = self._load_editor_preview(all_bands=True)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        if arr is None:
+            logging.warning("[Editor] Could not load all bands.")
+            return False
+        self.base_image = arr
+        self.original_image = arr
+        self._fast_open_preview = None
+        return True
+
     def _load_raw_image(self):
         """
         Load the *on-disk* original image.
@@ -1312,6 +1399,11 @@ class ImageEditorDialog(QDialog):
         import os, logging, numpy as np, cv2
         if not self.image_filepath:
             return None
+
+        # Large rasters: work on a decimated preview instead of the whole cube.
+        preview = self._load_editor_preview()
+        if preview is not None:
+            return preview
 
         ext = os.path.splitext(self.image_filepath)[1].lower()
 
@@ -1657,8 +1749,15 @@ class ImageEditorDialog(QDialog):
 
         # ensure anchor metadata exists
         if "orig_size" not in self.modifications and self.base_image is not None:
-            H0, W0 = self.base_image.shape[:2]
-            C0 = 1 if self.base_image.ndim == 2 else int(self.base_image.shape[2])
+            # On a decimated preview base_image is NOT the original, so record the
+            # real on-disk dimensions -- otherwise every consumer of orig_size
+            # would think the file is preview-sized.
+            full = getattr(self, "_editor_full_shape", None)
+            if full:
+                H0, W0, C0 = int(full[0]), int(full[1]), int(full[2])
+            else:
+                H0, W0 = self.base_image.shape[:2]
+                C0 = 1 if self.base_image.ndim == 2 else int(self.base_image.shape[2])
             ui_mods["orig_size"] = {"h": int(H0), "w": int(W0), "c": int(C0)}
             ui_mods["anchor_to_original"] = True
 
@@ -2290,12 +2389,28 @@ class ImageEditorDialog(QDialog):
 
         # --- helper to build combined mask (nodata + polygons) ---
         def _build_combined_mask(img, nd_vals, poly_points_list, poly_enabled):
-            """Build combined mask from NoData values and multiple polygon masks."""
+            """Build combined mask from NoData values and multiple polygon masks.
+
+            Reject a NoData mask that covers the ENTIRE image: this mask paints
+            over "NoData" pixels magenta in the editor preview
+            (normalize_image_for_display below), and multi-band prediction
+            stacks routinely carry an ancillary plane (viewing/solar geometry,
+            an internal MASK band) that is the NoData value EVERYWHERE, in
+            every pixel -- including where the science bands the editor is
+            actually previewing hold perfectly good data. Without this guard,
+            enabling NoData on such a file painted the WHOLE preview magenta,
+            making it look empty even though real data is right there.
+            """
             mask = None
-            
+
             # Build NoData mask
             if nd_vals:
                 mask = _build_nodata_mask(img, nd_vals)
+                if mask is not None and mask.all():
+                    logging.warning(
+                        "[image_editor] NoData %s matches every pixel (an "
+                        "all-fill band); not using it to paint the preview.", nd_vals)
+                    mask = None
             
             # Build combined polygon mask from all polygons
             if poly_enabled and poly_points_list:
@@ -3209,18 +3324,40 @@ class ImageEditorDialog(QDialog):
         self.hist_btn = QtWidgets.QPushButton("Calc")
         self.hist_btn.clicked.connect(self.on_hist_match_clicked)
         self.hist_btn.setEnabled(self.original_image is not None and getattr(self.original_image, "size", 0) > 0)
-        
+
+        # Opens the histogram comparison in its own window (keeps this panel compact).
+        self.hist_plot_btn = QtWidgets.QPushButton("Show Histogram")
+        self.hist_plot_btn.setToolTip("Compare this image's distribution with the stored reference")
+        self.hist_plot_btn.clicked.connect(self.show_hist_plot_window)
+
         self.hist_enabled_checkbox = QtWidgets.QCheckBox("Use")
         self.hist_enabled_checkbox.setChecked(True)
         self.hist_enabled_checkbox.stateChanged.connect(self._on_hist_enabled_changed)
-        
+
         row_hist.addWidget(hist_label)
         row_hist.addWidget(self.hist_mode_combo)
         row_hist.addWidget(self.hist_btn)
+        row_hist.addWidget(self.hist_plot_btn)
         row_hist.addStretch()
         row_hist.addWidget(self.hist_enabled_checkbox)
         img_ops_layout.addLayout(row_hist)
-        
+
+        # Provenance readout: which image the reference statistics were computed from.
+        # Previously the base image's identity was never recorded or shown, so there was
+        # no way to tell what a normalized image had been matched against.
+        self.hist_base_label = QtWidgets.QLabel("")
+        self.hist_base_label.setWordWrap(True)
+        self.hist_base_label.setStyleSheet("color: #888; font-size: 10px;")
+        img_ops_layout.addWidget(self.hist_base_label)
+        self._update_hist_base_label()
+
+        # The histogram plot lives in a separate pop-up window (see
+        # show_hist_plot_window), one tab per band; nothing is embedded in this panel.
+        self._hist_win = None
+        self._hist_tabs = None
+        self._hist_fig_cls = None
+        self._hist_canvas_cls = None
+
         control_layout.addWidget(img_ops_group)
 
         # ==========================================================
@@ -3405,6 +3542,278 @@ class ImageEditorDialog(QDialog):
             samp = samp.reshape(-1, C)[idx]     # [K,C]
         return samp
         
+    def _update_hist_base_label(self):
+        """
+        Show which image the current histogram-match reference statistics came from.
+
+        Reads the provenance keys written by on_hist_match_clicked. Older .ax files
+        predate them, so an unknown base is reported honestly rather than guessed.
+        """
+        lbl = getattr(self, "hist_base_label", None)
+        if lbl is None:
+            return
+        try:
+            hm = (getattr(self, "modifications", {}) or {}).get("hist_match") or {}
+            if not hm:
+                lbl.setText("")
+                return
+            name = hm.get("reference_name")
+            when = hm.get("computed_at") or ""
+            mode = hm.get("mode", "?")
+            if name:
+                txt = f"Base image: {name}  ({mode}{', ' + when.replace('T', ' ') if when else ''})"
+            else:
+                txt = f"Base image: not recorded — stats predate provenance tracking ({mode})"
+            lbl.setText(txt)
+            lbl.setToolTip(hm.get("reference_path") or "")
+        except Exception:
+            try:
+                lbl.setText("")
+            except Exception:
+                pass
+
+    def show_hist_plot_window(self):
+        """
+        Open (or raise) a separate window showing the histogram comparison, one TAB
+        per band (3-channel images get "Blue"/"Green"/"Red" tabs matching the app's
+        native BGR order; anything else gets "Band 1"..."Band N").
+
+        Modeless and non-blocking, so it can stay open while you keep editing — press
+        "Calc" again (or the window's own "Refresh") and every tab redraws in place.
+        Kept out of the editor panel so the controls stay compact.
+        """
+        from PyQt5 import QtWidgets, QtCore
+        try:
+            from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as _FigCanvas
+            from matplotlib.figure import Figure as _Figure
+        except Exception as e:
+            QtWidgets.QMessageBox.information(
+                self, "Histogram",
+                f"Plotting is unavailable (matplotlib could not be loaded):\n{e}")
+            return
+
+        win = getattr(self, "_hist_win", None)
+        if win is not None:
+            try:
+                win.show(); win.raise_(); win.activateWindow()
+                self._update_hist_plot()
+                return
+            except RuntimeError:
+                self._hist_win = None  # C++ side already deleted
+
+        win = QtWidgets.QDialog(self)
+        win.setWindowTitle("Histogram - current vs reference")
+        win.setWindowFlags(win.windowFlags() | QtCore.Qt.Window)
+        win.setAttribute(QtCore.Qt.WA_DeleteOnClose, False)
+        win.resize(620, 420)
+
+        lay = QtWidgets.QVBoxLayout(win)
+        self._hist_tabs = QtWidgets.QTabWidget()
+        lay.addWidget(self._hist_tabs)
+
+        btns = QtWidgets.QHBoxLayout()
+        refresh = QtWidgets.QPushButton("Refresh")
+        refresh.clicked.connect(self._update_hist_plot)
+        close = QtWidgets.QPushButton("Close")
+        close.clicked.connect(win.hide)
+        btns.addStretch(); btns.addWidget(refresh); btns.addWidget(close)
+        lay.addLayout(btns)
+
+        self._hist_win = win
+        self._hist_fig_cls = _Figure
+        self._hist_canvas_cls = _FigCanvas
+        self._update_hist_plot()
+        win.show(); win.raise_(); win.activateWindow()
+
+    def _update_hist_plot(self):
+        """
+        Rebuild the histogram tabs: one tab per band, each showing REAL vs CORRECTED
+        distributions for that band alone against the stored REFERENCE — as plain LINE
+        plots (density over bin-centre via np.histogram + ax.plot), not filled bars or
+        step outlines:
+
+          - solid line  = REAL, current pixel values
+          - dashed line = CORRECTED values: the SAME pixels after running the canonical
+                           ProjectTab._apply_hist_match transform, so this shows exactly
+                           what "Apply All Changes" will do
+          - thin grey line = the REFERENCE distribution the match targets
+
+        NoData is excluded from all three lines (built once via utils.build_nodata_mask
+        and reused per band, so real/corrected stay pixel-for-pixel comparable).
+
+        Never leaves a tab unexplained: any failure, or nothing to show, is rendered as
+        visible text on that tab instead of silently doing nothing — a previous version
+        swallowed exceptions at logging.debug (invisible by default), which is why "just
+        white" could happen with no clue why.
+        """
+        tabs = getattr(self, "_hist_tabs", None)
+        Fig = getattr(self, "_hist_fig_cls", None)
+        Canvas = getattr(self, "_hist_canvas_cls", None)
+        if tabs is None or Fig is None or Canvas is None:
+            return
+
+        def _message_tab(msg, title="Info", color="#b00020"):
+            tabs.clear()
+            fig = Fig(figsize=(5.2, 3.0), tight_layout=True)
+            canvas = Canvas(fig)
+            axm = fig.add_subplot(111)
+            axm.text(0.5, 0.5, msg, ha="center", va="center", fontsize=9,
+                     wrap=True, transform=axm.transAxes, color=color)
+            axm.set_xticks([]); axm.set_yticks([])
+            for s in axm.spines.values():
+                s.set_visible(False)
+            canvas.draw()
+            tabs.addTab(canvas, title)
+
+        try:
+            import numpy as np
+
+            img = getattr(self, "original_image", None)
+            if img is None or not getattr(img, "size", 0):
+                _message_tab("No image loaded yet.")
+                return
+
+            mods = getattr(self, "modifications", {}) or {}
+            hm = mods.get("hist_match") or {}
+            mode = str(hm.get("mode", "none")).lower()
+
+            samp = np.asarray(self._sample_for_stats(np.asarray(img)))
+            if samp.ndim == 2:
+                samp = samp[..., None]
+            C = samp.shape[2]
+
+            # NoData mask, built ONCE on the sample and reused for every band's real +
+            # corrected lines so they stay directly comparable (same excluded pixels).
+            nodata_enabled = mods.get("nodata_enabled", True)
+            nodata_values = list(mods.get("nodata_values", []) or []) if nodata_enabled else []
+            nd_mask = None
+            if nodata_values:
+                try:
+                    from .utils import build_nodata_mask as _bnm
+                    nd_mask = _bnm(samp, nodata_values, bgr_input=True)
+                except Exception as e:
+                    logging.debug(f"[_update_hist_plot] nodata mask skipped: {e}")
+
+            # Corrected sample: the exact same function used by the viewer, the editor's
+            # own Apply, and CSV export — so this preview is trustworthy, not a
+            # reimplementation that could drift from what actually gets written.
+            corrected = None
+            if hm and mode in ("meanstd", "cdf"):
+                try:
+                    parent = self.parent()
+                    fn = getattr(parent, "_apply_hist_match", None)
+                    if fn is None:
+                        from .project_tab import ProjectTab as _PT
+                        fn = _PT._apply_hist_match
+                    corrected = np.asarray(fn(samp, {"hist_match": hm},
+                                              nodata_values=nodata_values,
+                                              mask_polygon_enabled=False))
+                    if corrected.ndim == 2:
+                        corrected = corrected[..., None]
+                except Exception as e:
+                    logging.warning(f"[_update_hist_plot] correction preview failed: {e}")
+                    corrected = None
+
+            # Native cv2/app channel order is BGR (see "image_editor works with BGR
+            # data" elsewhere in this file), so label 3-channel imagery accordingly
+            # rather than assuming RGB.
+            if C == 3:
+                band_names = ["Blue", "Green", "Red"]
+            elif C == 1:
+                band_names = ["Gray"]
+            else:
+                band_names = [f"Band {i + 1}" for i in range(C)]
+
+            tabs.clear()
+            self._hist_band_figs = []      # keep strong refs alive alongside the tabs
+            self._hist_band_canvases = []
+            any_band_drawn = False
+
+            for c in range(C):
+                fig = Fig(figsize=(5.2, 3.0), tight_layout=True)
+                canvas = Canvas(fig)
+                axp = fig.add_subplot(111)
+
+                real_c = samp[..., c].astype(np.float32).reshape(-1)
+                valid = np.isfinite(real_c)
+                if nd_mask is not None:
+                    valid &= ~nd_mask.reshape(-1)
+                real_c = real_c[valid]
+
+                drawn = False
+                if real_c.size:
+                    counts, edges = np.histogram(real_c, bins=80, density=True)
+                    centers = 0.5 * (edges[:-1] + edges[1:])
+                    axp.plot(centers, counts, lw=1.6, color="#4C8DBE", label="real")
+                    drawn = True
+                    any_band_drawn = True
+
+                if corrected is not None and c < corrected.shape[2]:
+                    corr_c = corrected[..., c].astype(np.float32).reshape(-1)[valid]
+                    if corr_c.size:
+                        counts, edges = np.histogram(corr_c, bins=80, density=True)
+                        centers = 0.5 * (edges[:-1] + edges[1:])
+                        axp.plot(centers, counts, lw=1.6, linestyle="--",
+                                 color="#4C8DBE", label="corrected")
+                        drawn = True
+
+                if not drawn:
+                    axp.text(0.5, 0.5, "No valid (non-NoData) pixels.",
+                             ha="center", va="center", fontsize=9,
+                             transform=axp.transAxes, color="#b00020")
+                    axp.set_xticks([]); axp.set_yticks([])
+                    for s in axp.spines.values():
+                        s.set_visible(False)
+                else:
+                    # Reference line for this band only.
+                    if mode == "meanstd" and hm.get("ref_stats") and c < len(hm["ref_stats"]):
+                        st = hm["ref_stats"][c]
+                        mu = float(st.get("mean", 0.0)); sd = max(float(st.get("std", 1.0)), 1e-6)
+                        lo, hi = axp.get_xlim()
+                        xs = np.linspace(lo, hi, 256)
+                        ys = np.exp(-0.5 * ((xs - mu) / sd) ** 2) / (sd * np.sqrt(2 * np.pi))
+                        axp.plot(xs, ys, lw=1.0, color="#333333", alpha=0.6, label="reference")
+                    elif mode == "cdf" and (hm.get("ref_cdf") or {}).get("per_band"):
+                        bands = hm["ref_cdf"]["per_band"]
+                        if c < len(bands):
+                            band = bands[c]
+                            x = np.asarray(band.get("x", []), dtype=np.float64)
+                            y = np.asarray(band.get("y", []), dtype=np.float64)
+                            if x.size >= 3 and y.size == x.size:
+                                blo, bhi = float(band.get("lo", 0.0)), float(band.get("hi", 1.0))
+                                xr = x * (bhi - blo) + blo   # de-normalize to real values
+                                # Differentiate the cumulative curve back to a density.
+                                # Plain np.gradient warns (and yields inf) wherever
+                                # consecutive bin centres coincide, so use finite
+                                # differences with a clamped denominator instead.
+                                dy = np.diff(y)
+                                dx = np.maximum(np.diff(xr), 1e-12)
+                                dens = np.clip(dy / dx, 0, None)
+                                xc = 0.5 * (xr[:-1] + xr[1:])
+                                axp.plot(xc, dens, lw=1.0, color="#333333", alpha=0.6,
+                                         label="reference")
+
+                    axp.set_yticks([])
+                    axp.tick_params(axis="x", labelsize=8)
+                    for s in ("top", "right", "left"):
+                        axp.spines[s].set_visible(False)
+                    handles, _ = axp.get_legend_handles_labels()
+                    if handles:
+                        axp.legend(fontsize=7, frameon=False, loc="upper right")
+                    axp.set_title(band_names[c] if hm else f"{band_names[c]} — click Calc to set a reference",
+                                 fontsize=8)
+
+                canvas.draw()
+                self._hist_band_figs.append(fig)
+                self._hist_band_canvases.append(canvas)
+                tabs.addTab(canvas, band_names[c])
+
+            if not any_band_drawn:
+                _message_tab("No valid (non-NoData) pixels to plot.")
+        except Exception as e:
+            logging.exception("[_update_hist_plot] failed")
+            _message_tab(f"Could not draw histogram:\n{e}")
+
     def on_hist_match_clicked(self):
         """
         Build/clear histogram-match parameters for the *current edit session only*.
@@ -3641,239 +4050,36 @@ class ImageEditorDialog(QDialog):
                 per_band.append({"x": x_n.tolist(), "y": cdf.tolist(), "lo": float(lo), "hi": float(hi)})
             payload["ref_cdf"] = {"per_band": per_band}
 
+        # 6a) PROVENANCE — record WHICH image these reference statistics came from.
+        # Without this the base image's identity was discarded the moment the stats were
+        # computed, so an .ax (and any CSV derived from it) gave no way to tell what the
+        # imagery had been normalized against — unacceptable for reproducible science.
+        # `_hm_signature` in project_tab.py already expects `reference_path`/`reference_name`,
+        # so writing them also makes that cache signature meaningful.
+        # All keys are optional on read: older .ax files simply lack them.
+        try:
+            import datetime as _dt
+            _ref_fp = getattr(self, "image_filepath", None) or getattr(self, "filepath", None)
+            if _ref_fp:
+                payload["reference_path"] = str(_ref_fp)
+                payload["reference_name"] = os.path.splitext(os.path.basename(str(_ref_fp)))[0]
+            payload["computed_at"] = _dt.datetime.now().isoformat(timespec="seconds")
+            payload["algorithm"] = mode
+        except Exception as e:
+            logging.debug(f"[on_hist_match_clicked] provenance not recorded: {e}")
+
         # 6) Store *pending* edit only; do not write files or refresh tabs here
         self.modifications["hist_match"] = payload
-        logging.info(f"Histogram matching set to '{mode}' (stats computed). Will persist on 'Apply All Changes'.")
+        logging.info(
+            f"Histogram matching set to '{mode}' (stats computed from "
+            f"'{payload.get('reference_name', '?')}'). Will persist on 'Apply All Changes'."
+        )
+        self._update_hist_base_label()
+        self._update_hist_plot()
 
         # NOTE: Do NOT call reapply_modifications() here!
         # "Calculate" computes reference stats FROM this image for use on OTHER images.
         # Applying histogram matching to the reference image itself makes no sense.
-    def _apply_hist_match(self, img, block):
-        import numpy as np
-        import cv2
-
-        if (img is None) or (getattr(img, "size", 0) == 0) or (not isinstance(block, dict)):
-            return img
-
-        mode = (block.get("mode") or "meanstd").lower()
-        if mode == "none":  # <-- allow explicit "no normalization"
-            return img
-
-        bands_cfg = int(block.get("bands", 0))
-        src_dtype = img.dtype
-
-        # Helper: sample stride so we don't scan full-res to estimate stats/CDF
-        def _sample_stride(h, w, max_side):
-            return max(1, int(np.sqrt((h * w) / float(max(1, max_side * max_side)))))
-
-        # --- FAST PATH: mean/std with LUTs for integers ---
-        if mode == "meanstd":
-            ref = block.get("ref_stats") or []
-            # Normalize to HxWxC for uniform logic below
-            if img.ndim == 2:
-                H, W, C = img.shape[0], img.shape[1], 1
-            else:
-                H, W, C = img.shape
-            bands = min(bands_cfg if bands_cfg > 0 else C, C)
-            C2 = min(bands, len(ref))
-            if C2 == 0:
-                return img
-
-            # Sample target stats (cheap)
-            max_side = int(getattr(self, "HIST_SAMPLE_MAX", 1200))
-            s = _sample_stride(H, W, max_side)
-
-            if np.issubdtype(src_dtype, np.integer):
-                # Compute mu/sd from a sample casted to float (no need for nan-ops on ints)
-                if img.ndim == 2:
-                    samp = img[::s, ::s].astype(np.float32, copy=False)[..., None]
-                else:
-                    samp = img[::s, ::s, :C2].astype(np.float32, copy=False)
-
-                mu_t = np.mean(samp, axis=(0, 1)).astype(np.float32, copy=False).reshape(-1)
-                sd_t = np.std( samp, axis=(0, 1)).astype(np.float32, copy=False).reshape(-1)
-                sd_t = np.where(sd_t < 1e-6, 1.0, sd_t)
-
-                mu_r = np.array([float(ref[i].get("mean", 0.0)) for i in range(C2)], dtype=np.float32)
-                sd_r = np.array([float(ref[i].get("std",  1.0)) for i in range(C2)], dtype=np.float32)
-
-                # uint8: exact LUT 0..255
-                if src_dtype == np.uint8:
-                    xs = np.arange(256, dtype=np.float32)
-                    luts = []
-                    for c in range(C2):
-                        a = float(sd_r[c] / sd_t[c]); b = float(mu_r[c] - a * mu_t[c])
-                        lut_u8 = np.clip(a * xs + b, 0, 255).astype(np.uint8)
-                        luts.append(lut_u8)
-
-                    out = img.copy()
-                    if out.ndim == 2:
-                        out[:] = luts[0][out]
-                    else:
-                        for c in range(C2):
-                            out[..., c] = luts[c][out[..., c]]
-                    return out
-
-                # uint16: 12-bit quantized LUT (fast and small)
-                elif src_dtype == np.uint16:
-                    qbins = int(getattr(self, "HIST_BINS_16U", 4096))
-                    step  = 65536.0 / qbins
-                    xs    = (np.arange(qbins, dtype=np.float32) + 0.5) * step  # centers
-                    luts = []
-                    for c in range(C2):
-                        a = float(sd_r[c] / sd_t[c]); b = float(mu_r[c] - a * mu_t[c])
-                        lut_u16 = np.clip(a * xs + b, 0.0, 65535.0).astype(np.uint16)
-                        luts.append(lut_u16)
-
-                    out = img.copy()
-                    if out.ndim == 2:
-                        qidx = np.clip((out.astype(np.float32) * (1.0 / step)).astype(np.int32), 0, qbins - 1)
-                        out[:] = luts[0][qidx]
-                    else:
-                        for c in range(C2):
-                            qidx = np.clip((out[..., c].astype(np.float32) * (1.0 / step)).astype(np.int32), 0, qbins - 1)
-                            out[..., c] = luts[c][qidx]
-                    return out
-
-                # Other integer types: fall back to float math
-                # (rare in images; keeps behavior identical)
-                # Continue to float path below.
-
-            # --- float path (and non-u8/u16 ints fallback) ---
-            f = img.astype(np.float32, copy=False)
-            single_channel = False
-            if f.ndim == 2:
-                f = f[..., None]
-                single_channel = True
-            # recompute sample on float view
-            s = _sample_stride(f.shape[0], f.shape[1], int(getattr(self, "HIST_SAMPLE_MAX", 1200)))
-            samp = f[:, :, :C2] if s == 1 else f[::s, ::s, :C2]
-            mu_t = np.nanmean(samp, axis=(0, 1)).astype(np.float32, copy=False)
-            sd_t = np.nanstd( samp, axis=(0, 1)).astype(np.float32, copy=False)
-            sd_t = np.where(sd_t < 1e-6, 1.0, sd_t)
-
-            mu_r = np.array([float(ref[i].get("mean", 0.0)) for i in range(C2)], dtype=np.float32)
-            sd_r = np.array([float(ref[i].get("std",  1.0)) for i in range(C2)], dtype=np.float32)
-
-            gain = (sd_r / sd_t).reshape(1, 1, C2)
-            x = f[:, :, :C2]
-            x -= mu_t.reshape(1, 1, C2)
-            x *= gain
-            x += mu_r.reshape(1, 1, C2)
-
-            out = f[..., 0] if single_channel else f
-            if np.issubdtype(src_dtype, np.integer):
-                info = np.iinfo(src_dtype)
-                out = np.clip(out, info.min, info.max).astype(src_dtype, copy=False)
-            return out
-
-        # --- CDF path (unchanged, but convert lazily) ---
-        # Convert once here for CDF logic
-        f = img.astype(np.float32, copy=False)
-        single_channel = False
-        if f.ndim == 2:
-            f = f[..., None]
-            single_channel = True
-
-        H, W, C = f.shape
-        bands = min(bands_cfg if bands_cfg > 0 else C, C)
-
-        # small, safe sampler
-        def _sample_for_hist_channel(ch):
-            max_side = int(getattr(self, "HIST_SAMPLE_MAX", 1200))
-            h, w = ch.shape[:2]
-            if h == 0 or w == 0:
-                return ch
-            stride = _sample_stride(h, w, max_side)
-            return ch if stride == 1 else ch[::stride, ::stride]
-
-        refcdf = (block.get("ref_cdf") or {}).get("per_band") or []
-        ref_hash = self._ref_hash_hist(block)
-
-        dtype_tag = "float"
-        bins_float = getattr(self, "HIST_BINS_FLOAT", 2048)
-        bins_8u   = getattr(self, "HIST_BINS_8U", 256)
-        bins_16u  = getattr(self, "HIST_BINS_16U", 4096)
-
-        for c in range(min(bands, len(refcdf))):
-            ch = f[..., c]
-            info = refcdf[c]
-            lo = float(info.get("lo", 0.0)); hi = float(info.get("hi", 1.0))
-            x_ref_n = np.asarray(info.get("x", [0.0, 1.0]), dtype=np.float32)
-            y_ref   = np.asarray(info.get("y", [0.0, 1.0]), dtype=np.float32)
-            hi = hi if hi > lo else (lo + 1.0)
-            x_ref   = x_ref_n * (hi - lo) + lo
-
-            # Cache key (per band, per dtype/binning policy)
-            if np.issubdtype(src_dtype, np.integer):
-                if src_dtype == np.uint8:
-                    dtype_tag = "u8"
-                    cache_key = ("cdf", ref_hash, dtype_tag, bins_8u, c)
-                else:
-                    dtype_tag = "u16"
-                    cache_key = ("cdf", ref_hash, dtype_tag, bins_16u, c)
-            else:
-                dtype_tag = "float"
-                cache_key = ("cdf", ref_hash, dtype_tag, bins_float, c)
-
-            xs = xprime = None
-            if cache_key in getattr(self, "_hist_cache", {}):
-                xs, xprime = self._hist_cache[cache_key]
-            else:
-                ch_s = _sample_for_hist_channel(ch)
-                flat = ch_s.reshape(-1)
-                flat = flat[~np.isnan(flat)]
-                if flat.size == 0:
-                    continue
-
-                if dtype_tag == "u8":
-                    xs_src = np.arange(256, dtype=np.float32)
-                    hist = np.bincount(ch_s.astype(np.uint8, copy=False).ravel(), minlength=256).astype(np.float32)
-                    cdf_src = np.cumsum(hist) / max(1.0, float(hist.sum()))
-                    xprime_at_p = np.interp(cdf_src, y_ref, x_ref)
-                    lut = np.interp(xs_src, xs_src, xprime_at_p).astype(np.float32)
-                    xs, xprime = xs_src, lut
-
-                elif dtype_tag == "u16":
-                    qbins = int(bins_16u)
-                    step = 65536.0 / qbins
-                    qidx = np.clip((ch_s.astype(np.float32) * (1.0 / step)).astype(np.int32), 0, qbins - 1)
-                    hist = np.bincount(qidx.ravel(), minlength=qbins).astype(np.float32)
-                    cdf_src = np.cumsum(hist) / max(1.0, float(hist.sum()))
-                    xs_src = (np.arange(qbins, dtype=np.float32) + 0.5) * step
-                    xprime_at_p = np.interp(cdf_src, y_ref, x_ref)
-                    lut = np.interp(xs_src, xs_src, xprime_at_p).astype(np.float32)
-                    xs, xprime = xs_src, lut
-
-                else:
-                    hist, edges = np.histogram(flat, bins=int(bins_float), range=(lo, hi))
-                    cdf_src = np.cumsum(hist).astype(np.float32)
-                    cdf_src /= float(flat.size if flat.size else 1.0)
-                    xs_src = 0.5 * (edges[:-1] + edges[1:])
-                    xprime = np.interp(cdf_src, y_ref, x_ref).astype(np.float32)
-                    xs = xs_src.astype(np.float32)
-
-                if not hasattr(self, "_hist_cache"):
-                    self._hist_cache = {}
-                self._hist_cache[cache_key] = (xs, xprime)
-
-            # Apply mapping to full channel
-            if dtype_tag == "u8":
-                ch_u8 = np.clip(ch, 0, 255).astype(np.uint8, copy=False)
-                ch[:] = xprime[ch_u8]
-            elif dtype_tag == "u16":
-                qbins = int(bins_16u)
-                step = 65536.0 / qbins
-                qidx_full = np.clip((ch * (1.0 / step)).astype(np.int32), 0, qbins - 1)
-                ch[:] = xprime[qidx_full]
-            else:
-                ch[:] = np.interp(ch, xs, xprime, left=xprime[0], right=xprime[-1]).astype(np.float32)
-
-        out = f[..., 0] if single_channel else f
-        if np.issubdtype(src_dtype, np.integer):
-            info = np.iinfo(src_dtype)
-            out = np.clip(out, info.min, info.max).astype(src_dtype, copy=False)
-        return out
 
     def _on_all_groups_toggled(self, checked: bool):
         if checked:
@@ -4748,6 +4954,20 @@ class ImageEditorDialog(QDialog):
 
         bands = re.findall(r'b(\d+)', expression)
         unique_bands = sorted(set(bands), key=lambda x: int(x))
+
+        # A preview holds only the display bands; b1..bN needs the full stack.
+        # Load it now, on the first expression that actually requires it.
+        try:
+            need = max((int(b) for b in unique_bands), default=1)
+            loaded = (self.original_image.shape[2]
+                      if getattr(self.original_image, "ndim", 2) == 3 else 1)
+            if need > loaded and not self.ensure_all_bands_loaded():
+                QtWidgets.QMessageBox.warning(
+                    self, "Band Expression",
+                    "Could not load all bands for this image.")
+                return
+        except Exception as e:
+            logging.debug("Band availability check failed: %s", e)
         if self.original_image.ndim == 2:
             if any(int(b) != 1 for b in unique_bands):
                 logging.warning("Grayscale image only has one band (b1).")
@@ -4770,9 +4990,16 @@ class ImageEditorDialog(QDialog):
 
     # ---------- display normalization ----------
     def _percentiles_from_sample(self, arr_flat):
-        """Compute low/high percentiles from a 1D sample."""
-        lo = np.percentile(arr_flat, self.STRETCH_LOW_P)
-        hi = np.percentile(arr_flat, self.STRETCH_HIGH_P)
+        """
+        Compute low/high percentiles from a 1D sample.
+
+        NaN-aware: NoData/NaN pixels must not be counted as real data, or a float
+        image with a large NaN border computes its percentiles over a block of
+        (previously zero-filled) NaN and crushes the real contrast.
+        """
+        from .utils import _nanpct
+        lo = _nanpct(arr_flat, self.STRETCH_LOW_P)
+        hi = _nanpct(arr_flat, self.STRETCH_HIGH_P)
         return float(lo), float(hi)
 
     def _sample_for_stats(self, arr):
@@ -4823,8 +5050,12 @@ class ImageEditorDialog(QDialog):
                         nd_mask = nan_inf_mask
                         logging.debug(f"[normalize_image_for_display] Stored mask shape {nd_mask.shape} != image shape {res.shape[:2]}, using NaN/Inf only")
                 
-                # Replace NaN/Inf for processing
-                res = np.nan_to_num(res)
+                # NOTE: NaN/Inf are deliberately NOT zero-filled here any more.
+                # Doing so turned every NoData pixel into a real 0.0 that was then
+                # counted by the percentile stats below, crushing the stretch on float
+                # imagery with NaN borders. The percentile helpers are nan-aware and each
+                # branch zero-fills `norm` just before the uint8 cast, so non-finite
+                # pixels still render (and are painted over by the NoData overlay).
 
                 if res.ndim == 2:  # grayscale
                     sample = self._sample_for_stats(res)
@@ -4835,8 +5066,9 @@ class ImageEditorDialog(QDialog):
                         norm = (res - lo) / max(hi - lo, 1e-12)
                     if self.STRETCH_CLIP:
                         norm = np.clip(norm, 0.0, 1.0)
+                    norm = np.nan_to_num(norm, nan=0.0, posinf=1.0, neginf=0.0)
                     norm_img = (norm * 255.0).astype(np.uint8)
-                    
+
                     # Only convert grayscale to RGB if we have NoData pixels to color
                     has_nodata = nd_mask is not None and nd_mask.any()
                     if has_nodata:
@@ -4852,10 +5084,11 @@ class ImageEditorDialog(QDialog):
                     sample = self._sample_for_stats(x)
 
                     if self.STRETCH_PER_CHANNEL:
-                        # per-channel percentiles
+                        # per-channel percentiles (nan-aware — see _percentiles_from_sample)
+                        from .utils import _nanpct
                         flat = sample.reshape(-1, x.shape[2])
-                        lo = np.percentile(flat, self.STRETCH_LOW_P, axis=0)
-                        hi = np.percentile(flat, self.STRETCH_HIGH_P, axis=0)
+                        lo = _nanpct(flat, self.STRETCH_LOW_P, axis=0)
+                        hi = _nanpct(flat, self.STRETCH_HIGH_P, axis=0)
                         scale = np.maximum(hi - lo, 1e-12)
                         norm = (x - lo.reshape(1, 1, -1)) / scale.reshape(1, 1, -1)
                     else:
@@ -4868,6 +5101,7 @@ class ImageEditorDialog(QDialog):
                     if self.STRETCH_CLIP:
                         norm = np.clip(norm, 0.0, 1.0)
 
+                    norm = np.nan_to_num(norm, nan=0.0, posinf=1.0, neginf=0.0)
                     norm_img = (norm * 255.0).astype(np.uint8)
 
                     # If fewer than 3 channels, pad to 3 for preview
@@ -5651,6 +5885,14 @@ class ImageEditorDialog(QDialog):
                                               "Enable 'Use scikit-learn classification' first.")
             return
         try:
+            # The model's features are the image bands, so a display-band preview
+            # is not enough -- pull in the full stack before predicting.
+            if not self.ensure_all_bands_loaded():
+                from PyQt5 import QtWidgets
+                QtWidgets.QMessageBox.warning(
+                    self, "Classification",
+                    "Could not load all bands for this image.")
+                return
             self.run_sklearn_classification()
             # NEW: keep the flag persisted once classification has run
             self._persist_classification_enabled(True)

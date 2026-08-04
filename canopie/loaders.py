@@ -114,6 +114,16 @@ class _ImageLoadRunnable(QtCore.QRunnable):
             imgd.image = self._tab.__class__.apply_aux_modifications(
                 self._filepath, imgd.image, self._proj, global_mode=self._gmods
             )
+            # INVARIANT: `imgd.image` is now fully .ax-processed — crop/rotate,
+            # HISTOGRAM MATCH, resize, band expression and classification have all been
+            # applied exactly once. Downstream renderers must NOT re-apply any of them
+            # (_render_with_viewer_stretch used to re-run hist match here, which made the
+            # viewer disagree with CSV/ML export). Tagged explicitly so a future change
+            # that feeds raw pixels into the render path is easy to spot.
+            try:
+                imgd._aux_applied = True
+            except Exception:
+                pass
 
             if self._stop.is_set():
                 try: self.signals.done_one.emit()

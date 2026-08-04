@@ -1719,30 +1719,21 @@ class MachineLearningManager(QtWidgets.QDialog):
         chans = [cv2.resize(img[:, :, i], (new_w, new_h), interpolation=interpolation) for i in range(C)]
         return np.stack(chans, axis=2)
 
-    def _ensure_hwc(self, arr):
-        """Return 2D or HxWxC. Accepts (bands,H,W) and (pages,H,W[,samples]) stacks."""
+    def _ensure_hwc(self, arr, axes=None):
+        """Return 2D or HxWxC. Accepts (bands,H,W) and (pages,H,W[,samples]) stacks.
+
+        Delegates to raster_reader.ensure_hwc so ML export and CSV export cannot
+        disagree about band order. Pass `axes` for TIFF-sourced arrays.
+        """
         import numpy as np
+        from .raster_reader import ensure_hwc
+
         if arr is None:
             return None
         a = np.asarray(arr)
-
         if a.ndim == 2:
             return a
-
-        if a.ndim == 3:
-            # Treat axis 0 as bands if it's plausibly the smallest dimension (typical CHW)
-            B, H, W = a.shape
-            if B <= min(H, W) and H > 32 and W > 32:
-                return np.moveaxis(a, 0, 2).copy()         # (B,H,W) -> (H,W,B)
-            return a                                        # already (H,W,C)
-
-        if a.ndim == 4:
-            # (pages, H, W, samples) -> flatten pages into channels: (H,W, P*samples)
-            P, H, W, S = a.shape
-            a = a.reshape(P, H, W, S)
-            return np.concatenate([a[i] for i in range(P)], axis=2).copy()
-
-        return a
+        return ensure_hwc(a, axes=axes)
 
 
     def _ax_candidates(self, filepath):
@@ -1926,32 +1917,39 @@ class MachineLearningManager(QtWidgets.QDialog):
 
         # Prefer the local scientific matcher (float-preserving); fallback to parent if needed
         def _apply_hist_local(img, mods, nodata_vals=None, poly_points_list=None, poly_enabled=False):
-            FAST = True
-            MAX_SAMPLES = 1000  # same as ProjectTab.HIST_MAX_SAMPLES
-            # Prefer local implementation (if present) with fast/sampled args
-            try:
-                return self._apply_hist_match(img, mods, FAST, MAX_SAMPLES, nodata_values=nodata_vals,
-                                              mask_polygon_points=poly_points_list,
-                                              mask_polygon_enabled=poly_enabled)
-            except TypeError:
-                # Try without mask_polygon
-                try:
-                    return self._apply_hist_match(img, mods, FAST, MAX_SAMPLES, nodata_values=nodata_vals)
-                except TypeError:
-                    return self._apply_hist_match(img, mods)
-                except Exception:
-                    pass
-            # Fallback to ProjectTab’s implementation
+            """
+            Apply histogram matching using the ONE canonical implementation.
+
+            This used to try `self._apply_hist_match(img, mods, FAST, MAX_SAMPLES, ...)`
+            first. That signature never existed — the local method only took
+            (img, mods) — so every attempt raised TypeError and the chain bottomed out
+            at a two-argument call that SILENTLY DISCARDED nodata_values and the mask
+            polygon, and ran a different (argsort-rank) CDF algorithm than the rest of
+            the app. Any time this path executed, NoData pixels were folded into the
+            statistics and overwritten.
+
+            Now we call ProjectTab._apply_hist_match — the same function used by the
+            viewer, the editor and the CSV export — with the full argument set.
+            """
             parent = getattr(self, "parent_tab", None) or getattr(self, "parent", lambda: None)()
-            if parent is not None and hasattr(parent, "_apply_hist_match"):
+            fn = getattr(parent, "_apply_hist_match", None) if parent is not None else None
+            if fn is None:
                 try:
-                    return parent._apply_hist_match(img, mods, FAST, MAX_SAMPLES, nodata_values=nodata_vals)
-                except TypeError:
-                    return parent._apply_hist_match(img, mods)
+                    from .project_tab import ProjectTab as _PT
+                    fn = _PT._apply_hist_match
                 except Exception:
-                    pass
-            logging.warning("Histogram matching not applied (no working implementation found).")
-            return img
+                    fn = None
+            if fn is None:
+                logging.warning("Histogram matching not applied (canonical implementation unavailable).")
+                return img
+            try:
+                return fn(img, mods,
+                          nodata_values=nodata_vals,
+                          mask_polygon_points=poly_points_list,
+                          mask_polygon_enabled=poly_enabled)
+            except Exception as e:
+                logging.warning(f"Histogram matching failed: {e}")
+                return img
 
 
         # ---- start from HWC ----
@@ -2430,8 +2428,12 @@ class MachineLearningManager(QtWidgets.QDialog):
             # 1) tifffile
             try:
                 import tifffile as tiff
-                arr_tt = tiff.imread(filepath)
-                arr_tt = self._ensure_hwc(arr_tt)
+                with tiff.TiffFile(filepath) as _tf:
+                    # Use the file's own axis labels; guessing from shape misreads
+                    # band-first cubes with many bands.
+                    _axes = (_tf.series[0].axes or "").upper()
+                    arr_tt = _tf.asarray()
+                arr_tt = self._ensure_hwc(arr_tt, axes=_axes)
                 c_tt = _count_channels(arr_tt)
                 if c_tt > best_c:
                     best, best_c = arr_tt, c_tt
@@ -2495,62 +2497,24 @@ class MachineLearningManager(QtWidgets.QDialog):
     def _apply_hist_match(self, img, mods):
         """
         Apply histogram normalization described by mods['hist_match'] to img.
-        Supports:
-          - mode='meanstd' with 'ref_stats' [{'mean':..,'std':..}, ...]
-          - mode='cdf' with 'ref_cdf': {'per_band':[{'x':..,'y':..,'lo':..,'hi':..}, ...]}
-        Returns float32 image; preserves NaNs.
+
+        Thin delegation to ProjectTab._apply_hist_match — the single canonical
+        implementation shared by the viewer, the image editor and the CSV export.
+
+        This used to be an independent copy that (a) implemented a DIFFERENT CDF
+        algorithm (argsort/rank-based rather than the histogram-bin LUT used
+        everywhere else, which dithers flat regions and breaks tie-handling),
+        (b) accepted no nodata/mask arguments so NoData pixels were folded into the
+        statistics and overwritten, and (c) never cast back to the source dtype.
+        Keeping a second algorithm alive for a fallback path meant exported numbers
+        could silently depend on which code path happened to run.
         """
-        import numpy as np
-
-        hcfg = (mods or {}).get("hist_match")
-        if not hcfg:
+        try:
+            from .project_tab import ProjectTab as _PT
+            return _PT._apply_hist_match(img, mods)
+        except Exception as e:
+            logging.warning(f"_apply_hist_match delegation failed: {e}")
             return img
-
-        x = img.astype(np.float32, copy=False)
-        if x.ndim == 2:
-            x = x[..., None]
-        C = x.shape[2]
-
-        mode = str(hcfg.get("mode", "meanstd")).lower()
-
-        def _safe_std(a):
-            s = float(np.nanstd(a))
-            return s if s > 1e-12 else 1.0
-
-        if mode == "meanstd":
-            stats = list(hcfg.get("ref_stats") or [])
-            # Apply per channel; ignore extra channels beyond provided stats
-            for c in range(min(C, len(stats))):
-                ch   = x[..., c]
-                mu_r = float(stats[c].get("mean", 0.0))
-                sd_r = float(stats[c].get("std",  1.0))
-                mu_t = float(np.nanmean(ch))
-                sd_t = _safe_std(ch)
-                x[..., c] = (ch - mu_t) * (sd_r / sd_t) + mu_r
-        else:
-            # CDF-based matching (kept for completeness)
-            ref = hcfg.get("ref_cdf", {}) or {}
-            per = ref.get("per_band") or []
-            for c in range(min(C, len(per))):
-                lut = per[c] or {}
-                x_n = np.asarray(lut.get("x")  or [0.0, 1.0], dtype=np.float32)
-                y   = np.asarray(lut.get("y")  or [0.0, 1.0], dtype=np.float32)
-                lo  = float(lut.get("lo", 0.0))
-                hi  = float(lut.get("hi", 1.0))
-                if not np.isfinite(lo): lo = 0.0
-                if not np.isfinite(hi) or hi <= lo: hi = lo + 1.0
-
-                ch = x[..., c]
-                z  = np.clip((ch - lo) / (hi - lo), 0.0, 1.0)
-                flat = z.reshape(-1)
-                rk_idx = np.argsort(flat)
-                ranks  = np.empty_like(flat, dtype=np.float32)
-                ranks[rk_idx] = np.linspace(0.0, 1.0, flat.size, endpoint=True)
-                ranks = ranks.reshape(z.shape)
-                z2 = np.interp(ranks, y, x_n)
-                x[..., c] = z2 * (hi - lo) + lo
-
-        return x[..., 0] if img.ndim == 2 else x
 
     def _get_export_image(self, filepath):
         """
@@ -3317,16 +3281,33 @@ class MachineLearningManager(QtWidgets.QDialog):
                             vals.append(np.nan)
                 return vals
 
+            def _reflect_index(i, n):
+                """OpenCV BORDER_REFLECT: fedcba|abcdefgh|hgfedcb (index -1 -> 0)."""
+                if n <= 1:
+                    return 0
+                period = 2 * n
+                i = i % period
+                return i if i < n else period - 1 - i
+
             def _align_window_values(any_rgb, max_extras, max_small, chans, xi, yi, k):
+                # Gather the k x k neighbourhood directly instead of padding whole
+                # channels. The old version ran cv2.copyMakeBorder over every
+                # channel of the full image for *every point*; reflecting the
+                # indices gives identical values for a fraction of the work, and
+                # is what lets this work on windowed (OffsetBand) reads at all.
                 pad = k // 2
-                padded = [cv2.copyMakeBorder(ch, pad, pad, pad, pad, cv2.BORDER_REFLECT) for ch in chans]
+                ys = [_reflect_index(yi + dy, H) for dy in range(-pad, pad + 1)]
+                xs = [_reflect_index(xi + dx, W) for dx in range(-pad, pad + 1)]
 
                 def wflat(ch):
-                    cy = yi + pad
-                    cx = xi + pad
-                    win = ch[cy - pad: cy + pad + 1, cx - pad: cx + pad + 1]
+                    take = getattr(ch, "take_yx", None)
+                    if take is not None:                  # OffsetBand
+                        win = take(ys, xs)
+                    else:
+                        win = np.asarray(ch)[np.ix_(ys, xs)]
                     return win.reshape(-1).tolist()
 
+                padded = chans
                 out = []
                 if any_rgb:
                     # 3 RGB windows
@@ -3355,14 +3336,40 @@ class MachineLearningManager(QtWidgets.QDialog):
                     cv2.fillPoly(mask, arr, 255)
                 return mask
 
-            # Detect export channel layout across files
+            # Detect export channel layout across files.
+            # This only needs the band COUNT, so read it from the TIFF header
+            # instead of decoding every file. The previous version called
+            # _get_export_image() on each entry purely to look at C, which fully
+            # decoded (and cached) every image before extraction had even begun --
+            # 3.88 GB per file on hyperspectral scenes.
+            def _channel_count_cheap(fp):
+                """Band count without decoding pixels, or None if it can't be trusted."""
+                try:
+                    from .raster_reader import probe
+                except Exception:
+                    return None
+                try:
+                    ax = self._load_ax_mods(fp) or {}
+                    # These .ax ops append bands, so the header count would be wrong.
+                    if (ax.get("band_expression") or ax.get("classification")
+                            or ax.get("appended_bands")):
+                        return None
+                    profile = probe(fp)
+                    return profile.count if profile is not None else None
+                except Exception:
+                    return None
+
             any_rgb = False
             max_extras = 0
             max_small = 0
 
             for _g, fp in all_entries:
-                img, C = self._get_export_image(fp)
-                if img is None or C <= 0:
+                C = _channel_count_cheap(fp)
+                if C is None:
+                    img, C = self._get_export_image(fp)
+                    if img is None or C <= 0:
+                        continue
+                if C <= 0:
                     continue
                 if C >= 3:
                     any_rgb = True
@@ -3414,7 +3421,24 @@ class MachineLearningManager(QtWidgets.QDialog):
 
                 H, W = img.shape[:2]
                 chans = self._channels_in_export_order(img)
-                
+
+                # Lazily-read cubes: fetch just the bounding box of this file's
+                # points once, then keep full-image indexing via OffsetBand.
+                # Without this, every chans[b][yi, xi] below would decode a whole
+                # band -- 284 band reads per point.
+                if hasattr(chans, "read_window_offset") and raw_pts:
+                    try:
+                        pad = max(1, int(window_size) // 2) + 1
+                        xs = [int(round(p[0])) for p in raw_pts]
+                        ys = [int(round(p[1])) for p in raw_pts]
+                        chans = chans.read_window_offset(
+                            min(xs) - pad, min(ys) - pad,
+                            max(xs) + pad + 1, max(ys) + pad + 1)
+                    except Exception as e:
+                        logging.warning("[export_csv_data] windowed read failed for %s: %s",
+                                        os.path.basename(filepath), e)
+
+
                 # ---------- Load NoData values from .ax file ----------
                 nodata_values = []
                 try:
@@ -3468,7 +3492,11 @@ class MachineLearningManager(QtWidgets.QDialog):
                     """Build boolean mask where True = NoData pixel. Uses shared utility supporting expressions."""
                     from .utils import build_nodata_mask as _shared_build_nodata_mask
                     # build_nodata_mask expects HxW or HxWxC; for 2D we'll rely on it handling 2D arrays
-                    return _shared_build_nodata_mask(ch, nd_vals, bgr_input=True) or np.zeros(ch.shape, dtype=bool)
+                    # NOTE: must be an explicit `is None` test. `mask or default` evaluates
+                    # bool(mask), which raises "truth value of an array ... is ambiguous"
+                    # for any multi-element array — i.e. every time a mask was actually built.
+                    m = _shared_build_nodata_mask(ch, nd_vals, bgr_input=True)
+                    return m if m is not None else np.zeros(ch.shape, dtype=bool)
                 
                 # Build combined NoData mask (any channel has NoData)
                 nd_mask = np.zeros((H, W), dtype=bool)

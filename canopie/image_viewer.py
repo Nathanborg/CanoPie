@@ -832,6 +832,8 @@ class ImageViewer(QtWidgets.QGraphicsView):
     editing_finished = QtCore.pyqtSignal()
     pixel_clicked = QtCore.pyqtSignal(QtCore.QPointF, object)
     editing_cancelled = QtCore.pyqtSignal()
+    # Emits the 0-based FILE band index the user clicked in the band-selector bar.
+    band_selected = QtCore.pyqtSignal(int)
 
     def __init__(self, parent=None):
         super(ImageViewer, self).__init__(parent)
@@ -869,7 +871,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
         self._drag_active_count = 0
 
         # For drawing
-        self.drawing = False
+        self._drawing = False
         self.currentPolygon = QtGui.QPolygonF()
         self.polygons = []
         self._rb_dragging = False
@@ -892,7 +894,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
         self.inspection_mode = False
 
         # Original Image Data Reference
-        self.image_data = None
+        self._image_data = None
 
         # Drawing mode: "polygon", "point", "rectangle", "circle", "random_points"
         self.drawing_mode = "polygon"
@@ -946,6 +948,11 @@ class ImageViewer(QtWidgets.QGraphicsView):
         self._zoombar = None
         QtCore.QTimer.singleShot(0, self._attach_zoom_bar_deferred)
 
+        # --- Attach band-selector bar (same deferral, kept as a separate
+        # scheduled call so either overlay can be disabled independently) ---
+        self._bandbar = None
+        QtCore.QTimer.singleShot(0, self._attach_band_bar_deferred)
+
 
 
 
@@ -956,6 +963,122 @@ class ImageViewer(QtWidgets.QGraphicsView):
             attach_zoom_bar(self)
         except Exception as e:
             logging.debug(f"[ImageViewer] Failed to attach zoom bar: {e}")
+
+    def _attach_band_bar_deferred(self):
+        """Attach the band-selector bar after the widget is fully initialized."""
+        try:
+            attach_band_bar(self)
+        except Exception as e:
+            logging.debug(f"[ImageViewer] Failed to attach band bar: {e}")
+
+    # ------------------------------------------------------------------
+    # image_data / drawing as properties (not plain attributes)
+    #
+    # Both used to be bare instance attributes mutated from many call sites
+    # (image_data reassigned from four places in project_tab.py; drawing set
+    # true/false from ~8 places in this class). Converting them to properties
+    # gives one choke point to refresh the band-selector bar whenever the
+    # displayed image changes, and to hide it the instant drawing starts,
+    # without touching any of those existing call sites.
+    # ------------------------------------------------------------------
+
+    @property
+    def image_data(self):
+        return self._image_data
+
+    @image_data.setter
+    def image_data(self, value):
+        self._image_data = value
+        try:
+            self._refresh_band_bar()
+        except Exception as e:
+            logging.debug(f"[ImageViewer] band bar refresh failed: {e}")
+
+    @property
+    def drawing(self):
+        return self._drawing
+
+    @drawing.setter
+    def drawing(self, value):
+        value = bool(value)
+        turning_on = value and not self._drawing
+        self._drawing = value
+        if turning_on:
+            bb = getattr(self, "_bandbar", None)
+            if bb is not None:
+                try:
+                    bb.hide_immediately()
+                except Exception:
+                    pass
+
+    def _refresh_band_bar(self):
+        """Repopulate the band-selector bar for whatever image is now loaded.
+
+        Mirrors the same preview-vs-plain-image branching ImageStretchDialog
+        already uses (project_tab.py's __init__ and open_stretch_dialog) --
+        duplicated here rather than called back into ProjectTab, since this is
+        a pure read of data already sitting on image_data with no side effects,
+        and image_viewer.py has no existing import of project_tab.py.
+        """
+        bb = getattr(self, "_bandbar", None)
+        if bb is None:
+            return
+        idata = self._image_data
+        img = getattr(idata, "image", None) if idata is not None else None
+        if idata is None or img is None:
+            bb.hide_immediately()
+            return
+
+        profile = getattr(idata, "profile", None)
+        preview_bands = getattr(idata, "preview_bands", None)
+
+        if profile is not None and preview_bands:
+            names = list(getattr(profile, "band_names", None) or [])
+            count = int(profile.count)
+            band_names = [names[i] if i < len(names) and names[i] else None
+                          for i in range(count)]
+        else:
+            count = int(img.shape[2]) if hasattr(img, "ndim") and img.ndim == 3 else 1
+            band_names = None
+
+        # If a single band is currently displayed, highlight its button. Bar
+        # buttons are indexed by FILE band, so a position within the resident
+        # preview array must be mapped back through preview_bands first.
+        active_band = None
+        sp = getattr(self, "stretch_params", None)
+        if (sp is not None and str(getattr(sp, "display_mode", "")).lower() == "single"
+                and getattr(sp, "display_band", None) is not None):
+            pos = int(sp.display_band)
+            if profile is not None and preview_bands:
+                if 0 <= pos < len(preview_bands):
+                    active_band = int(preview_bands[pos])
+            else:
+                active_band = pos
+
+        # Leading "composite" button reflects whichever full-image stretch mode
+        # (auto / rgb) is the actual configured one -- while a single band is
+        # being viewed, that mode lives on the stashed _composite_stretch_params
+        # (see ProjectTab._on_band_bar_clicked), since stretch_params itself has
+        # been overridden to "single" for the duration of the single-band view.
+        composite_active = active_band is None
+        composite_mode = "auto"
+        if sp is not None and str(getattr(sp, "display_mode", "")).lower() != "single":
+            composite_mode = str(getattr(sp, "display_mode", "auto") or "auto").lower()
+        else:
+            comp = getattr(self, "_composite_stretch_params", None)
+            if comp is not None:
+                composite_mode = str(getattr(comp, "display_mode", "auto") or "auto").lower()
+        composite_label = "RGB" if composite_mode == "rgb" else "Auto"
+
+        try:
+            bb.populate(band_names, count, active_band=active_band,
+                        composite_label=composite_label, composite_active=composite_active)
+            bb.reposition()
+            zb = getattr(self, "_zoombar", None)
+            if zb is not None:
+                zb.reposition()
+        except Exception as e:
+            logging.debug(f"[ImageViewer] band bar populate failed: {e}")
 
     # ---------- Drag repaint helpers ----------
     def _begin_item_drag(self):
@@ -1049,21 +1172,32 @@ class ImageViewer(QtWidgets.QGraphicsView):
         elif self._image is None:
             self.set_image(pixmap)
 
-    def show_preview_array(self, arr_uint8):
+    def show_preview_array(self, arr_uint8, channel_order="rgb"):
         """
         Convenience: take a uint8 array (H,W), (H,W,1), (H,W,2), (H,W,3), or (H,W,4)
         and update pixmap in place.
-        
+
         - 2D or (H,W,1): Grayscale
         - (H,W,2): Pad with zeros to make 3-channel RGB (e.g., Gray + Classification)
         - (H,W,3): RGB
         - (H,W,4): Convert BGRA to RGB (discard alpha) or use ARGB format
+
+        channel_order: "rgb" (default, the historical assumption) or "bgr". The caller
+        must state the TRUE order of the array — this used to be hard-coded to RGB, so
+        cv2-loaded (BGR) images had red and blue swapped whenever the stretch dialog
+        rendered them, while the refresh path (Format_BGR888) drew them correctly.
         """
         if arr_uint8 is None or arr_uint8.size == 0:
             return
-        
+
         h, w = arr_uint8.shape[:2]
-        
+
+        # Pick the QImage format that matches the array's actual channel order, so no
+        # byte-level reordering (and no risk of a double swap) is needed.
+        _fmt3 = QtGui.QImage.Format_RGB888
+        if str(channel_order).lower() == "bgr" and getattr(QtGui.QImage, "Format_BGR888", None) is not None:
+            _fmt3 = QtGui.QImage.Format_BGR888
+
         if arr_uint8.ndim == 2:
             # Grayscale 2D
             fmt = QtGui.QImage.Format_Grayscale8
@@ -1082,20 +1216,19 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 zeros = np.zeros((h, w, 1), dtype=np.uint8)
                 arr = np.concatenate((arr_uint8, zeros), axis=2)
                 arr = np.ascontiguousarray(arr)
-                qimg = QtGui.QImage(arr.data, w, h, 3 * w, QtGui.QImage.Format_RGB888)
+                qimg = QtGui.QImage(arr.data, w, h, 3 * w, _fmt3)
             elif c == 3:
-                # Standard 3-channel RGB
+                # Standard 3-channel colour, in `channel_order`
                 arr = np.ascontiguousarray(arr_uint8)
-                qimg = QtGui.QImage(arr.data, w, h, 3 * w, QtGui.QImage.Format_RGB888)
+                qimg = QtGui.QImage(arr.data, w, h, 3 * w, _fmt3)
             elif c == 4:
-                # 4-channel (e.g., RGB + Classification or BGRA) -> convert to RGB
-                # Take first 3 channels as RGB
+                # 4-channel (e.g., RGB + Classification or BGRA) -> drop alpha/extra
                 arr = np.ascontiguousarray(arr_uint8[:, :, :3])
-                qimg = QtGui.QImage(arr.data, w, h, 3 * w, QtGui.QImage.Format_RGB888)
+                qimg = QtGui.QImage(arr.data, w, h, 3 * w, _fmt3)
             else:
                 # More than 4 channels -> take first 3 for display
                 arr = np.ascontiguousarray(arr_uint8[:, :, :3])
-                qimg = QtGui.QImage(arr.data, w, h, 3 * w, QtGui.QImage.Format_RGB888)
+                qimg = QtGui.QImage(arr.data, w, h, 3 * w, _fmt3)
         else:
             # Unexpected ndim, try to handle gracefully
             logging.warning(f"show_preview_array: unexpected array ndim={arr_uint8.ndim}")
@@ -1335,84 +1468,77 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 # 1 or 2 channels - no remapping
                 vals = [float(img_mod[ym, xm, c]) for c in range(C)]
 
-        # Check if this pixel is NoData using shared utility (consistent with process_polygon)
-        # This ensures grayscale, stacked, and resized images are handled correctly
-        is_nodata = False
+        # Check NoData status. This used to be "if ANY channel matches ANY
+        # NoData value, the WHOLE pixel is NoData" -- which is correct for a
+        # boolean EXPRESSION (e.g. "b1>182" is deliberately a whole-pixel
+        # exclusion rule, same as process_polygon), but is wrong for a plain
+        # numeric literal like -9999 checked across every channel.
+        #
+        # Multi-band prediction stacks carry ancillary planes (viewing/solar
+        # geometry, water-vapor/AOT, an internal MASK band) that are declared
+        # -9999 across the ENTIRE image, everywhere, including exactly where
+        # the science bands the user is looking at (P(liana), NDVI, reflectance)
+        # hold perfectly good values. Any file small enough to load in full
+        # (under the viewer's preview threshold) then had every single click
+        # report "NoData" in the status bar, no matter where you clicked --
+        # because the always-invalid ancillary bands matched -9999, and the
+        # per-pixel readout only ever reported the OR of every channel.
+        #
+        # NoData is now evaluated PER CHANNEL for numeric literals -- matching
+        # the per-band masks used by process_polygon and random_shapes for the
+        # same reason -- while expressions keep the original whole-pixel
+        # semantics, since those are an intentional "exclude this pixel" rule.
+        is_nodata = False           # whole-pixel, from an expression only
+        channel_is_nodata = [False] * len(vals)
         if nodata_values:
             try:
-                from canopie.utils import build_nodata_mask as _shared_build_nodata_mask
-                
-                # Build NoData mask for the full image (or use cached if available)
-                # For performance, we only evaluate the single pixel, not the whole image
-                # We'll re-implement the pixel-level check using the same logic as build_nodata_mask
                 import re
                 _NODATA_EXPR_RE = re.compile(r'^([bB]\d+)\s*(<=|>=|<|>|==|!=)\s*(-?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?)$')
-                
-                # Prepare the image for evaluation (consistent with build_nodata_mask)
-                x = img_mod
-                if x.ndim == 2:
-                    C = 1
-                else:
-                    C = x.shape[2]
-                
-                # Channel mapping function (consistent with build_nodata_mask)
+
+                C = 1 if img_mod.ndim == 2 else img_mod.shape[2]
+
                 def _get_channel_idx(band_num):
-                    """Convert band number (1-based) to channel index."""
-                    if C == 1:
-                        return 0  # Single channel - all band references go to channel 0
-                    if C == 2:
-                        return band_num - 1 if band_num <= 2 else band_num - 1
-                    # NOTE: vals is now in RGB semantic order (b1=Red, b2=Green, b3=Blue)
-                    # after our BGR→RGB remapping above, so direct indexing works correctly
+                    # vals/ch_names are already in RGB-semantic order (see above),
+                    # so direct 1-based -> 0-based indexing works for all C.
                     return band_num - 1
-                
+
+                numeric_vals = []
                 for nd_val in nodata_values:
                     if isinstance(nd_val, str):
-                        # Handle expression strings like "b1<50"
                         m = _NODATA_EXPR_RE.match(nd_val)
-                        if m:
-                            band_name, op, threshold = m.groups()
-                            band_num = int(band_name[1:])  # b1 -> 1
-                            ch_idx = _get_channel_idx(band_num)
-                            
-                            if ch_idx >= C:
-                                logging.debug(f"[Inspector] NoData expression {nd_val}: band {band_num} exceeds image channels ({C})")
-                                continue
-                            
-                            # Get the band value
-                            if C == 1:
-                                band_val = vals[0]  # Grayscale: always use the single channel
-                            else:
-                                band_val = vals[ch_idx] if ch_idx < len(vals) else None
-                            
-                            if band_val is None:
-                                continue
-                                
-                            threshold_val = float(threshold)
-                            
-                            # Check threshold condition
-                            if op == '<' and band_val < threshold_val:
-                                is_nodata = True
-                            elif op == '<=' and band_val <= threshold_val:
-                                is_nodata = True
-                            elif op == '>' and band_val > threshold_val:
-                                is_nodata = True
-                            elif op == '>=' and band_val >= threshold_val:
-                                is_nodata = True
-                            elif op == '==' and abs(band_val - threshold_val) < 1e-6:
-                                is_nodata = True
-                            elif op == '!=' and abs(band_val - threshold_val) >= 1e-6:
-                                is_nodata = True
-                            
-                            if is_nodata:
-                                logging.debug(f"[Inspector] NoData match: expression '{nd_val}' matched for b{band_num}(ch{ch_idx})={band_val}")
-                                break
+                        if not m:
+                            continue
+                        band_name, op, threshold = m.groups()
+                        ch_idx = _get_channel_idx(int(band_name[1:]))
+                        if ch_idx >= C or ch_idx >= len(vals):
+                            logging.debug(f"[Inspector] NoData expression {nd_val}: band exceeds image channels ({C})")
+                            continue
+                        band_val = vals[ch_idx]
+                        threshold_val = float(threshold)
+                        matched = (
+                            (op == '<' and band_val < threshold_val) or
+                            (op == '<=' and band_val <= threshold_val) or
+                            (op == '>' and band_val > threshold_val) or
+                            (op == '>=' and band_val >= threshold_val) or
+                            (op == '==' and abs(band_val - threshold_val) < 1e-6) or
+                            (op == '!=' and abs(band_val - threshold_val) >= 1e-6)
+                        )
+                        if matched:
+                            is_nodata = True
+                            logging.debug(f"[Inspector] NoData match: expression '{nd_val}' matched, ch{ch_idx}={band_val}")
                     else:
-                        # Handle numeric literal
                         try:
-                            fv = float(nd_val)
+                            numeric_vals.append(float(nd_val))
+                        except (ValueError, TypeError):
+                            pass
+
+                if numeric_vals:
+                    for i, v in enumerate(vals):
+                        if not math.isfinite(v):
+                            channel_is_nodata[i] = True
+                            continue
+                        for fv in numeric_vals:
                             abs_fv = abs(fv)
-                            # Use appropriate tolerance based on value magnitude (consistent with build_nodata_mask)
                             if abs_fv > 1e+30:
                                 tol = abs_fv * 0.01
                             elif abs_fv > 1e+10:
@@ -1421,24 +1547,14 @@ class ImageViewer(QtWidgets.QGraphicsView):
                                 tol = abs_fv * 0.001
                             else:
                                 tol = 0.01
-                            for v in vals:
-                                if abs(v - fv) < tol:
-                                    is_nodata = True
-                                    logging.debug(f"[Inspector] NoData match: pixel value {v} matches nodata {fv}")
-                                    break
-                                # Also check for NaN/Inf
-                                if not math.isfinite(v):
-                                    is_nodata = True
-                                    logging.debug(f"[Inspector] NoData match: pixel value {v} is NaN/Inf")
-                                    break
-                            if is_nodata:
+                            if abs(v - fv) < tol:
+                                channel_is_nodata[i] = True
                                 break
-                        except (ValueError, TypeError):
-                            pass
             except Exception as e:
                 logging.debug(f"[Inspector] NoData check failed: {e}")
 
-        payload = {"values": vals, "names": ch_names, "is_nodata": is_nodata}
+        payload = {"values": vals, "names": ch_names, "is_nodata": is_nodata,
+                   "channel_nodata": channel_is_nodata}
         try:
             self.pixel_clicked.emit(scene_pt, payload)
         except TypeError:
@@ -1697,23 +1813,85 @@ class ImageViewer(QtWidgets.QGraphicsView):
         if not self._image:
             super(ImageViewer, self).wheelEvent(event)
             return
-        
-        # Prevent re-entrancy during zoom
-        if getattr(self, '_zooming', False):
+
+        delta = event.angleDelta().y()
+        if not delta:
             event.accept()
             return
-        
-        # Throttle wheel events for performance on huge images
+
+        # COALESCE, never discard. This used to return early (dropping the
+        # event) whenever two wheel events arrived within 25 ms, and applied a
+        # fixed 1.25x step to whichever ones survived. High-resolution wheels
+        # and trackpads emit an event every few milliseconds, so most of the
+        # user's scrolling was thrown away and the zoom appeared to stall --
+        # while the zoom bar, which applies exactly what it is given, stayed
+        # responsive. Accumulating the angle instead means no input is lost:
+        # the throttle now only limits how often we REPAINT, not how much
+        # scrolling counts.
+        self._wheel_accum = getattr(self, '_wheel_accum', 0.0) + float(delta)
+        event.accept()
+
         import time
-        current_time = time.time() * 1000  # ms
-        last_wheel = getattr(self, '_last_wheel_time', 0)
-        if current_time - last_wheel < 25:  # Max ~40fps for wheel zoom
-            event.accept()
+        now = time.monotonic() * 1000.0
+        last_wheel = getattr(self, '_last_wheel_time', 0.0)
+
+        # Anchor the zoom to the point under the cursor, captured ONCE per
+        # gesture. Qt's AnchorUnderMouse consults its own idea of the cursor
+        # position when scale() runs, which is stale when the zoom is applied
+        # from the coalescing timer rather than inside the event -- and because
+        # scrollbars are integer-valued, re-deriving the anchor on every step
+        # let rounding errors accumulate, so the image slid away from the
+        # pointer during a long scroll. Pinning one scene point for the whole
+        # gesture means the error cannot compound: every step re-solves against
+        # the same reference.
+        gesture_gap = now - getattr(self, '_wheel_gesture_time', 0.0)
+        try:
+            pos = event.pos()
+            if gesture_gap > 250.0 or getattr(self, '_wheel_anchor_scene', None) is None:
+                self._wheel_anchor_vp = QtCore.QPointF(pos)
+                self._wheel_anchor_scene = self.mapToScene(pos)
+            elif (QtCore.QPointF(pos) - self._wheel_anchor_vp).manhattanLength() > 2.0:
+                # Cursor moved to a new spot mid-scroll: re-anchor there.
+                self._wheel_anchor_vp = QtCore.QPointF(pos)
+                self._wheel_anchor_scene = self.mapToScene(pos)
+        except Exception:
+            self._wheel_anchor_scene = None
+        self._wheel_gesture_time = now
+
+        if getattr(self, '_zooming', False):
+            return          # a pending apply will consume the accumulated delta
+
+        if now - last_wheel < 25.0:
+            timer = getattr(self, '_wheel_coalesce_timer', None)
+            if timer is None:
+                timer = QtCore.QTimer(self)
+                timer.setSingleShot(True)
+                timer.setInterval(25)
+                timer.timeout.connect(self._apply_wheel_zoom)
+                self._wheel_coalesce_timer = timer
+            if not timer.isActive():
+                timer.start()
             return
-        self._last_wheel_time = current_time
-        
+
+        self._apply_wheel_zoom()
+
+    def _apply_wheel_zoom(self):
+        """Apply (and clear) the accumulated wheel delta as a single zoom step."""
+        if not self._image:
+            self._wheel_accum = 0.0
+            return
+        if getattr(self, '_zooming', False):
+            return
+
+        accum = getattr(self, '_wheel_accum', 0.0)
+        self._wheel_accum = 0.0
+        if not accum:
+            return
+
+        import time
+        self._last_wheel_time = time.monotonic() * 1000.0
         self._zooming = True
-        
+
         try:
             # Get current zoom factor directly from transform matrix
             tr = self.transform()
@@ -1731,12 +1909,14 @@ class ImageViewer(QtWidgets.QGraphicsView):
             else:
                 fit_zoom = 0.01
             
-            # Calculate new zoom factor
-            if event.angleDelta().y() > 0:
-                new_zoom = current_zoom * 1.25
-            else:
-                new_zoom = current_zoom * 0.8
-            
+            # Zoom proportionally to how far the wheel actually turned. One
+            # standard notch is 120 units and still gives exactly 1.25x, but a
+            # high-resolution wheel sending many small deltas now sums to the
+            # same total instead of either over-zooming (a full step per tiny
+            # event) or under-zooming (events dropped by the old throttle).
+            steps = accum / 120.0
+            new_zoom = current_zoom * (1.25 ** steps)
+
             # Clamp zoom: min is fit_zoom, max is 50x
             new_zoom = max(fit_zoom, min(50.0, new_zoom))
             
@@ -1749,10 +1929,31 @@ class ImageViewer(QtWidgets.QGraphicsView):
             else:
                 self._zoom = 0
             
-            # PERFORMANCE: Use native Qt anchoring instead of manual calculation
-            self.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
-            self.scale(scale_factor, scale_factor)
-            
+            # Scale with NO anchor, then put the gesture's anchor scene point
+            # back under the cursor ourselves. Solving it explicitly against a
+            # fixed scene reference keeps the point under the pointer exactly,
+            # instead of drifting as integer scrollbar rounding accumulates.
+            anchor_scene = getattr(self, '_wheel_anchor_scene', None)
+            anchor_vp = getattr(self, '_wheel_anchor_vp', None)
+            prev_anchor = self.transformationAnchor()
+            if anchor_scene is not None and anchor_vp is not None:
+                self.setTransformationAnchor(QtWidgets.QGraphicsView.NoAnchor)
+                self.scale(scale_factor, scale_factor)
+                try:
+                    now_vp = self.mapFromScene(anchor_scene)
+                    dx = float(now_vp.x()) - anchor_vp.x()
+                    dy = float(now_vp.y()) - anchor_vp.y()
+                    if dx or dy:
+                        hb = self.horizontalScrollBar()
+                        vb = self.verticalScrollBar()
+                        hb.setValue(int(round(hb.value() + dx)))
+                        vb.setValue(int(round(vb.value() + dy)))
+                except Exception:
+                    pass
+            else:
+                self.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
+                self.scale(scale_factor, scale_factor)
+
             # Restore anchor immediately so subsequent operations use ViewCenter
             self.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorViewCenter)
             
@@ -1769,8 +1970,24 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 pen.setWidthF(2.0 / new_zoom)
                 self.temp_drawing_item.setPen(pen)
             
-            # Sync zoom to other viewers (debounced)
+            # Refresh the zoom bar HERE. attach_zoom_bar's wheel wrapper reads
+            # the zoom immediately after the event returns, which was correct
+            # when zooming happened inline -- but the coalescing timer applies
+            # it later, so that read saw the pre-zoom value and the bar lagged
+            # behind the view. QGraphicsView.scale() is C++ and bypasses the
+            # patched setTransform, so nothing else refreshes it either.
             zb = getattr(self, "_zoombar", None)
+            if zb is not None:
+                try:
+                    cur = self.current_zoom_factor()
+                    zb._block = True
+                    zb._set_slider_from_zoom(cur)
+                    zb._update_label(cur)
+                    zb._block = False
+                except Exception:
+                    pass
+
+            # Sync zoom to other viewers (debounced)
             if zb and _ZoomBar._zoom_sync_enabled and not _ZoomBar._syncing:
                 if not hasattr(self, '_wheel_sync_timer'):
                     self._wheel_sync_timer = QtCore.QTimer(self)
@@ -1785,10 +2002,21 @@ class ImageViewer(QtWidgets.QGraphicsView):
                             pass
                     self._wheel_sync_timer.timeout.connect(_do_sync)
                 self._wheel_sync_timer.start()
-            
-            event.accept()
         finally:
             self._zooming = False
+
+        # More wheel input arrived while this step was being applied: schedule
+        # it rather than leaving the view short of where the user scrolled to.
+        if getattr(self, '_wheel_accum', 0.0):
+            timer = getattr(self, '_wheel_coalesce_timer', None)
+            if timer is None:
+                timer = QtCore.QTimer(self)
+                timer.setSingleShot(True)
+                timer.setInterval(25)
+                timer.timeout.connect(self._apply_wheel_zoom)
+                self._wheel_coalesce_timer = timer
+            if not timer.isActive():
+                timer.start()
 
     def mousePressEvent(self, event):
         self.setFocus(QtCore.Qt.MouseFocusReason)
@@ -4431,6 +4659,15 @@ class _ZoomBar(QtWidgets.QFrame):
         # place immediately
         self.reposition()
 
+        # Catch viewport resizes that don't go through the outer QGraphicsView's
+        # own resizeEvent -- e.g. scrollbars appearing/disappearing as the zoom
+        # level crosses the fit threshold shrinks/grows the viewport directly.
+        # installEventFilter works here (unlike monkey-patching viewport()'s
+        # resizeEvent) because the viewport is a plain C++-created QWidget with
+        # no Python-overridable virtual table; the FILTER (this bar, a genuine
+        # Python QFrame subclass) is what needs the override, not the target.
+        parent_view.viewport().installEventFilter(self)
+
         # signals
         self._btn_fix.clicked.connect(self._on_fix_clicked)
         self._btn_minus.clicked.connect(lambda: self._nudge(-1))
@@ -4777,9 +5014,14 @@ class _ZoomBar(QtWidgets.QFrame):
         self._hide_timer.stop()
     
     def show_briefly(self):
-        """Show the zoom bar and start the auto-hide timer."""
-        if not self.isVisible():
-            self.reposition()
+        """Show the zoom bar and start the auto-hide timer.
+
+        Always repositions (not just when transitioning from hidden), so the
+        bar tracks the viewport's actual current size on every interaction --
+        zooming in past the fit level can bring in scrollbars that shrink the
+        viewport without necessarily firing the outer view's resizeEvent.
+        """
+        self.reposition()
         self.show()
         self._start_hide_timer()
     
@@ -4795,6 +5037,18 @@ class _ZoomBar(QtWidgets.QFrame):
         self.unsetCursor()
         super().leaveEvent(event)
 
+    def eventFilter(self, obj, event):
+        """Keep this bar docked correctly whenever the viewport itself
+        resizes (e.g. scrollbars appearing/disappearing at a given zoom
+        level), which does not necessarily fire the outer view's own
+        resizeEvent."""
+        if event.type() == QtCore.QEvent.Resize:
+            try:
+                self.reposition()
+            except Exception:
+                pass
+        return super().eventFilter(obj, event)
+
     # ---------- placement ----------
     def reposition(self):
         vp = self._view.viewport()
@@ -4805,6 +5059,20 @@ class _ZoomBar(QtWidgets.QFrame):
         s = self.sizeHint()
         x = max(m, vp.width() - s.width() - m)
         y = max(m, vp.height() - s.height() - m)
+
+        # The band-selector bar always docks to the very bottom edge of the
+        # viewport. Keep this bar in the row directly above it so the zoom
+        # bar is always above and the band bar always below, never
+        # overlapping, regardless of which one happened to move/resize last.
+        bb = getattr(self._view, "_bandbar", None)
+        if bb is not None:
+            try:
+                if bb._buttons_by_band:
+                    bb_h = bb.sizeHint().height()
+                    y = max(m, vp.height() - bb_h - m - s.height() - 4)
+            except Exception:
+                pass
+
         self.setGeometry(x, y, s.width(), s.height())
 
     # ---------- zoom mapping ----------
@@ -4867,6 +5135,265 @@ class _ZoomBar(QtWidgets.QFrame):
             self._sync_zoom_to_all_viewers(z)
 
 
+# --- BandBar overlay for ImageViewer ------------------------------------------
+class _BandBar(QtWidgets.QFrame):
+    """
+    Lightweight overlay widget: a horizontally scrollable strip of small buttons,
+    one per band, that floats over the ImageViewer viewport. Auto-hides when not
+    interacting (same pattern as _ZoomBar), and hides immediately when drawing
+    starts (see ImageViewer.drawing's setter).
+
+    Clicking a button emits ImageViewer.band_selected(file_band_index); it does
+    not directly touch image_data or the pixmap itself -- ProjectTab connects to
+    that signal (in display_image_group) and does the actual reload/render, since
+    that needs project-level context (root_name, the .ax sidecar, the stretch
+    render pipeline) this class has no business knowing about.
+    """
+
+    def __init__(self, parent_view):
+        super().__init__(parent_view.viewport())
+        self.setObjectName("_BandBar")
+        self._view = parent_view
+        self._buttons_by_band = {}   # file band index -> QToolButton
+
+        self.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        self.setFrameShadow(QtWidgets.QFrame.Raised)
+        self.setStyleSheet("""
+            QFrame#_BandBar {
+                background: rgba(245, 245, 245, 220);
+                border: 1px solid rgba(180, 180, 180, 200);
+                border-radius: 6px;
+            }
+            QToolButton {
+                color: black;
+                background: transparent;
+                border: none;
+                padding: 3px 6px;
+                font-size: 13px;
+                font-weight: bold;
+            }
+            QToolButton:hover {
+                background: rgba(0, 0, 0, 30);
+                border-radius: 3px;
+            }
+            QToolButton:pressed {
+                background: rgba(0, 0, 0, 50);
+            }
+            QToolButton:checked {
+                background: rgba(100, 149, 237, 150);
+                border-radius: 3px;
+            }
+            QToolButton#_BandBarComposite {
+                border: 1px solid rgba(120, 120, 120, 160);
+                border-radius: 3px;
+            }
+            QFrame#_BandBarSep {
+                background: rgba(150, 150, 150, 160);
+                max-width: 1px;
+                min-width: 1px;
+            }
+            QScrollArea { background: transparent; border: none; }
+            QScrollBar:horizontal {
+                height: 8px;
+                background: transparent;
+            }
+            QScrollBar::handle:horizontal {
+                background: rgba(0, 0, 0, 90);
+                border-radius: 4px;
+                min-width: 20px;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+            }
+        """)
+
+        outer = QtWidgets.QHBoxLayout(self)
+        outer.setContentsMargins(6, 4, 6, 4)
+        outer.setSpacing(0)
+
+        self._scroll = QtWidgets.QScrollArea(self)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self._scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self._scroll.setFixedHeight(42)
+
+        self._inner = QtWidgets.QWidget()
+        self._row = QtWidgets.QHBoxLayout(self._inner)
+        self._row.setContentsMargins(3, 3, 3, 3)
+        self._row.setSpacing(3)
+        self._scroll.setWidget(self._inner)
+        outer.addWidget(self._scroll)
+
+        self._group = QtWidgets.QButtonGroup(self)
+        self._group.setExclusive(True)
+
+        # Leading "composite" button: restores whatever the actual configured
+        # stretch is (Auto full-band composite, or an RGB composite) -- i.e.
+        # undoes single-band viewing. Persists across populate() calls; only
+        # its text/checked state is updated (unlike the numbered band buttons,
+        # which are rebuilt from scratch per image).
+        self._composite_btn = QtWidgets.QToolButton(self._inner)
+        self._composite_btn.setObjectName("_BandBarComposite")
+        self._composite_btn.setText("Auto")
+        self._composite_btn.setToolTip(
+            "Return to the full composite stretch (Auto/RGB) configured in the Stretch dialog.")
+        self._composite_btn.setCheckable(True)
+        self._composite_btn.setFixedHeight(34)
+        self._composite_btn.setMinimumWidth(52)
+        self._composite_btn.clicked.connect(lambda checked: self._on_button_clicked(-1))
+        self._group.addButton(self._composite_btn)
+        self._row.addWidget(self._composite_btn)
+
+        sep = QtWidgets.QFrame(self._inner)
+        sep.setObjectName("_BandBarSep")
+        sep.setFrameShape(QtWidgets.QFrame.VLine)
+        sep.setFixedHeight(24)
+        self._row.addWidget(sep)
+        self._row.addSpacing(3)
+
+        self._row.addStretch(1)   # keeps buttons left-aligned when the strip is wider than its content
+
+        # --- Auto-hide timer (same 1.5s convention as _ZoomBar) ---
+        self._hide_timer = QtCore.QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.setInterval(1500)
+        self._hide_timer.timeout.connect(self._do_hide)
+
+        self.hide()
+        self.reposition()
+
+        # Catch viewport resizes that don't go through the outer QGraphicsView's
+        # own resizeEvent -- see the matching comment in _ZoomBar.__init__.
+        parent_view.viewport().installEventFilter(self)
+
+    # ---------- population ----------
+    # Row layout is fixed as: [composite_btn][separator][spacing][...band btns...][stretch]
+    # -- the first 3 items persist across calls; only the band buttons (and the
+    # composite button's text/checked state) are rebuilt/updated here.
+    _LEADING_ITEMS = 3
+
+    def populate(self, band_names, count, active_band=None,
+                 composite_label="Auto", composite_active=False):
+        """Rebuild the numbered-band buttons for `count` bands (0-based indices)."""
+        self._composite_btn.setText(composite_label)
+        self._composite_btn.setChecked(bool(composite_active))
+
+        # Clear existing numbered buttons only -- composite/separator/spacing persist.
+        for btn in list(self._buttons_by_band.values()):
+            self._group.removeButton(btn)
+            btn.setParent(None)
+            btn.deleteLater()
+        self._buttons_by_band = {}
+        while self._row.count() > self._LEADING_ITEMS + 1:   # +1 keeps the trailing stretch
+            item = self._row.takeAt(self._LEADING_ITEMS)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+
+        count = max(0, int(count or 0))
+        for i in range(count):
+            nm = band_names[i] if (band_names and i < len(band_names) and band_names[i]) else None
+            btn = QtWidgets.QToolButton(self._inner)
+            btn.setText(str(i + 1))
+            btn.setToolTip(nm if nm else f"Band {i + 1}")
+            btn.setCheckable(True)
+            btn.setFixedSize(42, 34)
+            btn.clicked.connect(lambda checked, band_idx=i: self._on_button_clicked(band_idx))
+            self._row.insertWidget(self._row.count() - 1, btn)
+            self._group.addButton(btn)
+            self._buttons_by_band[i] = btn
+
+        if active_band is not None:
+            btn = self._buttons_by_band.get(int(active_band))
+            if btn is not None:
+                btn.setChecked(True)
+
+        self.adjustSize()
+
+    def _on_button_clicked(self, band_idx):
+        """band_idx == -1 is the sentinel for the leading composite button."""
+        try:
+            self._view.band_selected.emit(int(band_idx))
+        except Exception as e:
+            logging.debug(f"[_BandBar] band_selected emit failed: {e}")
+        # Clicking is itself an interaction -- keep the bar up a while longer.
+        self.show_briefly()
+
+    # ---------- show/hide ----------
+    def _do_hide(self):
+        self.hide()
+
+    def _start_hide_timer(self):
+        self._hide_timer.start()
+
+    def _reset_hide_timer(self):
+        self._hide_timer.stop()
+
+    def show_briefly(self):
+        """Show the band bar and start the auto-hide timer.
+
+        Always repositions (not just when transitioning from hidden), so the
+        bar stays docked to the bottom of the viewport at every zoom level --
+        zooming in past the fit level can bring in scrollbars that shrink the
+        viewport without necessarily firing the outer view's resizeEvent.
+        """
+        if not self._buttons_by_band:
+            return   # nothing to show (no image loaded yet)
+        self.reposition()
+        self.show()
+        self._start_hide_timer()
+
+    def hide_immediately(self):
+        """Hide with no delay -- used when the user starts drawing."""
+        self._hide_timer.stop()
+        self.hide()
+
+    def enterEvent(self, event):
+        """Stop hiding when mouse enters, change cursor to pointer."""
+        self._hide_timer.stop()
+        self.setCursor(QtCore.Qt.ArrowCursor)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        """Start hide timer when mouse leaves, restore cursor."""
+        self._start_hide_timer()
+        self.unsetCursor()
+        super().leaveEvent(event)
+
+    def eventFilter(self, obj, event):
+        """Keep this bar docked correctly whenever the viewport itself
+        resizes (e.g. scrollbars appearing/disappearing at a given zoom
+        level), which does not necessarily fire the outer view's own
+        resizeEvent."""
+        if event.type() == QtCore.QEvent.Resize:
+            try:
+                self.reposition()
+            except Exception:
+                pass
+        return super().eventFilter(obj, event)
+
+    # ---------- placement ----------
+    def reposition(self):
+        """Always dock to the very bottom edge of the viewport, below the zoom
+        bar's row. The zoom bar's own reposition() is what makes room for this
+        by sitting directly above whatever height this bar currently needs --
+        see _ZoomBar.reposition()."""
+        vp = self._view.viewport()
+        if not vp:
+            return
+        m = 8
+        self.adjustSize()
+        s = self.sizeHint()
+        # Always span a long strip (at least ~480px, or the content's own
+        # width if that's wider) rather than shrink-wrapping to however many
+        # buttons happen to fit -- clamped so it never exceeds the viewport.
+        target_w = max(s.width(), min(480, vp.width() - 2 * m))
+        bar_w = max(40, min(target_w, vp.width() - 2 * m))
+        x = max(m, (vp.width() - bar_w) // 2)
+        y = max(m, vp.height() - s.height() - m)
+        self.setGeometry(x, y, bar_w, s.height())
+
+
 # ---- installation helper (non-invasive): attach to an existing ImageViewer ----
 def attach_zoom_bar(viewer):
     """
@@ -4924,6 +5451,11 @@ def attach_zoom_bar(viewer):
             zb.show_briefly()
         except Exception:
             pass
+        try:
+            if getattr(viewer, "_bandbar", None):
+                viewer._bandbar.show_briefly()
+        except Exception:
+            pass
     viewer.wheelEvent = _wheel
 
     viewer._zoom_sync_timer = QtCore.QTimer(viewer)
@@ -4952,3 +5484,50 @@ def attach_zoom_bar(viewer):
     zb.reposition()
     zb.hide()  # Start hidden, will show on interaction
     return zb
+
+
+# ---- installation helper (non-invasive): attach a _BandBar to an existing ImageViewer ----
+def attach_band_bar(viewer):
+    """
+    Installs a _BandBar on top of `viewer`. Population happens separately via
+    ImageViewer._refresh_band_bar (called from the image_data property setter)
+    -- this function only creates the widget and wires resize/repositioning.
+    Showing it is driven by attach_zoom_bar's own wheelEvent wrapper (see the
+    guarded viewer._bandbar.show_briefly() call added there), so wheel-zoom
+    remains the single shared trigger for both overlay bars.
+    """
+    if getattr(viewer, "_bandbar", None) is not None:
+        return viewer._bandbar
+
+    bb = _BandBar(viewer)
+    viewer._bandbar = bb
+
+    old_resize = viewer.resizeEvent
+    def _resized(ev):
+        try:
+            bb.reposition()
+        except Exception:
+            pass
+        if callable(old_resize):
+            old_resize(ev)
+    viewer.resizeEvent = _resized
+
+    bb.reposition()
+    bb.hide()  # Start hidden, will show on interaction
+
+    # Now that the band bar exists, let the zoom bar make room above it.
+    zb = getattr(viewer, "_zoombar", None)
+    if zb is not None:
+        try:
+            zb.reposition()
+        except Exception:
+            pass
+
+    # If an image was already assigned before this deferred attach ran,
+    # populate immediately instead of waiting for the next image_data set.
+    try:
+        viewer._refresh_band_bar()
+    except Exception:
+        pass
+
+    return bb

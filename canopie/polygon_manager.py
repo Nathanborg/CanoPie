@@ -2220,8 +2220,17 @@ class PolygonManager(QtWidgets.QDialog):
 
     def _export_shapefile(self, groups):
         """
-        Export selected polygon groups as an ESRI Shapefile.
+        Export selected polygon groups as ESRI Shapefile(s), with the SAME per-shape
+        statistics CSV export computes embedded as DBF attributes.
+
         Uses GeoTIFF transforms when available, falls back to EXIF GPS.
+
+        A single .shp is geometrically homogeneous (ESRI's format declares one shape
+        type for the whole file), so Point-type shapes (including point-set
+        annotations, and Random Shapes' "Point" mode) and Polygon-type shapes are
+        written as separate <name>_points.shp / <name>_polygons.shp files when a
+        selection contains both; if it's all one type, the chosen filename is used
+        as-is.
         """
         import os, logging
         parent = self.parent()
@@ -2246,6 +2255,29 @@ class PolygonManager(QtWidgets.QDialog):
         if not save_path:
             return
 
+        # Same options dialog CSV export uses, so the shapefile's embedded stats
+        # always match whatever CSV you'd generate with the same choices (indices,
+        # RF classification, EXIF tags, band stats, etc.) — the user can also opt out
+        # of stats entirely, in which case only identity/geometry is exported.
+        stats_lookup = None
+        try:
+            from .machine_learning_manager import AnalysisOptionsDialog
+            opts_dlg = AnalysisOptionsDialog(parent)
+            if opts_dlg.exec_() == QtWidgets.QDialog.Accepted:
+                options = opts_dlg.get_options()
+                if hasattr(parent, "compute_shapefile_stats"):
+                    QtWidgets.QApplication.setOverrideCursor(Qt.WaitCursor)
+                    try:
+                        stats_lookup = parent.compute_shapefile_stats(selected_polys, options)
+                    finally:
+                        QtWidgets.QApplication.restoreOverrideCursor()
+            # If cancelled, proceed WITHOUT stats (geometry-only export) rather than
+            # aborting the whole shapefile export.
+        except Exception as e:
+            logging.warning(f"[Shapefile export] Could not compute CSV-equivalent stats, "
+                            f"exporting geometry only: {e}")
+            stats_lookup = None
+
         try:
             from .shapefile_io import json_polygons_to_features, write_shapefile
 
@@ -2253,18 +2285,44 @@ class PolygonManager(QtWidgets.QDialog):
             features, crs_wkt, warnings = json_polygons_to_features(
                 selected_polys, project_folder,
                 get_ax_path_fn=getattr(parent, "_ax_path_for", None),
+                stats_lookup=stats_lookup,
             )
 
             if not features:
                 warn_msg = "No features could be converted."
+                if stats_lookup is not None:
+                    warn_msg += (" This can happen if every selected shape had no "
+                                "exportable pixels (e.g. fully masked or outside the "
+                                "image) — the same shapes a CSV export would also skip.")
                 if warnings:
                     warn_msg += "\n\n" + "\n".join(warnings[:10])
                 QtWidgets.QMessageBox.warning(self, "Shapefile Export", warn_msg)
                 return
 
-            # write_shapefile expects path WITHOUT extension
-            shp_stem = os.path.splitext(save_path)[0]
-            write_shapefile(features, shp_stem, crs_wkt=crs_wkt)
+            # ESRI shapefiles are geometrically homogeneous; split Point vs Polygon
+            # into separate files rather than corrupting one .shp with a mixed type.
+            point_feats = [f for f in features if f['properties'].get('type') == 'point']
+            poly_feats = [f for f in features if f['properties'].get('type') != 'point']
+
+            base_stem = os.path.splitext(save_path)[0]
+            written_paths = []
+
+            if point_feats and poly_feats:
+                pts_stem = f"{base_stem}_points"
+                poly_stem = f"{base_stem}_polygons"
+                write_shapefile(point_feats, pts_stem, crs_wkt=crs_wkt, shape_type=1,
+                               legend_path=f"{pts_stem}_fields.csv")
+                write_shapefile(poly_feats, poly_stem, crs_wkt=crs_wkt, shape_type=5,
+                               legend_path=f"{poly_stem}_fields.csv")
+                written_paths = [f"{pts_stem}.shp", f"{poly_stem}.shp"]
+            elif point_feats:
+                write_shapefile(point_feats, base_stem, crs_wkt=crs_wkt, shape_type=1,
+                               legend_path=f"{base_stem}_fields.csv")
+                written_paths = [f"{base_stem}.shp"]
+            else:
+                write_shapefile(poly_feats, base_stem, crs_wkt=crs_wkt, shape_type=5,
+                               legend_path=f"{base_stem}_fields.csv")
+                written_paths = [f"{base_stem}.shp"]
 
             # Summary
             methods = {}
@@ -2275,9 +2333,11 @@ class PolygonManager(QtWidgets.QDialog):
             summary = ", ".join(summary_parts)
 
             msg = (f"Shapefile exported successfully!\n\n"
-                   f"Features: {len(features)}\n"
+                   f"Features: {len(features)}"
+                   f"{f' ({len(point_feats)} point, {len(poly_feats)} polygon)' if point_feats and poly_feats else ''}\n"
+                   f"Statistics: {'embedded (matches CSV export)' if stats_lookup is not None else 'not included'}\n"
                    f"Georeferencing: {summary}\n"
-                   f"Path: {shp_stem}.shp")
+                   f"Path(s): {', '.join(written_paths)}")
             if warnings:
                 msg += f"\n\nWarnings ({len(warnings)}):\n"
                 msg += "\n".join(warnings[:5])
@@ -2559,23 +2619,31 @@ class PolygonManager(QtWidgets.QDialog):
 
         parent = self.parent()
         if not parent: return
-        
+
         from canopie.project_tab import DeletePolygonCommand
 
         # Determine the polygons to delete
         groups_to_delete = set(groups)
-        
+        current_root_fps = getattr(self, "current_root_filepaths", None) or set()
+
         parent.undo_stack.beginMacro("Delete Selected Polygons")
         try:
             for group_name in groups_to_delete:
                 if group_name not in parent.all_polygons:
                     continue
-                # Iterate over all filepaths associated with the group
+                # All filepaths this group has polygons on.
                 filepaths = list(parent.all_polygons[group_name].keys())
-                for filepath in filepaths:
-                    if filepath not in self.current_root_filepaths:
-                        continue  # Skip if not in current root
-                    
+
+                # For a group shared across roots, "Delete" removes only the
+                # current-root instances (use "Delete All Polygons" for the rest).
+                # BUT if the group has NO polygons in the current root — e.g. random
+                # shapes generated on other roots via a batch scope — restricting to
+                # the current root would silently delete nothing and leave them
+                # undeletable, so fall back to deleting the whole group.
+                in_root = [fp for fp in filepaths if fp in current_root_fps]
+                fps_to_delete = in_root if in_root else filepaths
+
+                for filepath in fps_to_delete:
                     cmd = DeletePolygonCommand(parent, group_name, filepath)
                     parent.undo_stack.push(cmd)
         finally:

@@ -344,6 +344,22 @@ class MainWindow(QMainWindow):
         csv_viewer_action.triggered.connect(self.open_csv_viewer)      # NEW
         view_menu.addAction(csv_viewer_action)           # NEW
 
+        # Which bands to render for large rasters shown as a preview.
+        display_bands_action = QAction("Select Display Bands…", self)
+        display_bands_action.setShortcut("Ctrl+Shift+B")
+        display_bands_action.setStatusTip(
+            "Choose which bands of a large multi-band raster are rendered (display only)")
+        display_bands_action.triggered.connect(self.choose_display_bands)
+        view_menu.addAction(display_bands_action)
+
+    def choose_display_bands(self):
+        current_tab = self.get_current_tab()
+        if not current_tab:
+            QtWidgets.QMessageBox.warning(self, "No Tab Selected", "Please select a project tab.")
+            return
+        if hasattr(current_tab, "choose_display_bands"):
+            current_tab.choose_display_bands()
+
 
 
     def open_rgb_picker(self):
