@@ -135,6 +135,26 @@ def resize_safe(img, new_w, new_h, interp=cv2.INTER_LINEAR):
             out[..., i] = cv2.resize(img[..., i], (new_w, new_h), interpolation=cv2.INTER_AREA)
         return out
 
+def _nanpct(a, p, axis=None):
+    """
+    NaN-aware percentile that never propagates NaN.
+
+    np.nanpercentile emits a RuntimeWarning and returns NaN for an all-NaN slice,
+    which would then blank the display. Fall back to 0.0 for those entries.
+    """
+    import numpy as np
+    a = np.asarray(a, dtype=np.float32)
+    with np.errstate(all="ignore"):
+        try:
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                out = np.nanpercentile(a, p, axis=axis)
+        except Exception:
+            out = np.percentile(np.nan_to_num(a), p, axis=axis)
+    return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+
+
 def _normalize_for_display(
     img,
     low_p=STRETCH_LOW_P,
@@ -173,8 +193,12 @@ def _normalize_for_display(
     if isinstance(img, np.ndarray) and img.dtype == np.uint8 and img.ndim in (2, 3):
         disp = img.copy()
     else:
-        # Convert to float32 for stretching, replace NaNs/Infs
-        x = np.nan_to_num(np.asarray(img).astype(np.float32, copy=False))
+        # Convert to float32 for stretching.
+        # NaN/Inf are PRESERVED here (this used to nan_to_num() first, turning every
+        # NaN into a real 0.0 that then skewed the percentiles below). The percentile
+        # calls are nan-aware, and the final np.clip + uint8 cast maps any remaining
+        # NaN to 0, so non-finite pixels still render without polluting the statistics.
+        x = np.asarray(img).astype(np.float32, copy=False)
 
         def _sample(a):
             h, w = a.shape[:2]
@@ -190,11 +214,12 @@ def _normalize_for_display(
 
         if x.ndim == 2:
             s = _sample(x)
-            lo = np.percentile(s, low_p)
-            hi = np.percentile(s, high_p)
+            lo = _nanpct(s, low_p)
+            hi = _nanpct(s, high_p)
             n = (x - lo) / max(hi - lo, 1e-12) if hi > lo else np.full_like(x, 0.5, dtype=np.float32)
             if clip:
                 n = np.clip(n, 0.0, 1.0)
+            n = np.nan_to_num(n, nan=0.0, posinf=1.0, neginf=0.0)
             disp = (n * 255.0).astype(np.uint8)
 
         elif x.ndim == 3:
@@ -207,16 +232,17 @@ def _normalize_for_display(
             # is unaffected. `per_channel` now governs only Absolute per-band ranges elsewhere.
             if use.ndim == 3 and use.shape[2] > 1:
                 flat = s.reshape(-1, use.shape[2])
-                lo = np.percentile(flat, low_p, axis=0)
-                hi = np.percentile(flat, high_p, axis=0)
+                lo = _nanpct(flat, low_p, axis=0)
+                hi = _nanpct(flat, high_p, axis=0)
                 scale = np.maximum(hi - lo, 1e-12)
                 n = (use - lo.reshape(1, 1, -1)) / scale.reshape(1, 1, -1)
             else:
-                lo = np.percentile(s, low_p)
-                hi = np.percentile(s, high_p)
+                lo = _nanpct(s, low_p)
+                hi = _nanpct(s, high_p)
                 n = (use - lo) / max(hi - lo, 1e-12) if hi > lo else np.full_like(use, 0.5, dtype=np.float32)
             if clip:
                 n = np.clip(n, 0.0, 1.0)
+            n = np.nan_to_num(n, nan=0.0, posinf=1.0, neginf=0.0)
             disp = (n * 255.0).astype(np.uint8)
 
             # If only 1 or 2 channels, pad to 3 for display
@@ -631,14 +657,14 @@ def parse_nodata_text(text: str):
     return result
 
 
-def build_nodata_mask(img, nd_vals, *, bgr_input=True):
+def build_nodata_mask(img, nd_vals, *, bgr_input=True, include_nonfinite=False):
     """
     Build boolean mask where True = NoData pixel.
-    
+
     Supports:
       - Numeric literals: Match any channel within tolerance
       - Threshold expressions: b1<123 evaluates on specific band
-    
+
     Parameters
     ----------
     img : ndarray (H, W) or (H, W, C)
@@ -648,14 +674,35 @@ def build_nodata_mask(img, nd_vals, *, bgr_input=True):
     bgr_input : bool
         If True, input is BGR (OpenCV default): b1=Red(ch2), b2=Green(ch1), b3=Blue(ch0).
         If False, input is RGB: b1=ch0, b2=ch1, b3=ch2.
-    
+    include_nonfinite : bool
+        If True, build the mask even when `nd_vals` is empty, so that NaN/Inf pixels
+        alone are reported as NoData.
+
+        Historically this function returned None whenever `nd_vals` was empty, which
+        meant the NaN/Inf pass at the end (labelled "always masked") never ran unless
+        the user had already typed an explicit NoData value. Float GeoTIFFs whose
+        borders are NaN were therefore never auto-detected, and those NaNs leaked into
+        the contrast-stretch statistics. Stretch/statistics callers should pass True;
+        callers that USE the mask to restore or overwrite pixel values must keep the
+        default (False) so their behaviour is unchanged.
+
     Returns
     -------
     mask : ndarray (H, W) of bool, or None if no valid values
     """
-    if not nd_vals or img is None:
+    if img is None:
         return None
-    
+    if not nd_vals and not include_nonfinite:
+        return None
+    if not nd_vals:
+        # Nonfinite-only request: integer imagery can never hold NaN/Inf, so skip the
+        # full-image scan entirely and keep the cheap `None` fast path.
+        try:
+            if not np.issubdtype(np.asarray(img).dtype, np.floating):
+                return None
+        except Exception:
+            pass
+
     x = np.asarray(img, dtype=np.float32)
     if x.ndim == 2:
         x = x[..., None]
@@ -724,17 +771,25 @@ def build_nodata_mask(img, nd_vals, *, bgr_input=True):
                     tol = abs_fv * 0.001
                 else:
                     tol = 0.01
+                # With rtol=0, np.isclose is just |a - b| <= atol, but it costs
+                # ~10x more: it allocates several temporaries and runs its own
+                # finite/NaN handling. On a 15-band 1759x1930 scene that turned
+                # into 65 ms per channel, and CSV export spent 94 s of every
+                # 175 s inside isclose alone. NaN compares False either way, so
+                # the direct form is equivalent as well as much faster.
+                diff = np.empty(x.shape[:2], dtype=np.float32)
                 for c in range(C):
-                    ch = x[..., c]
-                    mask |= np.isclose(ch, fv, rtol=0.0, atol=tol)
+                    np.subtract(x[..., c], fv, out=diff)
+                    np.abs(diff, out=diff)
+                    mask |= (diff <= tol)
             except Exception:
                 pass
-    
-    # Also check for NaN/Inf (always masked)
-    for c in range(C):
-        ch = x[..., c]
-        mask |= np.isnan(ch)
-        mask |= np.isinf(ch)
+
+    # Also check for NaN/Inf (always masked). One isfinite pass per channel
+    # replaces separate isnan and isinf passes.
+    if np.issubdtype(x.dtype, np.floating):
+        for c in range(C):
+            mask |= ~np.isfinite(x[..., c])
     
     return mask
 
@@ -751,6 +806,7 @@ __all__ = [
     '_infer_crop_basis',
     '_rotate_point_in_rect',
     'resize_safe',
+    '_nanpct',
     '_normalize_for_display',
     '_sample_for_stats',
     'process_band_expression_float',

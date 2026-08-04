@@ -7,3 +7,9 @@ env/
 .agent/
 brain/
 *.log
+
+# Claude Code dev-workflow skill docs -- not used by the running app.
+.claude/
+
+# Manual pre-refactor snapshots -- not used by the running app.
+backups/
