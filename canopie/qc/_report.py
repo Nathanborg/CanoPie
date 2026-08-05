@@ -1,0 +1,164 @@
+"""
+Feature-grouped reporting for the QC suite.
+
+Produces a structured report at the end of every run, grouped by the CanoPie
+FEATURE each test file covers rather than by filename, so the output answers
+"which parts of the app are verified, and did any of them regress?" directly.
+
+Written to `canopie/qc/last_run_report.txt` (gitignored) as well as printed,
+because this environment's known native-crash flakiness can truncate terminal
+output after results are computed -- the file always survives.
+"""
+import os
+import time
+
+# test module -> (feature name, what it actually asserts)
+FEATURE_MAP = {
+    "test_image_viewer": (
+        "ImageViewer / image loading",
+        "loader routing, band count, channel_order, raw pixel values, preview decimation"),
+    "test_inspect_tool": (
+        "Pixel Inspector",
+        "per-band values at known coords, NoData display modes, band-expression index"),
+    "test_process_polygon_csv": (
+        "Main CSV export (process_polygon)",
+        "per-band Mean/Median/Std/Q25/Q75/PixelCount vs ground truth, NoData masking"),
+    "test_ml_manager_csv_and_training": (
+        "ML manager CSV export",
+        "all 3 extraction modes, agreement with process_polygon, NoData handling"),
+    "test_point_polygon_consistency": (
+        "Point <-> polygon consistency",
+        "1px-polygon == point, polygon Mean == mean of its points, cross-tool agreement"),
+    "test_lazy_eager_agreement": (
+        "Lazy vs eager raster reads",
+        "windowed reader == whole-array reader, .ax windowability gate, crop offset"),
+    "test_ml_manager_bugfix": (
+        "ML manager LazyChannels fix",
+        "regression guard for the .ndim crash on large rasters"),
+    "test_ax_pipeline": (
+        ".ax edit pipeline",
+        "rotate / resize / crop / band_expression applied correctly and in order"),
+    "test_stretch_rendering": (
+        "Display stretch rendering",
+        "percentile/stddev/absolute stretch, single-band vs RGB, raw data left untouched"),
+    "test_band_bar": (
+        "In-viewport band selector",
+        "population, band switching, composite restore, auto-hide on draw"),
+    "test_band_math": (
+        "Band math / vegetation indices",
+        "expression evaluation, reducers, band references, NaN handling"),
+    "test_random_shapes": (
+        "Random shape generation",
+        "count, containment in valid area, spacing constraints, stratification"),
+    "test_shapefile_export": (
+        "Shapefile export",
+        "geometry/attribute round-trip, pixel<->geo transforms, DBF field naming"),
+    "test_project_roundtrip": (
+        "Project save / load",
+        "project.json round-trip, polygon persistence, root mapping"),
+    "test_jpeg_compressed_tiff": (
+        "JPEG-compressed TIFF / COG decoding",
+        "shared JPEGTables forwarding, tile decode, real GDAL COG regression"),
+    "test_expression_nodata_lazy_path": (
+        "Expression-based NoData on the lazy read path",
+        "boolean NoData rules (b7==0) on windowed reads, real-project regression"),
+    "test_scene_stats_nodata": (
+        "Scene stats under NoData",
+        "Scene Mean/Median exclude fill values on the lazy path, lazy==eager"),
+    "test_band_math_formula_parsing": (
+        "Band-math / indices formula parsing",
+        "bare comparisons (b7==0) parse and yield a CSV row with the boolean average"),
+}
+
+
+class QCReporter:
+    def __init__(self, report_path):
+        self.report_path = report_path
+        self.results = []          # (module, testname, outcome, duration, longrepr)
+        self.session_start = time.time()
+
+    def record(self, report):
+        if report.when != "call" and not (report.when == "setup" and report.outcome in ("failed", "skipped")):
+            return
+        if report.when == "setup" and report.outcome == "passed":
+            return
+        module = report.nodeid.split("::")[0].split("/")[-1].replace(".py", "")
+        testname = report.nodeid.split("::", 1)[1] if "::" in report.nodeid else report.nodeid
+        longrepr = ""
+        if report.outcome == "failed":
+            longrepr = str(report.longrepr)
+            # keep the assertion line, drop the noise
+            lines = [ln for ln in longrepr.splitlines() if ln.strip().startswith("E ")]
+            longrepr = " | ".join(ln.strip()[2:].strip() for ln in lines[:3]) or longrepr[-300:]
+        self.results.append((module, testname, report.outcome, report.duration, longrepr))
+
+    def build(self):
+        by_module = {}
+        for module, testname, outcome, duration, longrepr in self.results:
+            by_module.setdefault(module, []).append((testname, outcome, duration, longrepr))
+
+        total = len(self.results)
+        passed = sum(1 for r in self.results if r[2] == "passed")
+        failed = sum(1 for r in self.results if r[2] == "failed")
+        skipped = sum(1 for r in self.results if r[2] == "skipped")
+        elapsed = time.time() - self.session_start
+
+        W = 78
+        out = []
+        out.append("=" * W)
+        out.append("CANOPIE QC REPORT".center(W))
+        out.append(time.strftime("%Y-%m-%d %H:%M:%S").center(W))
+        out.append("=" * W)
+        out.append("")
+
+        out.append("FEATURE COVERAGE")
+        out.append("-" * W)
+        for module in sorted(by_module):
+            feature, detail = FEATURE_MAP.get(module, (module, ""))
+            entries = by_module[module]
+            p = sum(1 for e in entries if e[1] == "passed")
+            f = sum(1 for e in entries if e[1] == "failed")
+            s = sum(1 for e in entries if e[1] == "skipped")
+            dur = sum(e[2] or 0.0 for e in entries)
+            status = "FAIL" if f else ("PASS" if p else "----")
+            out.append(f"[{status}] {feature}")
+            out.append(f"        {p} passed"
+                       + (f", {f} FAILED" if f else "")
+                       + (f", {s} skipped" if s else "")
+                       + f"  ({dur:.2f}s)")
+            if detail:
+                out.append(f"        covers: {detail}")
+            for testname, outcome, _d, longrepr in entries:
+                if outcome == "failed":
+                    out.append(f"          FAILED: {testname}")
+                    if longrepr:
+                        out.append(f"                  {longrepr[:200]}")
+                elif outcome == "skipped":
+                    out.append(f"          skipped: {testname}")
+            out.append("")
+
+        untested = [m for m in FEATURE_MAP if m not in by_module]
+        if untested:
+            out.append("NOT EXERCISED IN THIS RUN")
+            out.append("-" * W)
+            for m in sorted(untested):
+                out.append(f"  - {FEATURE_MAP[m][0]}  ({m}.py)")
+            out.append("")
+
+        out.append("=" * W)
+        verdict = "ALL GREEN" if failed == 0 else f"{failed} FAILURE(S) -- SEE ABOVE"
+        out.append(f"TOTAL: {total} tests | {passed} passed | {failed} failed | "
+                   f"{skipped} skipped | {elapsed:.1f}s")
+        out.append(f"VERDICT: {verdict}")
+        out.append("=" * W)
+        return "\n".join(out)
+
+    def write(self):
+        text = self.build()
+        try:
+            os.makedirs(os.path.dirname(self.report_path), exist_ok=True)
+            with open(self.report_path, "w", encoding="utf-8") as f:
+                f.write(text + "\n")
+        except Exception:
+            pass
+        return text
