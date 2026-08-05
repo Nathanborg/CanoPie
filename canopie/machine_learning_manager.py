@@ -4432,6 +4432,8 @@ class AnalysisOptionsDialog(QtWidgets.QDialog):
             '  "boolean1": "b1 >150",\n'
             '  "boolean2": "(b1 >150) & (b2>165)",\n'
             '  "boolean3": "(b2 / (b1 + b2 + b3))>0.41",\n'
+            '  "boolean4": "b1==7",\n'
+            '  "boolean5": "(b1==7) | (b2==2)",\n'
             '  "sum": "b1 + b2 + b3",\n'
             '  "GCC": "b2 / (b1 + b2 + b3)",\n'
             '  "EXG": "2*b2 - (b1 + b3)",\n'
@@ -4451,8 +4453,9 @@ class AnalysisOptionsDialog(QtWidgets.QDialog):
 
         self.te_bandmath = QtWidgets.QPlainTextEdit()
         self.te_bandmath.setPlaceholderText(
-            'JSON or lines like:  GCC=b2/(b1+b2+b3), EXG=2*b2-(b1+b3)\n'
-            'b1..bN refer to export-order channels (RGB -> b1,b2,b3, then extras).'
+            'JSON or lines like:  GCC=b2/(b1+b2+b3), EXG=2*b2-(b1+b3), flush=b1==7\n'
+            'b1..bN refer to export-order channels (RGB -> b1,b2,b3, then extras).\n'
+            'Comparisons use == (e.g. b1==7); a single = names the expression.'
         )
         self.te_bandmath.setMinimumHeight(120)
         self.te_bandmath.setPlainText(DEFAULT_BANDMATH_TEXT)
