@@ -68,6 +68,12 @@ FEATURE_MAP = {
     "test_band_math_formula_parsing": (
         "Band-math / indices formula parsing",
         "bare comparisons (b7==0) parse and yield a CSV row with the boolean average"),
+    "test_stretch_bar": (
+        "In-viewport stretch bar",
+        "min/max readout populates, range follows the selected band, agrees with the dialog"),
+    "test_inspect_nodata_nan": (
+        "Pixel Inspector / non-finite pixels",
+        "NaN and Inf read as NoData without an .ax, per channel, incl. band-expression index"),
 }
 
 

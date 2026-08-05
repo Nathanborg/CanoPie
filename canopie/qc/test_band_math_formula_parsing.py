@@ -167,3 +167,43 @@ def test_bare_comparison_produces_a_row_with_boolean_average(synthetic_project):
         f"{[r.get('Channel') for r in rows]}")
     assert_close(row["Mean"], expected_fraction, tol=1e-6,
                  msg=f"{user_text} boolean average")
+    assert row.get("Band Name") == user_text, f"expected Band Name to be {user_text!r}, got {row.get('Band Name')!r}"
+
+
+def test_band_math_expression_in_band_name_row(synthetic_project):
+    """Verifies that the math expression appears in the 'Band Name' field of CSV
+    rows for both named formulas (e.g. 'boolean1': 'b1 > 150') and bare formulas."""
+    from .fixtures_manifest import fixture_image_path, get_fixture
+    from .project_builder import polygon_group_name
+
+    name = "multiband_8band_ancillary"
+    spec = get_fixture(name)
+    fp = fixture_image_path(name)
+    group = polygon_group_name(name, spec["polygon"]["name"])
+    poly_dict = synthetic_project.all_polygons[group][fp]
+
+    formulas = {
+        "boolean1": "b1 > 150",
+        "GCC": "b2 / (b1 + b2 + b3)",
+        "b1 > 100": "b1 > 100"
+    }
+
+    opts = {
+        "stats": {"mean": True},
+        "band_math": {"enabled": True, "formulas": formulas}
+    }
+    rows, _ = synthetic_project.process_polygon(
+        group, fp, poly_dict, {}, [], False, opts=opts
+    )
+
+    by_channel = {r.get("Channel"): r for r in rows if isinstance(r, dict)}
+
+    assert "boolean1" in by_channel
+    assert by_channel["boolean1"].get("Band Name") == "b1 > 150"
+
+    assert "GCC" in by_channel
+    assert by_channel["GCC"].get("Band Name") == "b2 / (b1 + b2 + b3)"
+
+    assert "b1 > 100" in by_channel
+    assert by_channel["b1 > 100"].get("Band Name") == "b1 > 100"
+

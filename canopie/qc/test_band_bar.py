@@ -213,3 +213,32 @@ def test_composite_click_restores_previous_stretch(synthetic_project, viewer_fac
     assert restored.mode == "stddev" and restored.k_sigma == 2.5, (
         "composite restore lost the original tuned parameters "
         f"(mode={restored.mode!r}, k_sigma={restored.k_sigma})")
+
+
+def test_top_stretch_bar_attached_and_emits_absolute_stretch(synthetic_project, viewer_factory):
+    """The top stretch bar (_StretchBar) is attached to ImageViewer and allows
+    adjusting absolute contrast stretch ranges via Min/Max sliders."""
+    from PyQt5 import QtWidgets
+    from ..image_viewer import attach_stretch_bar
+    viewer = _viewer_with_image(synthetic_project, viewer_factory, "rgb_8bit_untiled")
+    QtWidgets.QApplication.processEvents()
+    sb = getattr(viewer, "_stretchbar", None) or attach_stretch_bar(viewer)
+    assert sb is not None, "_StretchBar overlay was not attached"
+
+    received_params = []
+    viewer.stretch_applied.connect(lambda p: received_params.append(p))
+
+    # Move slider min/max
+    sb._slider_min.setValue(100)
+    sb._slider_max.setValue(900)
+    sb._apply_stretch()
+
+    assert len(received_params) > 0, "stretch_applied was not emitted"
+    last = received_params[-1]
+    assert last is not None
+    assert last.mode == "absolute"
+    assert last.min_val is not None
+    assert last.max_val is not None
+    assert last.min_val < last.max_val
+
+
