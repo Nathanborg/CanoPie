@@ -421,7 +421,12 @@ def _sample_centers(params, dims, H, W, image=None, nodata_mask=None, nodata_val
             "[random_shapes] No valid pixels for restricted placement "
             f"(dtype={getattr(image, 'dtype', None)}, shape={getattr(image, 'shape', None)}, "
             f"had_nodata_mask={nodata_mask is not None}); falling back to full frame.")
-        return _sample_rect(border_px)
+        # _sample_rect takes SEPARATE x/y insets; passing one argument raised
+        # TypeError, so this "don't leave the user empty-handed" fallback
+        # crashed instead of falling back. Hit whenever restricted placement
+        # finds no valid pixels at all -- i.e. exactly the heavily-masked
+        # rasters this option exists for.
+        return _sample_rect(border_px, border_px)
 
     # Optional: even coverage across the separate valid patches instead of
     # uniform-over-area. Runs on the SAME eroded mask, so full-shape containment

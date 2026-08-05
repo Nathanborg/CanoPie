@@ -1371,7 +1371,18 @@ class ImageViewer(QtWidgets.QGraphicsView):
 
         # Read pixel values directly from the already-modified image
         img_mod = base_img.astype(np.float32, copy=False)
-        
+
+        # Whether channel 0/2 need swapping to read as R/…/B. Only true when the
+        # array is genuinely BGR (cv2-loaded, <=3-band small files). Multi-band
+        # TIFFs loaded via the tifffile-preflight stack path (see
+        # ProjectTab._imagedata_or_fallback) are tagged channel_order="rgb" and
+        # already sit in native band order -- swapping them here used to silently
+        # mislabel band 1 as band 3 and vice versa for every such file, since this
+        # was the one consumer of image_data that never consulted channel_order
+        # (the on-screen display and CSV export already do -- see
+        # ProjectTab._render_with_viewer_stretch / _channels_in_export_order).
+        _is_bgr = str(getattr(img_data, "channel_order", "bgr") or "bgr").lower() == "bgr"
+
         # Load NoData values from .ax file
         image_path = getattr(img_data, "filepath", None) or getattr(self, "image_path", None)
         mods = self._load_ax_mods(image_path)
@@ -1399,27 +1410,39 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 if img_mod.ndim == 2:
                     mapping = {'b1': img_mod}
                 else:
-                    # CRITICAL FIX: image_data.image is BGR from cv2.imread, but user sees RGB
-                    # in the viewer. When user types b1, they mean Red (what they see).
-                    # BGR channel order: 0=Blue, 1=Green, 2=Red
-                    # RGB mapping (what user sees): b1=Red, b2=Green, b3=Blue
-                    # So for 3-channel images: b1→channel2(Red), b2→channel1(Green), b3→channel0(Blue)
+                    # image_data.image is BGR from cv2.imread ONLY when _is_bgr
+                    # (channel_order == "bgr"); the user always types b1/b2/b3
+                    # meaning what they see as R/G/B in the viewer, so only swap
+                    # when the underlying array is genuinely in BGR order.
                     C = img_mod.shape[2]
                     if C == 3:
-                        # BGR→RGB semantic mapping
-                        mapping = {
-                            'b1': img_mod[:, :, 2],  # b1 = Red (user sees as channel 1)
-                            'b2': img_mod[:, :, 1],  # b2 = Green (channel 2)
-                            'b3': img_mod[:, :, 0],  # b3 = Blue (channel 3)
-                        }
+                        if _is_bgr:
+                            mapping = {
+                                'b1': img_mod[:, :, 2],  # b1 = Red (user sees as channel 1)
+                                'b2': img_mod[:, :, 1],  # b2 = Green (channel 2)
+                                'b3': img_mod[:, :, 0],  # b3 = Blue (channel 3)
+                            }
+                        else:
+                            mapping = {
+                                'b1': img_mod[:, :, 0],
+                                'b2': img_mod[:, :, 1],
+                                'b3': img_mod[:, :, 2],
+                            }
                     elif C > 3:
-                        # For >3 channels (e.g., BGR + appended bands):
-                        # First 3 are BGR, additional bands stay in order
-                        mapping = {
-                            'b1': img_mod[:, :, 2],  # Red
-                            'b2': img_mod[:, :, 1],  # Green
-                            'b3': img_mod[:, :, 0],  # Blue
-                        }
+                        # First 3 channels only swap when genuinely BGR; additional
+                        # bands stay in native order either way.
+                        if _is_bgr:
+                            mapping = {
+                                'b1': img_mod[:, :, 2],  # Red
+                                'b2': img_mod[:, :, 1],  # Green
+                                'b3': img_mod[:, :, 0],  # Blue
+                            }
+                        else:
+                            mapping = {
+                                'b1': img_mod[:, :, 0],
+                                'b2': img_mod[:, :, 1],
+                                'b3': img_mod[:, :, 2],
+                            }
                         for i in range(3, C):
                             mapping[f'b{i+1}'] = img_mod[:, :, i]
                     else:
@@ -1445,23 +1468,29 @@ class ImageViewer(QtWidgets.QGraphicsView):
             vals = [float(img_mod[ym, xm])]
         else:
             C = img_mod.shape[2]
-            # CRITICAL FIX: Extract values in RGB semantic order to match channel names
-            # img_mod is BGR from cv2, but ch_names are ["b1", "b2", "b3", ...]
-            # where b1=Red, b2=Green, b3=Blue semantically
+            # Extract values in the semantic order matching ch_names ("b1"=R,
+            # "b2"=G, "b3"=B). Only swap [2,1,0] when the array is genuinely BGR
+            # (_is_bgr) -- tifffile-loaded multi-band stacks (channel_order="rgb")
+            # already sit in native band order and must NOT be swapped, or band 1
+            # and band 3's values get reported under each other's label.
             if C == 3:
-                # BGR → show as RGB order: Red(2), Green(1), Blue(0)
-                vals = [
-                    float(img_mod[ym, xm, 2]),  # b1 = Red
-                    float(img_mod[ym, xm, 1]),  # b2 = Green
-                    float(img_mod[ym, xm, 0]),  # b3 = Blue
-                ]
+                if _is_bgr:
+                    vals = [
+                        float(img_mod[ym, xm, 2]),  # b1 = Red
+                        float(img_mod[ym, xm, 1]),  # b2 = Green
+                        float(img_mod[ym, xm, 0]),  # b3 = Blue
+                    ]
+                else:
+                    vals = [float(img_mod[ym, xm, c]) for c in range(3)]
             elif C > 3:
-                # First 3 are BGR, additional bands stay in order
-                vals = [
-                    float(img_mod[ym, xm, 2]),  # b1 = Red
-                    float(img_mod[ym, xm, 1]),  # b2 = Green
-                    float(img_mod[ym, xm, 0]),  # b3 = Blue
-                ]
+                if _is_bgr:
+                    vals = [
+                        float(img_mod[ym, xm, 2]),  # b1 = Red
+                        float(img_mod[ym, xm, 1]),  # b2 = Green
+                        float(img_mod[ym, xm, 0]),  # b3 = Blue
+                    ]
+                else:
+                    vals = [float(img_mod[ym, xm, c]) for c in range(3)]
                 for i in range(3, C):
                     vals.append(float(img_mod[ym, xm, i]))
             else:

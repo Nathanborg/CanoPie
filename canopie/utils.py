@@ -606,6 +606,7 @@ def eval_band_expression(image: np.ndarray, expr: str) -> np.ndarray:
 # =============================================================================
 
 # Pattern for threshold expressions: b1<123, b2>=50, B3>100, etc.
+# Equality must be written `==`; a bare `=` is deliberately NOT accepted.
 _NODATA_EXPR_RE = re.compile(
     r'^([bB]\d+)\s*(<=|>=|<|>|==|!=)\s*(-?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?)$'
 )

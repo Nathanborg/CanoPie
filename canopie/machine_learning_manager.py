@@ -194,7 +194,10 @@ class MachineLearningManager(QtWidgets.QDialog):
             img, _C = self._get_export_image(fp)
             if img is None:
                 continue
-            C = 1 if img.ndim == 2 else img.shape[2]
+            # _get_export_image already returns the correct band count as _C for
+            # BOTH plain arrays and lazy raster_reader.LazyChannels objects (which
+            # have no .ndim) -- use it directly instead of touching img.ndim.
+            C = int(_C)
             max_bands = max(max_bands, C)
             
             # Cache the loaded image for reuse during training (avoid loading twice)
@@ -3001,8 +3004,29 @@ class MachineLearningManager(QtWidgets.QDialog):
         Return a list of 2D float32 arrays (each C-contiguous) in export order.
         If exactly 3 channels, map OpenCV BGR->RGB; if >3, swap first 3 BGR->RGB
         and keep remaining bands as-is. Ensures dtype=float32 and C-contiguous memory.
+
+        Delegates to ProjectTab's own (already lazy-aware) implementation when a
+        parent_tab is available. A raster_reader.LazyChannels object -- returned
+        by ProjectTab._get_export_image for large rasters routed through the
+        windowed/lazy path -- has no .ndim attribute, which used to crash this
+        method's own `img.ndim == 3` check outright (AttributeError, surfaced as
+        an "Export Failed" dialog from export_csv_data and as a raw unhandled
+        crash from train_models' band-detection pre-pass). ProjectTab's version
+        already guards this via _is_lazy_channels and passes LazyChannels through
+        untouched (it already carries the export band order), so reuse it rather
+        than maintaining a second, drifted copy of the same logic.
+
+        The local fallback body below only runs when there's no parent_tab to
+        delegate to -- in that situation img can only ever be a plain ndarray,
+        since a LazyChannels can only be produced by ProjectTab._get_export_image,
+        which this class's own _get_export_image (see above) only reaches via
+        parent_tab in the first place.
         """
         import numpy as np
+
+        pt = getattr(self, "parent_tab", None)
+        if pt is not None and hasattr(pt, "_channels_in_export_order"):
+            return pt._channels_in_export_order(img)
 
         if img.ndim == 3:
             C = img.shape[2]
@@ -3731,8 +3755,10 @@ class MachineLearningManager(QtWidgets.QDialog):
                     return "rgb"
         except Exception:
             pass
-        # Heuristic fallback
-        if img is not None and img.ndim == 3 and img.shape[2] >= 3:
+        # Heuristic fallback. Use len(img.shape) rather than img.ndim -- img may
+        # be a raster_reader.LazyChannels (large lazily-loaded raster), which
+        # defines .shape as a plain (H, W, C) tuple but has no .ndim attribute.
+        if img is not None and len(img.shape) == 3 and img.shape[2] >= 3:
             img_type = "rgb"
         return img_type
 
@@ -4497,32 +4523,118 @@ class AnalysisOptionsDialog(QtWidgets.QDialog):
 
     @staticmethod
     def _parse_bandmath(text: str) -> dict:
-        """Parse JSON or simple 'name=expr' / 'name:expr' lines into a dict."""
+        """Parse JSON or simple 'name=expr' / 'name:expr' lines into a dict.
+
+        A bare expression with no name (e.g. `b7==0`) is allowed and becomes
+        its own column name.
+
+        The naive "split on the first '='" this used to do silently mangled
+        every comparison expression, which is exactly what a categorical band
+        needs. `b7==0` (a legitimate ask: "fraction of pixels of class 0" on a
+        0-3 leaf-age raster) parsed as name=`b7`, expr=`=0`; `=0` then raised
+        inside process_polygon's band-math eval, which swallows failures into a
+        logging.warning, so the expected row just never appeared in the CSV
+        with no visible error. `name: b7==0` was equally broken, since the '='
+        branch was tested before the ':' branch and matched the '=' inside the
+        expression.
+
+        The split point must therefore be a separator that is NOT part of a
+        comparison operator: a '=' that is not preceded by [<>!=] and not
+        followed by '='. Assignment binds looser than any comparison here, so
+        the FIRST such '=' is the name/expression boundary.
+        """
         import json, re
         text = (text or "").strip()
         if not text:
             return {}
-        # Try JSON
+
+        # --- 1) Strict JSON ------------------------------------------------
         try:
             d = json.loads(text)
-            return {str(k): str(v) for k, v in d.items()}
+            if isinstance(d, dict):
+                return {str(k).strip(): str(v).strip() for k, v in d.items()}
         except Exception:
             pass
-        # Fallback: split by newlines/commas into name=expr or name:expr
+
+        # --- 2) JSON with a trailing comma ---------------------------------
+        # `{"a": "b1>1", "b": "b7==2",}` is what people actually type (and what
+        # most editors leave behind after deleting a line). Strict JSON rejects
+        # it, and the old code fell straight through to the line parser, which
+        # then produced garbage entries for the braces and kept the quotes on
+        # every key/value -- so the "expression" became the Python STRING
+        # LITERAL '"b1 >150"' rather than an expression, which blew up inside
+        # process_polygon's band-math eval and was swallowed into a warning.
+        # Retry once with trailing commas removed before giving up on JSON.
+        try:
+            repaired = re.sub(r',\s*([}\]])', r'\1', text)
+            d = json.loads(repaired)
+            if isinstance(d, dict):
+                return {str(k).strip(): str(v).strip() for k, v in d.items()}
+        except Exception:
+            pass
+
+        # --- 3) Line/comma separated `name=expr`, `name:expr`, or bare expr --
+        # A '=' that is a genuine name/expr separator: not part of ==, <=, >=, !=
+        # A single '=' therefore keeps its documented `name=expr` meaning --
+        # equality must be written `==`, and `b7=0` is read as "a column named
+        # b7 holding the constant 0", not as a comparison.
+        _ASSIGN_RE = re.compile(r'(?<![<>!=])=(?!=)')
+
+        def _split_entries(s):
+            """Split on newlines, and on commas only at paren depth 0.
+
+            Splitting on every comma would tear apart legitimate multi-argument
+            calls -- `where(b1>50,1,0)` and `clip(b1,0,50)` are both documented
+            band-math functions.
+            """
+            entries, buf, depth = [], [], 0
+            for chunk in s.splitlines():
+                for chpart in chunk:
+                    if chpart in '([':
+                        depth += 1
+                    elif chpart in ')]':
+                        depth = max(0, depth - 1)
+                    if chpart == ',' and depth == 0:
+                        entries.append(''.join(buf)); buf = []
+                    else:
+                        buf.append(chpart)
+                entries.append(''.join(buf)); buf = []
+            return entries
+
+        def _clean(tok):
+            """Strip whitespace, then one layer of matching quotes.
+
+            Quote-stripping matters for the JSON-ish fallback: without it a
+            key/value arrives as '"boolean1"' / '"b1 >150"', and the quoted
+            expression evaluates to a plain Python string instead of a pixel
+            array."""
+            tok = (tok or "").strip()
+            if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in ("'", '"'):
+                tok = tok[1:-1].strip()
+            return tok
+
         out = {}
-        parts = re.split(r'[\n,]+', text)
-        for p in parts:
+        for p in _split_entries(text):
             p = p.strip()
+            # Drop stray JSON punctuation left over when the input was almost-
+            # JSON: a lone '{' or '}' is not a formula.
+            p = p.strip('{}').strip()
             if not p:
                 continue
-            if '=' in p:
-                k, v = p.split('=', 1)
+
+            k = v = None
+            m = _ASSIGN_RE.search(p)
+            if m:
+                k, v = p[:m.start()], p[m.end():]
             elif ':' in p:
                 k, v = p.split(':', 1)
             else:
-                continue
-            k = k.strip()
-            v = v.strip()
+                # Bare expression with no explicit name -- use it as its own
+                # column name. Without this, typing just `b7==0` produced
+                # nothing at all (the old code hit `continue`).
+                k = v = p
+
+            k, v = _clean(k), _clean(v)
             if k and v:
                 out[k] = v
         return out

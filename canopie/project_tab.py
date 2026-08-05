@@ -2436,7 +2436,8 @@ _PREVIEW_DECODE_BUDGET_BYTES = 1024 * 1024 * 1024
 
 
 def _per_band_nodata_masks(slices, values):
-    """Per-band NoData masks (True = NoData) for numeric NoData values.
+    """Per-band NoData masks (True = NoData) for numeric NoData values AND
+    per-band boolean expressions (b1<123, b7==0, etc.).
 
     Deliberately per-band rather than one master mask. These stacks carry
     ancillary planes that are 100% fill (WV_AOT and MASK are entirely -9999),
@@ -2444,9 +2445,35 @@ def _per_band_nodata_masks(slices, values):
     every pixel of every image and CSV export produced no rows at all. Masking
     each band against its own fill value gives correct statistics for the
     science bands and an honest NaN for the bands that hold nothing.
+
+    BUG FIX (found via a real classification band, e.g. a 0-3 "leaf_age"
+    band where excluding class 0 via `b7==0` is a legitimate, common ask):
+    this used to try `float(v)` on every entry and silently `continue` past
+    anything that failed -- which is EVERY expression string, with no
+    warning logged anywhere. On the lazy/windowed read path (any raster
+    over `_EXPORT_LAZY_THRESHOLD_BYTES`, i.e. most real multi-band scenes),
+    this is the ONLY nodata function ever consulted -- see
+    `_build_roi_nodata` in process_polygon -- so an expression-based NoData
+    rule had zero effect on any large file, full stop. `slices` are already
+    in export band order (see `_build_roi_nodata`'s own docstring: "b1 ==
+    slices[0]"), so a `b{N}` reference maps directly to `slices[N-1]`, no
+    BGR remap needed here (unlike `utils.build_nodata_mask`'s bgr_input path
+    for b1-b3, which this function's callers never use for anything beyond
+    that positional convention).
     """
+    from .utils import _NODATA_EXPR_RE
+
     numeric = []
+    # 0-based band index -> list of (op, threshold) expressions targeting it.
+    per_band_exprs = {}
     for v in (values or []):
+        if isinstance(v, str):
+            m = _NODATA_EXPR_RE.match(v.strip())
+            if m:
+                band_name, op, threshold = m.groups()
+                band_idx = int(band_name[1:]) - 1  # b1 -> slices[0]
+                per_band_exprs.setdefault(band_idx, []).append((op, float(threshold)))
+                continue
         try:
             nv = float(v)
         except (TypeError, ValueError):
@@ -2454,14 +2481,35 @@ def _per_band_nodata_masks(slices, values):
         if nv == nv:
             numeric.append(nv)
 
+    n_slices = len(slices)
+    for band_idx in per_band_exprs:
+        if not (0 <= band_idx < n_slices):
+            logging.warning(
+                "[_per_band_nodata_masks] NoData expression references band %d, "
+                "but this image only has %d band(s) here; ignoring.",
+                band_idx + 1, n_slices)
+
     masks = []
-    for ch in slices:
+    for i, ch in enumerate(slices):
         a = np.asarray(ch)
         af = a if a.dtype == np.float32 else a.astype(np.float32, copy=False)
         m = ~np.isfinite(af)
         for nv in numeric:
             tol = abs(nv) * 0.001 if abs(nv) > 100 else 0.01
             m |= np.abs(af - nv) < tol
+        for (op, threshold) in per_band_exprs.get(i, []):
+            if op == '<':
+                m |= (af < threshold)
+            elif op == '<=':
+                m |= (af <= threshold)
+            elif op == '>':
+                m |= (af > threshold)
+            elif op == '>=':
+                m |= (af >= threshold)
+            elif op == '==':
+                m |= np.isclose(af, threshold, rtol=0.0, atol=1e-6)
+            elif op == '!=':
+                m |= ~np.isclose(af, threshold, rtol=0.0, atol=1e-6)
         masks.append(m)
     return masks
 
@@ -12536,7 +12584,16 @@ class ProjectTab(QtWidgets.QWidget):
                   hm_sig if hm_on else None,
                   ax_mtime,
                   mask_poly_sig,
-                  nodata_sig)
+                  nodata_sig,
+                  # WHICH scene stats were asked for is part of the identity of
+                  # the cached result: _band_scene_stats returns {} when none
+                  # are requested. Without this, an export run with scene stats
+                  # OFF cached an empty dict that a later run with them ON then
+                  # reused, silently leaving Scene Mean/Median/Std blank for
+                  # every row.
+                  bool(stats_cfg.get('scene_mean')),
+                  bool(stats_cfg.get('scene_median')),
+                  bool(stats_cfg.get('scene_std')))
 
         if not hasattr(self, "_scene_stats_cache"):
             self._scene_stats_cache = {}
@@ -12597,11 +12654,49 @@ class ProjectTab(QtWidgets.QWidget):
                                or stats_cfg.get('scene_median')
                                or stats_cfg.get('scene_std'))
 
+            def _scene_vals_for_band(vals, bi):
+                """NoData rules that apply to band `bi`, rewritten as if that
+                band were b1 -- so a single-band mask build sees them.
+
+                Numeric values apply to every band. An expression applies only
+                to the band it names (matching _per_band_nodata_masks'
+                per-band semantics), so `b7==0` is dropped for every band
+                except band 7, where it becomes `b1==0`.
+                """
+                from .utils import _NODATA_EXPR_RE
+                out = []
+                for v in (vals or []):
+                    if isinstance(v, str):
+                        mm = _NODATA_EXPR_RE.match(v.strip())
+                        if mm and (int(mm.group(1)[1:]) - 1) == bi:
+                            out.append(f"b1{mm.group(2)}{mm.group(3)}")
+                        continue
+                    out.append(v)
+                return out
+
             def _band_scene_stats(bi):
                 if not _want_scene:
                     return {}
+                band = chans[bi]
                 m = (nd_masks[bi] if (nd_masks is not None and bi < len(nd_masks)) else None)
-                return _scene_stats_for_band(chans[bi], m)
+                if m is None and lazy_nd_vals:
+                    # LAZY PATH: nd_masks is never built here (NoData is applied
+                    # per-ROI instead -- see lazy_nd_vals), so scene stats used
+                    # to run over the RAW band and report the fill value itself:
+                    # a Scene Median of exactly -9999 and a Scene Mean dragged
+                    # to ~-9365 on the ancillary planes, while the polygon stats
+                    # on the same row were correctly masked. Build the mask here
+                    # from the band we have already read -- `chans[bi]` is a full
+                    # band read either way, so masking it costs nothing extra.
+                    try:
+                        m = _per_band_nodata_masks(
+                            [band], _scene_vals_for_band(lazy_nd_vals, bi))[0]
+                    except Exception as e:
+                        logging.warning(
+                            "[process_polygon] scene NoData mask failed for band %d: %s",
+                            bi + 1, e)
+                        m = None
+                return _scene_stats_for_band(band, m)
 
             # --- RGB naming for first 3 bands when available ---
             if len(chans) >= 3:
@@ -17704,13 +17799,16 @@ class ProjectTab(QtWidgets.QWidget):
                     self._last_export_nodata_mask = cached[2]
                     self._last_export_nodata_values = cached[3] if len(cached) > 3 else []
                     self._last_export_nodata_filepath = cached[4] if len(cached) > 4 else filepath  # Restore filepath
-                    
+
                     # THREAD-SAFE: Also populate per-filepath cache for O(1) lookup
                     # NOTE: _nodata_mask_by_filepath is initialized at export start
                     _nd_cache = getattr(self, "_nodata_mask_by_filepath", None)
                     if _nd_cache is not None:
                         fp_key = os.path.normcase(os.path.abspath(filepath))
                         _nd_cache[fp_key] = (cached[2], cached[3] if len(cached) > 3 else [])
+                # Restore which channel-order convention this cached array is in,
+                # for the immediately-following _channels_in_export_order call.
+                self._last_export_channel_order = cached[5] if len(cached) > 5 else "bgr"
                 return (cached[0], cached[1])  # Return only (img, info) for compatibility
             
             logging.info(f"[_get_export_image] CACHE MISS for {os.path.basename(filepath)}, loading fresh")
@@ -17726,11 +17824,24 @@ class ProjectTab(QtWidgets.QWidget):
                 self._last_export_nodata_mask = None
                 self._last_export_nodata_values = []
                 self._last_export_nodata_filepath = filepath
-                self._export_image_cache[cache_key] = (_lazy, info, None, [], filepath)
+                # The lazy path only ever reads TIFFs via raster_reader's own tiled
+                # reader (never cv2), so it is always native ("rgb") band order --
+                # see the matching fix in _try_lazy_export_channels' `order` build.
+                self._last_export_channel_order = "rgb"
+                self._export_image_cache[cache_key] = (_lazy, info, None, [], filepath, "rgb")
                 return (_lazy, info)
 
             # ---------- load RAW, prefer tifffile for TIFF ----------
             from .raster_reader import ensure_hwc as _ensure_hwc, axes_for as _axes_for
+
+            # Set alongside `img` by _read_raw_any: "rgb" when tifffile supplied the
+            # native (already band-order-correct) array, "bgr" when the cv2.imread
+            # fallback was used (genuinely BGR for 3+ channels). _channels_in_export_order
+            # only needs to apply its [2,1,0] swap in the latter case -- previously it
+            # swapped unconditionally, which mislabeled R/B for every TIFF (the
+            # overwhelming majority of files here), since tifffile succeeds for
+            # essentially any valid TIFF and never returns BGR order.
+            _read_channel_order = {"value": "bgr"}
 
             def _read_raw_any(fp):
                 ext = os.path.splitext(fp)[1].lower()
@@ -17742,7 +17853,9 @@ class ProjectTab(QtWidgets.QWidget):
                             # from the shape: band-first cubes with more than 64
                             # bands used to be misread as H x W x C.
                             axes = (tf.series[0].axes or "").upper()
-                            return _ensure_hwc(tf.asarray(), axes=axes)
+                            arr = _ensure_hwc(tf.asarray(), axes=axes)
+                        _read_channel_order["value"] = "rgb"
+                        return arr
                     except Exception:
                         pass
 
@@ -17752,12 +17865,14 @@ class ProjectTab(QtWidgets.QWidget):
                 img_ = cv2.imread(fp, cv2.IMREAD_UNCHANGED)
                 if img_ is None:
                     return None
+                _read_channel_order["value"] = "bgr"
                 # If it is 4-channel BGRA, we keep it as BGRA for now.
                 return _ensure_hwc(img_)
 
             img = _read_raw_any(filepath)
             if img is None:
                 return None, {}
+            self._last_export_channel_order = _read_channel_order["value"]
             # IMPORTANT: Keep original dtype through hist-match so LUT-based uint8 hist-match
             # behaves exactly like the viewer/editor. _apply_ax_to_raw will upcast to float32
             # later (after resize) before band-math / model inference.
@@ -17809,9 +17924,10 @@ class ProjectTab(QtWidgets.QWidget):
             # Get cached NoData mask from _apply_ax_to_raw
             nd_mask = getattr(self, "_last_export_nodata_mask", None)
             nd_vals = getattr(self, "_last_export_nodata_values", [])
-            
-            # Cache includes NoData mask and filepath for consistent retrieval
-            out = (img, {"H": H, "W": W, "C": C}, nd_mask, nd_vals, filepath)
+            chan_order = getattr(self, "_last_export_channel_order", "bgr")
+
+            # Cache includes NoData mask, filepath, and channel order for consistent retrieval
+            out = (img, {"H": H, "W": W, "C": C}, nd_mask, nd_vals, filepath, chan_order)
             self._export_image_cache[cache_key] = out
             return (img, {"H": H, "W": W, "C": C})  # Return only (img, info) for compatibility
                 
@@ -18288,10 +18404,13 @@ class ProjectTab(QtWidgets.QWidget):
             if reader is None:
                 return None
 
-            # Mirror _channels_in_export_order exactly, so a file read lazily and
-            # the same file read fully produce identical CSV columns.
+            # Native (pass-through) band order -- this path only ever reads TIFFs
+            # via raster_reader's own tiled reader, never cv2, so it is never BGR.
+            # Mirrors _channels_in_export_order's post-fix "rgb" behavior (see
+            # self._last_export_channel_order), so a file read lazily and the same
+            # file read fully produce identical CSV columns.
             C = profile.count
-            order = [2, 1, 0] + list(range(3, C)) if C >= 3 else list(range(C))
+            order = list(range(C))
             origin, size = self._ax_crop_in_full_pixels(ax, profile)
             lazy = LazyChannels(reader, order=order, origin=origin, size=size)
             logging.info("[_get_export_image] lazy tiled read for %s: %dx%d x%d bands "
@@ -18314,10 +18433,19 @@ class ProjectTab(QtWidgets.QWidget):
     def _channels_in_export_order(self, img):
             """
             Returns a list [R, G, B, band_4, band_5, ...] where each entry is HxW.
-            Assumes input 'img' is BGR if it has 3+ channels (matching OpenCV/Editor standard).
-            
-            FIX: When C > 3 (e.g., BGR + appended Boolean/label band), we still need to
-            swap the first 3 channels from BGR to RGB order, then keep remaining bands as-is.
+
+            Only swaps the first 3 channels [2,1,0] when the array is genuinely BGR
+            -- i.e. `img` came from the cv2.imread fallback in _get_export_image's
+            _read_raw_any (non-TIFF files, or a tifffile decode failure). TIFFs (the
+            overwhelming majority of files this app handles) are read via tifffile,
+            which returns native file band order, not BGR -- swapping those
+            unconditionally (the old behavior) silently mislabeled band 1 as band 3
+            and vice versa in every CSV/ML export for any TIFF with 3+ bands. This
+            mirrors the channel_order flag ProjectTab._imagedata_or_fallback already
+            attaches to image_data for the display path (_render_with_viewer_stretch);
+            _get_export_image sets self._last_export_channel_order the same way for
+            this (viewer-independent) export path -- see _read_raw_any and
+            _try_lazy_export_channels.
             """
             import numpy as np
 
@@ -18325,6 +18453,8 @@ class ProjectTab(QtWidgets.QWidget):
             # it here would defeat the point of reading lazily.
             if self._is_lazy_channels(img):
                 return img
+
+            is_bgr = str(getattr(self, "_last_export_channel_order", "bgr") or "bgr").lower() == "bgr"
 
             a = np.asarray(img)
             if a.ndim == 2:
@@ -18340,14 +18470,20 @@ class ProjectTab(QtWidgets.QWidget):
 
             chans = []
             if C == 3:
-                # BGR -> RGB (Standard OpenCV/Editor -> Scientific/Export)
-                chans = [a[:, :, 2], a[:, :, 1], a[:, :, 0]]
+                if is_bgr:
+                    # BGR -> RGB (Standard OpenCV/Editor -> Scientific/Export)
+                    chans = [a[:, :, 2], a[:, :, 1], a[:, :, 0]]
+                else:
+                    chans = [a[:, :, 0], a[:, :, 1], a[:, :, 2]]
             elif C > 3:
-                # FIX: First 3 channels are BGR from OpenCV, swap to RGB
-                # Then append remaining bands (band_expression result, label band, etc.) as-is
-                chans = [a[:, :, 2], a[:, :, 1], a[:, :, 0]]  # BGR -> RGB for first 3
+                if is_bgr:
+                    # First 3 channels are BGR from OpenCV, swap to RGB
+                    chans = [a[:, :, 2], a[:, :, 1], a[:, :, 0]]
+                else:
+                    chans = [a[:, :, 0], a[:, :, 1], a[:, :, 2]]
+                # Remaining bands (band_expression result, label band, etc.) stay in order
                 for i in range(3, C):
-                    chans.append(a[:, :, i])  # Keep additional bands in order
+                    chans.append(a[:, :, i])
             else:
                 # C == 1 or 2
                 for i in range(C):

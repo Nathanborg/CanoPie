@@ -134,6 +134,13 @@ STRATEGY_MEMMAP = "memmap"
 STRATEGY_TILES_BSQ = "tiles_bsq"
 STRATEGY_TILES_BIP = "tiles_bip"
 STRATEGY_STRIPS = "strips"
+
+#: TIFF Compression tag values that mean "JPEG" in one of its variants:
+#: 6 = old-style JPEG, 7 = JPEG (the one GDAL writes for COGs),
+#: 34892 = lossy DNG JPEG, 33007 = Alias/JPEG. Segments in these files need
+#: the page's shared jpegtables/jpegheader handed to decode() -- see
+#: _level_geometry. Value set matches tifffile's own TiffPage.segments().
+_JPEG_COMPRESSIONS = frozenset({6, 7, 34892, 33007})
 STRATEGY_FULL = "full"
 
 _WINDOWABLE_STRATEGIES = (
@@ -542,6 +549,32 @@ class TiledRasterReader:
         # level 0's, so a band-interleaved file that wants 2 workers at full
         # resolution can use all of them one level down.
         tile_bytes = tw * th * (count if planar == 1 else 1) * np.dtype(page.dtype).itemsize
+
+        # JPEG-in-TIFF keeps its quantization/Huffman tables ONCE in the
+        # JPEGTables tag (and, for some encoders, a shared jpegheader) rather
+        # than repeating them in every tile -- which is exactly what GDAL
+        # writes for a JPEG-compressed COG. Passing the raw tile bytes to
+        # decode() without those tables fails with
+        # "Quantization table 0x00 was not defined", because the tile alone is
+        # only entropy-coded scan data and genuinely cannot be decoded on its
+        # own. Mirrors tifffile's own TiffPage.segments():
+        #     if compression in {6, 7, 34892, 33007}:   # JPEG variants
+        #         decodeargs['jpegtables'] = page.jpegtables
+        #         decodeargs['jpegheader'] = page.jpegheader
+        # Resolved once per level here (they are per-page constants) rather
+        # than per tile. Note tifffile's own writer often stores the tables
+        # inline instead, leaving page.jpegtables None -- so a locally-written
+        # JPEG TIFF may decode fine while a real GDAL COG does not, which is
+        # why this went unnoticed.
+        decode_kwargs = {}
+        try:
+            compression = int(getattr(page, "compression", 0) or 0)
+        except (TypeError, ValueError):
+            compression = 0
+        if compression in _JPEG_COMPRESSIONS:
+            decode_kwargs["jpegtables"] = getattr(page, "jpegtables", None)
+            decode_kwargs["jpegheader"] = getattr(page, "jpegheader", None)
+
         return {
             "page": page, "width": width, "height": height, "count": count,
             "planar": planar, "tw": tw, "th": th,
@@ -549,6 +582,7 @@ class TiledRasterReader:
             "offsets": page.dataoffsets, "counts": page.databytecounts,
             "tile_bytes": tile_bytes,
             "workers": workers_for_tile_bytes(tile_bytes),
+            "decode_kwargs": decode_kwargs,
         }
 
     def level_shape(self, level=0):
@@ -679,7 +713,7 @@ class TiledRasterReader:
             fh = self._handle()
             fh.seek(offset)
             raw = fh.read(nbytes)
-            data = lv["page"].decode(raw, seg_index)[0]
+            data = lv["page"].decode(raw, seg_index, **lv.get("decode_kwargs", {}))[0]
             arr = np.squeeze(np.asarray(data))
             # Squeeze can flatten a legitimate single-band trailing axis.
             if lv["planar"] == 1 and arr.ndim == 2 and lv["count"] > 1:

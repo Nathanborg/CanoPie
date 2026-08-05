@@ -1,0 +1,94 @@
+{
+  "name": "gray_8bit_png",
+  "dtype": "uint8",
+  "raw_shape": [
+    40,
+    40,
+    1
+  ],
+  "working_shape": [
+    40,
+    40,
+    1
+  ],
+  "seed": 1111,
+  "modulus": 256,
+  "nodata_value": null,
+  "format": "png",
+  "export_channel_order": "bgr",
+  "viewer_channel_order": "bgr",
+  "points": {
+    "p_tl": {
+      "x": 3,
+      "y": 3,
+      "values": [
+        247.0
+      ]
+    },
+    "p_center": {
+      "x": 20,
+      "y": 20,
+      "values": [
+        125.0
+      ]
+    },
+    "p_br": {
+      "x": 36,
+      "y": 36,
+      "values": [
+        221.0
+      ]
+    }
+  },
+  "polygon": {
+    "pixel_count_total": 169,
+    "bands": {
+      "0": {
+        "process_polygon": {
+          "mean": 119.67455621301775,
+          "median": 108.0,
+          "std": 79.18591338894136,
+          "q25": 49.0,
+          "q75": 195.0,
+          "count": 169
+        },
+        "ml_manager": {
+          "mean": 119.67455621301775,
+          "median": 108.0,
+          "std": 79.18591338894136,
+          "q25": 49.0,
+          "q75": 195.0,
+          "count": 169
+        },
+        "no_mask": {
+          "mean": 119.67455621301775,
+          "median": 108.0,
+          "std": 79.18591338894136,
+          "q25": 49.0,
+          "q75": 195.0,
+          "count": 169
+        }
+      }
+    },
+    "name": "poly_interior",
+    "points": [
+      [
+        8,
+        8
+      ],
+      [
+        20,
+        8
+      ],
+      [
+        20,
+        20
+      ],
+      [
+        8,
+        20
+      ]
+    ]
+  },
+  "degenerate_point_name": "p_center"
+}

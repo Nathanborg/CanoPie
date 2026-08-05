@@ -13,3 +13,9 @@ brain/
 
 # Manual pre-refactor snapshots -- not used by the running app.
 backups/
+
+# QC fixture images -- regenerated on demand by canopie/qc/generate_fixtures.py,
+# not committed (ground_truth/ *is* committed -- see canopie/qc/).
+canopie/qc/fixture_images/
+.pytest_cache/
+canopie/qc/last_run_report.txt
