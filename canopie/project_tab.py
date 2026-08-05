@@ -1478,8 +1478,36 @@ class ImageStretchDialog(QtWidgets.QDialog):
             return a[::stride, ::stride]
 
         s = _sample_for_stats_local(stats_img)
-        self._real_min = float(np.nanmin(s)) if s is not None else 0.0
-        self._real_max = float(np.nanmax(s)) if s is not None else 1.0
+        
+        # Filter NoData values if available
+        if s is not None:
+            finite_mask = np.isfinite(s)
+            nodata_values = []
+            try:
+                ax_path = self.parent_tab._ax_path_for(self.image_filepath)
+                if os.path.exists(ax_path):
+                    with open(ax_path, 'r', encoding='utf-8') as f:
+                        ax = json.load(f) or {}
+                    if ax.get("nodata_enabled", True):
+                        nodata_values = list(ax.get("nodata_values", []) or [])
+            except Exception:
+                pass
+
+            for nd in nodata_values:
+                try:
+                    nd_val = float(nd)
+                    if not np.isnan(nd_val):
+                        finite_mask &= (s != nd_val)
+                except (ValueError, TypeError):
+                    pass
+            
+            if np.any(finite_mask):
+                self._real_min = float(np.nanmin(s[finite_mask]))
+                self._real_max = float(np.nanmax(s[finite_mask]))
+            else:
+                self._real_min, self._real_max = 0.0, 1.0
+        else:
+            self._real_min, self._real_max = 0.0, 1.0
 
         # ---------- UI Helpers ----------
         def _fixw(widget, w):
@@ -1874,15 +1902,53 @@ class ImageStretchDialog(QtWidgets.QDialog):
             return a[::stride, ::stride]
 
         s = _sample(arr)
+        
+        finite_mask = np.isfinite(s)
+        nodata_values = []
+        try:
+            ax_path = self.parent_tab._ax_path_for(self.image_filepath)
+            if os.path.exists(ax_path):
+                import json
+                with open(ax_path, 'r', encoding='utf-8') as f:
+                    ax = json.load(f) or {}
+                if ax.get("nodata_enabled", True):
+                    nodata_values = list(ax.get("nodata_values", []) or [])
+        except Exception:
+            pass
+
+        for nd in nodata_values:
+            try:
+                nd_val = float(nd)
+                if not np.isnan(nd_val):
+                    if s.ndim == 3:
+                        finite_mask &= (s != nd_val)
+                    else:
+                        finite_mask &= (s != nd_val)
+            except (ValueError, TypeError):
+                pass
+                
         if s.ndim == 3:
             C = s.shape[2]
-            flat = s.reshape(-1, C)
-            lo = [float(v) for v in np.nanmin(flat, axis=0)]
-            hi = [float(v) for v in np.nanmax(flat, axis=0)]
+            lo, hi = [], []
+            for c in range(C):
+                channel_data = s[..., c]
+                channel_mask = finite_mask[..., c]
+                if np.any(channel_mask):
+                    lo.append(float(np.nanmin(channel_data[channel_mask])))
+                    hi.append(float(np.nanmax(channel_data[channel_mask])))
+                else:
+                    lo.append(0.0)
+                    hi.append(1.0)
+            
             lo = (lo + [0.0] * 3)[:3]
             hi = (hi + [1.0] * 3)[:3]
             return lo, hi
-        v_lo = float(np.nanmin(s)); v_hi = float(np.nanmax(s))
+            
+        if np.any(finite_mask):
+            v_lo = float(np.nanmin(s[finite_mask]))
+            v_hi = float(np.nanmax(s[finite_mask]))
+        else:
+            v_lo, v_hi = 0.0, 1.0
         return [v_lo, v_lo, v_lo], [v_hi, v_hi, v_hi]
 
     def _recompute_and_seed_per_channel_boxes(self, seed_from_init=False):
@@ -3507,7 +3573,11 @@ class ProjectTab(QtWidgets.QWidget):
         `_render_with_viewer_stretch` avoids the >3-band / prefer_last_band heuristics that made the
         image flip to a single grayscale band and made the sliders appear not to update.
         """
-        scope = (getattr(params, "scope", "viewer") or "viewer").lower()
+        if params is None:
+            # Auto: restore the saved stretch for the viewer (file → root → project → default).
+            # Using a blank _StretchParams() would lose the band selection the user set.
+            params = None  # will be resolved per-viewer below using _resolve_stretch_for_viewer
+        scope = (getattr(params, "scope", "viewer") or "viewer") .lower() if params else "viewer"
 
         def _get_stretch_mask(v, base_img):
             """Build combined mask for stretch stats (nodata + mask polygons)."""
@@ -3589,26 +3659,37 @@ class ProjectTab(QtWidgets.QWidget):
 
             return mask
 
-        def _apply_to_viewer(v):
+        def _apply_to_viewer(v, effective_params=None):
             try:
                 base_img = getattr(getattr(v, "image_data", None), "image", None)
                 if base_img is None:
                     return
+                # When Auto is pressed (params=None), restore the saved stretch for this viewer
+                # so we don't lose band/display_mode settings.
+                if effective_params is None:
+                    fp = getattr(getattr(v, "image_data", None), "filepath", "")
+                    effective_params = (
+                        self._load_file_stretch(fp)
+                        or self._load_root_stretch(root_name)
+                        or self._load_project_stretch_default()
+                        or self._project_default_stretch
+                        or _StretchParams()
+                    )
                 # Get mask for stretch stats (nodata + mask polygons)
                 try:
                     mask = _get_stretch_mask(v, base_img)
                 except Exception:
                     mask = None  # a mask failure must never stop the stretch from applying
-                preview = self._compute_stretched_preview(base_img, params, mask)
+                preview = self._compute_stretched_preview(base_img, effective_params, mask)
                 if preview is None:
                     return
                 # remember params per-viewer for consistency
-                setattr(v, "stretch_params", params)
+                setattr(v, "stretch_params", effective_params)
                 # Tell the viewer the preview's TRUE channel order. `_pick_display_stack`
                 # does not reorder channels, so in "auto" mode a cv2-loaded (BGR) image
                 # comes back still BGR — rendering it as RGB888 swapped red and blue.
                 _src_order = getattr(getattr(v, "image_data", None), "channel_order", "bgr")
-                _out_order = _preview_out_order(params, _src_order)
+                _out_order = _preview_out_order(effective_params, _src_order)
                 v.show_preview_array(preview, channel_order=_out_order)  # swaps pixmap only; overlays intact
             except Exception as e:
                 # Do NOT swallow silently — a hidden exception here is exactly what makes the
@@ -3624,7 +3705,7 @@ class ProjectTab(QtWidgets.QWidget):
             for rec in (self.viewer_widgets or []):
                 v = rec.get("viewer")
                 if v is not None:
-                    _apply_to_viewer(v)
+                    _apply_to_viewer(v, effective_params=params)
             return
 
         if scope == "root" and root_name:
@@ -3635,12 +3716,12 @@ class ProjectTab(QtWidgets.QWidget):
                     continue
                 fp = getattr(v, "filepath", None) or getattr(getattr(v, "image_data", None), "filepath", None)
                 if fp and fp in target_files:
-                    _apply_to_viewer(v)
+                    _apply_to_viewer(v, effective_params=params)
             return
 
         # default: only this viewer
         if viewer is not None:
-            _apply_to_viewer(viewer)
+            _apply_to_viewer(viewer, effective_params=params)
   
     @staticmethod
     def _apply_hist_match(img, mods, *args, fast=True, max_samples=None, nodata_values=None,
@@ -10538,7 +10619,14 @@ class ProjectTab(QtWidgets.QWidget):
                 viewer._force_auto_stretch = True
                 if hasattr(viewer, "stretch_params"):
                     viewer.stretch_params = None
-                logging.info("edit_image_viewer: forced auto-stretch after apply")
+                viewer._stretch_data_min = None
+                viewer._stretch_data_max = None
+                # The per-band ranges the stretch bar caches describe the PRE-edit
+                # pixels; an edit can rescale them (band_expression, hist match),
+                # so drop them and let the bar recompute from the new array.
+                viewer._stretch_data_ranges = {}
+                viewer._stretch_data_ranges_fp = None
+                logging.info("edit_image_viewer: forced auto-stretch and cleared data min/max after apply")
             except Exception:
                 pass
 
@@ -13169,6 +13257,7 @@ class ProjectTab(QtWidgets.QWidget):
                                 "Centroid X": c_x,
                                 "Centroid Y": c_y,
                                 "Channel": fname,
+                                "Band Name": expr,
                                 "Pixel Count": pixel_count,
                                 "Lat": _root_lat,
                                 "Long": _root_lon,
@@ -13619,6 +13708,7 @@ class ProjectTab(QtWidgets.QWidget):
                                 "Centroid X": c_x,
                                 "Centroid Y": c_y,
                                 "Channel": fname,
+                                "Band Name": expr,
                                 "Pixel Count": pixel_count,
                                 "Lat": _root_lat,
                                 "Long": _root_lon,
@@ -13846,6 +13936,7 @@ class ProjectTab(QtWidgets.QWidget):
                                 "Centroid X": c_x,
                                 "Centroid Y": c_y,
                                 "Channel": fname,
+                                "Band Name": expr,
                                 "Pixel Count": pixel_count,
                                 "Lat": _root_lat,
                                 "Long": _root_lon,
@@ -21586,6 +21677,20 @@ class ProjectTab(QtWidgets.QWidget):
                                  band_names=band_names, preview_bands=preview_bands,
                                  reload_bands_cb=reload_cb, set_preview_cb=set_preview_cb)
 
+        # Share the dialog's computed data range with the viewer's _StretchBar so it uses
+        # the same absolute min/max (nodata-excluded, proper dtype) that the dialog shows.
+        try:
+            viewer._stretch_data_min = dlg._real_min
+            viewer._stretch_data_max = dlg._real_max
+            sb = getattr(viewer, "_stretchbar", None)
+            if sb is not None:
+                # seed_range files the dialog's range under the band context that
+                # is actually on screen. Writing it to a single viewer-wide pair
+                # instead used to make the bar show that range for EVERY band.
+                sb.seed_range(dlg._real_min, dlg._real_max)
+        except Exception:
+            pass
+
         # LIVE apply (does not close the dialog)
         dlg.applyRequested.connect(
             lambda params, v=viewer, rn=root_name: self._on_stretch_apply(params, v, rn)
@@ -21930,6 +22035,7 @@ class ProjectTab(QtWidgets.QWidget):
             edit_button.clicked.connect(partial(self.edit_image_viewer, viewer))
             stretch_button.clicked.connect(lambda _=False, v=viewer, rn=root_name: self.open_stretch_dialog(v, rn))
             viewer.band_selected.connect(lambda band_idx, v=viewer, rn=root_name: self._on_band_bar_clicked(v, rn, band_idx))
+            viewer.stretch_applied.connect(lambda params, v=viewer, rn=root_name: self._on_stretch_apply(params, v, rn))
 
             buttons_layout.addWidget(clean_button)
             buttons_layout.addWidget(edit_button)

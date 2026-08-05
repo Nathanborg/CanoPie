@@ -834,6 +834,8 @@ class ImageViewer(QtWidgets.QGraphicsView):
     editing_cancelled = QtCore.pyqtSignal()
     # Emits the 0-based FILE band index the user clicked in the band-selector bar.
     band_selected = QtCore.pyqtSignal(int)
+    # Emits stretch parameters when the user adjusts the stretch slider
+    stretch_applied = QtCore.pyqtSignal(object)
 
     def __init__(self, parent=None):
         super(ImageViewer, self).__init__(parent)
@@ -940,7 +942,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
         self._overlay_btn = None
         self._overlay_default_pos = QtCore.QPointF(14, 14)
         self._hover_hide_timer = QtCore.QTimer(self)
-        self._hover_hide_timer.setInterval(600)
+        self._hover_hide_timer.setInterval(3000)
         self._hover_hide_timer.setSingleShot(True)
         self._hover_hide_timer.timeout.connect(lambda: self._set_overlay_visible(False, immediate=True))
 
@@ -952,6 +954,10 @@ class ImageViewer(QtWidgets.QGraphicsView):
         # scheduled call so either overlay can be disabled independently) ---
         self._bandbar = None
         QtCore.QTimer.singleShot(0, self._attach_band_bar_deferred)
+
+        # --- Attach top stretch bar ---
+        self._stretchbar = None
+        QtCore.QTimer.singleShot(0, self._attach_stretch_bar_deferred)
 
 
 
@@ -970,6 +976,13 @@ class ImageViewer(QtWidgets.QGraphicsView):
             attach_band_bar(self)
         except Exception as e:
             logging.debug(f"[ImageViewer] Failed to attach band bar: {e}")
+
+    def _attach_stretch_bar_deferred(self):
+        """Attach the top stretch bar after the widget is fully initialized."""
+        try:
+            attach_stretch_bar(self)
+        except Exception as e:
+            logging.debug(f"[ImageViewer] Failed to attach stretch bar: {e}")
 
     # ------------------------------------------------------------------
     # image_data / drawing as properties (not plain attributes)
@@ -993,6 +1006,10 @@ class ImageViewer(QtWidgets.QGraphicsView):
             self._refresh_band_bar()
         except Exception as e:
             logging.debug(f"[ImageViewer] band bar refresh failed: {e}")
+        try:
+            self._refresh_stretch_bar()
+        except Exception as e:
+            logging.debug(f"[ImageViewer] stretch bar refresh failed: {e}")
 
     @property
     def drawing(self):
@@ -1010,6 +1027,41 @@ class ImageViewer(QtWidgets.QGraphicsView):
                     bb.hide_immediately()
                 except Exception:
                     pass
+            sb = getattr(self, "_stretchbar", None)
+            if sb is not None:
+                try:
+                    sb.hide_immediately()
+                except Exception:
+                    pass
+
+    def _refresh_stretch_bar(self):
+        """Re-seed the stretch bar's data range for whatever image is now loaded.
+
+        This method was CALLED from two places -- the `image_data` setter above
+        and `attach_stretch_bar()` -- but never actually defined. Both call
+        sites wrap the call in a bare try/except that logs at debug level, so
+        the resulting AttributeError was swallowed on every image load and the
+        bar's Min/Max readout sat at its "-" placeholder with the sliders
+        pinned at their construction defaults (0/1000 over a 0-255 assumed
+        range) until some unrelated path happened to call refresh_range().
+        That is why the min/max values never appeared.
+
+        Mirrors _refresh_band_bar: a pure read of data already on image_data,
+        with the same "no image -> hide" behaviour.
+        """
+        sb = getattr(self, "_stretchbar", None)
+        if sb is None:
+            return
+        idata = self._image_data
+        img = getattr(idata, "image", None) if idata is not None else None
+        if idata is None or img is None:
+            sb.hide_immediately()
+            return
+        try:
+            sb.refresh_range()
+            sb.reposition()
+        except Exception as e:
+            logging.debug(f"[ImageViewer] stretch bar range refresh failed: {e}")
 
     def _refresh_band_bar(self):
         """Repopulate the band-selector bar for whatever image is now loaded.
@@ -1169,6 +1221,14 @@ class ImageViewer(QtWidgets.QGraphicsView):
             self._image.setPixmap(pixmap)
             self.setSceneRect(QtCore.QRectF(pixmap.rect()))
             self.viewport().update()
+            
+            # Auto-refresh stretch bar so sliders match the newly applied stretch
+            sb = getattr(self, "_stretchbar", None)
+            if sb is not None:
+                try:
+                    sb.refresh_range()
+                except Exception:
+                    pass
         elif self._image is None:
             self.set_image(pixmap)
 
@@ -1454,8 +1514,14 @@ class ImageViewer(QtWidgets.QGraphicsView):
                         raise NameError(f"Use only {', '.join(mapping.keys())} in expression")
                 idx_res = eval(code, {"__builtins__": {}}, mapping)
                 if isinstance(idx_res, np.ndarray):
-                    idx_res = np.nan_to_num(idx_res.astype(np.float32, copy=False),
-                                            nan=0.0, posinf=0.0, neginf=0.0)
+                    # Keep NaN/Inf as-is instead of nan_to_num'ing them to 0.0.
+                    # An index computed over NoData inputs (a NaN-filled border,
+                    # or a 0/0 division inside e.g. NDVI) is not "0" -- reporting
+                    # it as a hard 0 was indistinguishable from a genuine zero
+                    # index. Non-finite now falls through to the NoData check
+                    # below and reads back as "NoData", matching what the viewer
+                    # renders for the same pixel.
+                    idx_res = idx_res.astype(np.float32, copy=False)
                     img_mod = np.dstack([img_mod, idx_res]) if img_mod.ndim == 3 else np.dstack([img_mod[..., None], idx_res])
                 else:
                     idx_plane = np.full((H, W), float(idx_res), dtype=np.float32)
@@ -1519,6 +1585,24 @@ class ImageViewer(QtWidgets.QGraphicsView):
         # semantics, since those are an intentional "exclude this pixel" rule.
         is_nodata = False           # whole-pixel, from an expression only
         channel_is_nodata = [False] * len(vals)
+
+        # Non-finite (NaN / +-Inf) is intrinsically NoData -- it is not a
+        # sentinel that has to be declared anywhere. Every other subsystem
+        # already treats it that way unconditionally: utils.build_nodata_mask
+        # ORs `~np.isfinite` in as its final pass, _per_band_nodata_masks seeds
+        # its mask with `~np.isfinite`, and the polygon statistics go through
+        # nanmean/nanmedian. The Inspector was the one place that gated it,
+        # running the check only inside `if numeric_vals:` -- itself nested
+        # inside `if nodata_values:`. So on a raster with no .ax sidecar, or one
+        # whose .ax declares only expressions, a NaN pixel read back as an
+        # ordinary value: the viewer showed a masked hole while clicking it
+        # reported a number. Float rasters that mark their fill as NaN rather
+        # than -9999 (the science bands of a prediction stack, typically) hit
+        # this on every single click.
+        for _i, _v in enumerate(vals):
+            if not math.isfinite(_v):
+                channel_is_nodata[_i] = True
+
         if nodata_values:
             try:
                 import re
@@ -1756,6 +1840,15 @@ class ImageViewer(QtWidgets.QGraphicsView):
         # Ensure overlay is ready (recreates if needed) and hidden
         self._ensure_overlay()
         self._set_overlay_visible(False, immediate=True)
+
+        # Refresh the stretch bar range so its data bounds and slider labels instantly
+        # reflect the new image data (e.g. after Image Editor changes the raw array).
+        sb = getattr(self, "_stretchbar", None)
+        if sb is not None:
+            try:
+                sb.refresh_range()
+            except Exception as e:
+                logging.debug(f"[ImageViewer] stretch bar auto-refresh failed: {e}")
     
     def _apply_fixed_zoom(self):
         """Apply the fixed zoom level and scroll position from _ZoomBar."""
@@ -5067,42 +5160,41 @@ class _ZoomBar(QtWidgets.QFrame):
         super().leaveEvent(event)
 
     def eventFilter(self, obj, event):
-        """Keep this bar docked correctly whenever the viewport itself
-        resizes (e.g. scrollbars appearing/disappearing at a given zoom
-        level), which does not necessarily fire the outer view's own
-        resizeEvent."""
         if event.type() == QtCore.QEvent.Resize:
             try:
                 self.reposition()
             except Exception:
                 pass
-        return super().eventFilter(obj, event)
+        return False
 
     # ---------- placement ----------
     def reposition(self):
-        vp = self._view.viewport()
-        if not vp:
+        if getattr(self, "_repositioning", False):
             return
-        m = 8
-        self.adjustSize()
-        s = self.sizeHint()
-        x = max(m, vp.width() - s.width() - m)
-        y = max(m, vp.height() - s.height() - m)
+        self._repositioning = True
+        try:
+            vp = self._view.viewport()
+            if not vp:
+                return
+            m = 8
+            s = self.sizeHint()
+            x = max(m, vp.width() - s.width() - m)
+            y = max(m, vp.height() - s.height() - m)
 
-        # The band-selector bar always docks to the very bottom edge of the
-        # viewport. Keep this bar in the row directly above it so the zoom
-        # bar is always above and the band bar always below, never
-        # overlapping, regardless of which one happened to move/resize last.
-        bb = getattr(self._view, "_bandbar", None)
-        if bb is not None:
-            try:
-                if bb._buttons_by_band:
-                    bb_h = bb.sizeHint().height()
-                    y = max(m, vp.height() - bb_h - m - s.height() - 4)
-            except Exception:
-                pass
+            bb = getattr(self._view, "_bandbar", None)
+            if bb is not None:
+                try:
+                    if getattr(bb, "_buttons_by_band", None):
+                        bb_h = bb.sizeHint().height()
+                        y = max(m, vp.height() - bb_h - m - s.height() - 4)
+                except Exception:
+                    pass
 
-        self.setGeometry(x, y, s.width(), s.height())
+            new_geom = QtCore.QRect(x, y, s.width(), s.height())
+            if self.geometry() != new_geom:
+                self.setGeometry(new_geom)
+        finally:
+            self._repositioning = False
 
     # ---------- zoom mapping ----------
     @staticmethod
@@ -5304,40 +5396,44 @@ class _BandBar(QtWidgets.QFrame):
     def populate(self, band_names, count, active_band=None,
                  composite_label="Auto", composite_active=False):
         """Rebuild the numbered-band buttons for `count` bands (0-based indices)."""
-        self._composite_btn.setText(composite_label)
-        self._composite_btn.setChecked(bool(composite_active))
+        self.setUpdatesEnabled(False)
+        try:
+            self._composite_btn.setText(composite_label)
+            self._composite_btn.setChecked(bool(composite_active))
 
-        # Clear existing numbered buttons only -- composite/separator/spacing persist.
-        for btn in list(self._buttons_by_band.values()):
-            self._group.removeButton(btn)
-            btn.setParent(None)
-            btn.deleteLater()
-        self._buttons_by_band = {}
-        while self._row.count() > self._LEADING_ITEMS + 1:   # +1 keeps the trailing stretch
-            item = self._row.takeAt(self._LEADING_ITEMS)
-            w = item.widget()
-            if w is not None:
-                w.setParent(None)
+            # Clear existing numbered buttons only -- composite/separator/spacing persist.
+            for btn in list(self._buttons_by_band.values()):
+                self._group.removeButton(btn)
+                btn.setParent(None)
+                btn.deleteLater()
+            self._buttons_by_band = {}
+            while self._row.count() > self._LEADING_ITEMS + 1:   # +1 keeps the trailing stretch
+                item = self._row.takeAt(self._LEADING_ITEMS)
+                w = item.widget()
+                if w is not None:
+                    w.setParent(None)
 
-        count = max(0, int(count or 0))
-        for i in range(count):
-            nm = band_names[i] if (band_names and i < len(band_names) and band_names[i]) else None
-            btn = QtWidgets.QToolButton(self._inner)
-            btn.setText(str(i + 1))
-            btn.setToolTip(nm if nm else f"Band {i + 1}")
-            btn.setCheckable(True)
-            btn.setFixedSize(42, 34)
-            btn.clicked.connect(lambda checked, band_idx=i: self._on_button_clicked(band_idx))
-            self._row.insertWidget(self._row.count() - 1, btn)
-            self._group.addButton(btn)
-            self._buttons_by_band[i] = btn
+            count = max(0, int(count or 0))
+            for i in range(count):
+                nm = band_names[i] if (band_names and i < len(band_names) and band_names[i]) else None
+                btn = QtWidgets.QToolButton(self._inner)
+                btn.setText(str(i + 1))
+                btn.setToolTip(nm if nm else f"Band {i + 1}")
+                btn.setCheckable(True)
+                btn.setFixedSize(42, 34)
+                btn.clicked.connect(lambda checked, band_idx=i: self._on_button_clicked(band_idx))
+                self._row.insertWidget(self._row.count() - 1, btn)
+                self._group.addButton(btn)
+                self._buttons_by_band[i] = btn
 
-        if active_band is not None:
-            btn = self._buttons_by_band.get(int(active_band))
-            if btn is not None:
-                btn.setChecked(True)
+            if active_band is not None:
+                btn = self._buttons_by_band.get(int(active_band))
+                if btn is not None:
+                    btn.setChecked(True)
 
-        self.adjustSize()
+            self.adjustSize()
+        finally:
+            self.setUpdatesEnabled(True)
 
     def _on_button_clicked(self, band_idx):
         """band_idx == -1 is the sentinel for the leading composite button."""
@@ -5390,37 +5486,33 @@ class _BandBar(QtWidgets.QFrame):
         super().leaveEvent(event)
 
     def eventFilter(self, obj, event):
-        """Keep this bar docked correctly whenever the viewport itself
-        resizes (e.g. scrollbars appearing/disappearing at a given zoom
-        level), which does not necessarily fire the outer view's own
-        resizeEvent."""
         if event.type() == QtCore.QEvent.Resize:
             try:
                 self.reposition()
             except Exception:
                 pass
-        return super().eventFilter(obj, event)
+        return False
 
     # ---------- placement ----------
     def reposition(self):
-        """Always dock to the very bottom edge of the viewport, below the zoom
-        bar's row. The zoom bar's own reposition() is what makes room for this
-        by sitting directly above whatever height this bar currently needs --
-        see _ZoomBar.reposition()."""
-        vp = self._view.viewport()
-        if not vp:
+        if getattr(self, "_repositioning", False):
             return
-        m = 8
-        self.adjustSize()
-        s = self.sizeHint()
-        # Always span a long strip (at least ~480px, or the content's own
-        # width if that's wider) rather than shrink-wrapping to however many
-        # buttons happen to fit -- clamped so it never exceeds the viewport.
-        target_w = max(s.width(), min(480, vp.width() - 2 * m))
-        bar_w = max(40, min(target_w, vp.width() - 2 * m))
-        x = max(m, (vp.width() - bar_w) // 2)
-        y = max(m, vp.height() - s.height() - m)
-        self.setGeometry(x, y, bar_w, s.height())
+        self._repositioning = True
+        try:
+            vp = self._view.viewport()
+            if not vp:
+                return
+            m = 8
+            s = self.sizeHint()
+            target_w = max(s.width(), min(480, vp.width() - 2 * m))
+            bar_w = max(40, min(target_w, vp.width() - 2 * m))
+            x = max(m, (vp.width() - bar_w) // 2)
+            y = max(m, vp.height() - s.height() - m)
+            new_geom = QtCore.QRect(x, y, bar_w, s.height())
+            if self.geometry() != new_geom:
+                self.setGeometry(new_geom)
+        finally:
+            self._repositioning = False
 
 
 # ---- installation helper (non-invasive): attach to an existing ImageViewer ----
@@ -5483,6 +5575,11 @@ def attach_zoom_bar(viewer):
         try:
             if getattr(viewer, "_bandbar", None):
                 viewer._bandbar.show_briefly()
+        except Exception:
+            pass
+        try:
+            if getattr(viewer, "_stretchbar", None):
+                viewer._stretchbar.show_briefly()
         except Exception:
             pass
     viewer.wheelEvent = _wheel
@@ -5560,3 +5657,527 @@ def attach_band_bar(viewer):
         pass
 
     return bb
+
+
+def _make_stretch_params(**kwargs):
+    """Helper to instantiate _StretchParams from project_tab or fallback container."""
+    try:
+        from .project_tab import _StretchParams
+        return _StretchParams(**kwargs)
+    except Exception:
+        class _Params:
+            def __init__(self, **kw):
+                self.mode = kw.get("mode", "percentile")
+                self.low_p = float(kw.get("low_p", 0.5))
+                self.high_p = float(kw.get("high_p", 99.5))
+                self.k_sigma = float(kw.get("k_sigma", 1.0))
+                self.min_val = kw.get("min_val", None)
+                self.max_val = kw.get("max_val", None)
+                self.per_channel = bool(kw.get("per_channel", True))
+                self.clip = bool(kw.get("clip", True))
+                self.scope = kw.get("scope", "viewer")
+                self.display_band = kw.get("display_band", None)
+                self.display_mode = kw.get("display_mode", "auto")
+                self.r_band = kw.get("r_band", None)
+                self.g_band = kw.get("g_band", None)
+                self.b_band = kw.get("b_band", None)
+        return _Params(**kwargs)
+
+
+# --- StretchBar overlay for ImageViewer ----------------------------------------
+class _StretchBar(QtWidgets.QFrame):
+    """
+    Lightweight overlay widget: docked to the top edge of the ImageViewer viewport.
+    Allows the user to adjust contrast stretch using the absolute data range of
+    the image via Min/Max sliders.
+    Auto-hides when not interacting, matching _BandBar and _ZoomBar.
+    """
+
+    def __init__(self, parent_view):
+        super().__init__(parent_view.viewport())
+        self.setObjectName("_StretchBar")
+        self._view = parent_view
+        self._data_min = 0.0
+        self._data_max = 255.0
+        self._block_signals = False
+
+        self.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        self.setFrameShadow(QtWidgets.QFrame.Raised)
+        self.setStyleSheet("""
+            QFrame#_StretchBar {
+                background: rgba(245, 245, 245, 220);
+                border: 1px solid rgba(180, 180, 180, 200);
+                border-radius: 6px;
+            }
+            QLabel {
+                color: black;
+                font-size: 11px;
+                font-weight: bold;
+            }
+            QToolButton {
+                color: black;
+                background: transparent;
+                border: 1px solid rgba(120, 120, 120, 160);
+                border-radius: 3px;
+                padding: 1px 5px;
+                font-size: 11px;
+                font-weight: bold;
+            }
+            QToolButton:hover {
+                background: rgba(0, 0, 0, 30);
+            }
+            QToolButton:pressed {
+                background: rgba(0, 0, 0, 50);
+            }
+            QSlider::groove:horizontal {
+                height: 4px;
+                background: rgba(180, 180, 180, 200);
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                background: #4682B4;
+                border: 1px solid #2B547E;
+                width: 12px;
+                height: 12px;
+                margin: -4px 0;
+                border-radius: 6px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #1E90FF;
+            }
+        """)
+
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(8, 3, 8, 3)
+        layout.setSpacing(6)
+
+        title = QtWidgets.QLabel("Stretch:", self)
+        layout.addWidget(title)
+
+        lbl_min = QtWidgets.QLabel("Min", self)
+        layout.addWidget(lbl_min)
+        self._slider_min = QtWidgets.QSlider(QtCore.Qt.Horizontal, self)
+        self._slider_min.setRange(0, 1000)
+        self._slider_min.setValue(0)
+        self._slider_min.setFixedWidth(75)
+        layout.addWidget(self._slider_min)
+
+        lbl_max = QtWidgets.QLabel("Max", self)
+        layout.addWidget(lbl_max)
+        self._slider_max = QtWidgets.QSlider(QtCore.Qt.Horizontal, self)
+        self._slider_max.setRange(0, 1000)
+        self._slider_max.setValue(1000)
+        self._slider_max.setFixedWidth(75)
+        layout.addWidget(self._slider_max)
+
+        self._lbl_vals = QtWidgets.QLabel("–", self)
+        self._lbl_vals.setMinimumWidth(110)
+        self._lbl_vals.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(self._lbl_vals)
+
+        self._btn_auto = QtWidgets.QToolButton(self)
+        self._btn_auto.setText("Auto")
+        self._btn_auto.setToolTip("Reset to default auto percentile stretch")
+        self._btn_auto.clicked.connect(self._on_auto_clicked)
+        layout.addWidget(self._btn_auto)
+
+        self._slider_min.valueChanged.connect(self._on_slider_changed)
+        self._slider_max.valueChanged.connect(self._on_slider_changed)
+        self._slider_min.sliderReleased.connect(self._apply_stretch)
+        self._slider_max.sliderReleased.connect(self._apply_stretch)
+
+        self._hide_timer = QtCore.QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.setInterval(1500)
+        self._hide_timer.timeout.connect(self._do_hide)
+
+        self.hide()
+        self.reposition()
+        parent_view.viewport().installEventFilter(self)
+
+    def _current_band_key(self):
+        """Identity of the band context the bar is currently showing.
+
+        ("single", <FILE band index>) while one band is displayed, else
+        ("composite",). The FILE band index is used rather than the channel
+        position inside the resident array because a preview-loaded cube swaps
+        its single resident channel out on every band switch (see
+        ProjectTab._on_band_bar_clicked -> set_viewer_preview_image), so
+        position 0 means a different band each time and caching on position
+        would collide across bands.
+        """
+        view = self._view
+        sp = getattr(view, "stretch_params", None)
+        pos = None
+        if (sp is not None
+                and str(getattr(sp, "display_mode", "")).lower() == "single"
+                and getattr(sp, "display_band", None) is not None):
+            try:
+                pos = int(sp.display_band)
+            except (TypeError, ValueError):
+                pos = None
+        if pos is None:
+            return ("composite",)
+
+        idata = getattr(view, "image_data", None)
+        preview_bands = getattr(idata, "preview_bands", None) if idata is not None else None
+        if preview_bands:
+            try:
+                if 0 <= pos < len(preview_bands):
+                    return ("single", int(preview_bands[pos]))
+            except (TypeError, ValueError):
+                pass
+        return ("single", pos)
+
+    def _nodata_values(self):
+        """NoData literals for the current file: in-memory ax_config, else .ax."""
+        idata = getattr(self._view, "image_data", None)
+        try:
+            ax_cfg = getattr(idata, "ax_config", None) or {}
+            if ax_cfg.get("nodata_enabled", True):
+                vals = list(ax_cfg.get("nodata_values", []) or [])
+                if vals:
+                    return vals
+        except Exception:
+            pass
+        try:
+            fp = getattr(idata, "filepath", None)
+            if fp:
+                ax_path = os.path.splitext(fp)[0] + ".ax"
+                if os.path.exists(ax_path):
+                    with open(ax_path, "r", encoding="utf-8") as f:
+                        ax_cfg = json.load(f) or {}
+                    if ax_cfg.get("nodata_enabled", True):
+                        return list(ax_cfg.get("nodata_values", []) or [])
+        except Exception:
+            pass
+        return []
+
+    def _stats_slice_for_key(self, img, key):
+        """The pixels whose min/max the bar should report for band context `key`."""
+        if key[0] == "single" and getattr(img, "ndim", 0) == 3:
+            # The resident array is what is on screen, so the channel POSITION
+            # indexes it -- not the file band index carried in the cache key.
+            sp = getattr(self._view, "stretch_params", None)
+            try:
+                pos = int(getattr(sp, "display_band", 0) or 0)
+            except (TypeError, ValueError):
+                pos = 0
+            if 0 <= pos < img.shape[2]:
+                return img[:, :, pos]
+        try:
+            from .project_tab import _preview_take3
+            return _preview_take3(img, prefer_last_band=False)
+        except Exception:
+            return img
+
+    def _compute_data_range(self, arr):
+        """Min/max over `arr`, sampled and NoData-filtered exactly the way
+        ImageStretchDialog computes the range it displays -- same k=400 stride
+        sampler, same .ax NoData exclusion -- so the bar's bounds always agree
+        with the Stretch Viewer's. Returns None when nothing is usable."""
+        a = np.asarray(arr, dtype=np.float64)
+        if a.ndim >= 2:
+            H, W = a.shape[:2]
+            stride = max(1, int(np.sqrt((H * W) / 400.0)))
+            s = a[::stride, ::stride, ...] if a.ndim == 3 else a[::stride, ::stride]
+        else:
+            s = a
+        if s.size == 0:
+            return None
+
+        finite_mask = np.isfinite(s)
+        for nd in self._nodata_values():
+            try:
+                nd_val = float(nd)
+            except (ValueError, TypeError):
+                continue        # an expression rule, not a value to drop here
+            if not np.isnan(nd_val):
+                finite_mask &= (s != nd_val)
+
+        if np.any(finite_mask):
+            return float(np.nanmin(s[finite_mask])), float(np.nanmax(s[finite_mask]))
+        if np.any(np.isfinite(s)):
+            return float(np.nanmin(s)), float(np.nanmax(s))
+        return None
+
+    def _range_cache(self):
+        """Per-band range cache for the file currently loaded in the viewer.
+
+        Reset whenever the viewer moves to a different file -- viewers are
+        reused as the user pages through roots, so a cache keyed only by band
+        would hand the next file the previous file's bounds."""
+        view = self._view
+        idata = getattr(view, "image_data", None)
+        fp = getattr(idata, "filepath", None) if idata is not None else None
+        cache = getattr(view, "_stretch_data_ranges", None)
+        if not isinstance(cache, dict) or getattr(view, "_stretch_data_ranges_fp", None) != fp:
+            cache = {}
+            view._stretch_data_ranges = cache
+            view._stretch_data_ranges_fp = fp
+        return cache
+
+    def seed_range(self, vmin, vmax):
+        """Adopt a data range computed elsewhere (the Stretch Viewer dialog's
+        _real_min/_real_max) for the band context currently on screen, so the
+        bar and the dialog never disagree about the bounds they are showing."""
+        try:
+            vmin, vmax = float(vmin), float(vmax)
+        except (TypeError, ValueError):
+            return
+        if not (np.isfinite(vmin) and np.isfinite(vmax)):
+            return
+        self._range_cache()[self._current_band_key()] = (vmin, vmax)
+        self.refresh_range()
+
+    def refresh_range(self):
+        """Set the slider bounds to the data range of the band CURRENTLY on screen.
+
+        The bounds used to come from one pair of `_stretch_data_min` /
+        `_stretch_data_max` attributes cached on the viewer, computed once over
+        `_preview_take3` (the first three channels) and then reused
+        unconditionally for the rest of the session. Switching bands with the
+        band-selector bar therefore left the Min/Max readout on the previous
+        band's range -- and on a cube whose band 1 is reflectance (0-1) while
+        band 11 is a sensor azimuth angle (0-360), the sliders were mapping
+        over an interval that had nothing to do with the pixels on screen.
+        The range is now derived from, and cached per, the displayed band.
+        """
+        idata = getattr(self._view, "image_data", None)
+        img = getattr(idata, "image", None) if idata is not None else None
+        if img is None or not isinstance(img, np.ndarray) or img.size == 0:
+            return
+
+        key = self._current_band_key()
+        cache = self._range_cache()
+        rng = cache.get(key)
+        if rng is None:
+            try:
+                rng = self._compute_data_range(self._stats_slice_for_key(img, key))
+            except Exception as e:
+                logging.debug(f"[_StretchBar] data range computation failed: {e}")
+                rng = None
+            if rng is None:
+                rng = (0.0, 255.0)
+            cache[key] = rng
+
+        self._data_min, self._data_max = float(rng[0]), float(rng[1])
+        if self._data_max <= self._data_min:
+            self._data_max = self._data_min + 1.0
+
+        # --- position sliders to match current stretch_params ---
+        sp = getattr(self._view, "stretch_params", None)
+        b_min = self._slider_min.blockSignals(True)
+        b_max = self._slider_max.blockSignals(True)
+        try:
+            if sp is not None and getattr(sp, "mode", "") == "absolute":
+                # Use current absolute bounds (prefer band_mins/band_maxs for per-ch)
+                bm = getattr(sp, "band_mins", None)
+                bx = getattr(sp, "band_maxs", None)
+                if bm and bx:
+                    c_min = float(min(bm))
+                    c_max = float(max(bx))
+                elif sp.min_val is not None and sp.max_val is not None:
+                    c_min = float(sp.min_val)
+                    c_max = float(sp.max_val)
+                else:
+                    c_min, c_max = self._data_min, self._data_max
+            else:
+                # Non-absolute stretch (auto/percentile): sliders show full data range
+                c_min, c_max = self._data_min, self._data_max
+
+            range_len = max(1e-6, self._data_max - self._data_min)
+            pos_min = int(round(max(0.0, min(1.0, (c_min - self._data_min) / range_len)) * 1000))
+            pos_max = int(round(max(0.0, min(1.0, (c_max - self._data_min) / range_len)) * 1000))
+            self._slider_min.setValue(pos_min)
+            self._slider_max.setValue(pos_max)
+            self._lbl_vals.setText(f"{c_min:.6g} – {c_max:.6g}")
+        finally:
+            self._slider_min.blockSignals(b_min)
+            self._slider_max.blockSignals(b_max)
+
+    def _pos_to_val(self, pos):
+        frac = pos / 1000.0
+        return self._data_min + frac * (self._data_max - self._data_min)
+
+    def _on_slider_changed(self):
+        pmin = self._slider_min.value()
+        pmax = self._slider_max.value()
+        if pmin > pmax:
+            b_min = self._slider_min.blockSignals(True)
+            b_max = self._slider_max.blockSignals(True)
+            try:
+                if self.sender() == self._slider_min:
+                    self._slider_max.setValue(pmin)
+                    pmax = pmin
+                else:
+                    self._slider_min.setValue(pmax)
+                    pmin = pmax
+            finally:
+                self._slider_min.blockSignals(b_min)
+                self._slider_max.blockSignals(b_max)
+
+        c_min = self._pos_to_val(pmin)
+        c_max = self._pos_to_val(pmax)
+        # Use :.6g so the label adapts to any data type:
+        # uint8 [0,255] → "0 – 255", float [0,1] → "0.001 – 0.999",
+        # uint16 [0,65535] → "0 – 65535", radiance [50.3,3000.5] → "50.3 – 3000.5"
+        self._lbl_vals.setText(f"{c_min:.6g} – {c_max:.6g}")
+        self.show_briefly()
+
+    def _apply_stretch(self):
+        """Apply absolute stretch — preserves all display_mode/band settings from the
+        current stretch_params so the bar never changes which band/composite is shown."""
+        pmin = self._slider_min.value()
+        pmax = self._slider_max.value()
+        c_min = self._pos_to_val(pmin)
+        c_max = self._pos_to_val(pmax)
+
+        old_sp = getattr(self._view, "stretch_params", None)
+        # Carry over every display setting — only override the stretch bounds.
+        disp_mode = getattr(old_sp, "display_mode", "auto") if old_sp else "auto"
+        disp_band = getattr(old_sp, "display_band", None) if old_sp else None
+        r_band = getattr(old_sp, "r_band", None) if old_sp else None
+        g_band = getattr(old_sp, "g_band", None) if old_sp else None
+        b_band = getattr(old_sp, "b_band", None) if old_sp else None
+        per_channel = bool(getattr(old_sp, "per_channel", True)) if old_sp else True
+        clip = bool(getattr(old_sp, "clip", True)) if old_sp else True
+
+        # Scale any existing band_mins/band_maxs proportionally so per-channel
+        # rendering still honours the individual-band ranges.
+        band_mins = None
+        band_maxs = None
+        old_bm = getattr(old_sp, "band_mins", None) if old_sp else None
+        old_bx = getattr(old_sp, "band_maxs", None) if old_sp else None
+        if old_bm and old_bx and len(old_bm) == len(old_bx):
+            old_lo = min(old_bm)
+            old_hi = max(old_bx)
+            old_range = max(1e-9, old_hi - old_lo)
+            new_range = max(1e-9, c_max - c_min)
+            scale = new_range / old_range
+            band_mins = [c_min + (v - old_lo) * scale for v in old_bm]
+            band_maxs = [c_min + (v - old_lo) * scale for v in old_bx]
+
+        params = _make_stretch_params(
+            mode="absolute",
+            min_val=c_min,
+            max_val=c_max,
+            per_channel=per_channel,
+            clip=clip,
+            scope="viewer",
+            display_mode=disp_mode,
+            display_band=disp_band,
+            r_band=r_band,
+            g_band=g_band,
+            b_band=b_band,
+        )
+        if band_mins is not None:
+            params.band_mins = band_mins
+            params.band_maxs = band_maxs
+
+        self._view.stretch_params = params
+        try:
+            self._view.stretch_applied.emit(params)
+        except Exception as e:
+            logging.debug(f"[_StretchBar] stretch_applied emit failed: {e}")
+
+    def _on_auto_clicked(self):
+        """Restore the saved stretch (file → root → project) without wiping band selection.
+        Emits None so the ProjectTab re-runs its normal stretch lookup chain."""
+        # Clear only the in-memory override; ProjectTab._on_stretch_apply(None) will
+        # fall back through file/root/project saved stretch, preserving band selection.
+        self._view.stretch_params = None
+        self.refresh_range()
+        try:
+            self._view.stretch_applied.emit(None)
+        except Exception as e:
+            logging.debug(f"[_StretchBar] stretch_applied auto emit failed: {e}")
+        self.show_briefly()
+
+    def _do_hide(self):
+        self.hide()
+
+    def _start_hide_timer(self):
+        self._hide_timer.start()
+
+    def show_briefly(self):
+        idata = getattr(self._view, "image_data", None)
+        if idata is None or getattr(idata, "image", None) is None:
+            return
+        self.reposition()
+        self.show()
+        self._start_hide_timer()
+
+    def hide_immediately(self):
+        self._hide_timer.stop()
+        self.hide()
+
+    def enterEvent(self, event):
+        self._hide_timer.stop()
+        self.setCursor(QtCore.Qt.ArrowCursor)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._start_hide_timer()
+        self.unsetCursor()
+        super().leaveEvent(event)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QtCore.QEvent.Resize:
+            try:
+                self.reposition()
+            except Exception:
+                pass
+        return False
+
+    def reposition(self):
+        if getattr(self, "_repositioning", False):
+            return
+        self._repositioning = True
+        try:
+            vp = self._view.viewport()
+            if not vp:
+                return
+            m = 8
+            s = self.sizeHint()
+            target_w = max(s.width(), min(480, vp.width() - 2 * m))
+            bar_w = max(40, min(target_w, vp.width() - 2 * m))
+            x = max(m, (vp.width() - bar_w) // 2)
+            y = m
+            new_geom = QtCore.QRect(x, y, bar_w, s.height())
+            if self.geometry() != new_geom:
+                self.setGeometry(new_geom)
+        finally:
+            self._repositioning = False
+
+
+def attach_stretch_bar(viewer):
+    """
+    Installs a _StretchBar on top of `viewer`. Docked to the top edge of the viewport.
+    """
+    if getattr(viewer, "_stretchbar", None) is not None:
+        return viewer._stretchbar
+
+    sb = _StretchBar(viewer)
+    viewer._stretchbar = sb
+
+    old_resize = viewer.resizeEvent
+    def _resized(ev):
+        try:
+            sb.reposition()
+        except Exception:
+            pass
+        if callable(old_resize):
+            old_resize(ev)
+    viewer.resizeEvent = _resized
+
+    sb.reposition()
+    sb.hide()
+
+    try:
+        viewer._refresh_stretch_bar()
+    except Exception:
+        pass
+
+    return sb
+
