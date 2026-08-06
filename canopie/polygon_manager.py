@@ -2279,7 +2279,7 @@ class PolygonManager(QtWidgets.QDialog):
             stats_lookup = None
 
         try:
-            from .shapefile_io import json_polygons_to_features, write_shapefile
+            from .shapefile_io import json_polygons_to_features, write_feature_collection
 
             project_folder = getattr(parent, 'project_folder', '') or ''
             features, crs_wkt, warnings = json_polygons_to_features(
@@ -2299,30 +2299,19 @@ class PolygonManager(QtWidgets.QDialog):
                 QtWidgets.QMessageBox.warning(self, "Shapefile Export", warn_msg)
                 return
 
-            # ESRI shapefiles are geometrically homogeneous; split Point vs Polygon
-            # into separate files rather than corrupting one .shp with a mixed type.
+            # Splitting is delegated to write_feature_collection, which handles
+            # BOTH ways a .shp is homogeneous: one geometry type per file AND one
+            # CRS per file. This used to split only Point/Polygon and write every
+            # CRS into a single file with one .prj, which mislocated every feature
+            # outside the first CRS (and wrote raw pixel coordinates into a
+            # projected file). Shared with CSV export's shapefile step so the two
+            # cannot drift apart.
             point_feats = [f for f in features if f['properties'].get('type') == 'point']
             poly_feats = [f for f in features if f['properties'].get('type') != 'point']
 
             base_stem = os.path.splitext(save_path)[0]
-            written_paths = []
-
-            if point_feats and poly_feats:
-                pts_stem = f"{base_stem}_points"
-                poly_stem = f"{base_stem}_polygons"
-                write_shapefile(point_feats, pts_stem, crs_wkt=crs_wkt, shape_type=1,
-                               legend_path=f"{pts_stem}_fields.csv")
-                write_shapefile(poly_feats, poly_stem, crs_wkt=crs_wkt, shape_type=5,
-                               legend_path=f"{poly_stem}_fields.csv")
-                written_paths = [f"{pts_stem}.shp", f"{poly_stem}.shp"]
-            elif point_feats:
-                write_shapefile(point_feats, base_stem, crs_wkt=crs_wkt, shape_type=1,
-                               legend_path=f"{base_stem}_fields.csv")
-                written_paths = [f"{base_stem}.shp"]
-            else:
-                write_shapefile(poly_feats, base_stem, crs_wkt=crs_wkt, shape_type=5,
-                               legend_path=f"{base_stem}_fields.csv")
-                written_paths = [f"{base_stem}.shp"]
+            written_paths, crs_notes = write_feature_collection(features, base_stem)
+            warnings = list(warnings or []) + list(crs_notes or [])
 
             # Summary
             methods = {}

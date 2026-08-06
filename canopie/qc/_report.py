@@ -74,6 +74,12 @@ FEATURE_MAP = {
     "test_inspect_nodata_nan": (
         "Pixel Inspector / non-finite pixels",
         "NaN and Inf read as NoData without an .ax, per channel, incl. band-expression index"),
+    "test_shapefile_crs": (
+        "Shapefile CRS handling",
+        "per-feature CRS, mixed-CRS split into separate files, pixel coords get no .prj"),
+    "test_shapefile_batch_export": (
+        "Shapefile export during batched/background CSV runs",
+        "ExportWorker writes the shapefile, processed-subset scoping, CSV-ordered DBF fields"),
 }
 
 

@@ -460,7 +460,40 @@ class ExportWorker(QtCore.QThread):
                         except Exception:
                             continue
 
-            self.finished.emit(self.output_path, True, f"Exported {len(all_keys)} columns ({errors} errors)")
+            # ---- Shapefile (optional) ------------------------------------
+            # The foreground path does this at the end of save_polygons_to_csv,
+            # which a background export never reaches (it returns early to hand
+            # off to this worker). Without this, ticking "Also export as
+            # Shapefile" and "run in background" produced only a CSV, silently.
+            shp_note = ""
+            if self.opts.get("export_shapefile", False):
+                try:
+                    rows_for_shp = []
+                    with open(tmp_rows_path, "r", encoding="utf-8", errors="replace") as rf:
+                        for line in rf:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                row = json.loads(line)
+                            except Exception:
+                                continue
+                            if isinstance(row, dict):
+                                rows_for_shp.append(row)
+                    # export_shapefile_bundle is deliberately dialog-free so it is
+                    # safe to call from this QThread; the message rides back on
+                    # `finished` for the Export Manager to display.
+                    msg, ok = self.project_tab.export_shapefile_bundle(
+                        self.output_path, self.polygons_to_process, rows_for_shp,
+                        fieldnames_raw=all_keys)
+                    shp_note = ("; shapefile: OK" if ok else "; shapefile FAILED")
+                    logging.info("[ExportWorker] %s", msg)
+                except Exception as e:
+                    shp_note = f"; shapefile FAILED: {e}"
+                    logging.error("[ExportWorker] Shapefile export failed: %s", e, exc_info=True)
+
+            self.finished.emit(self.output_path, True,
+                               f"Exported {len(all_keys)} columns ({errors} errors){shp_note}")
 
         except Exception as e:
             self.finished.emit(self.output_path, False, str(e))
@@ -14058,6 +14091,165 @@ class ProjectTab(QtWidgets.QWidget):
             
         return (processing_mode, n_workers, run_background)
 
+    def export_shapefile_bundle(self, save_path, polygons_to_process, data_rows,
+                                fieldnames_raw=None):
+        """Write the shapefile(s) accompanying a CSV export.
+
+        Thread-safe and dialog-free: it returns ``(message, ok)`` instead of
+        popping a QMessageBox, because the background ExportWorker calls this
+        from a QThread and Qt widgets may only be touched on the GUI thread.
+        The foreground caller shows the message; the Export Manager logs it.
+
+        Extracted from `save_polygons_to_csv`, where it was inlined AFTER that
+        method's `if run_background: return None` early exit -- so choosing
+        "run in background" produced a CSV and silently no shapefile, which is
+        the batched-export bug this method exists to fix.
+
+        Returns
+        -------
+        (message, ok) : (str, bool)
+            `message` is "" when nothing was requested. `ok` is False when the
+            export produced no features or raised.
+        """
+        from .shapefile_io import json_polygons_to_features, write_feature_collection
+        from collections import OrderedDict as _OD
+
+        try:
+            logging.info("[CSV export] Starting Shapefile export...")
+
+            # ---- Embed the SAME statistics this CSV run just computed -------
+            # `data_rows` already holds every row process_polygon produced, so
+            # nothing is recomputed here and the shapefile carries exactly the
+            # numbers written to the CSV.
+            #
+            # Two shapes of row have to be reconciled with "one record per
+            # feature":
+            #   * multi-channel imagery emits ONE ROW PER CHANNEL (Channel=R/G/B)
+            #     for the same polygon -> flattened into R_Mean, G_Mean, ... so a
+            #     single feature keeps every channel's statistics;
+            #   * a point SET emits one row per point (Object ID "<name>_point_N")
+            #     -> kept as separate rows, since each becomes its own Point
+            #     feature downstream.
+            shp_stats_lookup = None
+            try:
+                def _obj_base(obj_id):
+                    s = str(obj_id or "")
+                    return s.split("_point_")[0] if "_point_" in s else s
+
+                _rows_index = {}
+                for _r in (data_rows or []):
+                    if not isinstance(_r, dict):
+                        continue
+                    _rows_index.setdefault(
+                        (str(_r.get("File Name", "")), _obj_base(_r.get("Object ID"))), []
+                    ).append(_r)
+
+                def _merge_channel_rows(rs):
+                    """Collapse one shape's per-channel rows into a single record.
+                    A key with the same value in every row (identity/EXIF/RF class)
+                    stays unprefixed; a key that varies by channel is emitted as
+                    '<Channel>_<key>'."""
+                    if len(rs) == 1:
+                        return {k: v for k, v in rs[0].items() if k != "Channel"}
+                    merged = _OD()
+                    keys = _OD()
+                    for _r in rs:
+                        for k in _r.keys():
+                            keys.setdefault(k, None)
+                    for k in keys:
+                        if k == "Channel":
+                            continue
+                        vals = [_r.get(k) for _r in rs]
+                        if all(v == vals[0] for v in vals):
+                            merged[k] = vals[0]
+                        else:
+                            for _r in rs:
+                                ch = str(_r.get("Channel") or "").strip()
+                                merged[f"{ch}_{k}" if ch else k] = _r.get(k)
+                    return merged
+
+                shp_stats_lookup = {}
+                for _g, _fp, _pd in polygons_to_process:
+                    _name = (_pd.get("name") if isinstance(_pd, dict) else None) or _g
+                    _matched = _rows_index.get((os.path.basename(_fp), str(_name)), [])
+                    _by_obj = _OD()
+                    for _r in _matched:
+                        _by_obj.setdefault(str(_r.get("Object ID")), []).append(_r)
+                    shp_stats_lookup[(_g, _fp)] = [
+                        _merge_channel_rows(rs) for rs in _by_obj.values()
+                    ]
+                logging.info(
+                    f"[CSV export] Shapefile: prepared statistics for "
+                    f"{sum(1 for v in shp_stats_lookup.values() if v)}/"
+                    f"{len(shp_stats_lookup)} shape(s) from {len(data_rows or [])} CSV row(s).")
+            except Exception as e:
+                logging.error(f"[CSV export] Shapefile: could not attach CSV statistics, "
+                              f"exporting geometry only: {e}")
+                shp_stats_lookup = None
+
+            # Geometry comes from the SHAPES THIS EXPORT ACTUALLY PROCESSED, not
+            # from self.all_polygons. Passing the whole project put every polygon
+            # in the project into the shapefile -- including shapes on files the
+            # user excluded, which carry no CSV row and, worse, drag in rasters in
+            # other coordinate systems.
+            _subset = {}
+            for _g, _fp, _pd in polygons_to_process:
+                _subset.setdefault(_g, {})[_fp] = _pd
+
+            features, _crs_wkt, shp_warnings = json_polygons_to_features(
+                _subset,
+                getattr(self, 'project_folder', '') or '',
+                get_ax_path_fn=getattr(self, "_ax_path_for", None),
+                stats_lookup=shp_stats_lookup,
+            )
+
+            if not features:
+                warn_msg = "No features could be converted for shapefile export."
+                if shp_warnings:
+                    warn_msg += "\n\n" + "\n".join(shp_warnings[:10])
+                logging.warning(f"[CSV export] Shapefile: {warn_msg}")
+                return warn_msg, False
+
+            # Never clobber a previous run's shapefile. (save_polygons_to_csv has
+            # its own nested _next_available_path; this method is called from the
+            # worker thread too, so it cannot reach that closure.)
+            shp_stem = os.path.splitext(save_path)[0]
+            if os.path.exists(shp_stem + ".shp"):
+                _i = 1
+                while os.path.exists(f"{shp_stem}_{_i}.shp"):
+                    _i += 1
+                shp_stem = f"{shp_stem}_{_i}"
+
+            written_paths, notes = write_feature_collection(
+                features, shp_stem, field_order=fieldnames_raw)
+            shp_warnings = list(shp_warnings or []) + list(notes or [])
+
+            methods = {}
+            for feat in features:
+                m = feat['properties'].get('georef', 'none')
+                methods[m] = methods.get(m, 0) + 1
+            summary = ", ".join(f"{cnt} via {meth}" for meth, cnt in methods.items())
+
+            _n_with_stats = sum(
+                1 for f in features
+                if len(f['properties']) > 8  # more than the identity fields
+            )
+            msg = (f"Shapefile exported: {len(features)} feature(s)\n"
+                   f"Georeferencing: {summary}\n"
+                   f"Statistics embedded: {_n_with_stats}/{len(features)} feature(s)\n"
+                   f"File(s): " + ", ".join(os.path.basename(p) for p in written_paths))
+            if shp_warnings:
+                msg += f"\n\nWarnings ({len(shp_warnings)}):\n"
+                msg += "\n".join(shp_warnings[:10])
+                if len(shp_warnings) > 10:
+                    msg += f"\n...and {len(shp_warnings) - 10} more."
+            logging.info(f"[CSV export] Shapefile: {msg}")
+            return msg, True
+
+        except Exception as e:
+            logging.error(f"[CSV export] Shapefile export failed: {e}", exc_info=True)
+            return (f"Shapefile export failed:\n{e}\n\nCSV was saved successfully."), False
+
     def compute_shapefile_stats(self, selected_polys, options=None):
         """
         Compute the SAME per-shape statistics CSV export produces, for a specific
@@ -15431,160 +15623,19 @@ class ProjectTab(QtWidgets.QWidget):
             logging.info("Skipping modified polygons JSON export per user option.")
 
         # ===== SHAPEFILE EXPORT (optional) ================================
+        # Delegated to export_shapefile_bundle() so the BACKGROUND path can run the
+        # exact same export -- see ExportWorker.run(). This used to be ~150 lines
+        # inlined here, after the `if run_background: return None` early exit, so a
+        # batched export silently produced no shapefile at all.
         if opts.get("export_shapefile", False):
-            try:
-                from .shapefile_io import json_polygons_to_features, write_shapefile
-                logging.info("[CSV export] Starting Shapefile export…")
-
-                # ---- Embed the SAME statistics this CSV run just computed -------
-                # `data_rows` already holds every row process_polygon produced, so
-                # nothing is recomputed here and the shapefile is guaranteed to carry
-                # exactly the numbers written to the CSV.
-                #
-                # Two shapes of row have to be reconciled with "one record per
-                # feature":
-                #   * multi-channel imagery emits ONE ROW PER CHANNEL (Channel=R/G/B)
-                #     for the same polygon -> flattened into R_Mean, G_Mean, ... so a
-                #     single feature keeps every channel's statistics;
-                #   * a point SET emits one row per point (Object ID "<name>_point_N")
-                #     -> kept as separate rows, since each becomes its own Point
-                #     feature downstream.
-                shp_stats_lookup = None
-                try:
-                    from collections import OrderedDict as _OD
-
-                    def _obj_base(obj_id):
-                        s = str(obj_id or "")
-                        return s.split("_point_")[0] if "_point_" in s else s
-
-                    # Index the CSV rows by (file basename, polygon name).
-                    _rows_index = {}
-                    for _r in data_rows:
-                        if not isinstance(_r, dict):
-                            continue
-                        _rows_index.setdefault(
-                            (str(_r.get("File Name", "")), _obj_base(_r.get("Object ID"))), []
-                        ).append(_r)
-
-                    def _merge_channel_rows(rs):
-                        """Collapse one shape's per-channel rows into a single record.
-                        A key with the same value in every row (identity/EXIF/RF class)
-                        stays unprefixed; a key that varies by channel is emitted as
-                        '<Channel>_<key>'."""
-                        if len(rs) == 1:
-                            return {k: v for k, v in rs[0].items() if k != "Channel"}
-                        merged = _OD()
-                        keys = _OD()
-                        for _r in rs:
-                            for k in _r.keys():
-                                keys.setdefault(k, None)
-                        for k in keys:
-                            if k == "Channel":
-                                continue
-                            vals = [_r.get(k) for _r in rs]
-                            if all(v == vals[0] for v in vals):
-                                merged[k] = vals[0]
-                            else:
-                                for _r in rs:
-                                    ch = str(_r.get("Channel") or "").strip()
-                                    merged[f"{ch}_{k}" if ch else k] = _r.get(k)
-                        return merged
-
-                    shp_stats_lookup = {}
-                    for _g, _fp, _pd in polygons_to_process:
-                        _name = (_pd.get("name") if isinstance(_pd, dict) else None) or _g
-                        _matched = _rows_index.get((os.path.basename(_fp), str(_name)), [])
-                        _by_obj = _OD()
-                        for _r in _matched:
-                            _by_obj.setdefault(str(_r.get("Object ID")), []).append(_r)
-                        shp_stats_lookup[(_g, _fp)] = [
-                            _merge_channel_rows(rs) for rs in _by_obj.values()
-                        ]
-                    logging.info(
-                        f"[CSV export] Shapefile: prepared statistics for "
-                        f"{sum(1 for v in shp_stats_lookup.values() if v)}/"
-                        f"{len(shp_stats_lookup)} shape(s) from {len(data_rows)} CSV row(s)."
-                    )
-                except Exception as e:
-                    logging.error(f"[CSV export] Shapefile: could not attach CSV statistics, "
-                                  f"exporting geometry only: {e}")
-                    shp_stats_lookup = None
-
-                features, crs_wkt, shp_warnings = json_polygons_to_features(
-                    self.all_polygons,
-                    getattr(self, 'project_folder', '') or '',
-                    get_ax_path_fn=getattr(self, "_ax_path_for", None),
-                    stats_lookup=shp_stats_lookup,
-                )
-
-                if features:
-                    shp_base = os.path.splitext(save_path)[0]
-                    shp_out = _next_available_path(shp_base + ".shp")
-                    # write_shapefile expects path WITHOUT extension
-                    shp_stem = os.path.splitext(shp_out)[0]
-
-                    # ESRI shapefiles are geometrically homogeneous — one shape type
-                    # per file. Split rather than corrupting a single .shp with a
-                    # mix of Point and Polygon records.
-                    _pt_feats = [f for f in features if f['properties'].get('type') == 'point']
-                    _pg_feats = [f for f in features if f['properties'].get('type') != 'point']
-
-                    written_paths = []
-                    if _pt_feats and _pg_feats:
-                        write_shapefile(_pg_feats, shp_stem + "_polygons", crs_wkt=crs_wkt,
-                                        shape_type=5, legend_path=shp_stem + "_polygons_fields.csv")
-                        write_shapefile(_pt_feats, shp_stem + "_points", crs_wkt=crs_wkt,
-                                        shape_type=1, legend_path=shp_stem + "_points_fields.csv")
-                        written_paths = [shp_stem + "_polygons.shp", shp_stem + "_points.shp"]
-                    elif _pt_feats:
-                        write_shapefile(_pt_feats, shp_stem, crs_wkt=crs_wkt,
-                                        shape_type=1, legend_path=shp_stem + "_fields.csv")
-                        written_paths = [shp_stem + ".shp"]
-                    else:
-                        write_shapefile(_pg_feats, shp_stem, crs_wkt=crs_wkt,
-                                        shape_type=5, legend_path=shp_stem + "_fields.csv")
-                        written_paths = [shp_stem + ".shp"]
-
-                    # Summarise georeferencing methods used
-                    methods = {}
-                    for feat in features:
-                        m = feat['properties'].get('georef', 'none')
-                        methods[m] = methods.get(m, 0) + 1
-                    summary_parts = [f"{cnt} via {meth}" for meth, cnt in methods.items()]
-                    summary = ", ".join(summary_parts)
-
-                    _n_with_stats = sum(
-                        1 for f in features
-                        if len(f['properties']) > 8  # more than the identity fields
-                    )
-                    msg = (f"Shapefile exported: {len(features)} feature(s)\n"
-                           f"Georeferencing: {summary}\n"
-                           f"Statistics embedded: {_n_with_stats}/{len(features)} feature(s)\n"
-                           f"File(s): " + ", ".join(os.path.basename(p) for p in written_paths))
-                    if shp_warnings:
-                        msg += f"\n\nWarnings ({len(shp_warnings)}):\n"
-                        msg += "\n".join(shp_warnings[:10])
-                        if len(shp_warnings) > 10:
-                            msg += f"\n…and {len(shp_warnings) - 10} more."
-                    logging.info(f"[CSV export] Shapefile: {msg}")
-                    QtWidgets.QMessageBox.information(
-                        self, "Shapefile Exported", msg
-                    )
+            _shp_msg, _shp_ok = self.export_shapefile_bundle(
+                save_path, polygons_to_process, data_rows,
+                fieldnames_raw=fieldnames_raw)
+            if _shp_msg:
+                if _shp_ok:
+                    QtWidgets.QMessageBox.information(self, "Shapefile Exported", _shp_msg)
                 else:
-                    warn_msg = "No features could be converted for shapefile export."
-                    if shp_warnings:
-                        warn_msg += "\n\n" + "\n".join(shp_warnings[:10])
-                    logging.warning(f"[CSV export] Shapefile: {warn_msg}")
-                    QtWidgets.QMessageBox.warning(
-                        self, "Shapefile Export", warn_msg
-                    )
-
-            except Exception as e:
-                logging.error(f"[CSV export] Shapefile export failed: {e}")
-                QtWidgets.QMessageBox.warning(
-                    self, "Shapefile Export Error",
-                    f"Shapefile export failed:\n{e}\n\nCSV was saved successfully."
-                )
+                    QtWidgets.QMessageBox.warning(self, "Shapefile Export", _shp_msg)
         # ==================================================================
 
         total_duration = time.perf_counter() - total_start_time
