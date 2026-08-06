@@ -1,7 +1,9 @@
 import os
+import re
 import struct
 import math
 import json
+import hashlib
 import logging
 from datetime import datetime
 from collections import OrderedDict
@@ -42,7 +44,24 @@ def wkt_for_epsg(code):
 
     try:
         import pyproj
-        return pyproj.CRS.from_epsg(code).to_wkt()
+        crs = pyproj.CRS.from_epsg(code)
+        # A shapefile's .prj holds WKT1 in ESRI's flavour. `to_wkt()` defaults to
+        # WKT2_2019, which for EPSG:32617 is a 1.6 KB string built around an
+        # ENSEMBLE[...] node that simply does not exist in WKT1 -- ArcGIS cannot
+        # read it at all, and GDAL/QGIS below ~3.x either reject it or fall back
+        # to the project CRS, which is what "my shapefile opens in a completely
+        # different coordinate system" looks like from the user's side. The
+        # hand-written fallbacks further down this function already emit WKT1
+        # ESRI-style, so this branch was also the only one producing a different
+        # dialect than the rest of the module.
+        for flavour in ("WKT1_ESRI", "WKT1_GDAL"):
+            try:
+                wkt = crs.to_wkt(flavour)
+                if wkt:
+                    return wkt
+            except Exception:
+                continue
+        return crs.to_wkt()          # last resort: better a WKT2 .prj than none
     except Exception:
         pass
 
@@ -117,7 +136,7 @@ def _dbf_safe_fieldname(name, used_upper):
     return candidate
 
 
-def write_dbf(dbf_path, features, legend_path=None):
+def write_dbf(dbf_path, features, legend_path=None, field_order=None):
     """
     Write a DBF file using struct.
 
@@ -141,6 +160,28 @@ def write_dbf(dbf_path, features, legend_path=None):
             if k not in seen_keys:
                 seen_keys.add(k)
                 all_keys.append(k)
+
+    # 1b) Reorder to match `field_order` when given -- CSV export passes its own
+    #     column order here so the attribute table reads like the CSV instead of
+    #     in whatever order process_polygon happened to build each row's dict.
+    #     Keys the caller didn't list keep their discovered order, after the
+    #     listed ones, so nothing is ever dropped.
+    if field_order:
+        rank = {}
+        for i, k in enumerate(field_order):
+            rank.setdefault(k, i)
+        # Channel-flattened stats ("R_Mean", "NDVI_Q75") should sort with their
+        # base statistic, otherwise every channel's columns interleave randomly.
+        def _key(k):
+            if k in rank:
+                return (0, rank[k], "")
+            if "_" in k:
+                prefix, _, base = k.partition("_")
+                if base in rank:
+                    return (1, rank[base], prefix)
+            return (2, 0, "")
+        # sort() is stable, so keys that tie keep their discovered order.
+        all_keys.sort(key=_key)
 
     # 2) Infer type + width by scanning every feature's value for that key — not
     #    just the first feature, which could easily have an unrepresentative value
@@ -230,7 +271,8 @@ def write_dbf(dbf_path, features, legend_path=None):
             logging.warning(f"Failed to write field-name legend: {e}")
 
 
-def write_shapefile(features, output_path, crs_wkt=None, shape_type=5, legend_path=None):
+def write_shapefile(features, output_path, crs_wkt=None, shape_type=5, legend_path=None,
+                    field_order=None):
     """
     Write an ESRI Shapefile using struct. output_path should not include the extension.
 
@@ -262,8 +304,20 @@ def write_shapefile(features, output_path, crs_wkt=None, shape_type=5, legend_pa
     prj_path = f"{output_path}.prj"
 
     if crs_wkt:
-        with open(prj_path, 'w') as f:
-            f.write(crs_wkt)
+        # Explicit encoding, and ASCII by preference. `open(..., 'w')` used the
+        # machine's ANSI codepage, so a pyproj WKT -- which carries a degree sign
+        # in its AREA description ("Between 60°W and 54°W") -- was written as
+        # cp1252 0xB0 on this locale and as something else on another. A .prj is
+        # expected to be plain ASCII; encoding it per-machine makes the same
+        # export byte-different on different computers and can trip strict
+        # readers. Degrees are spelled out, everything else non-ASCII is dropped.
+        try:
+            safe_wkt = crs_wkt.replace('°', ' deg ')
+            safe_wkt = safe_wkt.encode('ascii', 'ignore').decode('ascii')
+        except Exception:
+            safe_wkt = crs_wkt
+        with open(prj_path, 'w', encoding='ascii', errors='ignore') as f:
+            f.write(safe_wkt)
 
     # Calculate bounding box
     all_x = []
@@ -360,7 +414,7 @@ def write_shapefile(features, output_path, crs_wkt=None, shape_type=5, legend_pa
     # DBF writing — same `written` list as shp/shx, so record N always describes
     # the correct geometry.
     try:
-        write_dbf(dbf_path, written, legend_path=legend_path)
+        write_dbf(dbf_path, written, legend_path=legend_path, field_order=field_order)
     except Exception as e:
         logging.warning(f"Error writing DBF file: {e}")
 
@@ -1062,7 +1116,8 @@ def json_polygons_to_features(all_polygons, project_folder,
                                 if k in ('Centroid X', 'Centroid Y') or k in props:
                                     continue
                                 props[k] = _sanitize_dbf_value(v)
-                        features_list.append({'geometry': [geo_pt], 'properties': props})
+                        features_list.append({'geometry': [geo_pt], 'properties': props,
+                                              'crs_wkt': crs if transform else None})
                     continue
 
                 # ---------------------------------------------------------- #
@@ -1101,11 +1156,143 @@ def json_polygons_to_features(all_polygons, project_folder,
                 features_list.append({
                     'geometry': geo_points,
                     'properties': props,
+                    'crs_wkt': crs if transform else None,
                 })
 
     except Exception as e:
         logging.warning(f"Error converting polygons to features: {e}")
         warnings_list.append(f"Conversion error: {e}")
 
+    # A shapefile carries ONE .prj, so features from rasters in different CRSs
+    # cannot share a file. Report it here; group_features_by_crs() is what
+    # actually splits them.
+    _groups = group_features_by_crs(features_list)
+    if len(_groups) > 1:
+        _labels = ", ".join(f"{lbl} ({len(fs)} feature(s))"
+                            for lbl, (_w, fs) in _groups.items())
+        warnings_list.append(
+            "Features span MORE THAN ONE coordinate reference system and were "
+            f"written to separate shapefiles: {_labels}. A single .shp can only "
+            "carry one .prj, so merging them would have silently mislocated "
+            "every feature outside the first CRS.")
+
     return features_list, global_crs, warnings_list
+
+
+def write_feature_collection(features, output_stem, field_order=None):
+    """Write `features` as however many shapefiles ESRI's format actually requires.
+
+    A .shp is homogeneous in BOTH respects that matter here:
+      * one geometry type per file (Point vs Polygon), and
+      * one CRS per file (there is exactly one .prj).
+
+    Callers used to handle only the first of those, splitting Point/Polygon but
+    writing every CRS into one file with a single .prj -- see
+    `group_features_by_crs` for what that did to the coordinates. This is the
+    single place both export paths (CSV export and the Polygon Manager) now go
+    through, so the two cannot drift apart again.
+
+    Naming: the dominant CRS group keeps the plain stem, so the common
+    single-CRS case is unchanged (`export.shp`, or `export_points.shp` /
+    `export_polygons.shp` when both geometry types are present). Additional CRS
+    groups get a `_<label>` suffix (`export_EPSG32621_polygons.shp`,
+    `export_pixel_polygons.shp`).
+
+    Returns
+    -------
+    (written_paths, notes)
+    """
+    written, notes = [], []
+    groups = group_features_by_crs(features)
+    if not groups:
+        return written, notes
+
+    # Largest group keeps the unsuffixed name -- it is what the user thinks of
+    # as "the" output, and suffixing it would break existing workflows.
+    ordered = sorted(groups.items(), key=lambda kv: -len(kv[1][1]))
+
+    for gi, (label, (crs_wkt, feats)) in enumerate(ordered):
+        stem = output_stem if gi == 0 else f"{output_stem}_{label}"
+        if crs_wkt is None and feats:
+            notes.append(
+                f"{len(feats)} feature(s) had no georeferencing and carry RAW PIXEL "
+                f"coordinates; written to '{os.path.basename(stem)}' with no .prj. "
+                "Do not overlay these on a map -- they are image coordinates.")
+
+        pts = [f for f in feats if f['properties'].get('type') == 'point']
+        pgs = [f for f in feats if f['properties'].get('type') != 'point']
+
+        for feats_sub, suffix, shape_type in ((pgs, "_polygons", 5), (pts, "_points", 1)):
+            if not feats_sub:
+                continue
+            # Only disambiguate by geometry when both kinds are present.
+            sub_stem = stem + suffix if (pts and pgs) else stem
+            write_shapefile(feats_sub, sub_stem, crs_wkt=crs_wkt,
+                            shape_type=shape_type,
+                            legend_path=sub_stem + "_fields.csv",
+                            field_order=field_order)
+            written.append(sub_stem + ".shp")
+
+    return written, notes
+
+
+def crs_label(crs_wkt):
+    """Short, filename-safe label for a CRS, used to name per-CRS output files.
+
+    Prefers the authority code (`UTM20N` reads better than a WKT hash); falls
+    back to the projection name, then to a stable digest so two different
+    unnamed CRSs never collide into one filename.
+    """
+    if not crs_wkt:
+        return "pixel"
+    try:
+        import pyproj
+        crs = pyproj.CRS.from_wkt(crs_wkt)
+        code = crs.to_epsg()
+        if code:
+            return f"EPSG{int(code)}"
+    except Exception:
+        pass
+    m = re.search(r'(?:PROJCS|PROJCRS|GEOGCS|GEOGCRS)\["([^"]+)"', crs_wkt or "")
+    if m:
+        safe = re.sub(r'[^A-Za-z0-9]+', '_', m.group(1)).strip('_')
+        if safe:
+            return safe[:40]
+    return "CRS_" + hashlib.md5((crs_wkt or "").encode("utf-8")).hexdigest()[:8]
+
+
+def group_features_by_crs(features):
+    """Split `features` into one bucket per coordinate reference system.
+
+    ESRI shapefiles are single-CRS by definition -- there is exactly one .prj
+    per .shp. Before this existed, `json_polygons_to_features` returned only
+    the FIRST CRS it encountered and every caller wrote all features into one
+    file with that single .prj, so:
+
+      * a project mixing UTM zones (or any two CRSs) placed every feature
+        outside the first zone hundreds of kilometres from where it belongs;
+      * a raster with NO georeferencing falls back to RAW PIXEL coordinates
+        (10, 10), which then landed next to the projection's origin -- for
+        UTM, in the ocean off West Africa -- inside a file claiming metres;
+      * an EXIF-estimated transform yields WGS84 DEGREES, which mixed into a
+        metre-based file the same way.
+
+    All three presented identically to the user: "QGIS shows my shapefile in a
+    very different coordinate system".
+
+    Returns
+    -------
+    OrderedDict[label -> (crs_wkt, [features])]
+        `label` is filename-safe (see `crs_label`); un-georeferenced features
+        group under "pixel" with a crs_wkt of None, so the caller writes them
+        without a .prj rather than mislabelling them.
+    """
+    groups = OrderedDict()
+    for feat in (features or []):
+        wkt = feat.get('crs_wkt')
+        label = crs_label(wkt)
+        if label not in groups:
+            groups[label] = (wkt, [])
+        groups[label][1].append(feat)
+    return groups
 
