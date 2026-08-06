@@ -94,6 +94,118 @@ class CollapsibleBox(QtWidgets.QWidget):
         self.toggle_button.setArrowType(QtCore.Qt.DownArrow if checked else QtCore.Qt.RightArrow)
         self.content_area.setVisible(checked)
 
+def contaminated_reference_bands(hist_match, nodata_values):
+    """Bands whose STORED reference statistics look like a NoData fill value.
+
+    A reference computed before NoData was honoured averaged the fill sentinel
+    in with the real pixels, so e.g. a sensor-azimuth band whose valid range is
+    0-360 ended up with a stored reference mean of -9356. Matching against that
+    drags real data to nonsense, and the `.ax` keeps doing it until the user
+    presses Calc again -- silently, because the numbers look like numbers.
+
+    A contaminated mean is a weighted average of the fill value and the real
+    pixels, so it lands somewhere between the two -- and because fill usually
+    dominates (93% of a scene, in the case that prompted this), it lands close
+    to the sentinel. Flagging only an exact match is therefore not enough: on a
+    real stack the 100%-fill bands stored -9988 (0.1% from the -9999 sentinel)
+    but the partially-filled angle bands stored -9356, which is 6% away and
+    would slip through a tight tolerance while being the bands that actually
+    corrupt real data.
+
+    The rule used instead: same sign as the sentinel AND at least half its
+    magnitude. Real radiometry never has a mean that far toward its own fill
+    value, so this stays conservative while catching the -9356 case.
+
+    Returns [(band_index, stored_mean, matched_nodata_value), ...].
+    """
+    import numpy as np
+    hm = hist_match or {}
+    stats = hm.get("ref_stats") or []
+    numeric = []
+    for v in (nodata_values or []):
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(fv) and fv != 0.0:
+            numeric.append(fv)
+    if not stats or not numeric:
+        return []
+
+    bad = []
+    for i, st in enumerate(stats):
+        try:
+            mu = float((st or {}).get("mean"))
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(mu):
+            continue
+        for nv in numeric:
+            same_sign = (mu < 0) == (nv < 0)
+            if same_sign and abs(mu) >= abs(nv) * 0.5:
+                bad.append((i, mu, nv))
+                break
+    return bad
+
+
+def cdf_reference_density(x, y, lo, hi):
+    """Differentiate a stored reference CDF back into a plottable density.
+
+    `x` are normalised quantile positions (0..1) and `y` the cumulative
+    probabilities; `lo`/`hi` de-normalise `x` to real data values.
+
+    Zero-width steps are DROPPED rather than divided through. The previous form,
+    `dx = np.maximum(np.diff(xr), 1e-12)`, looks like a divide-by-zero guard but
+    is not one: it turns `dy/0` into `dy/1e-12`, i.e. a density of ~1e10 instead
+    of an inf. Flat runs in a stored CDF are completely ordinary -- a saturated
+    or constant-valued image region produces many identical quantiles -- and one
+    such spike sets the y-axis scale for the whole plot, squashing the real and
+    corrected curves flat onto the axis. A zero-width step is a point mass and
+    has no finite density, so there is nothing meaningful to plot for it.
+
+    Returns (centres, density), or (None, None) when nothing is plottable.
+    """
+    import numpy as np
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    if x.size < 2 or y.size != x.size:
+        return None, None
+    xr = x * (hi - lo) + lo
+    dx = np.diff(xr)
+    ok = dx > 0
+    if not np.any(ok):
+        return None, None
+    dens = np.clip(np.diff(y)[ok] / dx[ok], 0, None)
+    xc = (0.5 * (xr[:-1] + xr[1:]))[ok]
+    return xc, dens
+
+
+def shared_hist_edges(real, corrected=None, bins=80):
+    """One set of histogram edges spanning both series.
+
+    Each series used to get its own `bins=80` over its own min..max. Histogram
+    matching deliberately shifts and rescales values, so the two curves were
+    binned at different widths over different ranges -- an apparent difference
+    in shape could be a pure binning artefact rather than a real change in the
+    distribution. Returns None when there is nothing to plot.
+    """
+    import numpy as np
+    real = np.asarray(real)
+    if real.size == 0:
+        return None
+    lo = float(real.min())
+    hi = float(real.max())
+    if corrected is not None and np.asarray(corrected).size:
+        corrected = np.asarray(corrected)
+        lo = min(lo, float(corrected.min()))
+        hi = max(hi, float(corrected.max()))
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return None
+    if hi <= lo:
+        hi = lo + 1.0
+    return np.linspace(lo, hi, int(bins) + 1)
+
+
 class ImageEditorDialog(QDialog):
     # signal to let parent optionally react when group/all-group mods are saved
     modificationsAppliedToGroup = QtCore.pyqtSignal(str)
@@ -3684,15 +3796,40 @@ class ImageEditorDialog(QDialog):
 
             # NoData mask, built ONCE on the sample and reused for every band's real +
             # corrected lines so they stay directly comparable (same excluded pixels).
-            nodata_enabled = mods.get("nodata_enabled", True)
-            nodata_values = list(mods.get("nodata_values", []) or []) if nodata_enabled else []
-            nd_mask = None
+            # Same union the reference calc and the replay paths use, so the
+            # plotted "corrected" line is exactly what Apply will produce.
+            nodata_values = []
+            if mods.get("nodata_enabled", True):
+                try:
+                    from .project_tab import hist_nodata_values as _hist_nd
+                    nodata_values = _hist_nd(mods, getattr(self, "image_filepath", None))
+                except Exception:
+                    nodata_values = list(mods.get("nodata_values", []) or [])
+            # PER-BAND masks. utils.build_nodata_mask ORs across channels, so on a
+            # stack with a 100%-fill ancillary plane it masked every pixel and the
+            # plot had nothing left to draw for ANY band.
+            nd_masks = None
             if nodata_values:
                 try:
-                    from .utils import build_nodata_mask as _bnm
-                    nd_mask = _bnm(samp, nodata_values, bgr_input=True)
+                    from .project_tab import _per_band_nodata_masks
+                    nd_masks = _per_band_nodata_masks(
+                        [samp[..., i] for i in range(C)], nodata_values)
                 except Exception as e:
                     logging.debug(f"[_update_hist_plot] nodata mask skipped: {e}")
+
+            # A reference stored before NoData was honoured has fill-contaminated
+            # statistics and will keep corrupting every match until re-computed.
+            stale_bands = {}
+            try:
+                for _bi, _mu, _nv in contaminated_reference_bands(hm, nodata_values):
+                    stale_bands[_bi] = (_mu, _nv)
+                if stale_bands:
+                    logging.warning(
+                        "[_update_hist_plot] stored reference looks NoData-contaminated "
+                        "for band(s) %s -- press Calc to recompute",
+                        [b + 1 for b in sorted(stale_bands)])
+            except Exception as e:
+                logging.debug(f"[_update_hist_plot] stale-reference check failed: {e}")
 
             # Corrected sample: the exact same function used by the viewer, the editor's
             # own Apply, and CSV export — so this preview is trustworthy, not a
@@ -3736,26 +3873,36 @@ class ImageEditorDialog(QDialog):
 
                 real_c = samp[..., c].astype(np.float32).reshape(-1)
                 valid = np.isfinite(real_c)
-                if nd_mask is not None:
-                    valid &= ~nd_mask.reshape(-1)
+                if nd_masks is not None and c < len(nd_masks):
+                    valid &= ~nd_masks[c].reshape(-1)
                 real_c = real_c[valid]
 
+                corr_c = None
+                if corrected is not None and c < corrected.shape[2]:
+                    corr_c = corrected[..., c].astype(np.float32).reshape(-1)[valid]
+                    # The transform can emit non-finite values (a zero-variance
+                    # band gives sd_t == 0; a degenerate CDF gives 0/0). Those
+                    # make np.histogram raise on its auto-range, which the outer
+                    # handler turns into a blank "could not draw" tab.
+                    corr_c = corr_c[np.isfinite(corr_c)]
+                    if corr_c.size == 0:
+                        corr_c = None
+
+                # SHARED bin edges for real and corrected -- see shared_hist_edges.
+                edges = shared_hist_edges(real_c, corr_c, bins=80)
+
                 drawn = False
-                if real_c.size:
-                    counts, edges = np.histogram(real_c, bins=80, density=True)
+                if real_c.size and edges is not None:
+                    counts, _ = np.histogram(real_c, bins=edges, density=True)
                     centers = 0.5 * (edges[:-1] + edges[1:])
                     axp.plot(centers, counts, lw=1.6, color="#4C8DBE", label="real")
                     drawn = True
                     any_band_drawn = True
 
-                if corrected is not None and c < corrected.shape[2]:
-                    corr_c = corrected[..., c].astype(np.float32).reshape(-1)[valid]
-                    if corr_c.size:
-                        counts, edges = np.histogram(corr_c, bins=80, density=True)
-                        centers = 0.5 * (edges[:-1] + edges[1:])
+                    if corr_c is not None and corr_c.size:
+                        counts, _ = np.histogram(corr_c, bins=edges, density=True)
                         axp.plot(centers, counts, lw=1.6, linestyle="--",
                                  color="#4C8DBE", label="corrected")
-                        drawn = True
 
                 if not drawn:
                     axp.text(0.5, 0.5, "No valid (non-NoData) pixels.",
@@ -3767,12 +3914,20 @@ class ImageEditorDialog(QDialog):
                 else:
                     # Reference line for this band only.
                     if mode == "meanstd" and hm.get("ref_stats") and c < len(hm["ref_stats"]):
+                        # Mean/std matching forces only the MEAN and STD; it is a
+                        # linear rescale, so it preserves the source's shape. The
+                        # reference was drawn as a Gaussian PDF, which implied the
+                        # corrected curve ought to become bell-shaped -- it never
+                        # will, so the plot looked permanently "wrong". Show what
+                        # is actually being targeted instead: the mean, and the
+                        # +-1 sigma interval.
                         st = hm["ref_stats"][c]
-                        mu = float(st.get("mean", 0.0)); sd = max(float(st.get("std", 1.0)), 1e-6)
-                        lo, hi = axp.get_xlim()
-                        xs = np.linspace(lo, hi, 256)
-                        ys = np.exp(-0.5 * ((xs - mu) / sd) ** 2) / (sd * np.sqrt(2 * np.pi))
-                        axp.plot(xs, ys, lw=1.0, color="#333333", alpha=0.6, label="reference")
+                        mu = float(st.get("mean", 0.0))
+                        sd = max(float(st.get("std", 1.0)), 1e-6)
+                        axp.axvline(mu, lw=1.2, color="#333333", alpha=0.75,
+                                    label="reference mean")
+                        axp.axvspan(mu - sd, mu + sd, color="#333333", alpha=0.10,
+                                    lw=0, label="reference ±1σ")
                     elif mode == "cdf" and (hm.get("ref_cdf") or {}).get("per_band"):
                         bands = hm["ref_cdf"]["per_band"]
                         if c < len(bands):
@@ -3781,17 +3936,22 @@ class ImageEditorDialog(QDialog):
                             y = np.asarray(band.get("y", []), dtype=np.float64)
                             if x.size >= 3 and y.size == x.size:
                                 blo, bhi = float(band.get("lo", 0.0)), float(band.get("hi", 1.0))
-                                xr = x * (bhi - blo) + blo   # de-normalize to real values
-                                # Differentiate the cumulative curve back to a density.
-                                # Plain np.gradient warns (and yields inf) wherever
-                                # consecutive bin centres coincide, so use finite
-                                # differences with a clamped denominator instead.
-                                dy = np.diff(y)
-                                dx = np.maximum(np.diff(xr), 1e-12)
-                                dens = np.clip(dy / dx, 0, None)
-                                xc = 0.5 * (xr[:-1] + xr[1:])
-                                axp.plot(xc, dens, lw=1.0, color="#333333", alpha=0.6,
-                                         label="reference")
+                                # Differentiate the cumulative curve back to a
+                                # density -- see cdf_reference_density for why a
+                                # zero-width step must be dropped, not clamped.
+                                xc, dens = cdf_reference_density(x, y, blo, bhi)
+                                if xc is not None:
+                                    axp.plot(xc, dens, lw=1.0, color="#333333",
+                                             alpha=0.6, label="reference")
+
+                    if c in stale_bands:
+                        _mu, _nv = stale_bands[c]
+                        axp.text(0.5, 0.97,
+                                 f"Stored reference mean is {_mu:.6g}, which is the NoData "
+                                 f"value ({_nv:g}).\nThis reference is contaminated — press "
+                                 "Calc to recompute it.",
+                                 ha="center", va="top", fontsize=7.5, color="#b00020",
+                                 transform=axp.transAxes, wrap=True)
 
                     axp.set_yticks([])
                     axp.tick_params(axis="x", labelsize=8)
@@ -3861,13 +4021,28 @@ class ImageEditorDialog(QDialog):
         # 3b) Build combined mask (nodata + mask polygons) for reference stats
         combined_mask = None
         
-        # Get nodata values
+        # Get nodata values.
+        #
+        # UNION the .ax list with the raster's own declared NoData, exactly as
+        # the replay paths now do (project_tab.hist_nodata_values). Reading the
+        # .ax alone meant that on a stack whose `.ax` carries
+        # `nodata_values: []`, the -9999 fill of the ancillary planes was
+        # averaged into the reference: band 11's stored reference mean came out
+        # as -9356 for a sensor-azimuth band whose true valid mean is 55.4, and
+        # every image matched against it was ruined. Science bands using NaN
+        # fill were unaffected, because nanmean/nanstd skip NaN for free --
+        # which is why only the sentinel-based bands looked broken.
         mods = self.modifications or {}
         nodata_enabled = mods.get("nodata_enabled", True)
         nodata_values = []
         if nodata_enabled:
-            nodata_values = list(mods.get("nodata_values", []) or [])
-        
+            try:
+                from .project_tab import hist_nodata_values as _hist_nd
+                nodata_values = _hist_nd(mods, getattr(self, "image_filepath", None))
+            except Exception as e:
+                logging.debug(f"[on_hist_match_clicked] declared-NoData lookup failed: {e}")
+                nodata_values = list(mods.get("nodata_values", []) or [])
+
         # Build nodata mask using shared utility (supports expressions like b1>143)
         if nodata_values:
             from .utils import build_nodata_mask as _shared_build_nodata_mask
@@ -4016,15 +4191,47 @@ class ImageEditorDialog(QDialog):
         payload = {"mode": mode, "bands": C}
 
         if mode == "meanstd":
-            if is_flat:
-                mu = np.nanmean(ref_samp, axis=0).astype(np.float32, copy=False)
-                sd = np.nanstd( ref_samp, axis=0).astype(np.float32, copy=False)
-            else:
-                mu = np.nanmean(ref_samp, axis=(0, 1)).astype(np.float32, copy=False)
-                sd = np.nanstd( ref_samp, axis=(0, 1)).astype(np.float32, copy=False)
-            sd = np.where(np.isfinite(sd) & (sd >= 1e-6), sd, 1.0)
+            # PER-BAND statistics, from each band's own valid pixels.
+            #
+            # `ref_samp` above keeps only pixels valid in EVERY band, because
+            # `combined_mask` is a whole-pixel OR (utils.build_nodata_mask ORs
+            # across channels). On a stack carrying an ancillary plane that is
+            # 100% fill -- which real prediction stacks do -- that leaves ZERO
+            # valid pixels, `_sample_hwC_masked` logs "All pixels are masked!"
+            # and returns a SINGLE pixel, and the whole reference becomes that
+            # one pixel's values with std 0. Band i's reference must depend
+            # only on band i, exactly as _apply_hist_match now does.
+            mu = np.zeros(C, dtype=np.float32)
+            sd = np.ones(C, dtype=np.float32)
+            band_masks = None
+            if nodata_values:
+                try:
+                    from .project_tab import _per_band_nodata_masks
+                    band_masks = _per_band_nodata_masks(
+                        [ref_f[..., i] for i in range(C)], nodata_values)
+                except Exception as e:
+                    logging.debug(f"[on_hist_match_clicked] per-band mask failed: {e}")
+            if combined_mask is not None and mask_polygon_enabled:
+                # A mask polygon is a deliberate spatial exclusion: all bands.
+                if band_masks is None:
+                    band_masks = [combined_mask] * C
+                else:
+                    band_masks = [m | combined_mask for m in band_masks]
+
+            n_used = []
+            for i in range(C):
+                vals = ref_f[..., i].reshape(-1)
+                if band_masks is not None and i < len(band_masks):
+                    vals = vals[~band_masks[i].reshape(-1)]
+                vals = vals[np.isfinite(vals)]
+                n_used.append(int(vals.size))
+                if vals.size:
+                    mu[i] = float(np.mean(vals))
+                    s = float(np.std(vals))
+                    sd[i] = s if np.isfinite(s) and s >= 1e-6 else 1.0
             payload["ref_stats"] = [{"mean": float(mu[i]), "std": float(sd[i])} for i in range(C)]
-            logging.info(f"[on_hist_match_clicked] Calculated ref_stats from {ref_samp.shape[0]} samples: mean={mu.tolist()}, std={sd.tolist()}")
+            logging.info(f"[on_hist_match_clicked] Calculated per-band ref_stats "
+                         f"(valid px per band: {n_used}): mean={mu.tolist()}, std={sd.tolist()}")
 
         elif mode == "cdf":
             per_band = []
@@ -4065,6 +4272,22 @@ class ImageEditorDialog(QDialog):
                 payload["reference_name"] = os.path.splitext(os.path.basename(str(_ref_fp)))[0]
             payload["computed_at"] = _dt.datetime.now().isoformat(timespec="seconds")
             payload["algorithm"] = mode
+            # Record which channel order these statistics were measured in.
+            # Matching is positional, and the editor works on cv2-loaded data
+            # (BGR) for <=4-band images while multi-band TIFFs come off
+            # tifffile in native RGB order -- so a reference taken on a JPEG and
+            # applied to a multiband TIFF pairs the Blue reference with Red.
+            # Storing the order is what makes that detectable at apply time.
+            try:
+                idata = getattr(self, "image_data_obj", None)
+                order = getattr(idata, "channel_order", None) if idata is not None else None
+                if not order:
+                    parent = self.parent()
+                    getter = getattr(parent, "_last_export_channel_order", None) if parent else None
+                    order = getter if isinstance(getter, str) else None
+                payload["channel_order"] = str(order or ("bgr" if C <= 4 else "rgb")).lower()
+            except Exception:
+                payload["channel_order"] = "bgr" if C <= 4 else "rgb"
         except Exception as e:
             logging.debug(f"[on_hist_match_clicked] provenance not recorded: {e}")
 
@@ -5002,16 +5225,18 @@ class ImageEditorDialog(QDialog):
         hi = _nanpct(arr_flat, self.STRETCH_HIGH_P)
         return float(lo), float(hi)
 
-    def _sample_for_stats(self, arr):
-        """Return a downsampled view for percentile stats to keep UI responsive."""
-        h, w = arr.shape[:2]
-        m = max(h, w)
-        if m <= self.STRETCH_SAMPLE_MAX:
-            return arr
-        scale = self.STRETCH_SAMPLE_MAX / float(m)
-        new_w = max(1, int(round(w * scale)))
-        new_h = max(1, int(round(h * scale)))
-        return cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    # NOTE: _sample_for_stats used to be defined a SECOND time right here, and
+    # since a later `def` silently replaces an earlier one, this duplicate was
+    # the definition that actually ran. It called cv2.resize directly, and
+    # OpenCV asserts `cn <= 4` -- so on any raster with more than 4 bands it
+    # raised
+    #     cv2.error: (-215:Assertion failed) func != 0 && cn <= 4
+    # which _update_hist_plot caught and turned into a "Could not draw
+    # histogram" tab. That is why the histogram plot did not work on 15-band
+    # stacks. The surviving definition (search upward for `def
+    # _sample_for_stats`) goes through resize_safe, which resizes band-by-band
+    # when C > 4; it was already correct but was being shadowed.
+    # Do not re-add a second definition here.
 
     def normalize_image_for_display(self, image):
         """

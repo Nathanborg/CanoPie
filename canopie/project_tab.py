@@ -2467,6 +2467,81 @@ def _per_channel_stats(sample):
     sd = np.nanstd(flat, axis=0)
     return mu, sd
 
+_DECLARED_NODATA_CACHE = {}
+
+
+def declared_file_nodata(filepath):
+    """The NoData value the raster itself declares (GDAL_NODATA), or [].
+
+    Cached per file. NaN is deliberately NOT returned: non-finite is always
+    treated as invalid by every mask builder, so a NaN tag adds nothing to a
+    value list.
+    """
+    if not filepath:
+        return []
+    try:
+        key = os.path.normcase(os.path.abspath(filepath))
+    except Exception:
+        return []
+    if key in _DECLARED_NODATA_CACHE:
+        return list(_DECLARED_NODATA_CACHE[key])
+    found = []
+    try:
+        from .raster_reader import probe
+        profile = probe(filepath)
+        nd = getattr(profile, "nodata", None) if profile else None
+        if nd is not None and nd == nd:
+            found = [float(nd)]
+    except Exception as e:
+        logging.debug("nodata probe failed for %s: %s", filepath, e)
+    _DECLARED_NODATA_CACHE[key] = list(found)
+    return list(found)
+
+
+def hist_nodata_values(ax, filepath):
+    """NoData values histogram matching must exclude from its statistics.
+
+    The `.ax` list UNIONed with the raster's own declared NoData -- the same
+    rule `ProjectTab.effective_nodata_values` applies elsewhere.
+
+    Histogram matching previously read `ax["nodata_values"]` alone. On a
+    prediction stack whose `.ax` carries `nodata_values: []`, the ancillary
+    planes' -9999 fill was therefore treated as real data in BOTH the reference
+    and the source, with two consequences measured on a real 15-band scene:
+
+      * the reference statistics became the fill value (band 11 mean -9356 for
+        a sensor-azimuth band whose true valid mean is 55.4), so the "matched"
+        output was meaningless (55.4 -> -1362);
+      * the fill pixels themselves were rescaled (-9999 -> -10110.4), so the
+        sentinel no longer matched and 172470 px per band silently became
+        "valid data" for CSV export, ML extraction, Inspect and scene stats.
+
+    Science bands that mark fill as NaN were never affected -- numpy's
+    nan-aware reductions skip those for free -- which is why only the
+    sentinel-based bands were corrupt.
+
+    Returns [] when NoData is disabled for the file.
+    """
+    ax = ax or {}
+    if not ax.get("nodata_enabled", True):
+        return []
+    vals = list(ax.get("nodata_values", []) or [])
+    known = set()
+    for v in vals:
+        try:
+            known.add(float(v))
+        except (TypeError, ValueError):
+            pass
+    for nv in declared_file_nodata(filepath):
+        if nv not in known:
+            vals.append(nv)
+            logging.info("[hist] %s: excluding the file's declared NoData %g from "
+                         "histogram statistics (.ax lists %s)",
+                         os.path.basename(filepath or "?"), nv,
+                         list(ax.get("nodata_values", []) or []) or "nothing")
+    return vals
+
+
 def _preview_take3(cv_img, prefer_last_band=False):
     # mirror current preview choice (no channel reordering)
     if cv_img.ndim == 3:
@@ -3790,6 +3865,27 @@ class ProjectTab(QtWidgets.QWidget):
         mode = (hcfg.get("mode") or "meanstd").lower()
         bands_cfg = int(hcfg.get("bands", 0)) if hcfg.get("bands", 0) else 0
 
+        # A reference is paired to the source POSITIONALLY, band i to entry i --
+        # nothing matches by name or wavelength. So a 3-entry reference (taken on
+        # an RGB image) applied to a 15-band stack quietly matches bands 1-3 and
+        # leaves 4-15 raw. That is a legitimate thing to want, but it must not be
+        # invisible: a half-normalised stack looks fine and exports wrong numbers.
+        try:
+            _n_ref = len(hcfg.get("ref_stats") or
+                         ((hcfg.get("ref_cdf") or {}).get("per_band") or []))
+            _n_img = img.shape[2] if img.ndim == 3 else 1
+            if _n_ref and _n_ref < _n_img:
+                logging.warning(
+                    "[hist] reference has %d band(s) but the image has %d: bands %d-%d "
+                    "will NOT be normalised (matching is positional, band i -> "
+                    "reference entry i).", _n_ref, _n_img, _n_ref + 1, _n_img)
+            elif _n_ref > _n_img:
+                logging.warning(
+                    "[hist] reference has %d band(s) but the image has only %d: the "
+                    "extra reference entries are ignored.", _n_ref, _n_img)
+        except Exception:
+            pass
+
         src_dtype = img.dtype
         H, W = img.shape[:2]
         C = img.shape[2] if img.ndim == 3 else 1
@@ -3799,15 +3895,35 @@ class ProjectTab(QtWidgets.QWidget):
         # Build combined mask (NoData + polygon)
         combined_mask = None
         
-        # NoData mask
+        # NoData mask -- PER BAND, not one whole-pixel mask.
+        #
+        # This used to OR every channel's NoData together into a single (H, W)
+        # mask. That is wrong for histogram matching, whose statistics are
+        # computed per band: band i's mean should exclude band i's own invalid
+        # pixels, not pixels that happen to be invalid in some unrelated
+        # ancillary plane. On a real 15-band prediction stack two ancillary
+        # bands are 100% -9999 fill, so the OR came out True for 100.00% of the
+        # image -- and since the mask also drives the "restore original values"
+        # step, histogram matching silently became a complete no-op for the
+        # whole file. Per-band masks are also what process_polygon and
+        # _per_band_nodata_masks already use, for the same reason.
+        per_band_masks = None
         if nodata_values:
             x_test = img.astype(np.float32, copy=False)
             if x_test.ndim == 2:
                 x_test = x_test[..., None]
-            combined_mask = np.zeros((H, W), dtype=bool)
+            n_ch = x_test.shape[2]
+            numeric = []
             for v in nodata_values:
                 try:
-                    fv = float(v)
+                    numeric.append(float(v))
+                except (TypeError, ValueError):
+                    pass   # expressions are a polygon/whole-pixel concept, not handled here
+            per_band_masks = []
+            for c in range(n_ch):
+                ch = x_test[..., c]
+                m = ~np.isfinite(ch)          # NaN / +-Inf is always invalid
+                for fv in numeric:
                     abs_fv = abs(fv)
                     if abs_fv > 1e+30:
                         tol = abs_fv * 0.01
@@ -3817,16 +3933,14 @@ class ProjectTab(QtWidgets.QWidget):
                         tol = abs_fv * 0.001
                     else:
                         tol = 0.01
-                    for c in range(min(C, x_test.shape[2] if x_test.ndim == 3 else 1)):
-                        ch = x_test[..., c] if x_test.ndim == 3 else x_test
-                        combined_mask |= np.isclose(ch, fv, rtol=0.0, atol=tol)
-                except Exception:
-                    pass
-            # Also check for NaN/Inf
-            for c in range(min(C, x_test.shape[2] if x_test.ndim == 3 else 1)):
-                ch = x_test[..., c] if x_test.ndim == 3 else x_test
-                combined_mask |= np.isnan(ch)
-                combined_mask |= np.isinf(ch)
+                    m |= np.isclose(ch, fv, rtol=0.0, atol=tol)
+                per_band_masks.append(m)
+            # `combined_mask` stays the any-band OR purely so the polygon merge
+            # below and the legacy `nodata_mask is not None` checks keep working;
+            # the per-band masks are what the statistics and restore steps use.
+            combined_mask = np.zeros((H, W), dtype=bool)
+            for m in per_band_masks:
+                combined_mask |= m
         
         # Polygon mask (can be a list of polygon point lists)
         if mask_polygon_enabled and mask_polygon_points:
@@ -3860,9 +3974,23 @@ class ProjectTab(QtWidgets.QWidget):
                     combined_mask = poly_mask_combined
                 else:
                     combined_mask = combined_mask | poly_mask_combined
-        
+                # A mask polygon is a deliberate SPATIAL exclusion ("ignore this
+                # region"), so unlike NoData it applies to every band.
+                if per_band_masks is not None:
+                    per_band_masks = [m | poly_mask_combined for m in per_band_masks]
+                else:
+                    per_band_masks = [poly_mask_combined] * max(1, C)
+
         # Use combined_mask instead of nodata_mask throughout
         nodata_mask = combined_mask
+
+        def _band_mask(c):
+            """Invalid-pixel mask for band `c` (None when nothing is masked)."""
+            if per_band_masks is None:
+                return None
+            if c < len(per_band_masks):
+                return per_band_masks[c]
+            return per_band_masks[-1] if per_band_masks else None
 
         # --- small, safe sampler for stats (to keep UI snappy) ---
         def _sample_stride(h, w, target_pixels=90000):
@@ -3889,13 +4017,15 @@ class ProjectTab(QtWidgets.QWidget):
             if samp_f.ndim == 2:
                 samp_f = samp_f[..., None]
 
-            # Apply nodata mask to sample for stats
-            if nodata_mask is not None:
-                samp_mask = nodata_mask[::s, ::s] if s > 1 else nodata_mask
-                # Mask nodata as NaN for stats calculation
+            # Apply the PER-BAND nodata mask to the sample for stats.
+            if per_band_masks is not None:
                 samp_f = samp_f.copy()
                 for c in range(C2):
-                    samp_f[..., c] = np.where(samp_mask, np.nan, samp_f[..., c])
+                    bm = _band_mask(c)
+                    if bm is None:
+                        continue
+                    bm_s = bm[::s, ::s] if s > 1 else bm
+                    samp_f[..., c] = np.where(bm_s, np.nan, samp_f[..., c])
 
             mu_t = np.nanmean(samp_f, axis=(0, 1)).astype(np.float32)
             sd_t = np.nanstd(samp_f, axis=(0, 1)).astype(np.float32)
@@ -3914,24 +4044,20 @@ class ProjectTab(QtWidgets.QWidget):
                     # Build 256-entry LUT (exact for uint8)
                     lut = np.arange(256, dtype=np.float32) * gain + offset
                     lut = np.clip(lut, 0, 255).astype(np.uint8)
+                    bm = _band_mask(c)
                     if twoD:
                         new_vals = lut[out]
-                        if nodata_mask is not None:
-                            out = np.where(nodata_mask, out, new_vals)
-                        else:
-                            out = new_vals
+                        out = np.where(bm, out, new_vals) if bm is not None else new_vals
                     else:
                         new_vals = lut[out[..., c]]
-                        if nodata_mask is not None:
-                            out[..., c] = np.where(nodata_mask, out[..., c], new_vals)
-                        else:
-                            out[..., c] = new_vals
+                        out[..., c] = (np.where(bm, out[..., c], new_vals)
+                                       if bm is not None else new_vals)
                 return out
 
             # FULL PRECISION PATH: For 16-bit and float images
             # Use vectorized float operations to preserve all precision
             x = img.astype(np.float32, copy=True)
-            orig_x = x.copy() if nodata_mask is not None else None
+            orig_x = x.copy() if per_band_masks is not None else None
             if twoD:
                 x = x[..., None]
                 if orig_x is not None:
@@ -3943,10 +4069,13 @@ class ProjectTab(QtWidgets.QWidget):
             x_view *= gain
             x_view += mu_r.reshape(1, 1, C2)
 
-            # Restore nodata values
-            if nodata_mask is not None and orig_x is not None:
+            # Restore nodata values, per band -- so a band that is entirely fill
+            # cannot freeze every OTHER band's pixels back to their originals.
+            if per_band_masks is not None and orig_x is not None:
                 for c in range(C2):
-                    x[:, :, c] = np.where(nodata_mask, orig_x[:, :, c], x[:, :, c])
+                    bm = _band_mask(c)
+                    if bm is not None:
+                        x[:, :, c] = np.where(bm, orig_x[:, :, c], x[:, :, c])
 
             out = x[..., 0] if twoD else x
             if np.issubdtype(src_dtype, np.integer):
@@ -3960,7 +4089,7 @@ class ProjectTab(QtWidgets.QWidget):
 
             # Need float working copy for CDF (preserves precision during transform)
             x = img.astype(np.float32, copy=True)
-            orig_x = x.copy() if nodata_mask is not None else None
+            orig_x = x.copy() if per_band_masks is not None else None
             if twoD:
                 x = x[..., None]
                 if orig_x is not None:
@@ -3979,8 +4108,9 @@ class ProjectTab(QtWidgets.QWidget):
                     # fallback: compute percentiles on SAMPLE only
                     ch_samp = ch[::s, ::s] if s > 1 else ch
                     # Exclude nodata from percentile calculation
-                    if nodata_mask is not None:
-                        samp_mask = nodata_mask[::s, ::s] if s > 1 else nodata_mask
+                    _bm = _band_mask(c)
+                    if _bm is not None:
+                        samp_mask = _bm[::s, ::s] if s > 1 else _bm
                         finite = np.isfinite(ch_samp) & ~samp_mask
                     else:
                         finite = np.isfinite(ch_samp)
@@ -4004,8 +4134,9 @@ class ProjectTab(QtWidgets.QWidget):
                 idx_samp = np.clip((z_samp * (bins - 1)).astype(np.int32), 0, bins - 1)
                 
                 # Exclude nodata from histogram
-                if nodata_mask is not None:
-                    samp_mask = nodata_mask[::s, ::s] if s > 1 else nodata_mask
+                _bm = _band_mask(c)
+                if _bm is not None:
+                    samp_mask = _bm[::s, ::s] if s > 1 else _bm
                     valid_idx = idx_samp[~samp_mask]
                     hist = np.bincount(valid_idx.ravel(), minlength=bins).astype(np.float32)
                 else:
@@ -4025,8 +4156,9 @@ class ProjectTab(QtWidgets.QWidget):
                 new_vals = xprime_norm[idx_full] * (hi - lo) + lo
                 
                 # Restore nodata values
-                if nodata_mask is not None and orig_x is not None:
-                    ch[:] = np.where(nodata_mask, orig_x[..., c], new_vals)
+                _bm = _band_mask(c)
+                if _bm is not None and orig_x is not None:
+                    ch[:] = np.where(_bm, orig_x[..., c], new_vals)
                 else:
                     ch[:] = new_vals
 
@@ -4314,16 +4446,20 @@ class ProjectTab(QtWidgets.QWidget):
                     else:
                         mask_polygon_points_list.append(points)
             
+            # Same union as _apply_ax_to_raw: the .ax NoData list plus whatever
+            # the raster itself declares. See hist_nodata_values.
+            _hist_nd = hist_nodata_values(ax, image_filepath)
+
             try:
-                result = ProjectTab._apply_hist_match(result, ax, fast=True, max_samples=HIST_MAX_SAMPLES, 
-                                                      nodata_values=nodata_values,
+                result = ProjectTab._apply_hist_match(result, ax, fast=True, max_samples=HIST_MAX_SAMPLES,
+                                                      nodata_values=_hist_nd,
                                                       mask_polygon_points=mask_polygon_points_list,
                                                       mask_polygon_enabled=mask_polygon_enabled)
             except TypeError:
                 # Fallback if function doesn't support mask_polygon
                 try:
-                    result = ProjectTab._apply_hist_match(result, ax, fast=True, max_samples=HIST_MAX_SAMPLES, 
-                                                          nodata_values=nodata_values)
+                    result = ProjectTab._apply_hist_match(result, ax, fast=True, max_samples=HIST_MAX_SAMPLES,
+                                                          nodata_values=_hist_nd)
                 except TypeError:
                     try:
                         result = ProjectTab._apply_hist_match(result, ax, fast=True, max_samples=HIST_MAX_SAMPLES)
@@ -16538,13 +16674,13 @@ class ProjectTab(QtWidgets.QWidget):
                 return fn(
                     img_, {"hist_match": hmatch},
                     fast=True, max_samples=HIST_MAX_SAMPLES,
-                    nodata_values=nodata_values,
+                    nodata_values=hist_nd_vals,
                     mask_polygon_points=poly_points,
                     mask_polygon_enabled=mask_polygon_enabled
                 )
             except TypeError:
                 try:
-                    return fn(img_, {"hist_match": hmatch}, fast=True, max_samples=HIST_MAX_SAMPLES, nodata_values=nodata_values)
+                    return fn(img_, {"hist_match": hmatch}, fast=True, max_samples=HIST_MAX_SAMPLES, nodata_values=hist_nd_vals)
                 except TypeError:
                     pass
             except Exception as e:
@@ -16659,6 +16795,27 @@ class ProjectTab(QtWidgets.QWidget):
                 return
             if isinstance(hmatch, dict) and hmatch:
                 img = _apply_hist_match_local(img)
+
+        # Histogram matching gets the .ax NoData list UNIONed with the raster's
+        # own declared NoData -- see hist_nodata_values for what including the
+        # fill value did to the statistics. Kept separate from `nodata_values`
+        # so the rest of this pipeline's masking behaviour is unchanged.
+        hist_nd_vals = hist_nodata_values(ax, filepath) if hist_enabled else []
+
+        # Matching pairs bands positionally, so a reference measured in BGR
+        # (the editor's order for cv2-loaded <=4-band images) applied to an
+        # RGB-ordered multiband TIFF swaps the Red and Blue references. Warn
+        # rather than silently reorder: quietly permuting a stored reference
+        # would change numbers a previous export already used.
+        if hist_enabled and isinstance(hmatch, dict) and hmatch:
+            _ref_order = str(hmatch.get("channel_order") or "").lower()
+            _src_order = str(getattr(self, "_last_export_channel_order", "") or "").lower()
+            if _ref_order and _src_order and _ref_order != _src_order:
+                logging.warning(
+                    "[hist] %s: reference was measured in %s order but this image is "
+                    "%s -- matching is positional, so the first three bands are paired "
+                    "in reverse. Recompute the reference on an image of this type.",
+                    os.path.basename(filepath or "?"), _ref_order.upper(), _src_order.upper())
 
         def _do_resize():
             nonlocal img, nodata_mask
@@ -18460,6 +18617,18 @@ class ProjectTab(QtWidgets.QWidget):
         "band_expression", "classification", "appended_bands", "mask_polygon",
     )
 
+    # An op's on/off switch is stored as a TOP-LEVEL sibling key, not inside the
+    # op's own dict: the editor writes `hist_enabled`, `resize_enabled`, ... (see
+    # image_editor_dialog's _collect_modifications), and both replay paths read
+    # them from there (apply_aux_modifications / _apply_ax_to_raw).
+    _AX_ENABLE_FLAG = {
+        "hist_match": "hist_enabled",
+        "resize": "resize_enabled",
+        "rotate": "rotate_enabled",
+        "rotation": "rotate_enabled",
+        "band_expression": "band_enabled",
+    }
+
     def _ax_is_windowable(self, ax):
         """True when a .ax config has no operation that needs the whole image."""
         if not ax:
@@ -18468,10 +18637,17 @@ class ProjectTab(QtWidgets.QWidget):
             val = ax.get(key)
             if not val:
                 continue
+            # A disabled op will not run, so it cannot block windowing. This used
+            # to look only for an "enabled" key INSIDE the op's dict -- which
+            # nothing writes -- so switching histogram matching off in the editor
+            # left the stored hist_match block behind and every large raster
+            # silently kept falling back to the slow whole-image read path.
+            flag = self._AX_ENABLE_FLAG.get(key)
+            if flag is not None and not ax.get(flag, True):
+                continue
             if isinstance(val, dict):
-                # Some ops carry an explicit on/off flag (hist_match, registration,
-                # mask_polygon); others are bare parameter dicts (crop, resize) and
-                # are active merely by being present. Treat "no flag" as active.
+                # Ops that do carry their own flag (registration, mask_polygon)
+                # keep honouring it; a bare parameter dict is active by presence.
                 if "enabled" in val and not val.get("enabled"):
                     continue
                 return False
