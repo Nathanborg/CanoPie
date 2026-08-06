@@ -80,6 +80,12 @@ FEATURE_MAP = {
     "test_shapefile_batch_export": (
         "Shapefile export during batched/background CSV runs",
         "ExportWorker writes the shapefile, processed-subset scoping, CSV-ordered DBF fields"),
+    "test_hist_match": (
+        "Histogram matching",
+        "diagnostic plot maths, windowing gate, viewer/CSV/ML/Inspect agreement"),
+    "test_hist_match_nodata": (
+        "Histogram matching under NoData",
+        "declared GDAL_NODATA honoured, fill sentinel preserved, per-band masking"),
 }
 
 
