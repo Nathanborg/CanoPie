@@ -17,6 +17,9 @@ from .project_builder import (
     point_group_name, polygon_group_name,
 )
 
+# Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
+pytestmark = [pytest.mark.io]
+
 
 def test_all_polygon_groups_survive_load(synthetic_project):
     """Every group written to project.json must be present after load --

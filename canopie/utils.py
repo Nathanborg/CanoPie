@@ -532,11 +532,12 @@ def eval_band_expression(image: np.ndarray, expr: str) -> np.ndarray:
     }
     allowed_funcs.update({k.upper(): v for k, v in allowed_funcs.items()})
 
-    # Safe divide
+    # Safe divide: returns 0.0 when denominator is zero or non-finite
     def safe_div(a, b):
         a = _to_arr(a); b = _to_arr(b)
         out = _np.zeros(_np.broadcast(a, b).shape, dtype=_np.float32)
-        _np.divide(a, b, out=out, where=(b != 0))
+        valid = (b != 0) & _np.isfinite(a) & _np.isfinite(b)
+        _np.divide(a, b, out=out, where=valid)
         return out
 
     # AST transform: whitelist names/calls; / -> safe_div; &,|,~ -> np.logical_*

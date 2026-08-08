@@ -278,6 +278,25 @@ class VertexHandle(QtWidgets.QGraphicsObject):
 
 
 # -------------------------------------------------------------------
+# Scene stacking order (QGraphicsItem Z values)
+# -------------------------------------------------------------------
+# These were all implicitly 0 and resolved by INSERTION ORDER, which worked
+# only as long as nothing was ever inserted between the base image and the
+# annotations. The high-resolution zoom overlay is exactly such an item: it is
+# added later, is opaque, and sits at 0.5 -- so with polygons left at the
+# default 0 it covered every polygon and point the moment a zoom refined the
+# view. The symptom was "polygons vanish when I zoom in and come back when I
+# zoom out", because zooming back out clears the overlay.
+#
+# Making the order explicit removes the dependence on insertion order.
+IMAGE_Z          = 0.0     # base (preview) pixmap
+HIGHRES_TILE_Z   = 0.5     # sharpened viewport tile -- above the image...
+POLYGON_Z        = 1.0     # ...and BELOW every annotation
+TEMP_DRAWING_Z   = 1e6     # in-progress rubber-band polygon
+LABEL_Z          = 1e7     # name labels, always on top
+
+
+# -------------------------------------------------------------------
 # Editable overlay items
 # -------------------------------------------------------------------
 class EditablePolygonItem(QtWidgets.QGraphicsObject):
@@ -289,6 +308,11 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
         self.name = name
         self.is_rgb = is_rgb  # Determines polygon appearance
         self.is_mask_polygon = is_mask_polygon  # If True, draw with solid fill
+
+        # Explicitly above the high-res zoom overlay -- see the Z constants at
+        # the top of this module. Left at the default 0 these were covered by
+        # the overlay as soon as a zoom refined the view.
+        self.setZValue(POLYGON_Z)
 
         self.setFlags(
             QtWidgets.QGraphicsItem.ItemIsSelectable |
@@ -318,9 +342,22 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
         if self._cached_img_size is not None:
             return self._cached_img_size
         
-        # Find the pixmap item (usually just one)
+        # Prefer the main viewer base image item
+        views = scn.views() if scn else []
+        if views and hasattr(views[0], '_image') and views[0]._image is not None:
+            try:
+                pm = views[0]._image.pixmap()
+                if not pm.isNull():
+                    self._cached_img_size = (pm.width(), pm.height())
+                    long_side = max(self._cached_img_size)
+                    self._cached_res_boost = min(3.0, max(1.0, (long_side / 2048.0) ** 0.5))
+                    return self._cached_img_size
+            except Exception:
+                pass
+
+        # Fallback: Find base pixmap item (zValue == 0)
         for it in scn.items():
-            if isinstance(it, QtWidgets.QGraphicsPixmapItem):
+            if isinstance(it, QtWidgets.QGraphicsPixmapItem) and getattr(it, 'zValue', lambda: 0)() == 0:
                 pm = it.pixmap()
                 if not pm.isNull():
                     self._cached_img_size = (pm.width(), pm.height())
@@ -449,6 +486,23 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
             self.prepareGeometryChange()
             
             self.is_moving = True
+            
+            # Only deselect others if:
+            #   - This item is NOT already selected (i.e. a fresh click on a new polygon), AND
+            #   - Ctrl is NOT held (Ctrl = intentional multi-select)
+            # This preserves Ctrl-built groups during drag: the user clicks an already-selected
+            # item to start the drag without Ctrl, and we must NOT clear the group.
+            try:
+                scene = self.scene()
+                if scene:
+                    mods = event.modifiers()
+                    if not self.isSelected() and not (mods & QtCore.Qt.ControlModifier):
+                        for item in scene.selectedItems():
+                            if item is not self:
+                                item.setSelected(False)
+            except Exception:
+                pass
+            
             self.setSelected(True)
             
             # Capture start positions for ALL selected items (Batch Move support)
@@ -479,7 +533,6 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
             except Exception:
                 pass
         super(EditablePolygonItem, self).mousePressEvent(event)
-
 
     def mouseReleaseEvent(self, event):
         if event.button() == QtCore.Qt.LeftButton:
@@ -595,6 +648,9 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
         self.is_rgb = is_rgb
         self.pixmap_item = pixmap_item
         self.points_are_pixmap_local = points_are_pixmap_local
+
+        # Same stacking rule as EditablePolygonItem.
+        self.setZValue(POLYGON_Z)
 
         self.setFlags(
             QtWidgets.QGraphicsItem.ItemIsSelectable |
@@ -749,6 +805,19 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
             self.prepareGeometryChange()
 
             self.is_moving = True
+
+            # Only deselect others if this item is NOT already selected AND Ctrl is NOT held.
+            try:
+                scene = self.scene()
+                if scene:
+                    mods = event.modifiers()
+                    if not self.isSelected() and not (mods & QtCore.Qt.ControlModifier):
+                        for item in scene.selectedItems():
+                            if item is not self:
+                                item.setSelected(False)
+            except Exception:
+                pass
+
             self.setSelected(True)
 
             # PERFORMANCE: Notify viewer that item is being dragged
@@ -763,7 +832,6 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
             except Exception:
                 pass
         super(EditablePointItem, self).mousePressEvent(event)
-
 
     def mouseReleaseEvent(self, event):
         if event.button() == QtCore.Qt.LeftButton:
@@ -837,6 +905,26 @@ class ImageViewer(QtWidgets.QGraphicsView):
     # Emits stretch parameters when the user adjusts the stretch slider
     stretch_applied = QtCore.pyqtSignal(object)
 
+    # Carries a finished high-resolution viewport tile back to the GUI thread.
+    #
+    # The tile is produced on a ThreadPoolExecutor worker (see
+    # ProjectTab._request_highres_viewport_region). It CANNOT be applied from
+    # there: update_highres_overlay mutates the QGraphicsScene, which is only
+    # legal on the GUI thread. The previous attempt used
+    # QTimer.singleShot(0, callable) from the worker, but a QTimer takes the
+    # affinity of the thread that creates it and that worker has no Qt event
+    # loop -- so it never fired and every finished tile was silently dropped
+    # (the region really was read and rendered; it just never reached the
+    # scene, so zooming showed no error and no sharpening).
+    #
+    # A signal is the right primitive: emitting across threads queues the call
+    # onto the receiver's thread automatically, with no event-loop assumptions
+    # about the sender.
+    highres_tile_ready = QtCore.pyqtSignal(object, float, float, float, float, object)
+
+    # Global overlay toggle state across all viewers
+    overlays_muted = False
+
     def __init__(self, parent=None):
         super(ImageViewer, self).__init__(parent)
         self._labels_visible = True
@@ -878,8 +966,11 @@ class ImageViewer(QtWidgets.QGraphicsView):
         self.polygons = []
         self._rb_dragging = False
         self.setRubberBandSelectionMode(Qt.IntersectsItemShape)
-
         self.temp_drawing_item = None
+
+        if not hasattr(ImageViewer, "overlays_muted"):
+            ImageViewer.overlays_muted = False
+        self._overlay_toggle_btn = _OverlayToggleButton(self)
 
         # Panning / focus
         self.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
@@ -932,6 +1023,15 @@ class ImageViewer(QtWidgets.QGraphicsView):
         self._polygon_item_count = 0  # Number of polygon/point items for fast panning check
         self._hover_inspect_enabled = True  # Set to False to disable hover pixel inspection
 
+        # --- Double-Buffered High-Resolution Overlay System ---
+        self._highres_front_item = None
+        self._highres_back_item = None
+        self._highres_enabled = False
+        self._highres_request_callback = None
+        # Worker threads emit this; Qt queues it onto THIS (the GUI) thread,
+        # which is the only thread allowed to touch the QGraphicsScene.
+        self.highres_tile_ready.connect(self._on_highres_tile_ready)
+
         # For rectangle zoom mode (right-click drag to zoom to rectangle)
         self._rect_zoom_mode = False
         self._rect_zoom_start = None
@@ -942,7 +1042,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
         self._overlay_btn = None
         self._overlay_default_pos = QtCore.QPointF(14, 14)
         self._hover_hide_timer = QtCore.QTimer(self)
-        self._hover_hide_timer.setInterval(3000)
+        self._hover_hide_timer.setInterval(5000)
         self._hover_hide_timer.setSingleShot(True)
         self._hover_hide_timer.timeout.connect(lambda: self._set_overlay_visible(False, immediate=True))
 
@@ -1031,6 +1131,12 @@ class ImageViewer(QtWidgets.QGraphicsView):
             if sb is not None:
                 try:
                     sb.hide_immediately()
+                except Exception:
+                    pass
+            zb = getattr(self, "_zoombar", None)
+            if zb is not None:
+                try:
+                    zb.hide_immediately()
                 except Exception:
                     pass
 
@@ -1136,6 +1242,13 @@ class ImageViewer(QtWidgets.QGraphicsView):
     def _begin_item_drag(self):
         """Temporarily switch to a repaint mode that avoids label 'ink' trails."""
         try:
+            if getattr(self, "_bandbar", None) is not None:
+                self._bandbar.hide_immediately()
+            if getattr(self, "_stretchbar", None) is not None:
+                self._stretchbar.hide_immediately()
+            if getattr(self, "_zoombar", None) is not None:
+                self._zoombar.hide_immediately()
+                
             self._drag_active_count = getattr(self, "_drag_active_count", 0) + 1
             if self._drag_active_count == 1:
                 # Save current modes (in case caller changed them elsewhere)
@@ -1163,6 +1276,13 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 if scn:
                     scn.invalidate(scn.sceneRect(), QtWidgets.QGraphicsScene.AllLayers)
                 self.viewport().update()
+                
+                if getattr(self, "_bandbar", None) is not None:
+                    self._bandbar.show_briefly()
+                if getattr(self, "_stretchbar", None) is not None:
+                    self._stretchbar.show_briefly()
+                if getattr(self, "_zoombar", None) is not None:
+                    self._zoombar.show_briefly()
         except Exception:
             pass
 
@@ -1331,6 +1451,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
             pen.setWidthF(2.0 / max(1e-6, scale))
             self.temp_drawing_item.setPen(pen)
         self.viewport().update()
+        self._trigger_highres_update()
 
     def _load_ax_mods(self, image_path):
         """Load .ax modifications with mtime-based cache invalidation."""
@@ -1718,12 +1839,17 @@ class ImageViewer(QtWidgets.QGraphicsView):
     def has_image(self):
         return not self._empty
 
+    def scale(self, sx, sy):
+        super().scale(sx, sy)
+        self._trigger_highres_update()
+
     def fit_to_window(self):
         # Fit the IMAGE item to the view, ignoring the extra scene padding
         if self._image:
             self.fitInView(self._image, QtCore.Qt.KeepAspectRatio)
         else:
             self.fitInView(self._scene.sceneRect(), QtCore.Qt.KeepAspectRatio)
+        self._trigger_highres_update()
 
     def _get_image_rect(self):
         """Get the actual image bounding rect in scene coordinates."""
@@ -1774,6 +1900,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
         # scene.clear() destroys all items, which is expensive.
         # We manually clear polygons/misc items but keep the heavy pixmap item.
         self.clear_polygons()
+        self._clear_highres_overlay()
         
         # Remove rect zoom item if exists
         if self._rect_zoom_item:
@@ -1889,9 +2016,213 @@ class ImageViewer(QtWidgets.QGraphicsView):
             if zb:
                 zb._set_slider_from_zoom(z)
                 zb._update_label(z)
+            self._trigger_highres_update()
         finally:
             self._suppress_sync = False
             _ZoomBar._applying_fixed_zoom = False
+
+    # --- High-Resolution Dynamic Viewport Region Loading ---
+    def enable_highres_viewport(self, callback=None, cancel_callback=None):
+        self._highres_request_callback = callback
+        self._highres_cancel_callback = cancel_callback
+        self._highres_enabled = True
+        self.cancel_pending_highres_requests()
+
+    def disable_highres_viewport(self):
+        self.cancel_pending_highres_requests()
+        self._highres_enabled = False
+        self._highres_request_callback = None
+        self._highres_cancel_callback = None
+        self._clear_highres_overlay()
+
+    def cancel_pending_highres_requests(self):
+        """Cancel any pending or in-flight highres tile requests."""
+        self._highres_request_id = getattr(self, "_highres_request_id", 0) + 1
+        timer = getattr(self, "_highres_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+        cancel_cb = getattr(self, "_highres_cancel_callback", None)
+        if cancel_cb is not None and callable(cancel_cb):
+            try:
+                cancel_cb(self, self._highres_request_id)
+            except Exception as e:
+                logging.debug(f"[ImageViewer] highres cancel callback failed: {e}")
+
+    def _clear_highres_overlay(self):
+        """Remove both front and back buffer items from the scene and reset all handles."""
+        scene = getattr(self, "_scene", None)
+        for attr in ("_highres_front_item", "_highres_back_item"):
+            item = getattr(self, attr, None)
+            if item is not None:
+                try:
+                    if not sip.isdeleted(item) and item.scene() is scene:
+                        scene.removeItem(item)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        self._highres_item = None
+
+    def scrollContentsBy(self, dx, dy):
+        super().scrollContentsBy(dx, dy)
+        self._trigger_highres_update()
+
+    def fitInView(self, *args, **kwargs):
+        super().fitInView(*args, **kwargs)
+        self._trigger_highres_update()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._trigger_highres_update()
+
+    def setTransform(self, transform, combine=False):
+        super().setTransform(transform, combine)
+        self._trigger_highres_update()
+
+    def resetTransform(self):
+        super().resetTransform()
+        self._trigger_highres_update()
+
+    def centerOn(self, *args, **kwargs):
+        super().centerOn(*args, **kwargs)
+        self._trigger_highres_update()
+
+    def _trigger_highres_update(self):
+        if not getattr(self, "_highres_enabled", False):
+            return
+        self.cancel_pending_highres_requests()
+        timer = getattr(self, "_highres_timer", None)
+        if timer is None:
+            timer = QtCore.QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(200)  # 200 ms debounce
+            timer.timeout.connect(self._on_highres_timer_timeout)
+            self._highres_timer = timer
+        timer.start()
+
+    def _on_highres_timer_timeout(self):
+        if not getattr(self, "_highres_enabled", False):
+            return
+        current_req_id = getattr(self, "_highres_request_id", 0)
+        scale = self.transform().m11()
+        vp = self.viewport()
+        cached_size = getattr(self, '_cached_pixmap_size', None)
+        if vp and cached_size and cached_size[0] > 0 and cached_size[1] > 0:
+            fit_scale = min(vp.width() / float(cached_size[0]), vp.height() / float(cached_size[1]))
+            if scale <= fit_scale * 1.05:
+                self._clear_highres_overlay()
+                return
+        elif scale <= 1.05:
+            self._clear_highres_overlay()
+            return
+
+        vp_rect = self.viewport().rect()
+        scene_rect = self.mapToScene(vp_rect).boundingRect()
+        cb = getattr(self, "_highres_request_callback", None)
+        if cb is not None and callable(cb):
+            try:
+                import inspect
+                sig = inspect.signature(cb)
+                if len(sig.parameters) >= 3:
+                    cb(self, scene_rect, current_req_id)
+                else:
+                    cb(self, scene_rect)
+            except Exception:
+                cb(self, scene_rect)
+
+    def _on_highres_tile_ready(self, pixmap, scene_pos_x, scene_pos_y,
+                               scale_x, scale_y, request_id):
+        """GUI-thread landing point for a tile produced on a worker thread.
+
+        Connected to `highres_tile_ready` in __init__, so Qt queues the call
+        here from whatever thread emitted it. See that signal's comment for
+        why the previous QTimer.singleShot approach silently dropped tiles.
+        """
+        try:
+            self.update_highres_overlay(pixmap, scene_pos_x, scene_pos_y,
+                                        scale_x, scale_y, request_id=request_id)
+        except Exception as e:
+            logging.debug(f"[ImageViewer] high-res tile apply failed: {e}")
+
+    def update_highres_overlay(self, pixmap, scene_pos_x, scene_pos_y, scale_x, scale_y, request_id=None):
+        """Double-buffered overlay swap.
+
+        On each call:
+          - The current *back* item (hidden) is promoted to *front* and filled
+            with the new pixmap.
+          - The current *front* item is demoted to *back* and hidden.
+        This guarantees at most 2 QGraphicsPixmapItem allocations for the lifetime
+        of the viewer and produces zero flicker.
+
+        Backward-compat: ``self._highres_item`` always points to the front item.
+        """
+        if not getattr(self, "_highres_enabled", False) or pixmap is None or pixmap.isNull():
+            return
+        if request_id is not None and request_id != getattr(self, "_highres_request_id", 0):
+            logging.debug(
+                "[ImageViewer] Ignoring stale highres overlay (req %s != current %s)",
+                request_id, self._highres_request_id,
+            )
+            return
+        scene = getattr(self, "_scene", None)
+        if scene is None or sip.isdeleted(scene):
+            return
+
+        def _item_valid(it):
+            """True if the item belongs to the current scene and has not been deleted."""
+            if it is None:
+                return False
+            try:
+                return not sip.isdeleted(it) and it.scene() is scene
+            except Exception:
+                return False
+
+        front = getattr(self, "_highres_front_item", None)
+        back  = getattr(self, "_highres_back_item", None)
+
+        if not _item_valid(front) and not _item_valid(back):
+            # ── First call: create the front item from scratch ──────────────
+            new_front = scene.addPixmap(pixmap)
+            new_front.setZValue(HIGHRES_TILE_Z)
+            new_front.setPos(scene_pos_x, scene_pos_y)
+            new_front.setTransform(QtGui.QTransform().scale(scale_x, scale_y))
+            new_front.setVisible(True)
+            self._highres_front_item = new_front
+            self._highres_back_item  = None
+        else:
+            # ── Subsequent calls: swap buffers ──────────────────────────────
+            # The *back* buffer becomes the new *front* (reusing its scene item).
+            # The current *front* is demoted to *back* and hidden.
+
+            if _item_valid(back):
+                # Promote back → front
+                new_front = back
+                new_front.setPixmap(pixmap)
+                new_front.setPos(scene_pos_x, scene_pos_y)
+                new_front.setTransform(QtGui.QTransform().scale(scale_x, scale_y))
+                new_front.setVisible(True)
+                new_front.setZValue(HIGHRES_TILE_Z)
+            else:
+                # Back was invalid/missing: allocate a second item
+                new_front = scene.addPixmap(pixmap)
+                new_front.setZValue(HIGHRES_TILE_Z)
+                new_front.setPos(scene_pos_x, scene_pos_y)
+                new_front.setTransform(QtGui.QTransform().scale(scale_x, scale_y))
+                new_front.setVisible(True)
+
+            # Demote the old front → back (hide it)
+            new_back = front if _item_valid(front) else None
+            if new_back is not None:
+                new_back.setVisible(False)
+
+            self._highres_front_item = new_front
+            self._highres_back_item  = new_back
+
+        # Backward-compat alias
+        self._highres_item = self._highres_front_item
+
+        self._highres_front_item.update()
+        if self.viewport():
+            self.viewport().update()
 
     def reapply_fixed_zoom_if_enabled(self):
         """
@@ -2126,6 +2457,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 self._wheel_sync_timer.start()
         finally:
             self._zooming = False
+            self._trigger_highres_update()
 
         # More wheel input arrived while this step was being applied: schedule
         # it rather than leaving the view short of where the user scrolled to.
@@ -2172,6 +2504,15 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 if not self.drawing:
                     self.drawing = True
                     self.setDragMode(QtWidgets.QGraphicsView.NoDrag)
+                    
+                    # Hide overlay bars immediately when drawing starts
+                    if getattr(self, "_bandbar", None) is not None:
+                        self._bandbar.hide_immediately()
+                    if getattr(self, "_stretchbar", None) is not None:
+                        self._stretchbar.hide_immediately()
+                    if getattr(self, "_zoombar", None) is not None:
+                        self._zoombar.hide_immediately()
+                        
                     point = self.mapToScene(event.pos())
                     self.currentPolygon = QtGui.QPolygonF()
                     self.currentPolygon.append(point)
@@ -2282,6 +2623,11 @@ class ImageViewer(QtWidgets.QGraphicsView):
                     self._rect_zoom_item.setPen(pen)
                     brush = QtGui.QBrush(QtGui.QColor(0, 120, 215, 40))
                     self._rect_zoom_item.setBrush(brush)
+                    # Above the high-res zoom overlay, same as the polygon
+                    # rubber band -- otherwise the selection rectangle is
+                    # painted over by a refined tile mid-drag and the user
+                    # cannot see what they are selecting.
+                    self._rect_zoom_item.setZValue(TEMP_DRAWING_Z)
                     self._scene.addItem(self._rect_zoom_item)
                     self.setCursor(QtCore.Qt.CrossCursor)
                     event.accept()
@@ -3506,7 +3852,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
         self.temp_drawing_item.setPen(pen)
         self.temp_drawing_item.setBrush(QtGui.QBrush(QtCore.Qt.transparent))
         try:
-            self.temp_drawing_item.setZValue(1e6)
+            self.temp_drawing_item.setZValue(TEMP_DRAWING_Z)
         except Exception:
             pass
 
@@ -4260,6 +4606,88 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 self._pop_local_sync()
             logging.error(f"[ImageViewer] (edit_all_polygons_in_group) unexpected error: {e}")
 
+# --- Overlay Toggle Button ---------------------------------------------------
+class _OverlayToggleButton(QtWidgets.QToolButton):
+    """
+    Small button in the top-left of the viewer to toggle all overlays
+    (Band, Stretch, Zoom) on or off globally across all viewers.
+    """
+    def __init__(self, viewer):
+        super().__init__(viewer)
+        self.viewer = viewer
+        self.setFixedSize(36, 36)
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+        self.update_icon()
+        
+        self.setStyleSheet("""
+            QToolButton {
+                background: rgba(0, 0, 0, 0.4);
+                color: rgba(255, 255, 255, 0.8);
+                border-radius: 6px;
+                font-size: 20px;
+                font-weight: bold;
+                border: 1px solid rgba(255, 255, 255, 0.3);
+            }
+            QToolButton:hover {
+                background: rgba(0, 0, 0, 0.9);
+                color: white;
+                border: 1px solid rgba(255, 255, 255, 0.6);
+            }
+        """)
+        self.clicked.connect(self.toggle_overlays)
+        self.reposition()
+        self.show()
+
+        # Wire up resize tracking to stay anchored bottom-left
+        old_resize = viewer.resizeEvent
+        def _resized(ev):
+            try:
+                self.reposition()
+            except Exception:
+                pass
+            if callable(old_resize):
+                old_resize(ev)
+        viewer.resizeEvent = _resized
+
+    def reposition(self):
+        vp_geom = self.viewer.viewport().geometry()
+        margin = 15
+        x = vp_geom.x() + margin
+        y = max(vp_geom.y(), vp_geom.bottom() - self.height() - margin + 1)
+        self.move(x, y)
+
+    def update_icon(self):
+        muted = getattr(ImageViewer, "overlays_muted", False)
+        # 👁 for visible, ✕ for hidden
+        self.setText("👁" if not muted else "✕")
+        self.setToolTip("Hide all UI Overlays" if not muted else "Show all UI Overlays")
+        
+    def toggle_overlays(self):
+        muted = getattr(ImageViewer, "overlays_muted", False)
+        ImageViewer.overlays_muted = not muted
+        
+        # Sync button state and overlay visibility across all viewers
+        try:
+            from PyQt5.QtWidgets import QApplication
+            all_viewers = set()
+            for w in QApplication.topLevelWidgets():
+                if isinstance(w, ImageViewer):
+                    all_viewers.add(w)
+                all_viewers.update(w.findChildren(ImageViewer))
+            
+            # Fallback to self.viewer if topLevelWidgets is empty or doesn't include it
+            if hasattr(self, "viewer") and self.viewer:
+                all_viewers.add(self.viewer)
+                
+            for v in all_viewers:
+                if hasattr(v, "_overlay_toggle_btn"):
+                    v._overlay_toggle_btn.update_icon()
+                if ImageViewer.overlays_muted:
+                    if getattr(v, "_bandbar", None): v._bandbar.hide_immediately()
+                    if getattr(v, "_stretchbar", None): v._stretchbar.hide_immediately()
+                    if getattr(v, "_zoombar", None): v._zoombar.hide_immediately()
+        except Exception:
+            pass
 
 # --- ZoomBar overlay for ImageViewer -----------------------------------------
 class _ZoomBar(QtWidgets.QFrame):
@@ -4772,7 +5200,7 @@ class _ZoomBar(QtWidgets.QFrame):
         # --- Auto-hide timer ---
         self._hide_timer = QtCore.QTimer(self)
         self._hide_timer.setSingleShot(True)
-        self._hide_timer.setInterval(1500)  # hide after 1.5 seconds of no interaction
+        self._hide_timer.setInterval(5000)  # hide after 5 seconds of no interaction
         self._hide_timer.timeout.connect(self._do_hide)
         
         # Start hidden
@@ -5136,16 +5564,17 @@ class _ZoomBar(QtWidgets.QFrame):
         self._hide_timer.stop()
     
     def show_briefly(self):
-        """Show the zoom bar and start the auto-hide timer.
-
-        Always repositions (not just when transitioning from hidden), so the
-        bar tracks the viewport's actual current size on every interaction --
-        zooming in past the fit level can bring in scrollbars that shrink the
-        viewport without necessarily firing the outer view's resizeEvent.
-        """
+        """Show the zoom bar and start the auto-hide timer."""
+        if getattr(ImageViewer, "overlays_muted", False): return
+        
         self.reposition()
         self.show()
         self._start_hide_timer()
+
+    def hide_immediately(self):
+        """Hide with no delay."""
+        self._hide_timer.stop()
+        self.hide()
     
     def enterEvent(self, event):
         """Stop hiding when mouse enters, change cursor to pointer."""
@@ -5374,10 +5803,10 @@ class _BandBar(QtWidgets.QFrame):
 
         self._row.addStretch(1)   # keeps buttons left-aligned when the strip is wider than its content
 
-        # --- Auto-hide timer (same 1.5s convention as _ZoomBar) ---
+        # --- Auto-hide timer (same 5s convention as _ZoomBar) ---
         self._hide_timer = QtCore.QTimer(self)
         self._hide_timer.setSingleShot(True)
-        self._hide_timer.setInterval(1500)
+        self._hide_timer.setInterval(5000)
         self._hide_timer.timeout.connect(self._do_hide)
 
         self.hide()
@@ -5455,13 +5884,9 @@ class _BandBar(QtWidgets.QFrame):
         self._hide_timer.stop()
 
     def show_briefly(self):
-        """Show the band bar and start the auto-hide timer.
+        """Show the band bar and start the auto-hide timer."""
+        if getattr(ImageViewer, "overlays_muted", False): return
 
-        Always repositions (not just when transitioning from hidden), so the
-        bar stays docked to the bottom of the viewport at every zoom level --
-        zooming in past the fit level can bring in scrollbars that shrink the
-        viewport without necessarily firing the outer view's resizeEvent.
-        """
         if not self._buttons_by_band:
             return   # nothing to show (no image loaded yet)
         self.reposition()
@@ -5505,7 +5930,7 @@ class _BandBar(QtWidgets.QFrame):
             m = 8
             s = self.sizeHint()
             target_w = max(s.width(), min(480, vp.width() - 2 * m))
-            bar_w = max(40, min(target_w, vp.width() - 2 * m))
+            bar_w = max(s.width(), min(target_w, vp.width() - 2 * m))
             x = max(m, (vp.width() - bar_w) // 2)
             y = max(m, vp.height() - s.height() - m)
             new_geom = QtCore.QRect(x, y, bar_w, s.height())
@@ -5544,6 +5969,8 @@ def attach_zoom_bar(viewer):
         viewer.setTransformationAnchor(prev_anchor)
         if getattr(viewer, "_zoombar", None):
             viewer._zoombar.set_zoom(z)
+        if hasattr(viewer, "_trigger_highres_update"):
+            viewer._trigger_highres_update()
     viewer.set_zoom_factor = set_zoom_factor
 
     zb.zoomChanged.connect(lambda z: viewer.set_zoom_factor(z, anchor=QtWidgets.QGraphicsView.AnchorViewCenter))
@@ -5569,16 +5996,17 @@ def attach_zoom_bar(viewer):
             zb._set_slider_from_zoom(cur)
             zb._update_label(cur)
             zb._block = False
-            zb.show_briefly()
+            if not getattr(viewer, "drawing", False):
+                zb.show_briefly()
         except Exception:
             pass
         try:
-            if getattr(viewer, "_bandbar", None):
+            if getattr(viewer, "_bandbar", None) and not getattr(viewer, "drawing", False):
                 viewer._bandbar.show_briefly()
         except Exception:
             pass
         try:
-            if getattr(viewer, "_stretchbar", None):
+            if getattr(viewer, "_stretchbar", None) and not getattr(viewer, "drawing", False):
                 viewer._stretchbar.show_briefly()
         except Exception:
             pass
@@ -5759,7 +6187,8 @@ class _StretchBar(QtWidgets.QFrame):
         self._slider_min = QtWidgets.QSlider(QtCore.Qt.Horizontal, self)
         self._slider_min.setRange(0, 1000)
         self._slider_min.setValue(0)
-        self._slider_min.setFixedWidth(75)
+        self._slider_min.setMinimumWidth(20)
+        self._slider_min.setMaximumWidth(75)
         layout.addWidget(self._slider_min)
 
         lbl_max = QtWidgets.QLabel("Max", self)
@@ -5767,11 +6196,12 @@ class _StretchBar(QtWidgets.QFrame):
         self._slider_max = QtWidgets.QSlider(QtCore.Qt.Horizontal, self)
         self._slider_max.setRange(0, 1000)
         self._slider_max.setValue(1000)
-        self._slider_max.setFixedWidth(75)
+        self._slider_max.setMinimumWidth(20)
+        self._slider_max.setMaximumWidth(75)
         layout.addWidget(self._slider_max)
 
         self._lbl_vals = QtWidgets.QLabel("–", self)
-        self._lbl_vals.setMinimumWidth(110)
+        self._lbl_vals.setMinimumWidth(40)
         self._lbl_vals.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(self._lbl_vals)
 
@@ -5788,7 +6218,7 @@ class _StretchBar(QtWidgets.QFrame):
 
         self._hide_timer = QtCore.QTimer(self)
         self._hide_timer.setSingleShot(True)
-        self._hide_timer.setInterval(1500)
+        self._hide_timer.setInterval(5000)
         self._hide_timer.timeout.connect(self._do_hide)
 
         self.hide()
@@ -5991,7 +6421,7 @@ class _StretchBar(QtWidgets.QFrame):
             pos_max = int(round(max(0.0, min(1.0, (c_max - self._data_min) / range_len)) * 1000))
             self._slider_min.setValue(pos_min)
             self._slider_max.setValue(pos_max)
-            self._lbl_vals.setText(f"{c_min:.6g} – {c_max:.6g}")
+            self._lbl_vals.setText(f"{self._format_val(c_min)} – {self._format_val(c_max)}")
         finally:
             self._slider_min.blockSignals(b_min)
             self._slider_max.blockSignals(b_max)
@@ -5999,6 +6429,17 @@ class _StretchBar(QtWidgets.QFrame):
     def _pos_to_val(self, pos):
         frac = pos / 1000.0
         return self._data_min + frac * (self._data_max - self._data_min)
+
+    def _format_val(self, val):
+        try:
+            img = getattr(getattr(self._view, "image_data", None), "image", None)
+            if img is not None and img.dtype.kind in ('i', 'u'):
+                return f"{int(round(val))}"
+        except Exception:
+            pass
+        if getattr(self, "_data_max", 0) - getattr(self, "_data_min", 0) > 255:
+            return f"{int(round(val))}"
+        return f"{val:.4g}"
 
     def _on_slider_changed(self):
         pmin = self._slider_min.value()
@@ -6019,10 +6460,8 @@ class _StretchBar(QtWidgets.QFrame):
 
         c_min = self._pos_to_val(pmin)
         c_max = self._pos_to_val(pmax)
-        # Use :.6g so the label adapts to any data type:
-        # uint8 [0,255] → "0 – 255", float [0,1] → "0.001 – 0.999",
-        # uint16 [0,65535] → "0 – 65535", radiance [50.3,3000.5] → "50.3 – 3000.5"
-        self._lbl_vals.setText(f"{c_min:.6g} – {c_max:.6g}")
+        # Formatted dynamically to prevent UI overlap for integers/large floats
+        self._lbl_vals.setText(f"{self._format_val(c_min)} – {self._format_val(c_max)}")
         self.show_briefly()
 
     def _apply_stretch(self):
@@ -6101,6 +6540,8 @@ class _StretchBar(QtWidgets.QFrame):
         self._hide_timer.start()
 
     def show_briefly(self):
+        if getattr(ImageViewer, "overlays_muted", False): return
+        
         idata = getattr(self._view, "image_data", None)
         if idata is None or getattr(idata, "image", None) is None:
             return
@@ -6141,7 +6582,7 @@ class _StretchBar(QtWidgets.QFrame):
             m = 8
             s = self.sizeHint()
             target_w = max(s.width(), min(480, vp.width() - 2 * m))
-            bar_w = max(40, min(target_w, vp.width() - 2 * m))
+            bar_w = max(s.width(), min(target_w, vp.width() - 2 * m))
             x = max(m, (vp.width() - bar_w) // 2)
             y = m
             new_geom = QtCore.QRect(x, y, bar_w, s.height())

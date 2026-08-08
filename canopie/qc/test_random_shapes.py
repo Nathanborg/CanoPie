@@ -12,6 +12,9 @@ import pytest
 
 from ..random_shapes_generator import generate_random_shape_pointlists
 
+# Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
+pytestmark = [pytest.mark.polygons]
+
 
 def _params(**over):
     p = {

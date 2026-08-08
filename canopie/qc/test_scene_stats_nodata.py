@@ -29,6 +29,9 @@ from .fixtures_manifest import fixture_image_path, get_fixture
 from .project_builder import polygon_group_name
 from ._helpers import load_raw_npz, assert_close
 
+# Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
+pytestmark = [pytest.mark.extraction]
+
 SCENE_OPTS = {"stats": {"mean": True, "scene_mean": True,
                         "scene_median": True, "scene_std": True}}
 

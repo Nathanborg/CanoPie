@@ -25,6 +25,9 @@ import pytest
 
 from ..machine_learning_manager import AnalysisOptionsDialog
 
+# Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
+pytestmark = [pytest.mark.extraction]
+
 parse = AnalysisOptionsDialog._parse_bandmath
 
 

@@ -15,6 +15,9 @@ wrong rotation/flip is unambiguous rather than plausible-looking.
 import numpy as np
 import pytest
 
+# Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
+pytestmark = [pytest.mark.editor, pytest.mark.extraction]
+
 
 def _positional_array(h=4, w=6, c=3):
     """value = row*100 + col*10 + band -- every pixel identifies itself, so

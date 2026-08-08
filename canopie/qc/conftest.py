@@ -145,6 +145,29 @@ def _no_modal_dialogs(monkeypatch):
                         lambda self, v: None, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _restore_global_app_state():
+    """Snapshot and restore module/class-level state that tests can mutate.
+
+    `ImageViewer.overlays_muted` is a CLASS attribute -- that is deliberate,
+    since the overlay toggle is global across every viewer -- but it means a
+    test that flips it changes the starting conditions for every test that runs
+    afterwards, in whatever order pytest happens to pick. That is the classic
+    "passes alone, fails in the suite" (or worse, "passes in the suite, fails
+    alone") shape, and it is invisible in the failure message.
+
+    Restoring here rather than in each test means a NEW test that touches this
+    state cannot forget to clean up.
+    """
+    from ..image_viewer import ImageViewer
+
+    saved = getattr(ImageViewer, "overlays_muted", False)
+    try:
+        yield
+    finally:
+        ImageViewer.overlays_muted = saved
+
+
 @pytest.fixture(scope="session", autouse=True)
 def fixtures_ready():
     """Regenerates only whatever fixture images/ground-truth are missing --

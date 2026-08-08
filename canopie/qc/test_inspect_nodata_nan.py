@@ -41,6 +41,9 @@ from PyQt5 import QtCore, QtGui
 
 from ..project_tab import ProjectTab
 
+# Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
+pytestmark = [pytest.mark.viewer, pytest.mark.extraction]
+
 
 def _image_data(arr, *, filepath=None, channel_order="rgb"):
     """Minimal stand-in for ImageData.

@@ -32,6 +32,9 @@ import tifffile
 from ..shapefile_io import (crs_label, group_features_by_crs,
                             json_polygons_to_features, write_feature_collection)
 
+# Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
+pytestmark = [pytest.mark.io]
+
 
 def _write_geotiff(path, epsg, origin_x, origin_y, scale=1.0, w=64, h=64):
     """Minimal but real GeoTIFF: ModelTiepoint + ModelPixelScale + a

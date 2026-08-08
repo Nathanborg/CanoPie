@@ -15,6 +15,9 @@ from .fixtures_manifest import FIXTURES, fixture_image_path, get_fixture
 from .project_builder import polygon_group_name, point_group_name, degenerate_group_name
 from ._helpers import load_ground_truth, assert_close, expected_channel_names
 
+# Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
+pytestmark = [pytest.mark.extraction]
+
 ALL_NAMES = [f["name"] for f in FIXTURES]
 
 STATS_OPTS = {"stats": {"mean": True, "median": True, "std": True, "quantiles": [25, 75]}}

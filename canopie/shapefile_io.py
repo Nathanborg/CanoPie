@@ -1296,3 +1296,495 @@ def group_features_by_crs(features):
         groups[label][1].append(feat)
     return groups
 
+
+# ============================================================================
+# Binary Shapefile & DBF Readers (Zero-Dependency Inverse Path)
+# ============================================================================
+
+def parse_crs_from_prj(prj_path):
+    """
+    Parse Coordinate Reference System (CRS) from a shapefile's .prj sidecar.
+    Returns (wkt_string, pyproj_crs_or_None).
+    """
+    if not prj_path or not os.path.exists(prj_path):
+        return None, None
+    try:
+        with open(prj_path, 'r', encoding='utf-8', errors='ignore') as f:
+            wkt_str = f.read().strip()
+        if not wkt_str:
+            return None, None
+        crs_obj = None
+        try:
+            import pyproj
+            crs_obj = pyproj.CRS.from_user_input(wkt_str)
+        except Exception:
+            pass
+        return wkt_str, crs_obj
+    except Exception as e:
+        logging.warning("Failed to parse CRS from %s: %s", prj_path, e)
+        return None, None
+
+
+def read_dbf(dbf_path, encoding='cp1252', legend_path=None):
+    """
+    Pure-Python binary dBASE III / IV reader using standard library struct.
+    Reads field descriptors and records, optionally mapping 10-char truncated
+    field names back to original full names using an accompanying _fields.csv.
+
+    Returns
+    -------
+    list of OrderedDict
+        Record dictionaries: [{'field_name': value, ...}, ...]
+    """
+    if not os.path.exists(dbf_path):
+        return []
+
+    # Check for accompanying field legend CSV produced by write_shapefile
+    legend_map = {}
+    if legend_path is None:
+        cand_legend = os.path.splitext(dbf_path)[0] + "_fields.csv"
+        if os.path.exists(cand_legend):
+            legend_path = cand_legend
+
+    if legend_path and os.path.exists(legend_path):
+        try:
+            with open(legend_path, 'r', encoding='utf-8', errors='ignore') as lf:
+                reader = csv.DictReader(lf)
+                for row in reader:
+                    if 'dbf_field' in row and 'original_name' in row:
+                        legend_map[row['dbf_field']] = row['original_name']
+        except Exception as e:
+            logging.debug("Could not load DBF legend CSV: %s", e)
+
+    records = []
+    try:
+        with open(dbf_path, 'rb') as f:
+            header = f.read(32)
+            if len(header) < 32:
+                return []
+
+            num_records, header_len, record_len = struct.unpack('<IHH', header[4:12])
+
+            fields = []
+            while True:
+                b = f.read(1)
+                if not b or b == b'\x0D':
+                    break
+                field_bytes = b + f.read(31)
+                if len(field_bytes) < 32:
+                    break
+                raw_name = field_bytes[:11].split(b'\x00')[0]
+                try:
+                    name = raw_name.decode('ascii', errors='ignore').strip()
+                except Exception:
+                    name = f"FIELD_{len(fields)+1}"
+                typ = chr(field_bytes[11])
+                length = field_bytes[16]
+                dec = field_bytes[17]
+                fields.append((name, typ, length, dec))
+
+            f.seek(header_len)
+
+            for _ in range(num_records):
+                rec_buf = f.read(record_len)
+                if len(rec_buf) < record_len:
+                    break
+                if rec_buf[0:1] == b'*':  # Deleted record marker
+                    continue
+
+                row = OrderedDict()
+                offset = 1  # Skip 1-byte deletion flag
+                for dbf_name, typ, length, dec in fields:
+                    val_bytes = rec_buf[offset:offset + length]
+                    offset += length
+                    try:
+                        val_str = val_bytes.decode(encoding, errors='replace').strip()
+                    except Exception:
+                        val_str = val_bytes.decode('ascii', errors='ignore').strip()
+
+                    if not val_str or val_str == '*':
+                        val = None
+                    elif typ in ('N', 'I'):
+                        if dec == 0:
+                            try:
+                                val = int(val_str)
+                            except ValueError:
+                                try:
+                                    val = float(val_str)
+                                except ValueError:
+                                    val = None
+                        else:
+                            try:
+                                val = float(val_str)
+                            except ValueError:
+                                val = None
+                    elif typ == 'F':
+                        try:
+                            val = float(val_str)
+                        except ValueError:
+                            val = None
+                    elif typ == 'L':
+                        val = True if val_str.upper() in ('T', 'Y', '1') else (False if val_str.upper() in ('F', 'N', '0') else None)
+                    elif typ == 'D':
+                        val = val_str if len(val_str) == 8 else val_str
+                    else:
+                        val = val_str
+
+                    real_name = legend_map.get(dbf_name, dbf_name)
+                    row[real_name] = val
+
+                records.append(row)
+    except Exception as e:
+        logging.warning("Error reading DBF %s: %s", dbf_path, e)
+
+    return records
+
+
+def read_shapefile(shp_path, dbf_path=None, encoding='cp1252'):
+    """
+    Pure-Python binary Shapefile (.shp) reader using struct.
+    Supports Point (1), PolyLine (3), Polygon (5), MultiPoint (8), and Null (0).
+
+    Returns
+    -------
+    list of dict
+        [
+            {
+                'geometry': [(x, y), ...],
+                'parts': [[(x, y), ...], ...],  # List of rings / sub-parts
+                'shape_type': int,
+                'bbox': (xmin, ymin, xmax, ymax),
+                'properties': OrderedDict(...)
+            },
+            ...
+        ]
+    """
+    stem = os.path.splitext(shp_path)[0]
+    shp_file = stem + ".shp"
+    if not os.path.exists(shp_file):
+        shp_file = shp_path
+    if not os.path.exists(shp_file):
+        raise FileNotFoundError(f"Shapefile not found: {shp_path}")
+
+    actual_dbf = dbf_path or (stem + ".dbf")
+    dbf_records = read_dbf(actual_dbf, encoding=encoding) if os.path.exists(actual_dbf) else []
+
+    features = []
+    try:
+        with open(shp_file, 'rb') as f:
+            header = f.read(100)
+            if len(header) < 100:
+                return []
+            file_code, _, _, _, _, _, file_length_words = struct.unpack('>7i', header[:28])
+            if file_code != 9994:
+                raise ValueError(f"Invalid Shapefile header code: {file_code} (expected 9994)")
+
+            version, global_shape_type = struct.unpack('<2i', header[28:36])
+
+            rec_idx = 0
+            while True:
+                hdr_bytes = f.read(8)
+                if not hdr_bytes or len(hdr_bytes) < 8:
+                    break
+                rec_num, content_words = struct.unpack('>2i', hdr_bytes)
+                content_bytes = content_words * 2
+                data = f.read(content_bytes)
+                if len(data) < content_bytes or len(data) < 4:
+                    break
+
+                shape_type = struct.unpack('<i', data[:4])[0]
+                geom = []
+                parts_list = []
+                bbox = None
+
+                if shape_type == 0:  # Null
+                    geom = []
+                elif shape_type == 1:  # Point
+                    if len(data) >= 20:
+                        x, y = struct.unpack('<2d', data[4:20])
+                        geom = [(x, y)]
+                        parts_list = [geom]
+                        bbox = (x, y, x, y)
+                elif shape_type in (3, 5):  # PolyLine (3) or Polygon (5)
+                    if len(data) >= 44:
+                        xmin, ymin, xmax, ymax = struct.unpack('<4d', data[4:36])
+                        num_parts, num_points = struct.unpack('<2i', data[36:44])
+                        bbox = (xmin, ymin, xmax, ymax)
+
+                        parts_offset = 44
+                        parts_size = 4 * num_parts
+                        if len(data) >= parts_offset + parts_size + 16 * num_points:
+                            parts_indices = list(struct.unpack(f'<{num_parts}i', data[parts_offset:parts_offset + parts_size]))
+                            pts_offset = parts_offset + parts_size
+                            flat_pts = struct.unpack(f'<{num_points * 2}d', data[pts_offset:pts_offset + 16 * num_points])
+                            all_pts = [(flat_pts[i], flat_pts[i + 1]) for i in range(0, len(flat_pts), 2)]
+
+                            part_bounds = parts_indices + [num_points]
+                            for p_i in range(num_parts):
+                                p_start = part_bounds[p_i]
+                                p_end = part_bounds[p_i + 1]
+                                ring = all_pts[p_start:p_end]
+                                if ring:
+                                    parts_list.append(ring)
+
+                            geom = all_pts
+                elif shape_type == 8:  # MultiPoint
+                    if len(data) >= 40:
+                        xmin, ymin, xmax, ymax, num_points = struct.unpack('<4di', data[4:40])
+                        bbox = (xmin, ymin, xmax, ymax)
+                        if len(data) >= 40 + 16 * num_points:
+                            flat_pts = struct.unpack(f'<{num_points * 2}d', data[40:40 + 16 * num_points])
+                            geom = [(flat_pts[i], flat_pts[i + 1]) for i in range(0, len(flat_pts), 2)]
+                            parts_list = [[pt] for pt in geom]
+
+                props = dbf_records[rec_idx] if rec_idx < len(dbf_records) else OrderedDict()
+                features.append({
+                    'geometry': geom,
+                    'parts': parts_list if parts_list else ([geom] if geom else []),
+                    'shape_type': shape_type,
+                    'bbox': bbox,
+                    'properties': props
+                })
+                rec_idx += 1
+    except Exception as e:
+        logging.warning("Error parsing Shapefile %s: %s", shp_file, e)
+
+    return features
+
+
+def reproject_shapefile_geometry_to_image_pixels(
+    geo_points,
+    shapefile_crs,
+    target_image_path,
+    ax_data=None,
+    ref_size=None
+):
+    """
+    Inverse coordinate transform: Reprojects geographic coordinates from a Shapefile
+    into CanoPie's target image coordinate frame, taking into account CRS differences,
+    inverse raster affine transform, and forward .ax modifications (rotate/crop/resize).
+
+    Parameters
+    ----------
+    geo_points : list of (x, y)
+        Geographic coordinate tuples (meters or degrees).
+    shapefile_crs : str or pyproj.CRS or None
+        CRS of the shapefile (from .prj or EPSG code).
+    target_image_path : str
+        Filepath of the destination raster image in CanoPie.
+    ax_data : dict, optional
+        Loaded .ax sidecar dictionary for this image.
+    ref_size : dict, optional
+        Target image reference size {'w': ..., 'h': ...}.
+
+    Returns
+    -------
+    list of (x_stored, y_stored)
+        Canvas pixel points scaled to target image_ref_size.
+    """
+    if not geo_points:
+        return []
+
+    norm_fp = os.path.normpath(target_image_path)
+    raw_h, raw_w = _raw_image_dims(norm_fp)
+    if not raw_w or not raw_h:
+        if ref_size:
+            raw_w = float(ref_size.get('w', 0) or ref_size.get('width', 0) or 1000)
+            raw_h = float(ref_size.get('h', 0) or ref_size.get('height', 0) or 1000)
+        else:
+            raw_w, raw_h = 1000.0, 1000.0
+
+    # 1. Obtain image georeferencing transform and image CRS
+    transform, img_crs = None, None
+    if os.path.isfile(norm_fp):
+        transform, img_crs = get_geotiff_transform(norm_fp)
+        if not transform:
+            transform, img_crs = estimate_transform_from_exif(norm_fp, raw_w, raw_h)
+
+    # 2. CRS Reprojection if shapefile_crs and img_crs differ
+    pts_to_project = list(geo_points)
+    if transform and shapefile_crs and img_crs:
+        try:
+            import pyproj
+            src_c = pyproj.CRS.from_user_input(shapefile_crs)
+            dst_c = pyproj.CRS.from_user_input(img_crs)
+            if not (src_c == dst_c or src_c.equals(dst_c)):
+                transformer = pyproj.Transformer.from_crs(src_c, dst_c, always_xy=True)
+                pts_to_project = [transformer.transform(x, y) for x, y in pts_to_project]
+        except Exception as e:
+            logging.debug("CRS reprojection hook skipped: %s", e)
+
+    # 3. Geographic -> RAW pixels via geo_to_pixel
+    if transform:
+        raw_pixels = geo_to_pixel(pts_to_project, transform)
+    else:
+        raw_pixels = pts_to_project
+
+    # 4. RAW pixels -> MODIFIED (.ax) pixels via matrix M
+    M = np.eye(3, dtype=np.float64)
+    out_w, out_h = int(raw_w), int(raw_h)
+    if ax_data and isinstance(ax_data, dict):
+        try:
+            M, out_w, out_h = get_ax_transform_matrix(ax_data, raw_w, raw_h)
+        except Exception as e:
+            logging.debug("Failed to calculate .ax transform matrix: %s", e)
+
+    mod_pixels = []
+    for col_raw, row_raw in raw_pixels:
+        pt_vec = np.array([col_raw, row_raw, 1.0], dtype=np.float64)
+        pt_mod = M @ pt_vec
+        mod_pixels.append((float(pt_mod[0]), float(pt_mod[1])))
+
+    # 5. MODIFIED pixels -> Stored reference pixels
+    target_ref_w = float(ref_size.get('w', out_w) if ref_size else out_w)
+    target_ref_h = float(ref_size.get('h', out_h) if ref_size else out_h)
+    scale_x = target_ref_w / float(max(out_w, 1))
+    scale_y = target_ref_h / float(max(out_h, 1))
+
+    stored_pixels = []
+    for xm, ym in mod_pixels:
+        stored_pixels.append((xm * scale_x, ym * scale_y))
+
+    return stored_pixels
+
+
+def shapefile_to_json_polygons(
+    shp_path,
+    target_filepaths,
+    project_folder=None,
+    get_ref_size_fn=None,
+    get_ax_path_fn=None,
+    default_group="Imported_Polygons"
+):
+    """
+    Ingest a Shapefile and map its features to internal CanoPie polygon dictionaries
+    for target project images.
+
+    Returns
+    -------
+    tuple of (dict, list)
+        (imported_all_polygons, warnings_list)
+        where imported_all_polygons is {group_name: {filepath: polygon_dict}}
+    """
+    stem = os.path.splitext(shp_path)[0]
+    prj_file = stem + ".prj"
+    shp_crs_wkt, shp_crs_obj = parse_crs_from_prj(prj_file)
+
+    features = read_shapefile(shp_path)
+    if not features:
+        return {}, [f"No features found in {os.path.basename(shp_path)}"]
+
+    warnings_list = []
+    imported_polygons = {}
+
+    target_list = list(target_filepaths) if target_filepaths else []
+    if not target_list:
+        return {}, ["No target images available in active project."]
+
+    for feat_idx, feat in enumerate(features, start=1):
+        raw_geom = feat['geometry']
+        props = feat.get('properties', {})
+        shape_type = feat.get('shape_type', 5)
+        parts = feat.get('parts', [raw_geom])
+
+        if not raw_geom:
+            continue
+
+        # Extract group name from DBF or fallback
+        group_name = None
+        for k in ('GROUP', 'group', 'CLASS', 'class', 'LAYER', 'layer', 'CATEGORY', 'category'):
+            if k in props and props[k]:
+                group_name = str(props[k]).strip()
+                break
+        if not group_name:
+            group_name = str(props.get('name') or default_group)
+
+        # Extract polygon name / ID
+        poly_name = None
+        for k in ('NAME', 'name', 'ID', 'id', 'POLY_ID', 'poly_id', 'LABEL', 'label', 'TREE_ID'):
+            if k in props and props[k]:
+                poly_name = str(props[k]).strip()
+                break
+        if not poly_name:
+            poly_name = f"Poly_{feat_idx:03d}"
+
+        # Determine extraction type
+        type_val = "point" if shape_type in (1, 8) or len(raw_geom) == 1 else "polygon"
+
+        # Extract GPS centroid if present
+        gps_lat = props.get('gps_lat') or props.get('latitude') or props.get('lat')
+        gps_lon = props.get('gps_lon') or props.get('longitude') or props.get('lon')
+        try:
+            lat_f = float(gps_lat) if gps_lat is not None else 0.0
+            lon_f = float(gps_lon) if gps_lon is not None else 0.0
+        except (ValueError, TypeError):
+            lat_f, lon_f = 0.0, 0.0
+
+        root_val = ""
+        for k in ('ROOT', 'root', 'PLANT_ID', 'plant_id', 'PLOT_ID', 'plot_id'):
+            if k in props and props[k]:
+                root_val = str(props[k]).strip()
+                break
+
+        # Map to each target image (or single target image)
+        for tfp in target_list:
+            norm_tfp = os.path.normpath(tfp)
+            ref_size = get_ref_size_fn(norm_tfp) if callable(get_ref_size_fn) else None
+
+            # Load .ax sidecar if available
+            ax_data = None
+            ax_path = None
+            if callable(get_ax_path_fn):
+                ax_path = get_ax_path_fn(norm_tfp)
+            if not ax_path and project_folder:
+                base_ax = os.path.splitext(os.path.basename(norm_tfp))[0] + ".ax"
+                cand_ax = os.path.join(project_folder, base_ax)
+                if os.path.exists(cand_ax):
+                    ax_path = cand_ax
+            if ax_path and os.path.exists(ax_path):
+                try:
+                    with open(ax_path, 'r', encoding='utf-8', errors='ignore') as axf:
+                        ax_data = json.load(axf)
+                except Exception:
+                    pass
+
+            # Handle multi-ring / multi-part polygons or single ring
+            # If multi-part polygon, process the largest outer ring for canonical polygon
+            ring_to_use = parts[0] if parts else raw_geom
+            stored_points = reproject_shapefile_geometry_to_image_pixels(
+                geo_points=ring_to_use,
+                shapefile_crs=shp_crs_obj or shp_crs_wkt,
+                target_image_path=norm_tfp,
+                ax_data=ax_data,
+                ref_size=ref_size
+            )
+
+            # Strip duplicate closing vertex if present for internal format
+            if type_val == 'polygon' and len(stored_points) > 2:
+                if (abs(stored_points[0][0] - stored_points[-1][0]) < 1e-4 and
+                    abs(stored_points[0][1] - stored_points[-1][1]) < 1e-4):
+                    stored_points.pop()
+
+            ref_w = float(ref_size.get('w', 0)) if ref_size else 0.0
+            ref_h = float(ref_size.get('h', 0)) if ref_size else 0.0
+            if ref_w <= 0 or ref_h <= 0:
+                raw_h_t, raw_w_t = _raw_image_dims(norm_tfp)
+                ref_w = float(raw_w_t or 1000)
+                ref_h = float(raw_h_t or 1000)
+
+            poly_dict = {
+                'name': group_name,
+                'root': root_val,
+                'type': type_val,
+                'coord_space': 'pixel',
+                'image_ref_size': {'w': ref_w, 'h': ref_h},
+                'points': stored_points,
+                'coordinates': {'latitude': lat_f, 'longitude': lon_f},
+                'properties': dict(props)
+            }
+
+            imported_polygons.setdefault(group_name, {})[norm_tfp] = poly_dict
+
+    return imported_polygons, warnings_list
+
+

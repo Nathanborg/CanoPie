@@ -33,6 +33,9 @@ import pytest
 from ..project_tab import ProjectTab, hist_nodata_values, declared_file_nodata
 from ..image_editor_dialog import contaminated_reference_bands
 
+# Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
+pytestmark = [pytest.mark.editor, pytest.mark.extraction]
+
 FILL = -9999.0
 
 

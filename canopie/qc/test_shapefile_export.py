@@ -18,6 +18,9 @@ from ..shapefile_io import (
     pixel_to_geo, geo_to_pixel, wkt_for_epsg,
 )
 
+# Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
+pytestmark = [pytest.mark.io]
+
 SHAPE_TYPE_POLYGON = 5
 
 

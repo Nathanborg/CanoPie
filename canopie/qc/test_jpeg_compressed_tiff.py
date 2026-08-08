@@ -32,6 +32,9 @@ import tifffile
 
 from ..raster_reader import _JPEG_COMPRESSIONS, TiledRasterReader, probe, open_reader, clear_reader_cache
 
+# Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
+pytestmark = [pytest.mark.io]
+
 # A real GDAL-written JPEG COG, if this machine has one. Not required: the
 # mechanism tests below stand on their own.
 REAL_JPEG_COG = r"C:\Users\natha\Downloads\aligned_COG\aligned_COG\P0194882_aligned.cog.tif"

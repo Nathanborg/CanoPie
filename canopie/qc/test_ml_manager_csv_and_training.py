@@ -23,6 +23,9 @@ from .fixtures_manifest import FIXTURES, fixture_image_path, get_fixture
 from .project_builder import polygon_group_name
 from ._helpers import load_ground_truth, assert_close
 
+# Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
+pytestmark = [pytest.mark.ml, pytest.mark.extraction]
+
 # A representative subset, not every NoData-free fixture: each
 # MachineLearningManager() construction is expensive (sklearn-adjacent
 # imports + QDialog setup), and channel_order/band-count/tiling correctness
