@@ -14,6 +14,9 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from .fixtures_manifest import FIXTURES, fixture_image_path, get_fixture
 from ._helpers import load_ground_truth, pixel_values_native_order, assert_close
 
+# Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
+pytestmark = [pytest.mark.viewer, pytest.mark.extraction]
+
 ALL_NAMES = [f["name"] for f in FIXTURES]
 
 

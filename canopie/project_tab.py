@@ -439,7 +439,12 @@ class ExportWorker(QtCore.QThread):
                 self.finished.emit(self.output_path, False, "No data to export")
                 return
 
-            all_keys = sorted(keys_union)
+            # Canonical order, identical to the foreground export's. Plain
+            # sorted() here meant a background ("run in background") CSV came
+            # out ALPHABETICAL -- Q25 before Q5, Standard Deviation separated
+            # from Mean/Median by the Scene columns -- while the same export
+            # run in the foreground was in logical order.
+            all_keys = order_csv_columns(keys_union)
             with open(self.output_path, "w", newline="", encoding="utf-8-sig") as fcsv:
                 writer = csv.DictWriter(
                     fcsv,
@@ -721,8 +726,12 @@ class ThumbnailExportWorker(QtCore.QThread):
         if ext in ('.tif', '.tiff'):
             try:
                 import tifffile
+                from .raster_reader import ensure_hwc
                 with tifffile.TiffFile(filepath) as tf:
-                    return np.ascontiguousarray(np.squeeze(tf.asarray()))
+                    axes = (tf.series[0].axes or "").upper() if tf.series else ""
+                    arr = np.squeeze(tf.asarray())
+                    arr = ensure_hwc(arr, axes=axes)
+                    return np.ascontiguousarray(arr)
             except Exception:
                 pass
         try:
@@ -730,7 +739,8 @@ class ThumbnailExportWorker(QtCore.QThread):
             data = np.fromfile(filepath, dtype=np.uint8)
             img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
             if img is not None:
-                return img
+                from .raster_reader import ensure_hwc
+                return ensure_hwc(img)
         except Exception:
             pass
         try:
@@ -743,7 +753,8 @@ class ThumbnailExportWorker(QtCore.QThread):
             # PIL yields RGB; convert to BGR so the .ax replay sees the expected order.
             if arr.ndim == 3 and arr.shape[2] >= 3:
                 arr = np.ascontiguousarray(arr[..., :3][..., ::-1])
-            return arr
+            from .raster_reader import ensure_hwc
+            return ensure_hwc(arr)
         except Exception:
             pass
         return None
@@ -905,12 +916,20 @@ class ThumbnailExportWorker(QtCore.QThread):
                         skipped += 1
                         continue
 
-                    # Ensure uint8
+                    # Ensure uint8 with robust percentile stretch for float/16-bit stacks
                     if crop_rgb.dtype != np.uint8:
-                        if crop_rgb.max() <= 1.0:
-                            crop_rgb = (crop_rgb * 255).astype(np.uint8)
+                        arr = crop_rgb.astype(np.float32)
+                        valid_mask = np.isfinite(arr) & (arr > -9000)
+                        valid_vals = arr[valid_mask]
+                        if valid_vals.size > 0:
+                            p1, p99 = np.percentile(valid_vals, [1, 99])
+                            if p99 > p1:
+                                arr = (arr - p1) / (p99 - p1) * 255.0
+                            else:
+                                arr = np.zeros_like(arr)
                         else:
-                            crop_rgb = np.clip(crop_rgb, 0, 255).astype(np.uint8)
+                            arr = np.zeros_like(arr)
+                        crop_rgb = np.clip(arr, 0, 255).astype(np.uint8)
                     
                     # Resize and save
                     safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in str(group_name))
@@ -1361,7 +1380,9 @@ class _StretchParams(object):
                  per_channel=True, clip=True, scope="viewer",
                  display_band=None,                 # single-band index or None
                  display_mode="auto",               # "auto" | "single" | "rgb"
-                 r_band=None, g_band=None, b_band=None):  # for RGB compose
+                 r_band=None, g_band=None, b_band=None,
+                 calibrated_mins=None, calibrated_maxs=None):  # for tile parity calibration
+        import numpy as np
         self.mode = mode
         self.low_p = float(low_p)
         self.high_p = float(high_p)
@@ -1380,6 +1401,10 @@ class _StretchParams(object):
         # Optional per-band absolute ranges (used only if mode=="absolute" and per_channel==True)
         self.band_mins = None  # list[float] or None
         self.band_maxs = None  # list[float] or None
+
+        self.calibrated_mins = None if calibrated_mins is None else np.asarray(calibrated_mins, dtype=np.float32)
+        self.calibrated_maxs = None if calibrated_maxs is None else np.asarray(calibrated_maxs, dtype=np.float32)
+
 
 class CollapsibleBox(QtWidgets.QWidget):
     def __init__(self, title="", parent=None):
@@ -2608,6 +2633,64 @@ _EXPORT_LAZY_THRESHOLD_BYTES = 64 * 1024 * 1024
 # reader drop to a pyramid level instead. ~1 GB is roughly 3 s of zlib/zstd.
 _PREVIEW_DECODE_BUDGET_BYTES = 1024 * 1024 * 1024
 
+# Budgets for band-math SCENE statistics on the lazy export path (Scene
+# Mean/Median/Std for a "compute these indices" formula, not the polygon's own
+# exact row). These are deliberately much smaller than the preview budgets
+# above: a scene-wide Mean/Median/Std needs a stable sample, not a viewable
+# image, and every other expensive whole-image statistic in this app already
+# works from a decimated sample rather than the full array (the Stretch
+# dialog's percentiles, the histogram-match reference/source stats). Whole-
+# image band math was previously simply skipped on this path (returning None,
+# see `_get_bm_arr`'s `if _chans_are_lazy: return None`), which left Scene
+# Mean/Median/Std silently NaN for every index on any raster large enough to
+# go lazy -- i.e. on every real multi-band prediction stack.
+_SCENE_STATS_SAMPLE_BUDGET_BYTES = 8 * 1024 * 1024
+_SCENE_STATS_SAMPLE_DECODE_BUDGET_BYTES = 64 * 1024 * 1024
+
+
+_CSV_COLUMN_ORDER_HINT = [
+    # Identity first, then geometry, then the statistics, then scene context.
+    'Project', 'Root ID', 'Root Folder', 'File Name', 'Object ID',
+    'Channel', 'Band Name', 'Label Band Index', 'FakePath',
+    'Lat', 'Long', 'Centroid X', 'Centroid Y',
+    'Pixel Count',
+    'Mean', 'Median', 'Standard Deviation',
+    'Scene Mean', 'Scene Median', 'Scene Standard Deviation',
+]
+
+
+def order_csv_columns(keys):
+    """Canonical CSV column order, shared by the foreground and background exports.
+
+    The background ExportWorker used to write `sorted(keys_union)` -- plain
+    ALPHABETICAL order. That put `Q25` before `Q5`, and `Standard Deviation`
+    after `Scene Standard Deviation`, so the same project exported in the
+    background and in the foreground produced CSVs whose columns were in
+    different orders and whose statistic columns were interleaved with the
+    scene-context ones. Reading a value off the wrong column is a very easy
+    mistake to make in that layout.
+
+    Rules: the explicit identity/statistic columns above come first, in that
+    order; quantiles (`Q5`, `Q25`, `Q50`, `Q75`, `Q95`, ...) then follow in
+    NUMERIC order rather than lexicographic; anything else (EXIF tags,
+    Class_* / counts_* columns, band-math formula names) keeps a stable
+    alphabetical tail so the header never reorders between runs.
+    """
+    import re as _re
+
+    keys = list(keys)
+    known = {k: i for i, k in enumerate(_CSV_COLUMN_ORDER_HINT)}
+
+    def sort_key(k):
+        if k in known:
+            return (0, known[k], 0.0, "")
+        m = _re.fullmatch(r'Q(\d+(?:\.\d+)?)', str(k))
+        if m:
+            return (1, 0, float(m.group(1)), "")
+        return (2, 0, 0.0, str(k))
+
+    return sorted(keys, key=sort_key)
+
 
 def _per_band_nodata_masks(slices, values):
     """Per-band NoData masks (True = NoData) for numeric NoData values AND
@@ -3057,8 +3140,12 @@ class _SliderPreviewTooltip(QtWidgets.QWidget):
         self.adjustSize()
         self.update()
 
-    def update_content(self, root_id: str, n_files: int, pixmaps=None):
-        self._header.setText(f"Root {root_id}  ·  {n_files} image{'s' if n_files != 1 else ''}")
+    def update_content(self, root_id: str, n_files_or_str, pixmaps=None):
+        if isinstance(n_files_or_str, int):
+            info_str = f"{n_files_or_str} image{'s' if n_files_or_str != 1 else ''}"
+        else:
+            info_str = str(n_files_or_str)
+        self._header.setText(f"Root {root_id}  ·  {info_str}")
 
         # Reset styles
         for lbl in self._thumb_labels:
@@ -3086,57 +3173,109 @@ class _SliderPreviewTooltip(QtWidgets.QWidget):
 
 
 def _load_and_make_thumb(fp):
-    """Load any image (8/16-bit, 1-N bands, TIFF/PNG/JPG) -> 8-bit RGB thumbnail."""
+    """Load any image (8/16-bit, 1-N bands, TIFF/PNG/JPG, stack/single) -> 8-bit RGB thumbnail."""
     import os
+    import numpy as np
+    import cv2
+    from PyQt5 import QtGui
+
     img = None
-    try:
-        # cv2.IMREAD_UNCHANGED is critical for 16-bit TIFFs
-        img = cv2.imread(fp, cv2.IMREAD_UNCHANGED)
-    except Exception:
-        pass
+    ext = os.path.splitext(fp)[1].lower()
+    is_native_rgb = False
+
+    # Strategy 1: tifffile preflight with ensure_hwc for stack/multiband TIFFs
+    if ext in ('.tif', '.tiff'):
+        try:
+            import tifffile
+            from .raster_reader import ensure_hwc
+            with tifffile.TiffFile(fp) as tf:
+                axes = (tf.series[0].axes or "").upper() if tf.series else ""
+                arr = np.squeeze(tf.asarray())
+                img = ensure_hwc(arr, axes=axes)
+                is_native_rgb = True
+        except Exception:
+            img = None
+
+    # Strategy 2: OpenCV fallback
     if img is None:
         try:
-            data = np.fromfile(fp, dtype=np.uint8)
-            img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+            img = cv2.imread(fp, cv2.IMREAD_UNCHANGED)
         except Exception:
             pass
-    
+        if img is None:
+            try:
+                data = np.fromfile(fp, dtype=np.uint8)
+                img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+            except Exception:
+                pass
+
+    # Strategy 3: PIL/Pillow fallback
     if img is None:
+        try:
+            from PIL import Image
+            im = Image.open(fp)
+            im.load()
+            if im.mode == "P":
+                im = im.convert("RGBA")
+            img = np.array(im)
+            is_native_rgb = True
+        except Exception:
+            pass
+
+    if img is None or getattr(img, "size", 0) == 0:
         return None
 
-    # Normalization
-    if img.dtype != np.uint8:
-        mn, mx = float(np.nanmin(img)), float(np.nanmax(img))
-        if mx > mn:
-            img = ((img.astype(np.float32) - mn) / (mx - mn) * 255.0)
-        else:
-            img = np.zeros_like(img, dtype=np.float32)
-        img = np.clip(img, 0, 255).astype(np.uint8)
+    # Ensure shape is HWC
+    from .raster_reader import ensure_hwc
+    img = ensure_hwc(img)
 
-    # Channels
+    # Normalize to 8-bit uint8 with percentile stretch on valid pixels
+    if img.dtype != np.uint8:
+        arr = img.astype(np.float32)
+        valid_mask = np.isfinite(arr) & (arr > -9000)
+        valid_vals = arr[valid_mask]
+        if valid_vals.size > 0:
+            p1, p99 = np.percentile(valid_vals, [1, 99])
+            if p99 > p1:
+                arr = (arr - p1) / (p99 - p1) * 255.0
+            else:
+                arr = np.zeros_like(arr)
+        else:
+            arr = np.zeros_like(arr)
+        img = np.clip(arr, 0, 255).astype(np.uint8)
+
+    # Channel selection & RGB conversion
     if img.ndim == 2:
         rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
     elif img.ndim == 3:
         c = img.shape[2]
         if c == 1:
             rgb = cv2.cvtColor(img[:, :, 0], cv2.COLOR_GRAY2RGB)
-        elif c == 3:
-            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        elif c >= 4:
-            rgb = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2RGB)
+        elif is_native_rgb:
+            # Native RGB from tifffile or PIL
+            if c >= 3:
+                rgb = img[:, :, :3]
+            else:
+                rgb = cv2.cvtColor(img[:, :, 0], cv2.COLOR_GRAY2RGB)
         else:
-            return None
+            # BGR from OpenCV
+            if c == 3:
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            elif c >= 4:
+                rgb = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2RGB)
+            else:
+                return None
     else:
         return None
 
-    # Downscale
+    # Downscale for thumbnail
     h, w = rgb.shape[:2]
-    scale = min(128.0 / max(w, 1), 96.0 / max(h, 1))
+    scale = min(128.0 / max(w, 1), 96.0 / max(h, 1), 1.0)
     if scale < 1.0:
         nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
         rgb = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_AREA)
 
-    # Convert
+    # Convert to QImage
     th, tw = rgb.shape[:2]
     rgb = np.ascontiguousarray(rgb)
     qimg = QtGui.QImage(rgb.data, tw, th, tw * 3, QtGui.QImage.Format_RGB888).copy()
@@ -4713,22 +4852,15 @@ class ProjectTab(QtWidgets.QWidget):
                         for c in range(res.shape[2]):
                             res[..., c] = np.where(nd_mask, nd_restore_val, res[..., c])
 
-                if export_label_band:
-                    # Append a single 2D expression band to the ORIGINAL result (no channel reorders here)
-                    expr2d = res if getattr(res, "ndim", 0) == 2 else res[..., 0]
-                    expr2d = expr2d.astype(_float_dtype, copy=False)
-                    if result.ndim == 2:
-                        result = result[..., None]
-                    result = result.astype(_float_dtype, copy=False)
-                    result = np.concatenate([result, expr2d[..., None]], axis=2)
-                else:
-                    # Viewer path: replace result with expression output.
-                    # If the expression produced a 3-channel RGB image but our base looked BGR,
-                    # flip it back to BGR so downstream expectations remain consistent.
-                    if isinstance(res, np.ndarray) and res.ndim == 3 and res.shape[2] == 3:
-                        result = res[..., [2, 1, 0]] if bgr_like else res
-                    else:
-                        result = res.astype(_float_dtype, copy=False) if hasattr(res, "dtype") else res
+                # Always append the expression band to the ORIGINAL result (no channel reorders here).
+                # This ensures the viewer retains the original bands (allowing the user to switch back to them via the BandBar)
+                # while displaying the expression result as the new last band.
+                expr2d = res if getattr(res, "ndim", 0) == 2 else res[..., 0]
+                expr2d = expr2d.astype(_float_dtype, copy=False)
+                if result.ndim == 2:
+                    result = result[..., None]
+                result = result.astype(_float_dtype, copy=False)
+                result = np.concatenate([result, expr2d[..., None]], axis=2)
 
             except Exception as e:
                 logging.warning(f"Band expression failed ('{expr_str}'): {e}")
@@ -5282,7 +5414,7 @@ class ProjectTab(QtWidgets.QWidget):
         # Lightweight shim that looks like ImageData
         class _Lite:
             __slots__ = ("filepath", "image", "raw_shape", "ax_config", "channel_order",
-                         "profile", "preview_bands", "full_shape", "display_scale")
+                         "profile", "preview_bands", "full_shape", "display_scale", "reader")
             def __init__(self, fp, im, raw_shape=None, ax_config=None, channel_order="bgr",
                          profile=None, preview_bands=None):
                 self.filepath = fp
@@ -5302,6 +5434,7 @@ class ProjectTab(QtWidgets.QWidget):
                 # factor from displayed pixels back to full-resolution pixels.
                 self.full_shape = None
                 self.display_scale = 1.0
+                self.reader = None
 
         def _tifffile_is_stack(path):
             """Quick metadata probe: does this TIFF represent a stack (>3 bands or >3 pages)?"""
@@ -5390,6 +5523,7 @@ class ProjectTab(QtWidgets.QWidget):
                                      profile=profile, preview_bands=bands)
                         lite.full_shape = (profile.height, profile.width, profile.count)
                         lite.display_scale = scale
+                        lite.reader = reader
                         return lite
             except Exception as e:
                 logging.warning("Preview load failed for '%s', falling back: %s", filepath, e)
@@ -6800,6 +6934,30 @@ class ProjectTab(QtWidgets.QWidget):
         files_in_root = self.multispectral_image_data_groups.get(root_name, [])
         n_files = len(files_in_root)
 
+        # Detect stack file metadata
+        is_stack_file = False
+        n_bands = 0
+        if n_files == 1 and files_in_root:
+            fp = files_in_root[0]
+            ext = os.path.splitext(fp)[1].lower()
+            if ext in ('.tif', '.tiff'):
+                try:
+                    import tifffile
+                    with tifffile.TiffFile(fp) as tf:
+                        series = tf.series[0] if tf.series else None
+                        shape = getattr(series, "shape", ())
+                        if len(shape) >= 3 and max(shape) > 0:
+                            if shape[0] <= 500 and shape[0] not in (shape[1], shape[2]):
+                                n_bands = shape[0]
+                            elif len(shape) == 3 and shape[2] <= 500:
+                                n_bands = shape[2]
+                            if n_bands > 3 or len(tf.pages) > 3:
+                                is_stack_file = True
+                except Exception:
+                    pass
+
+        info_str = f"Stack ({n_bands} bands)" if (is_stack_file and n_bands > 0) else f"{n_files} image{'s' if n_files != 1 else ''}"
+
         # Get thumbnails from cache (or try JIT fallback)
         thumbs = self._root_thumbnails.get(idx)
         error_msg = None
@@ -6821,7 +6979,7 @@ class ProjectTab(QtWidgets.QWidget):
         if error_msg:
             preview.show_message(f"Root {root_id}: {error_msg}")
         else:
-            preview.update_content(root_id, n_files, thumbs)
+            preview.update_content(root_id, info_str, thumbs)
 
         # Position above the slider handle
         slider = self.group_slider
@@ -6904,64 +7062,7 @@ class ProjectTab(QtWidgets.QWidget):
             @staticmethod
             def _load_and_make_thumb(fp):
                 """Load any image (8/16-bit, 1-N bands, TIFF/PNG/JPG) → 8-bit RGB thumbnail."""
-                import os
-                img = None
-                # Try cv2.imread with UNCHANGED to get raw data
-                try:
-                    img = cv2.imread(fp, cv2.IMREAD_UNCHANGED)
-                except Exception:
-                    pass
-                if img is None:
-                    try:
-                        data = np.fromfile(fp, dtype=np.uint8)
-                        img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
-                    except Exception:
-                        pass
-                if img is None:
-                    logging.debug(f"[ThumbWorker] Could not read: {os.path.basename(fp)}")
-                    return None
-
-                # --- Normalize to 8-bit ---
-                if img.dtype != np.uint8:
-                    # 16-bit or float → scale to 0-255
-                    mn, mx = float(np.nanmin(img)), float(np.nanmax(img))
-                    if mx > mn:
-                        img = ((img.astype(np.float32) - mn) / (mx - mn) * 255.0)
-                    else:
-                        img = np.zeros_like(img, dtype=np.float32)
-                    img = np.clip(img, 0, 255).astype(np.uint8)
-
-                # --- Reduce to 3-channel RGB ---
-                if img.ndim == 2:
-                    # Grayscale
-                    rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-                elif img.ndim == 3:
-                    c = img.shape[2]
-                    if c == 1:
-                        rgb = cv2.cvtColor(img[:, :, 0], cv2.COLOR_GRAY2RGB)
-                    elif c == 3:
-                        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    elif c == 4:
-                        rgb = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2RGB)
-                    else:
-                        # Multi-band (5+ channels): take first 3 as pseudo-RGB
-                        rgb = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2RGB)
-                else:
-                    return None
-
-                # --- Downscale ---
-                h, w = rgb.shape[:2]
-                scale = min(128.0 / max(w, 1), 96.0 / max(h, 1), 1.0)
-                if scale < 1.0:
-                    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
-                    rgb = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_AREA)
-
-                # --- Convert to QImage ---
-                th, tw = rgb.shape[:2]
-                rgb = np.ascontiguousarray(rgb)
-                qimg = QtGui.QImage(rgb.data, tw, th, tw * 3,
-                                    QtGui.QImage.Format_RGB888).copy()
-                return qimg
+                return _load_and_make_thumb(fp)
 
             def run(self):
                 try:
@@ -7198,6 +7299,13 @@ class ProjectTab(QtWidgets.QWidget):
         # Convert image to QPixmap with normalization (preview may prefer last band)
         pixmap = self.convert_cv_to_pixmap(image_data.image, prefer_last_band=prefer_last_band)
         if pixmap is not None:
+            if has_classification:
+                viewer._force_auto_stretch = True
+                viewer.stretch_params = None
+            elif has_expr and hasattr(image_data.image, "shape") and image_data.image.ndim == 3 and image_data.image.shape[2] > 3:
+                C = image_data.image.shape[2]
+                viewer.stretch_params = _StretchParams(display_mode="single", display_band=C - 1)
+
             viewer.set_image(pixmap)
             self._wire_viewer_for_inspection(viewer)
 
@@ -12833,7 +12941,15 @@ class ProjectTab(QtWidgets.QWidget):
         mask_poly_sig = (tuple(sorted(mask_polygon_names)) if mask_polygon_names else None,
                         mask_polygon_enabled,
                         mask_poly_hash)
-        nodata_sig = tuple(sorted(nodata_values)) if nodata_values else None
+        # key=str: nodata_values legitimately mixes numeric literals and
+        # expression strings (the documented workaround for the "explicit
+        # nodata_values replaces rather than adds to auto-detected NoData" gap
+        # is exactly "list both", e.g. [-9999, "b7==0"]). A bare sorted() on a
+        # list mixing int/float and str raises TypeError: '<' not supported
+        # between instances of 'str' and 'int' -- which crashed EVERY export
+        # that combined a numeric fill value with a per-band rule, the one
+        # case this app's own documentation tells users to use.
+        nodata_sig = tuple(sorted(nodata_values, key=str)) if nodata_values else None
 # fp_key must be the first element because cleanup code assumes k[0] is the filepath key
         sc_key = (fp_key,
                   exif_key,
@@ -12931,9 +13047,53 @@ class ProjectTab(QtWidgets.QWidget):
                     out.append(v)
                 return out
 
+            # One sampled read of EVERY band, shared by all per-band scene
+            # stats below. On the lazy path `chans[bi]` is a FULL-RESOLUTION
+            # single-band read, so asking for per-band scene stats on a
+            # 284-band cube meant 284 of them: measured at 82 ms each, i.e.
+            # 23.2 s per file, which is what made "a simple stat on a small
+            # polygon take forever". Sampling every band ONCE costs 84 ms for
+            # the same 284 bands (~275x less) at ~0.35% error on the mean --
+            # the same accuracy trade already accepted for band-math scene
+            # stats, the stretch dialog's percentiles and the histogram-match
+            # reference stats. The polygon's OWN statistics are untouched:
+            # they are still exact, read from the polygon's own window.
+            _scene_band_sample = {"arr": None, "done": False}
+
+            def _scene_sample_all_bands():
+                if not _scene_band_sample["done"]:
+                    _scene_band_sample["done"] = True
+                    try:
+                        _scene_band_sample["arr"] = np.asarray(
+                            chans.sample_bands(
+                                list(range(len(chans))),
+                                max_bytes=_SCENE_STATS_SAMPLE_BUDGET_BYTES,
+                                decode_budget=_SCENE_STATS_SAMPLE_DECODE_BUDGET_BYTES),
+                            dtype=np.float32)
+                    except Exception as e:
+                        logging.warning(
+                            "[process_polygon] scene band sample failed for '%s' "
+                            "(falling back to full-resolution reads): %s", filepath, e)
+                        _scene_band_sample["arr"] = None
+                return _scene_band_sample["arr"]
+
             def _band_scene_stats(bi):
                 if not _want_scene:
                     return {}
+                if _chans_are_lazy:
+                    samp = _scene_sample_all_bands()
+                    if samp is not None and bi < samp.shape[2]:
+                        band = samp[..., bi]
+                        m = None
+                        if lazy_nd_vals:
+                            try:
+                                m = _per_band_nodata_masks(
+                                    [band], _scene_vals_for_band(lazy_nd_vals, bi))[0]
+                            except Exception as e:
+                                logging.warning(
+                                    "[process_polygon] sampled scene NoData mask "
+                                    "failed for band %d: %s", bi + 1, e)
+                        return _scene_stats_for_band(band, m)
                 band = chans[bi]
                 m = (nd_masks[bi] if (nd_masks is not None and bi < len(nd_masks)) else None)
                 if m is None and lazy_nd_vals:
@@ -12981,28 +13141,112 @@ class ProjectTab(QtWidgets.QWidget):
                     scene_stats["Other"] = scene_stats["band_1"]
 
             # --- band-math scene stats ---
-            if bm_formulas:
+            #
+            # `_eval_band_expr` (== `_get_bm_arr`) returns None on the lazy
+            # path by design -- computing a formula over the whole image would
+            # decode the exact multi-GB cube the lazy path exists to avoid. On
+            # the EAGER path that is never an issue: `chans` are already
+            # in-memory arrays, so `_eval_band_expr(expr)` is the same fast,
+            # exact, in-memory computation it has always been -- nothing below
+            # changes eager-path behaviour or its numbers.
+            #
+            # On the LAZY path, `arr` being None used to flow straight into
+            # `np.asarray(None)` and produce a silently NaN Scene Mean/Median/
+            # Std for every formula on every raster large enough to go lazy --
+            # i.e. on every real multi-band prediction stack. Fixed by reading
+            # a small DECIMATED sample of just the bands each formula needs
+            # (LazyChannels.sample_bands, budgeted by
+            # _SCENE_STATS_SAMPLE_BUDGET_BYTES) and evaluating the same
+            # expression on that sample instead. This makes the lazy-path
+            # Scene Mean/Median/Std an ESTIMATE rather than an exact figure --
+            # consistent with every other expensive whole-image statistic in
+            # this app (Stretch dialog percentiles, histogram-match reference
+            # stats), all of which are already sample-based. The per-polygon
+            # row for the same formula is unaffected: it is computed exactly,
+            # from the polygon's own lazily-read pixels
+            # (`_eval_band_expr_on_roi`), never from this sample.
+            if bm_formulas and _want_scene:
+                _scene_sample_cache = {}   # band-index tuple -> sampled cube
+
+                def _scene_sample_for_bands(band_idxs):
+                    key = tuple(sorted(band_idxs))
+                    if key not in _scene_sample_cache:
+                        try:
+                            samp = chans.sample_bands(
+                                list(key),
+                                max_bytes=_SCENE_STATS_SAMPLE_BUDGET_BYTES,
+                                decode_budget=_SCENE_STATS_SAMPLE_DECODE_BUDGET_BYTES)
+                            _scene_sample_cache[key] = np.asarray(samp, dtype=np.float32)
+                        except Exception as e:
+                            logging.warning(
+                                "[process_polygon] band-math scene sample failed "
+                                "for bands %s in '%s': %s", key, filepath, e)
+                            _scene_sample_cache[key] = None
+                    return _scene_sample_cache[key]
+
                 for fname, expr in bm_formulas.items():
                     try:
-                        arr = _eval_band_expr(expr)
-                        arrf = np.asarray(arr, dtype=np.float64)
+                        if _chans_are_lazy:
+                            used = sorted(set(expr_bands_used.get(fname) or []))
+                            if not used:
+                                raise ValueError(f"no band references found in {expr!r}")
+                            samp = _scene_sample_for_bands(used)
+                            if samp is None or samp.size == 0:
+                                raise ValueError("sample read returned nothing")
+                            # Remap b<real_index+1> -> the sample's OWN column
+                            # position, so the same formula sees the same
+                            # bands whether the sample holds 3 columns or 15.
+                            pos = {bi: i for i, bi in enumerate(used)}
+                            local = {f"b{bi + 1}": samp[..., pos[bi]] for bi in used}
+                            # Evaluate expression on the sample using safe division
+                            from .utils import eval_band_expression as _shared_eval_band_expression
+                            try:
+                                arrf = _shared_eval_band_expression(samp, expr).astype(np.float64, copy=False)
+                            except Exception:
+                                expr_norm = _normalize_expr(expr)
+                                arrf = np.asarray(
+                                    eval(expr_norm, {"np": np, "__builtins__": {}}, local),
+                                    dtype=np.float64)
 
-                        if nd_masks is not None and expr_bands_used.get(fname):
-                            m = np.zeros((H, W), dtype=bool)
-                            for bi in expr_bands_used[fname]:
-                                if 0 <= bi < len(nd_masks):
-                                    m |= nd_masks[bi]
-                            vals_scene = arrf[~m]
+                            # Per-band NoData, re-evaluated on the SAMPLE, ONE
+                            # BAND AT A TIME
+                            m = None
+                            if lazy_nd_vals and used:
+                                try:
+                                    for bi in used:
+                                        band_vals = _scene_vals_for_band(lazy_nd_vals, bi)
+                                        if not band_vals:
+                                            continue
+                                        band_mask = _per_band_nodata_masks(
+                                            [samp[..., pos[bi]]], band_vals)[0]
+                                        m = band_mask if m is None else (m | band_mask)
+                                except Exception as e:
+                                    logging.debug(
+                                        "[process_polygon] band-math sample NoData "
+                                        "mask failed (%s): %s", fname, e)
+                                    m = None
+                            vals_scene = arrf[~m] if m is not None else arrf.ravel()
                         else:
-                            vals_scene = arrf.ravel()
+                            arr = _eval_band_expr(expr)
+                            arrf = np.asarray(arr, dtype=np.float64)
 
+                            if nd_masks is not None and expr_bands_used.get(fname):
+                                m = np.zeros((H, W), dtype=bool)
+                                for bi in expr_bands_used[fname]:
+                                    if 0 <= bi < len(nd_masks):
+                                        m |= nd_masks[bi]
+                                vals_scene = arrf[~m]
+                            else:
+                                vals_scene = arrf.ravel()
+
+                        finite_scene = vals_scene[np.isfinite(vals_scene)]
                         scene_stats[fname] = {}
                         if stats_cfg.get('scene_mean'):
-                            scene_stats[fname]["Scene Mean"] = float(np.nanmean(vals_scene) if vals_scene.size else np.nan)
+                            scene_stats[fname]["Scene Mean"] = float(np.nanmean(finite_scene) if finite_scene.size else np.nan)
                         if stats_cfg.get('scene_median'):
-                            scene_stats[fname]["Scene Median"] = float(np.nanmedian(vals_scene) if vals_scene.size else np.nan)
+                            scene_stats[fname]["Scene Median"] = float(np.nanmedian(finite_scene) if finite_scene.size else np.nan)
                         if stats_cfg.get('scene_std'):
-                            scene_stats[fname]["Scene Standard Deviation"] = float(np.nanstd(vals_scene) if vals_scene.size else np.nan)
+                            scene_stats[fname]["Scene Standard Deviation"] = float(np.nanstd(finite_scene) if finite_scene.size else np.nan)
                     except Exception as e:
                         logging.warning(f"Band-math scene stats skipped ({fname}='{expr}') for '{filepath}': {e}")
 
@@ -13583,35 +13827,58 @@ class ProjectTab(QtWidgets.QWidget):
             roi_stack = None
             def _eval_band_expr_on_roi(expr):
                 """Evaluate band expression on the ROI by slicing the cached full-image result.
-                Falls back to local eval if full-image result is unavailable."""
+                Falls back to local eval with safe_div if full-image result is unavailable."""
                 try:
                     full_arr = _eval_band_expr(expr)
                     if full_arr is not None:
                         return full_arr[y0:y1, x0:x1]
                 except Exception:
                     pass
-                # Fallback: evaluate locally on the ROI stack
+                # Fallback: evaluate locally on the ROI stack using safe_div
                 nonlocal roi_stack
                 if roi_stack is None:
                     roi_stack = np.stack(roi_slices, axis=2).astype(np.float32, copy=False)
-                expr_norm = _normalize_expr(expr)
-                local = {f"b{i+1}": roi_stack[..., i] for i in range(roi_stack.shape[2])}
-                return eval(expr_norm, {"np": np}, local)
+                from .utils import eval_band_expression as _shared_eval_band_expression
+                try:
+                    return _shared_eval_band_expression(roi_stack, expr)
+                except Exception:
+                    expr_norm = _normalize_expr(expr)
+                    local = {f"b{i+1}": roi_stack[..., i] for i in range(roi_stack.shape[2])}
+                    return eval(expr_norm, {"np": np}, local)
 
             is_rgb = len(chans) >= 3
             if is_rgb:
                 r_roi, g_roi, b_roi = roi_slices[0], roi_slices[1], roi_slices[2]
                 if nd_roi is not None:
-                    # CRITICAL FIX: Use ONE master mask for all RGB channels
-                    # Boolean expressions like b1>182 should invalidate the ENTIRE pixel
-                    # (all R, G, B values), not just one channel.
-                    # All nd_roi masks should be identical when using boolean NoData expressions,
-                    # so we use nd_roi[0] as the master mask for consistency.
-                    master_nodata_mask = nd_roi[0]
-                    valid_mask = mask_b & ~master_nodata_mask
-                    red_vec   = r_roi[valid_mask].astype(np.float32, copy=False)
-                    green_vec = g_roi[valid_mask].astype(np.float32, copy=False)
-                    blue_vec  = b_roi[valid_mask].astype(np.float32, copy=False)
+                    # PER-BAND masks, one per channel -- matching what bands 4+
+                    # already do a few hundred lines below (`valid = mask_b &
+                    # ~nd_roi[j]`).
+                    #
+                    # This used to collapse all three channels onto `nd_roi[0]`,
+                    # on the stated assumption that "all nd_roi masks should be
+                    # identical when using boolean NoData expressions". That was
+                    # true while an expression produced ONE whole-pixel mask, but
+                    # `_per_band_nodata_masks` builds genuinely per-band masks
+                    # (each band also carries its own ~isfinite seed), so the
+                    # assumption silently stopped holding and the consequence was
+                    # severe: a rule naming any band except b1 had NO EFFECT
+                    # WHATSOEVER on the R/G/B rows.
+                    #
+                    # Reproduced on a real 15-band stack: with
+                    # `nodata_values: ["b2>1", -9999]`, band 2's rule correctly
+                    # masked its outlier in nd_roi[1] -- but the G row read
+                    # nd_roi[0] and reported Mean 1.5205 (the value INCLUDING a
+                    # 215.6 artefact pixel) instead of ~0.886. `b1>...` appeared
+                    # to work while `b2>...`, `b3>...` did nothing, with no error.
+                    _m_r = nd_roi[0] if len(nd_roi) > 0 else None
+                    _m_g = nd_roi[1] if len(nd_roi) > 1 else _m_r
+                    _m_b = nd_roi[2] if len(nd_roi) > 2 else _m_r
+                    red_vec   = r_roi[mask_b & ~_m_r].astype(np.float32, copy=False)
+                    green_vec = g_roi[mask_b & ~_m_g].astype(np.float32, copy=False)
+                    blue_vec  = b_roi[mask_b & ~_m_b].astype(np.float32, copy=False)
+                    # Kept for the code below that still wants a single mask
+                    # (RF feature extraction, which needs one aligned pixel set).
+                    valid_mask = mask_b & ~_m_r
                 else:
                     red_vec   = r_roi[mask_b].astype(np.float32, copy=False)
                     green_vec = g_roi[mask_b].astype(np.float32, copy=False)
@@ -13857,17 +14124,24 @@ class ProjectTab(QtWidgets.QWidget):
                     for fname, expr in bm_formulas.items():
                         try:
                             arr_roi = _eval_band_expr_on_roi(expr).astype(np.float32, copy=False)
-                            # Use master mask for all bands
+                            # Build valid mask combining mask_b and NoData for all bands referenced by this formula
+                            formula_valid = mask_b.copy()
                             if nd_roi is not None:
-                                valid = valid_mask
-                            else:
-                                valid = mask_b
-                            vals = arr_roi[valid]
+                                used_bis = expr_bands_used.get(fname)
+                                if used_bis:
+                                    for bi in used_bis:
+                                        if bi < len(nd_roi):
+                                            formula_valid &= ~nd_roi[bi]
+                                else:
+                                    formula_valid &= ~nd_roi[0]
 
-                            channel_stats = _calc_stats(vals)
-                            pixel_count = _valid_count(vals)
+                            raw_vals = arr_roi[formula_valid]
+                            vals = raw_vals[np.isfinite(raw_vals)]
+                            pixel_count = int(vals.size)
                             if pixel_count == 0:
                                 continue
+
+                            channel_stats = _calc_stats(vals)
                             row = {
                                 "Project": project_label,
                                 "Root ID": root_id,
@@ -14090,12 +14364,24 @@ class ProjectTab(QtWidgets.QWidget):
                     for fname, expr in bm_formulas.items():
                         try:
                             arr_roi = _eval_band_expr_on_roi(expr).astype(np.float32, copy=False)
-                            # Use master mask for band-math (same as all other bands)
-                            valid = mask_b if nd_roi is None else (mask_b & ~nd_roi[0])
-                            vals = arr_roi[valid]
+                            # Build valid mask combining mask_b and NoData for all bands referenced by this formula
+                            formula_valid = mask_b.copy()
+                            if nd_roi is not None:
+                                used_bis = expr_bands_used.get(fname)
+                                if used_bis:
+                                    for bi in used_bis:
+                                        if bi < len(nd_roi):
+                                            formula_valid &= ~nd_roi[bi]
+                                else:
+                                    formula_valid &= ~nd_roi[0]
+
+                            raw_vals = arr_roi[formula_valid]
+                            vals = raw_vals[np.isfinite(raw_vals)]
+                            pixel_count = int(vals.size)
+                            if pixel_count == 0:
+                                continue
 
                             channel_stats = _calc_stats(vals)
-                            pixel_count = _valid_count(vals)
                             row = {
                                 "Project": project_label,
                                 "Root ID": root_id,
@@ -18119,15 +18405,16 @@ class ProjectTab(QtWidgets.QWidget):
             _lazy = self._try_lazy_export_channels(filepath, ax=_lazy_ax)
             if _lazy is not None:
                 info = {"H": _lazy.height, "W": _lazy.width, "C": len(_lazy)}
-                # _ax_is_windowable already guaranteed there is no NoData config.
+                # Populating the declared/effective NoData values on the lazy path
+                # so that process_polygon and other downstreams can apply them per-ROI.
                 self._last_export_nodata_mask = None
-                self._last_export_nodata_values = []
+                self._last_export_nodata_values = self.effective_nodata_values(filepath, _lazy_ax or {})
                 self._last_export_nodata_filepath = filepath
                 # The lazy path only ever reads TIFFs via raster_reader's own tiled
                 # reader (never cv2), so it is always native ("rgb") band order --
                 # see the matching fix in _try_lazy_export_channels' `order` build.
                 self._last_export_channel_order = "rgb"
-                self._export_image_cache[cache_key] = (_lazy, info, None, [], filepath, "rgb")
+                self._export_image_cache[cache_key] = (_lazy, info, None, list(self._last_export_nodata_values), filepath, "rgb")
                 return (_lazy, info)
 
             # ---------- load RAW, prefer tifffile for TIFF ----------
@@ -18656,6 +18943,248 @@ class ProjectTab(QtWidgets.QWidget):
         # path (see _build_roi_nodata), which is both correct and far cheaper
         # than scanning the whole image.
         return True
+
+    # ------------------------------------------------------------------
+    # Windowability for the ZOOM TILE -- deliberately NOT the same question
+    # as `_ax_is_windowable` above.
+    #
+    #   export asks:  can I compute EXACT STATISTICS from a window?
+    #   the tile asks: can I draw a FAITHFUL PICTURE of a window?
+    #
+    # Those genuinely differ, and answering the viewer's question with the
+    # export predicate is what cost all the resolution. `resize` is the
+    # clearest case: it changes pixel values, so export must refuse it -- but
+    # for the viewer a resize is only a change of SCALE between scene
+    # coordinates and raster coordinates, so reading the region natively shows
+    # more of the same picture, not a different one. `rotate` is a rigid map
+    # (rotating a sub-window equals the sub-window of the rotated image) and
+    # `band_expression` is pointwise (evaluating on a window equals the window
+    # of evaluating on everything), so both survive windowing exactly.
+    #
+    # What cannot be tiled is anything that needs GLOBAL information the
+    # window does not contain:
+    #   hist_match     per-band gain/offset derived from whole-image stats
+    #   registration   a warp that pulls pixels from outside the window
+    #   classification palette / label mapping built off the full image
+    #   mask_polygon   geometry expressed in full-image coordinates
+    #   appended_bands bands that do not exist in the reader at all
+    _AX_BLOCKS_TILING = (
+        "registration", "hist_match", "classification",
+        "appended_bands", "mask_polygon",
+    )
+
+    #: rotate degrees -> np.rot90 turns, matching _do_rotate's cv2-style
+    #: clockwise convention (90 -> k=3, 180 -> k=2, 270 -> k=1).
+    _ROT_K = {0: 0, 90: 3, 180: 2, 270: 1}
+
+    def _ax_is_tileable(self, ax):
+        """True when the zoom tile can reproduce this .ax on a window alone."""
+        if not ax:
+            return True
+        for key in self._AX_BLOCKS_TILING:
+            val = ax.get(key)
+            if not val:
+                continue
+            flag = self._AX_ENABLE_FLAG.get(key)
+            if flag is not None and not ax.get(flag, True):
+                continue
+            if isinstance(val, dict) and "enabled" in val and not val.get("enabled"):
+                continue
+            return False
+        return True
+
+    @staticmethod
+    def _ax_do_rotate_first(ax, raw_w, raw_h):
+        """Does the pipeline rotate BEFORE cropping for this .ax?
+
+        Mirrors the decision `apply_aux_modifications` makes verbatim, including
+        its default, because the tile has to reproduce whatever the preview
+        actually did -- not whatever would be most sensible. `crop_rect_ref_size`
+        records the frame the user drew the rect in: matching the raw dims means
+        the crop came first, matching the ROTATED dims means the rotation did.
+
+        `raw_w`/`raw_h` must be the dims of the array the pipeline saw, which for
+        a large raster is the DECIMATED preview, not the full raster. Passing the
+        full dims there would answer a different question than the pipeline asked
+        and put the crop in the wrong frame.
+        """
+        try:
+            rot = int(ax.get("rotate", 0)) % 360 if ax.get("rotate_enabled", True) else 0
+        except Exception:
+            rot = 0
+        if not (ax.get("crop_enabled", True) and ax.get("crop_rect")
+                and rot in (90, 180, 270)):
+            return True
+        ref = ax.get("crop_rect_ref_size")
+        if not (isinstance(ref, dict) and "w" in ref and "h" in ref):
+            return True
+        try:
+            ref_w, ref_h = int(ref.get("w") or 0), int(ref.get("h") or 0)
+        except Exception:
+            return True
+        if ref_w <= 0 or ref_h <= 0:
+            return True
+        rotated_w, rotated_h = (raw_h, raw_w) if rot in (90, 270) else (raw_w, raw_h)
+        if (ref_w, ref_h) == (int(raw_w), int(raw_h)):
+            return False
+        if (ref_w, ref_h) == (rotated_w, rotated_h):
+            return True
+        return True                      # pipeline's default
+
+    def _ax_tile_geometry(self, ax, profile, disp_shape, raw_shape=None):
+        """Build the map between DISPLAY (scene) pixels and raster pixels.
+
+        Returns ``(rot_k, (crop_ox, crop_oy), (crop_w, crop_h), sx, sy,
+        rotate_first)``:
+
+          rot_k        np.rot90 turns taking raster -> display
+          crop_o*      the crop origin, in the frame the crop is applied in
+          crop_*       the crop size, in that same frame
+          sx, sy       display pixels -> pre-crop-or-post-crop rotated pixels
+          rotate_first True when the pipeline rotates before cropping, in which
+                       case the crop rect lives in ROTATED raster coordinates
+
+        `sx`/`sy` are derived from the DISPLAYED array's own shape, never from
+        `image_data.display_scale`: that attribute is set in
+        `_imagedata_or_fallback`, i.e. BEFORE the .ax runs, so it knows nothing
+        about the crop or the resize and is simply wrong once either is active.
+        Taking the ratio against the real displayed shape absorbs the preview
+        decimation AND the resize in one number, which is why a resize needs no
+        tile-side work at all -- including an UPSCALE, where the preview
+        legitimately holds more pixels than the source region.
+        """
+        rot_k = 0
+        try:
+            if ax.get("rotate_enabled", True):
+                rot_k = self._ROT_K.get(int(ax.get("rotate", 0)) % 360, 0)
+        except Exception:
+            rot_k = 0
+
+        full_w = int(getattr(profile, "width", 0) or 0)
+        full_h = int(getattr(profile, "height", 0) or 0)
+
+        if raw_shape and len(raw_shape) >= 2 and raw_shape[0] and raw_shape[1]:
+            raw_h_pipe, raw_w_pipe = int(raw_shape[0]), int(raw_shape[1])
+        else:
+            raw_h_pipe, raw_w_pipe = full_h, full_w
+        rotate_first = self._ax_do_rotate_first(ax, raw_w_pipe, raw_h_pipe)
+
+        # When the rotation runs FIRST the crop rect is expressed in the rotated
+        # raster's frame, so it must be scaled against the rotated dims.
+        if rot_k % 2 and rotate_first:
+            from types import SimpleNamespace
+            crop_basis = SimpleNamespace(width=full_h, height=full_w)
+        else:
+            crop_basis = profile
+
+        crop_ox = crop_oy = 0
+        crop_w = int(getattr(crop_basis, "width", full_w) or full_w)
+        crop_h = int(getattr(crop_basis, "height", full_h) or full_h)
+        try:
+            (crop_ox, crop_oy), size = self._ax_crop_in_full_pixels(ax, crop_basis)
+            if size:
+                crop_w, crop_h = size
+        except Exception as e:
+            logging.debug("[highres] crop translation failed: %s", e)
+            crop_ox = crop_oy = 0
+
+        # Displayed extent, in whatever frame the display ends up in.
+        if rotate_first:
+            # rotate -> crop: the crop already IS the displayed extent.
+            rot_w, rot_h = crop_w, crop_h
+        else:
+            # crop -> rotate: rotating the crop swaps its axes for odd turns.
+            rot_w, rot_h = (crop_h, crop_w) if (rot_k % 2) else (crop_w, crop_h)
+
+        sx = sy = 1.0
+        if disp_shape and len(disp_shape) >= 2 and disp_shape[0] and disp_shape[1]:
+            sx = rot_w / float(disp_shape[1])
+            sy = rot_h / float(disp_shape[0])
+        return rot_k, (crop_ox, crop_oy), (crop_w, crop_h), sx, sy, rotate_first
+
+    def _tile_window_for_scene(self, ax, profile, disp_shape, scene_rect,
+                               raw_shape=None):
+        """Scene rect -> full-resolution raster window, plus what to do with the
+        pixels once they are read.
+
+        Returns ``(window, rot_k, placement)`` where `window` is
+        ``(x0, y0, x1, y1)`` in raster pixels, `rot_k` is the rotation to apply
+        to the fetched array, and `placement` is ``(rj0, ri0, rj1, ri1, sx, sy)``
+        for mapping the finished tile back to scene coordinates.
+        Returns ``None`` when the request is empty.
+        """
+        from math import floor, ceil
+
+        (rot_k, (crop_ox, crop_oy), (crop_w, crop_h),
+         sx, sy, rotate_first) = self._ax_tile_geometry(ax, profile, disp_shape,
+                                                        raw_shape=raw_shape)
+        full_w = int(getattr(profile, "width", 0) or 0)
+        full_h = int(getattr(profile, "height", 0) or 0)
+
+        rj0 = int(floor(scene_rect.left() * sx))
+        ri0 = int(floor(scene_rect.top() * sy))
+        rj1 = int(ceil(scene_rect.right() * sx))
+        ri1 = int(ceil(scene_rect.bottom() * sy))
+
+        disp_w, disp_h = crop_w, crop_h
+        if not rotate_first and (rot_k % 2):
+            disp_w, disp_h = crop_h, crop_w
+        rj0 = max(0, min(rj0, disp_w)); rj1 = max(rj0, min(rj1, disp_w))
+        ri0 = max(0, min(ri0, disp_h)); ri1 = max(ri0, min(ri1, disp_h))
+        if rj1 <= rj0 or ri1 <= ri0:
+            return None
+
+        if rotate_first:
+            # display == crop of the ROTATED raster: offset into rotated
+            # coordinates first, then invert the rotation.
+            #
+            # `_unrotate_window` takes the dims of the array the rotation was
+            # applied TO -- here the full raster, NOT its rotated extent.
+            # Passing the rotated dims silently produces a valid-looking but
+            # transposed window: measured on the real 19499x17481 COG it drove
+            # the tile-vs-preview correlation to 0.01 (i.e. unrelated pixels)
+            # for both 90 and 270, while 180 -- where the dims do not swap and
+            # the mistake cancels -- stayed correct at the 0.97 baseline.
+            cr0, cc0, cr1, cc1 = self._unrotate_window(
+                rot_k, full_w, full_h, ri0 + crop_oy, rj0 + crop_ox,
+                ri1 + crop_oy, rj1 + crop_ox)
+            x0, y0, x1, y1 = cc0, cr0, cc1, cr1
+        else:
+            # display == rotation of the CROP: invert against the crop's dims,
+            # then offset into the raster.
+            cr0, cc0, cr1, cc1 = self._unrotate_window(
+                rot_k, crop_w, crop_h, ri0, rj0, ri1, rj1)
+            x0, y0 = cc0 + crop_ox, cr0 + crop_oy
+            x1, y1 = cc1 + crop_ox, cr1 + crop_oy
+
+        x0 = max(0, x0); y0 = max(0, y0)
+        x1 = min(full_w, x1); y1 = min(full_h, y1)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return (x0, y0, x1, y1), rot_k, (rj0, ri0, rj1, ri1, sx, sy)
+
+    @staticmethod
+    def _unrotate_window(rot_k, crop_w, crop_h, ri0, rj0, ri1, rj1):
+        """Take a rect in ROTATED (display-oriented) pixels back to the
+        cropped raster's own pixels.
+
+        Inverts `np.rot90(m, k)` for m of shape (crop_h, crop_w):
+            k=1  out[i,j] = m[j,          W-1-i]
+            k=2  out[i,j] = m[H-1-i,      W-1-j]
+            k=3  out[i,j] = m[H-1-j,      i    ]
+        Rotation is rigid, so the rotated sub-window equals the sub-window of
+        the rotated image -- which is why the tile can simply read this rect
+        and `np.rot90` the result by the same k.
+        """
+        H, W = crop_h, crop_w
+        k = rot_k % 4
+        if k == 1:
+            return rj0, W - ri1, rj1, W - ri0          # (r0, c0, r1, c1)
+        if k == 2:
+            return H - ri1, W - rj1, H - ri0, W - rj0
+        if k == 3:
+            return H - rj1, ri0, H - rj0, ri1
+        return ri0, rj0, ri1, rj1
 
     @staticmethod
     def _ax_crop_in_full_pixels(ax, profile):
@@ -19643,16 +20172,19 @@ class ProjectTab(QtWidgets.QWidget):
                     # Get scene points of the item (including item translation)
                     pts_scene = []
 
-                    if hasattr(it, "polygon") and callable(getattr(it, "polygon")):
-                        # Map the polygon to scene coords (handles item.pos() moves correctly)
+                    if hasattr(it, "polygon"):
                         try:
-                            poly_local = it.polygon()
+                            # QGraphicsPolygonItem has a callable polygon() method, EditablePolygonItem has a QPolygonF attribute
+                            if callable(getattr(it, "polygon")):
+                                poly_local = it.polygon()
+                            else:
+                                poly_local = it.polygon
                             poly_scene = it.mapToScene(poly_local)
                             pts_scene = [(float(p.x()), float(p.y())) for p in poly_scene]
                             shape_type = "polygon"
                         except Exception:
                             # fallback: read local as-is
-                            poly_local = it.polygon()
+                            poly_local = it.polygon() if callable(getattr(it, "polygon")) else it.polygon
                             pts_scene = [(float(p.x()), float(p.y())) for p in poly_local]
                             shape_type = "polygon"
 
@@ -21215,7 +21747,273 @@ class ProjectTab(QtWidgets.QWidget):
         if y.ndim == 3 and y.shape[2] == 2:
             y = np.concatenate([y, y[:, :, :1]], axis=2)
         return y
-       
+
+    def _highres_viewport_callback(self, viewer, scene_rect, request_id=None,
+                                   fallback_image_data=None):
+        """Entry point for every zoom refinement request.
+
+        Resolves BOTH the image data and the `.ax` at REQUEST time. That is the
+        whole point of this indirection: the callback installed by
+        `display_image_group` used to capture them as default arguments, frozen
+        at display time, and nothing re-runs `display_image_group` after an edit
+        -- the post-editor path is `refresh_single_viewer`, which rebinds
+        `viewer.image_data` to a NEW object and never touches the callback.
+
+        So after applying a crop or a band expression the tile was still being
+        computed from the PRE-EDIT image data and an EMPTY .ax, and faithfully
+        painted the original, uncropped, un-computed raster over the edited
+        preview. Reported as "on cropping the original image is retrieved on
+        zooming, and the same for band math".
+
+        `_get_cached_ax` is keyed on the sidecar's mtime+size, so re-reading it
+        per request costs nothing and picks up the editor's write automatically.
+        """
+        imgd = getattr(viewer, 'image_data', None) or fallback_image_data
+        if imgd is None or getattr(imgd, 'reader', None) is None:
+            return
+        fp = getattr(imgd, 'filepath', None)
+        try:
+            ax = (self._get_cached_ax(fp) if fp else None) or {}
+        except Exception as e:
+            logging.debug("[highres] could not read .ax for %s: %s", fp, e)
+            ax = {}
+
+        if not self._ax_is_tileable(ax):
+            # e.g. histogram matching was just switched on. Any tile already on
+            # screen now shows unmatched pixels, so drop it rather than leave a
+            # sharp patch that disagrees with the image under it.
+            logging.debug(
+                "[highres] skipped for %s: .ax has ops needing whole-image "
+                "information", os.path.basename(fp or "?"))
+            try:
+                viewer.cancel_pending_highres_requests()
+                viewer._clear_highres_overlay()
+            except Exception:
+                pass
+            return
+
+        self._request_highres_viewport_region(viewer, imgd, scene_rect,
+                                              request_id=request_id, ax=ax)
+
+    def _request_highres_viewport_region(self, viewer, image_data, scene_rect,
+                                         request_id=None, ax=None):
+        """Asynchronously load high-res region for current viewport and update viewer overlay.
+
+        Replays the windowable part of the `.ax` on the tile so the sharpened
+        region shows the SAME picture as the preview underneath it:
+
+          crop    undone as a read offset  (geometry)
+          resize  absorbed by the display->raster scale, no tile-side work
+          rotate  coordinates un-rotated to read, tile rotated forward
+          band    expression re-evaluated on the window (pointwise)
+
+        Ops needing whole-image information never reach here -- `_ax_is_tileable`
+        disables the overlay for them in display_image_group.
+        """
+        try:
+            from math import floor, ceil
+            reader = getattr(image_data, 'reader', None)
+            display_scale = getattr(image_data, 'display_scale', 1.0)
+            preview_bands = getattr(image_data, 'preview_bands', None)
+            full_shape = getattr(image_data, 'full_shape', None)
+
+            if not reader or not full_shape:
+                return
+
+            full_h, full_w = full_shape[0], full_shape[1]
+
+            if ax is None:
+                ax = self._load_ax_mods(getattr(image_data, 'filepath', None)) or {}
+
+            # ---- display <-> raster geometry --------------------------------------
+            # `display_scale` and `full_shape` describe the UNCROPPED, UNROTATED,
+            # UNRESIZED raster: they are set in _imagedata_or_fallback, before
+            # apply_aux_modifications touches the preview. Using them directly is
+            # what put the tile at scene (-529.6,-428.7), fully black, once a crop
+            # was active. _ax_tile_geometry rebuilds the mapping from the real
+            # displayed shape instead.
+            disp = getattr(image_data, 'image', None)
+            disp_shape = getattr(disp, 'shape', None)
+            profile = getattr(image_data, 'profile', None)
+            if profile is None or not disp_shape:
+                return
+
+            # The ordering decision inside apply_aux_modifications compares the
+            # crop's reference size against the dims of the array IT saw -- the
+            # decimated preview -- so reconstruct those from the decimation
+            # factor rather than handing it the full raster's dims.
+            raw_shape = None
+            try:
+                _ds = float(display_scale) or 1.0
+                raw_shape = (int(round(full_h / _ds)), int(round(full_w / _ds)))
+            except Exception:
+                raw_shape = None
+
+            plan = self._tile_window_for_scene(ax, profile, disp_shape,
+                                               scene_rect, raw_shape=raw_shape)
+            if plan is None:
+                return
+            (x0, y0, x1, y1), rot_k, (rj0, ri0, rj1, ri1, sx_disp, sy_disp) = plan
+
+            win_w = x1 - x0
+            win_h = y1 - y0
+
+            # Determine best pyramid level based on actual screen viewport size
+            level = 0
+            try:
+                vp = viewer.viewport()
+                vp_w = max(1, int(vp.width())) if vp else max(1, int(round(scene_rect.width())))
+                vp_h = max(1, int(vp.height())) if vp else max(1, int(round(scene_rect.height())))
+            except Exception:
+                vp_w = max(1, int(round(scene_rect.width())))
+                vp_h = max(1, int(round(scene_rect.height())))
+
+            target_dim = max(vp_w, vp_h)
+            if hasattr(reader, "_levels") and len(reader._levels) > 1:
+                # If viewport covers a large fraction of the whole dataset, select overview level.
+                # Otherwise, when inspecting details/zoomed in, select Level 0 (100% native).
+                if win_w >= target_dim * 2 and win_h >= target_dim * 2:
+                    for i, lv in enumerate(reader._levels):
+                        sx = lv["width"] / float(full_w)
+                        sy = lv["height"] / float(full_h)
+                        if win_w * sx >= target_dim and win_h * sy >= target_dim:
+                            level = i
+                        else:
+                            break
+
+            # Scale window coordinates into chosen level coordinate space
+            lv = reader._levels[level] if (hasattr(reader, "_levels") and level < len(reader._levels)) else None
+            if lv is not None:
+                sx = lv["width"] / float(full_w)
+                sy = lv["height"] / float(full_h)
+                lx0 = max(0, int(floor(x0 * sx)))
+                ly0 = max(0, int(floor(y0 * sy)))
+                lx1 = min(lv["width"], max(lx0 + 1, int(ceil(x1 * sx))))
+                ly1 = min(lv["height"], max(ly0 + 1, int(ceil(y1 * sy))))
+            else:
+                lx0, ly0, lx1, ly1 = x0, y0, x1, y1
+
+            def _fetch_job():
+                try:
+                    bands = preview_bands if preview_bands else [0, 1, 2]
+                    arr = reader.read_window(lx0, ly0, lx1, ly1, bands=bands, level=level)
+                    logging.debug(f"[highres_viewport] arr shape: {getattr(arr, 'shape', None)}")
+                    if arr is None or getattr(arr, "size", 0) == 0:
+                        return None
+
+                    # Replay the pointwise part of the .ax, then the rotation.
+                    # Both commute with windowing, so doing them here reproduces
+                    # exactly what apply_aux_modifications put in the preview.
+                    arr = self._tile_apply_band_expression(arr, ax)
+                    if rot_k % 4:
+                        arr = np.ascontiguousarray(np.rot90(arr, k=rot_k % 4))
+
+                    uint8_arr = self._render_with_viewer_stretch(arr, viewer, _as_array=True)
+                    logging.debug(f"[highres_viewport] uint8_arr: {uint8_arr is not None}")
+                    if uint8_arr is None:
+                        return None
+                    pm = _pixmap_from_uint8(uint8_arr)
+                    return pm
+                except Exception as e:
+                    logging.debug(f"[highres_viewport] fetch failed: {e}")
+                    return None
+
+            def _on_done(future):
+                try:
+                    pm = future.result()
+                    logging.debug(f"[highres_viewport] pm: {pm}")
+                    if pm is not None and not pm.isNull():
+                        # Back to SCENE coordinates. The tile has already been
+                        # rotated forward, so it lines up with the ROTATED
+                        # cropped-raster frame -- which is the frame ri0/rj0 were
+                        # computed in. Dividing those by the display scale is the
+                        # exact inverse of the mapping used to build the request,
+                        # for every combination of crop, resize and rotation.
+                        scene_x = rj0 / float(sx_disp)
+                        scene_y = ri0 / float(sy_disp)
+                        sc_x = ((rj1 - rj0) / float(sx_disp)) / float(pm.width())
+                        sc_y = ((ri1 - ri0) / float(sy_disp)) / float(pm.height())
+                        
+                        # Hand the tile to the GUI thread via a SIGNAL.
+                        #
+                        # `_on_done` is a Future done-callback, so it runs on the
+                        # ThreadPoolExecutor's WORKER thread, and
+                        # update_highres_overlay mutates the QGraphicsScene --
+                        # only legal on the GUI thread.
+                        #
+                        # This used to be `QTimer.singleShot(0, callable)`. A
+                        # QTimer takes the affinity of the thread that CREATES
+                        # it, and the worker has no Qt event loop, so the timer
+                        # never fired: every finished tile was silently dropped.
+                        # Everything upstream succeeded (region read, stretch,
+                        # QPixmap built), which is exactly why zooming produced
+                        # no error and no sharpening -- the high-res tile was
+                        # computed on every zoom and thrown away.
+                        #
+                        # (The 3-argument QTimer.singleShot(msec, context, slot)
+                        # overload would also work in principle, but is not
+                        # exposed by this PyQt5 build -- it raises "arguments did
+                        # not match any overloaded call". A signal is portable
+                        # and is the idiomatic cross-thread hand-off.)
+                        viewer.highres_tile_ready.emit(
+                            pm, float(scene_x), float(scene_y),
+                            float(sc_x), float(sc_y), request_id)
+                except Exception as e:
+                    logging.debug(f"[highres_viewport] on_done failed: {e}")
+
+            if not hasattr(self, '_highres_executor'):
+                import concurrent.futures
+                self._highres_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="canopie-highres-vp")
+
+            fut = self._highres_executor.submit(_fetch_job)
+            fut.add_done_callback(_on_done)
+        except Exception as e:
+            logging.debug(f"[_request_highres_viewport_region] failed: {e}")
+
+    def _tile_apply_band_expression(self, arr, ax):
+        """Append the .ax band expression to a WINDOW, exactly as
+        `apply_aux_modifications._do_band_expr` appends it to the whole image.
+
+        A band expression is pointwise, so evaluating it on a window gives the
+        same pixels as windowing the whole-image result -- which is why the
+        zoom tile can honour band math instead of having to give up resolution
+        for it.
+
+        Channel indices line up for free: the window is read with the SAME
+        `preview_bands` the preview used, so `b1`, `b2`, ... address the same
+        channels in both, and the expression lands in the same last position
+        that the band bar selects it from.
+        """
+        if arr is None or not ax:
+            return arr
+        if not ax.get("band_enabled", True):
+            return arr
+        expr_str = (ax.get("band_expression") or "").strip()
+        if not expr_str:
+            return arr
+        try:
+            work = arr if arr.ndim == 3 else arr[..., None]
+            # Same BGR-view rule as _do_band_expr: an exactly-3-channel image is
+            # treated as cv2-style BGR unless the .ax says otherwise, so `b1` is
+            # red in both places.
+            _co = str(ax.get("channel_order") or "").lower()
+            bgr_like = (work.ndim == 3 and work.shape[2] == 3)
+            if _co == "rgb":
+                bgr_like = False
+            elif _co == "bgr":
+                bgr_like = True
+            base = work[..., [2, 1, 0]] if bgr_like else work
+
+            res = eval_band_expression(base.astype(np.float32, copy=False), expr_str)
+            expr2d = res if getattr(res, "ndim", 0) == 2 else res[..., 0]
+            return np.concatenate(
+                [work.astype(np.float32, copy=False),
+                 expr2d.astype(np.float32, copy=False)[..., None]], axis=2)
+        except Exception as e:
+            logging.debug("[highres] band expression on tile failed (%r): %s",
+                          expr_str, e)
+            return arr
+
     def _render_with_viewer_stretch(self, cv_img, viewer, prefer_last_band=False, mask=None, ax_override=None, _as_array=False, sp_override=None):
         """
         Render using the SAME pipeline your old version used (display mapping -> preview plane
@@ -21333,6 +22131,12 @@ class ProjectTab(QtWidgets.QWidget):
                         if base is not None and hasattr(base, "ndim") and base.ndim == 3 and base.shape[2] > 3:
                             prefer_last_band = True
                             logging.debug(f"_render_with_viewer_stretch: band_expression mode={mode}, auto-setting prefer_last_band=True (image has {base.shape[2]} bands)")
+                elif isinstance(be, str):
+                    has_expr = bool(be.strip())
+                    if has_expr:
+                        if base is not None and hasattr(base, "ndim") and base.ndim == 3 and base.shape[2] > 3:
+                            prefer_last_band = True
+                            logging.debug(f"_render_with_viewer_stretch: band_expression (string), auto-setting prefer_last_band=True (image has {base.shape[2]} bands)")
         except Exception as e:
             logging.debug(f"_render_with_viewer_stretch: band_expression check failed: {e}")
 
@@ -21852,6 +22656,28 @@ class ProjectTab(QtWidgets.QWidget):
 
 
     @QtCore.pyqtSlot(object)
+    def _on_viewer_stretch_applied(self, params, viewer, root_name):
+        """
+        Handle a stretch applied directly from the in-viewer _StretchBar.
+        Since this represents a final, committed change by the user (slider release or Auto click),
+        we save it to disk before applying it visually.
+        """
+        if viewer is not None:
+            fp = getattr(getattr(viewer, "image_data", None), "filepath", None)
+            if fp:
+                try:
+                    if params is None:
+                        # "Auto" button was clicked -> clear the saved file stretch
+                        self._clear_file_stretch(fp)
+                    elif getattr(params, "scope", "") == "viewer":
+                        # Slider was released -> save the new custom stretch
+                        self._save_file_stretch(fp, params)
+                except Exception as e:
+                    import logging
+                    logging.warning(f"Failed to save/clear in-viewer stretch to {fp}: {e}")
+                    
+        self._on_stretch_apply(params, viewer, root_name)
+
     def _on_stretch_apply(self, params, viewer, root_name):
         """
         Live-apply stretch from the dialog (also used for the committed OK render).
@@ -22262,7 +23088,7 @@ class ProjectTab(QtWidgets.QWidget):
             edit_button.clicked.connect(partial(self.edit_image_viewer, viewer))
             stretch_button.clicked.connect(lambda _=False, v=viewer, rn=root_name: self.open_stretch_dialog(v, rn))
             viewer.band_selected.connect(lambda band_idx, v=viewer, rn=root_name: self._on_band_bar_clicked(v, rn, band_idx))
-            viewer.stretch_applied.connect(lambda params, v=viewer, rn=root_name: self._on_stretch_apply(params, v, rn))
+            viewer.stretch_applied.connect(lambda params, v=viewer, rn=root_name: self._on_viewer_stretch_applied(params, v, rn))
 
             buttons_layout.addWidget(clean_button)
             buttons_layout.addWidget(edit_button)
@@ -22441,6 +23267,51 @@ class ProjectTab(QtWidgets.QWidget):
 
         self.update_polygon_manager()
         self._rewire_all_viewers_for_inspection()
+
+        # Enable dynamic high-res viewport region loading for oversized rasters
+        for rec in self.viewer_widgets:
+            imgd = rec.get('image_data')
+            viewer = rec.get('viewer')
+            # The high-res tile is read STRAIGHT FROM THE READER and only
+            # stretched -- it does NOT go through apply_aux_modifications, which
+            # is what produced the preview underneath it. So the moment the .ax
+            # carries an op that changes geometry or pixel VALUES (band
+            # expression, resize, rotate, hist match, classification), the tile
+            # and the preview disagree: band math and rescaling "don't translate
+            # to the viewer", because the sharpened region is raw data.
+            #
+            # `_ax_is_windowable` already answers exactly the right question --
+            # "can this .ax be replayed on a WINDOW rather than the whole
+            # image?" -- and is the same gate the lazy export path uses. Reusing
+            # it means the two paths can never disagree about what is safe, and
+            # there is no second list of ops to keep in sync.
+            #
+            # When it is NOT windowable the overlay is disabled: the viewer then
+            # shows the preview at its own resolution, which is softer but
+            # CORRECT. A sharp tile of the wrong pixels is far worse than a
+            # slightly blurry one of the right pixels.
+            _ax_for_hr = None
+            _hr_ok = False
+            # Enable purely on "is there a reader?". Whether the CURRENT .ax can
+            # be tiled is decided per request, not here -- see
+            # _highres_viewport_callback. Deciding it here froze the answer at
+            # display time, and nothing re-runs display_image_group after an
+            # edit (the post-editor path is refresh_single_viewer), so toggling
+            # histogram matching off left the overlay disabled forever.
+            _hr_ok = bool(imgd and getattr(imgd, 'reader', None) is not None)
+
+            if _hr_ok and hasattr(viewer, 'enable_highres_viewport'):
+                # `imgd` is passed ONLY as a fallback. It must never be the
+                # authoritative source: refresh_single_viewer rebinds
+                # viewer.image_data to a NEW object after every edit, so a
+                # captured one goes stale the moment the user applies a crop.
+                def _highres_cb(v, scene_rect, req_id=None, _fallback=imgd):
+                    self._highres_viewport_callback(
+                        v, scene_rect, request_id=req_id,
+                        fallback_image_data=_fallback)
+                viewer.enable_highres_viewport(_highres_cb)
+            elif viewer and hasattr(viewer, 'disable_highres_viewport'):
+                viewer.disable_highres_viewport()
         # NOTE: We do NOT re-enable updates here. We keep them disabled until
         # _reapply_fixed_zoom_after_layout runs. This prevents the "uncentered" flash.
 
@@ -23527,11 +24398,29 @@ class ProjectTab(QtWidgets.QWidget):
         filepath = getattr(viewer.image_data, "filepath", None)
         if not filepath: return
         
+        # Capture current image reference size for coordinate scaling
+        eff_h, eff_w = 0, 0
+        try:
+            eff_h, eff_w = viewer.image_data.image.shape[:2]
+        except Exception:
+            pass
+            
+        # Map scene points directly back to image coordinates for storage
+        old_img_pts = []
+        for p in old_points:
+            ip = self.scene_to_image_coords(viewer, p)
+            old_img_pts.append((float(ip.x()), float(ip.y())))
+
+        new_img_pts = []
+        for p in new_points:
+            ip = self.scene_to_image_coords(viewer, p)
+            new_img_pts.append((float(ip.x()), float(ip.y())))
+
         label = getattr(item, "name", "") or ""
         group_name = label # Simplify
         
         try:
-             cmd = ModifyPolygonCommand(self, label, filepath, group_name, old_points, new_points)
+             cmd = ModifyPolygonCommand(self, label, filepath, group_name, old_points, new_points, old_img_pts, new_img_pts, eff_w, eff_h)
              self.undo_stack.push(cmd)
         except NameError:
              logging.error("ModifyPolygonCommand class not found")
@@ -25745,14 +26634,23 @@ class ProjectTab(QtWidgets.QWidget):
             # Detect classification and band expression for proper rendering
             prefer_last_band = False
             has_classification = False
+            has_expr = False
             try:
                 ax = self._load_ax_json(filepath)
-                # Check for band expression
+                # Check for band expression. Honour the enable flag: with band
+                # math switched off apply_aux_modifications appends nothing, so
+                # there is no last band to prefer.
                 be = ax.get("band_expression")
+                if not ax.get("band_enabled", True):
+                    be = None
                 if isinstance(be, dict):
                     prefer_last_band = bool((be.get("expression") or "").strip())
                 elif isinstance(be, str):
                     prefer_last_band = bool(be.strip())
+                # Keep a dedicated flag: `prefer_last_band` is ALSO set by
+                # classification below, and the branch further down needs to
+                # know specifically whether a band expression is active.
+                has_expr = prefer_last_band
                 # Check for sklearn classification
                 cblock = ax.get("classification") or {}
                 if isinstance(cblock, dict):
@@ -25795,9 +26693,32 @@ class ProjectTab(QtWidgets.QWidget):
                     if has_classification:
                         viewer._force_auto_stretch = True
                         viewer.stretch_params = None
+                    elif has_expr and hasattr(imgd.image, "shape") and imgd.image.ndim == 3 and imgd.image.shape[2] > 3:
+                        # Sync UI to show the expression band is active.
+                        # `stretch_params` is NOT set in ImageViewer.__init__ --
+                        # every other read site in the codebase goes through
+                        # getattr(..., None) for exactly that reason. Reading it
+                        # as an attribute raised AttributeError on any viewer the
+                        # user had not yet stretched, which (being swallowed by
+                        # the except below) skipped the stretch-aware render.
+                        C = imgd.image.shape[2]
+                        _sp = getattr(viewer, "stretch_params", None)
+                        if (_sp is None
+                                or str(getattr(_sp, "display_mode", "")).lower() != "single"
+                                or getattr(_sp, "display_band", None) != C - 1):
+                            viewer.stretch_params = _StretchParams(display_mode="single", display_band=C - 1)
                 pm = self._render_with_viewer_stretch(imgd.image, viewer, prefer_last_band=prefer_last_band)
-            except Exception:
-                pass
+            except Exception as e:
+                # Do NOT swallow this silently. A bare `except: pass` here hid a
+                # NameError (`has_expr`, never assigned) on every non-classified
+                # refresh: the stretch-aware renderer was skipped entirely and
+                # the plain fallback below repainted the viewer with a default
+                # stretch instead of the user's -- reported as "applying changes
+                # temporarily changes my stretching", with nothing in the log.
+                logging.warning(
+                    "refresh_single_viewer: stretch-aware render failed for %s "
+                    "(%s); falling back to a default stretch",
+                    os.path.basename(filepath or "?"), e, exc_info=True)
             if pm is None:
                 pm = self.convert_cv_to_pixmap(imgd.image, prefer_last_band=prefer_last_band)
 
@@ -25921,6 +26842,11 @@ class ProjectTab(QtWidgets.QWidget):
                 if has_classification:
                     viewer._force_auto_stretch = True
                     viewer.stretch_params = None
+                elif prefer_last_band and hasattr(image_data.image, "shape") and image_data.image.ndim == 3 and image_data.image.shape[2] > 3:
+                    # Sync UI to show the expression band is active
+                    C = image_data.image.shape[2]
+                    if viewer.stretch_params is None or str(getattr(viewer.stretch_params, "display_mode", "")).lower() != "single" or getattr(viewer.stretch_params, "display_band", None) != C - 1:
+                        viewer.stretch_params = _StretchParams(display_mode="single", display_band=C - 1)
             pm = self._render_with_viewer_stretch(image_data.image, viewer, prefer_last_band=prefer_last_band)
         except Exception:
             pass
@@ -26222,6 +27148,11 @@ class ProjectTab(QtWidgets.QWidget):
             return np.ascontiguousarray(out8)
 
         cropped_bgr = _to_bgr_preview(cropped)
+
+        # Check channel order from export image loader (tifffile loads native RGB)
+        last_order = getattr(self, "_last_export_channel_order", "bgr")
+        if last_order == "rgb" and cropped_bgr.ndim == 3 and cropped_bgr.shape[2] == 3:
+            cropped_bgr = np.ascontiguousarray(cropped_bgr[..., ::-1])
 
         # --- 7) Draw polygon (scaled, then shifted by crop origin)
         adjusted = (pts_scaled - np.array([x_new, y_new], dtype=np.float32)).astype(np.int32).reshape(-1, 1, 2)
@@ -29380,35 +30311,41 @@ class ProcessingModeDialog(QDialog):
 
 
 class ModifyPolygonCommand(QUndoCommand):
-    def __init__(self, project_tab, label, filepath, group_name, old_points, new_points):
+    def __init__(self, project_tab, label, filepath, group_name, old_points, new_points, old_img_pts, new_img_pts, eff_w, eff_h):
         super().__init__(f"Move Polygon '{label}'")
         self.tab = project_tab
         self.label = label
         self.filepath = filepath
         self.group_name = group_name
-        self.old_points = old_points  # QPolygonF (scene coords)
-        self.new_points = new_points  # QPolygonF (scene coords)
+        self.old_points = old_points  # QPolygonF (scene coords) for UI
+        self.new_points = new_points  # QPolygonF (scene coords) for UI
+        self.old_img_pts = old_img_pts # [(x,y)] list for JSON
+        self.new_img_pts = new_img_pts # [(x,y)] list for JSON
+        self.eff_w = eff_w
+        self.eff_h = eff_h
         self._first_run = True
 
     def redo(self):
         # On first run (initial drag end), we do NOT update visual because it is already consistent.
         # But we MUST update memory and save JSON.
         logging.info(f"[UndoStack] Redo Move: {self.label}")
-        self._apply_state(self.new_points, update_visual=not self._first_run)
+        self._apply_state(self.new_points, self.new_img_pts, update_visual=not self._first_run)
         self._first_run = False
 
     def undo(self):
         logging.info(f"[UndoStack] Undo Move: {self.label}")
-        self._apply_state(self.old_points, update_visual=True)
+        self._apply_state(self.old_points, self.old_img_pts, update_visual=True)
 
-    def _apply_state(self, points, update_visual=False):
+    def _apply_state(self, points, img_pts, update_visual=False):
         import os
-        # 1. Update memory
+        # 1. Update memory (use TRUE image coordinates to avoid compound scaling bug)
         if self.group_name in self.tab.all_polygons:
              d = self.tab.all_polygons[self.group_name].get(self.filepath)
              if d:
-                 pts_list = [(p.x(), p.y()) for p in points]
-                 d['points'] = pts_list
+                 d['points'] = img_pts
+                 # Make sure to update the reference size since these coordinates are tied to the active scaled basis
+                 if self.eff_w > 0 and self.eff_h > 0:
+                     d['image_ref_size'] = {'w': int(self.eff_w), 'h': int(self.eff_h)}
         
         # 2. Save to JSON (Single File)
         if hasattr(self.tab, '_save_specific_polygon_file'):

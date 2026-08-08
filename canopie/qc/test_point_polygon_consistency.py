@@ -21,6 +21,9 @@ from .fixtures_manifest import FIXTURES, fixture_image_path, get_fixture
 from .project_builder import point_group_name, polygon_group_name, degenerate_group_name
 from ._helpers import load_ground_truth, load_raw_npz, assert_close, expected_channel_names
 
+# Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
+pytestmark = [pytest.mark.extraction, pytest.mark.polygons]
+
 # One representative fixture per distinct extraction shape: 3-band cv2/BGR,
 # 8-band tifffile/native, and single-band ("Gray" channel) -- the three
 # branches process_polygon actually has.

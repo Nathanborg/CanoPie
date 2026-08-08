@@ -19,6 +19,7 @@ from typing import Dict, List, Tuple, Optional, Any, Callable
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import threading
+import weakref
 
 # ============================================================================
 # CONFIGURATION
@@ -188,6 +189,20 @@ def _convert_to_numexpr(expr: str, num_bands: int) -> Optional[str]:
     return result
 
 
+
+def _weak_or_none(obj):
+    """weakref.ref(obj), or None when the object does not support weak refs.
+
+    A plain numpy array does; a view backed by some buffers may not. Returning
+    None degrades the cache to "always a miss" for that entry, which is correct
+    (just slower) rather than wrong.
+    """
+    try:
+        return weakref.ref(obj)
+    except TypeError:
+        return None
+
+
 class FastBandMathEngine:
     """
     High-performance band math evaluation engine.
@@ -228,12 +243,39 @@ class FastBandMathEngine:
         if not expr_norm:
             raise ValueError("Empty expression")
 
-        # Check cache
-        if cache_key and cache_key in self._local_cache:
-            return self._local_cache[cache_key]
+        # Check cache -- but only return a hit that was computed from THIS image.
+        #
+        # This engine is a process-wide singleton (get_band_math_engine), and
+        # `process_polygon` caches by expression string alone
+        # (`cache_key=expr_norm`). So a CSV export over several images computed
+        # e.g. GCC on the first image and then handed that SAME array back for
+        # every later image -- each image's own polygon mask applied to the
+        # wrong pixels. Measured across three fixtures in one process: image 1
+        # exported the correct 382.0, image 2 exported 383.8 instead of 86022.0,
+        # image 3 exported 366.0 instead of 1527.0. Every multi-image export
+        # using band math or a vegetation index was affected from the second
+        # image onward.
+        #
+        # The identity check below is on the ARRAY OBJECT, held weakly so the
+        # cache cannot keep whole cubes alive. A dead or mismatched reference is
+        # simply a miss, which is always safe.
+        if cache_key:
+            entry = self._local_cache.get(cache_key)
+            if entry is not None:
+                src_ref, cached = entry
+                src = src_ref() if src_ref is not None else None
+                if src is not None and src is img_float:
+                    return cached
 
-        # Ensure float32 contiguous array
+        # Ensure float32 contiguous array.
+        #
+        # Sanitise the INPUT exactly as utils.eval_band_expression does (see its
+        # `x = np.nan_to_num(...)` line). Without this the two engines disagree
+        # on NaN: `b1+b2` with b1=NaN gave 2.0 through the reference (NaN->0
+        # first) but NaN here -- so the same formula on the same project
+        # exported different numbers depending on which engine happened to run.
         img = np.asarray(img_float, dtype=np.float32)
+        img = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
         if not img.flags.c_contiguous:
             img = np.ascontiguousarray(img)
 
@@ -247,7 +289,7 @@ class FastBandMathEngine:
                 try:
                     result = self._eval_numexpr(img, ne_expr, C)
                     if cache_key:
-                        self._local_cache[cache_key] = result
+                        self._local_cache[cache_key] = (_weak_or_none(img_float), result)
                     return result
                 except Exception as e:
                     logging.debug(f"NumExpr eval failed, falling back to numpy: {e}")
@@ -256,7 +298,7 @@ class FastBandMathEngine:
         result = self._eval_numpy(img, expr_norm, C)
 
         if cache_key:
-            self._local_cache[cache_key] = result
+            self._local_cache[cache_key] = (_weak_or_none(img_float), result)
 
         return result
 
@@ -275,11 +317,43 @@ class FastBandMathEngine:
         # NumExpr evaluation
         result = _ne.evaluate(expr, local_dict=local_dict)
 
-        # Ensure float32 output
-        return np.asarray(result, dtype=np.float32)
+        # Sanitise the OUTPUT the same way utils.eval_band_expression does.
+        # numexpr has no safe_div, so x/0 comes back as +-inf (or NaN for 0/0);
+        # mapping those to 0 reproduces safe_div's contract exactly. Without it
+        # an index like GCC = b2/(b1+b2+b3) returned inf on any zero-sum pixel
+        # (shadow, NoData edge) and that inf flowed straight into the exported
+        # Mean/Median.
+        out = np.asarray(result, dtype=np.float32)
+        return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _eval_numpy(self, img: np.ndarray, expr: str, num_bands: int) -> np.ndarray:
-        """Evaluate expression using optimized numpy."""
+        """Evaluate expression using the CANONICAL evaluator in utils.
+
+        This used to be a second, independent implementation whose expression
+        rewriting was regex-based (`_transform_expr_for_eval`). It diverged from
+        utils.eval_band_expression in three ways, all of which reached real
+        exports because process_polygon prefers this engine and only falls back
+        to utils when this one *raises*:
+
+          * `/` was never rewritten to safe_div despite the comment saying so,
+            so `b1/b2` with b2=0 returned inf where the reference returned 0;
+          * the result was never sanitised, so inf/NaN flowed into Mean/Median;
+          * `(\\S+)\\s*&\\s*(\\S+)` cannot see parentheses, so
+            `(b1 >150) & (b2>165)` -- the shipped "boolean2" default -- produced
+            invalid Python and raised, silently falling back on every export.
+
+        numexpr (when installed) remains the genuinely fast path; this branch is
+        the fallback, and there is no benefit to it being a different
+        implementation from the reference. Delegating makes the two agree BY
+        CONSTRUCTION rather than by two parsers being kept in sync by hand.
+        The AST parse is negligible next to the array math, and eval_expression
+        caches results by expression anyway.
+        """
+        from .utils import eval_band_expression
+        return eval_band_expression(img, expr)
+
+    def _eval_numpy_legacy(self, img: np.ndarray, expr: str, num_bands: int) -> np.ndarray:
+        """Superseded by _eval_numpy above; kept only for reference. Do not call."""
         H, W = img.shape[:2]
 
         # Build band mapping

@@ -23,6 +23,9 @@ from .fixtures_manifest import fixture_image_path, get_fixture
 from .project_builder import polygon_group_name
 from ._helpers import load_ground_truth, assert_close, expected_channel_names
 
+# Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
+pytestmark = [pytest.mark.io, pytest.mark.extraction]
+
 STATS_OPTS = {"stats": {"mean": True, "median": True, "std": True, "quantiles": [25, 75]}}
 
 # Fixtures whose .ax (if any) leaves them windowable, so the lazy path can

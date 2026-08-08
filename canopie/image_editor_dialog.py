@@ -2340,11 +2340,13 @@ class ImageEditorDialog(QDialog):
                     pass
 
         _update_progress("Preparing image...", 0)
-
+        if image is None:
+            image = self.original_image
         if image is None or getattr(image, "size", 0) == 0:
             logging.error("apply_all_modifications_to_image: empty source image.")
             return image
 
+        self._has_expression_band = False
         mods = modifications or {}
         _has_mods = any(k in mods for k in ("rotate","crop_rect","hist_match","resize","band_expression","registration"))
         result = image.copy() if _has_mods else image
@@ -3056,13 +3058,23 @@ class ImageEditorDialog(QDialog):
                                 img_ch = image[..., c] if image.ndim == 3 else image
                                 res[..., c] = np.where(nodata_mask, img_ch.astype(res.dtype), res[..., c])
 
-            # ⚠️ Normalize channel order for the editor: keep 3-ch arrays in BGR
-            if isinstance(res, np.ndarray) and res.ndim == 3 and res.shape[2] == 3:
-                # res coming from the util is RGB — flip to BGR so display_image's
-                # BGR→RGB step produces correct colors.
-                res = res[:, :, ::-1].copy()
-
             self.last_band_float_result = res.copy()
+
+            # Stack expression result onto original image as a new channel
+            # So processed_image retains all original bands [B, G, R, ..., Expression_Result]
+            if isinstance(image, np.ndarray) and isinstance(res, np.ndarray):
+                img_3d = image[..., np.newaxis] if image.ndim == 2 else image
+                res_2d = res[:, :, -1] if res.ndim == 3 else res
+                
+                # Determine target dtype to avoid losing float/bool precision when stacking with uint8
+                target_dtype = np.float32 if (res_2d.dtype.kind in 'fb' or img_3d.dtype.kind in 'f') else img_3d.dtype
+                img_3d_cast = img_3d.astype(target_dtype, copy=False)
+                res_3d_cast = res_2d[..., np.newaxis].astype(target_dtype, copy=False)
+                
+                stacked = np.concatenate([img_3d_cast, res_3d_cast], axis=2)
+                self._has_expression_band = True
+                return stacked
+
             return res
         except Exception as e:
             logging.error(f"Error processing band expression '{expr}': {e}")
@@ -3135,7 +3147,7 @@ class ImageEditorDialog(QDialog):
         # RIGHT: Sidebar (Fixed Width)
         # ==========================================================
         sidebar_container = QtWidgets.QWidget()
-        sidebar_container.setFixedWidth(320)
+        sidebar_container.setFixedWidth(390)
         sidebar_layout = QtWidgets.QVBoxLayout(sidebar_container)
         sidebar_layout.setContentsMargins(0, 0, 0, 0)
         sidebar_layout.setSpacing(6)
@@ -3149,7 +3161,7 @@ class ImageEditorDialog(QDialog):
         
         control_container = QtWidgets.QWidget()
         control_layout = QtWidgets.QVBoxLayout(control_container)
-        control_layout.setContentsMargins(0, 0, 4, 0) # Right margin for scrollbar
+        control_layout.setContentsMargins(2, 2, 6, 2) # Right margin for scrollbar
         control_layout.setSpacing(10)
         
         control_scroll.setWidget(control_container)
@@ -3612,7 +3624,7 @@ class ImageEditorDialog(QDialog):
         mask_group.toggle_button.setChecked(True)
         img_ops_group.toggle_button.setChecked(True)
         
-        self.resize(900, 600) # Compact default size
+        self.resize(980, 650) # Updated size for wider sidebar panel
         
         # Sync UI from modifications (load cached values from .ax file)
         self._sync_ui_from_modifications()
@@ -4724,8 +4736,11 @@ class ImageEditorDialog(QDialog):
             else:
                 disp = image_or_pixmap
 
-                # Ensure displayable uint8
-                if getattr(disp, "dtype", None) != np.uint8 or getattr(disp, "ndim", None) not in (2, 3):
+                # Ensure displayable uint8 (and normalize if >3 channels or expression active)
+                if (getattr(disp, "dtype", None) != np.uint8 or 
+                    getattr(disp, "ndim", None) not in (2, 3) or 
+                    (getattr(disp, "ndim", None) == 3 and disp.shape[2] > 3) or
+                    getattr(self, "_has_expression_band", False)):
                     disp = self.normalize_image_for_display(disp)
                 if disp is None:
                     self.image_label.setText("Normalization Failed.")
@@ -5301,38 +5316,54 @@ class ImageEditorDialog(QDialog):
 
                 elif res.ndim == 3:  # color or multispectral
                     H, W, C = res.shape
-                    # choose channels for preview
-                    if C >= 3:
-                        x = res[:, :, :3]  # preview first 3 channels
-                    else:
-                        x = res  # C==1 handled above; C==2, show first 2 + duplicate third
-                    sample = self._sample_for_stats(x)
-
-                    if self.STRETCH_PER_CHANNEL:
-                        # per-channel percentiles (nan-aware — see _percentiles_from_sample)
-                        from .utils import _nanpct
-                        flat = sample.reshape(-1, x.shape[2])
-                        lo = _nanpct(flat, self.STRETCH_LOW_P, axis=0)
-                        hi = _nanpct(flat, self.STRETCH_HIGH_P, axis=0)
-                        scale = np.maximum(hi - lo, 1e-12)
-                        norm = (x - lo.reshape(1, 1, -1)) / scale.reshape(1, 1, -1)
-                    else:
+                    has_expr_band = getattr(self, "_has_expression_band", False) or bool((self.modifications or {}).get("band_expression"))
+                    if has_expr_band:
+                        # Display the stacked expression result channel (channel -1) as stretched preview
+                        expr_ch = res[:, :, -1]
+                        sample = self._sample_for_stats(expr_ch)
                         lo, hi = self._percentiles_from_sample(sample.reshape(-1))
                         if hi <= lo:
-                            norm = np.full(x.shape, 0.5, dtype=np.float32)
+                            norm = np.full(expr_ch.shape, 0.5, dtype=np.float32)
                         else:
-                            norm = (x - lo) / max(hi - lo, 1e-12)
+                            norm = (expr_ch - lo) / max(hi - lo, 1e-12)
+                        if self.STRETCH_CLIP:
+                            norm = np.clip(norm, 0.0, 1.0)
+                        norm = np.nan_to_num(norm, nan=0.0, posinf=1.0, neginf=0.0)
+                        norm_img = (norm * 255.0).astype(np.uint8)
+                        norm_img = np.stack([norm_img, norm_img, norm_img], axis=2)
+                    else:
+                        # choose channels for preview
+                        if C >= 3:
+                            x = res[:, :, :3]  # preview first 3 channels
+                        else:
+                            x = res  # C==1 handled above; C==2, show first 2 + duplicate third
+                        sample = self._sample_for_stats(x)
 
-                    if self.STRETCH_CLIP:
-                        norm = np.clip(norm, 0.0, 1.0)
+                        if self.STRETCH_PER_CHANNEL:
+                            # per-channel percentiles (nan-aware — see _percentiles_from_sample)
+                            from .utils import _nanpct
+                            flat = sample.reshape(-1, x.shape[2])
+                            lo = _nanpct(flat, self.STRETCH_LOW_P, axis=0)
+                            hi = _nanpct(flat, self.STRETCH_HIGH_P, axis=0)
+                            scale = np.maximum(hi - lo, 1e-12)
+                            norm = (x - lo.reshape(1, 1, -1)) / scale.reshape(1, 1, -1)
+                        else:
+                            lo, hi = self._percentiles_from_sample(sample.reshape(-1))
+                            if hi <= lo:
+                                norm = np.full(x.shape, 0.5, dtype=np.float32)
+                            else:
+                                norm = (x - lo) / max(hi - lo, 1e-12)
 
-                    norm = np.nan_to_num(norm, nan=0.0, posinf=1.0, neginf=0.0)
-                    norm_img = (norm * 255.0).astype(np.uint8)
+                        if self.STRETCH_CLIP:
+                            norm = np.clip(norm, 0.0, 1.0)
 
-                    # If fewer than 3 channels, pad to 3 for preview
-                    if norm_img.ndim == 3 and norm_img.shape[2] == 2:
-                        third = norm_img[:, :, :1]
-                        norm_img = np.concatenate([norm_img, third], axis=2)
+                        norm = np.nan_to_num(norm, nan=0.0, posinf=1.0, neginf=0.0)
+                        norm_img = (norm * 255.0).astype(np.uint8)
+
+                        # If fewer than 3 channels, pad to 3 for preview
+                        if norm_img.ndim == 3 and norm_img.shape[2] == 2:
+                            third = norm_img[:, :, :1]
+                            norm_img = np.concatenate([norm_img, third], axis=2)
 
                 else:
                     logging.error("Unsupported Image Format in normalization.")

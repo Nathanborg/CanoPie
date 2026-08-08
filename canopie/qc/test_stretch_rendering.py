@@ -12,6 +12,9 @@ import pytest
 
 from ..project_tab import _StretchParams
 
+# Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
+pytestmark = [pytest.mark.viewer]
+
 
 def _gradient(h=16, w=16, c=3, lo=0.0, hi=1000.0):
     """A deterministic ramp per band, so percentile behavior is predictable."""

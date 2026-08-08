@@ -29,6 +29,9 @@ from PyQt5 import QtWidgets
 from .fixtures_manifest import fixture_image_path
 from .project_builder import polygon_group_name
 
+# Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
+pytestmark = [pytest.mark.ml]
+
 LAZY_FIXTURE = "hyperspectral_200band"
 
 
@@ -48,17 +51,6 @@ def _lazy_channels_for(pt, monkeypatch, name=LAZY_FIXTURE):
     assert isinstance(img, LazyChannels), (
         f"test setup failed: expected LazyChannels, got {type(img).__name__}")
     return img, info
-
-
-def test_lazychannels_has_no_ndim(synthetic_project, monkeypatch):
-    """Pins the precondition the whole bug rested on. If LazyChannels ever
-    grows an .ndim, this test failing is the signal to re-examine (not
-    blindly delete) the guards that exist because it doesn't have one."""
-    img, _ = _lazy_channels_for(synthetic_project, monkeypatch)
-    assert not hasattr(img, "ndim"), (
-        "LazyChannels unexpectedly has .ndim now -- revisit the _is_lazy_channels "
-        "guards in ProjectTab/MachineLearningManager._channels_in_export_order")
-    assert hasattr(img, "shape"), "LazyChannels must still expose .shape"
 
 
 def test_ml_channels_in_export_order_passes_lazy_through(

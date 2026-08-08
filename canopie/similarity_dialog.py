@@ -112,12 +112,26 @@ class _ThumbLoader(QtCore.QObject):
         cv2.setNumThreads(0)
 
         img = None
+        import os
+        ext = os.path.splitext(path)[1].lower()
+        if ext in ('.tif', '.tiff'):
+            try:
+                import tifffile
+                from .raster_reader import ensure_hwc
+                with tifffile.TiffFile(path) as tf:
+                    axes = (tf.series[0].axes or "").upper() if tf.series else ""
+                    arr = np.squeeze(tf.asarray())
+                    img = ensure_hwc(arr, axes=axes)
+            except Exception:
+                img = None
+
         # Strategy 1: cv2.imread (fast, handles most formats)
-        try:
-            if path.isascii():
-                img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-        except Exception:
-            pass
+        if img is None:
+            try:
+                if path.isascii():
+                    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+            except Exception:
+                pass
 
         # Strategy 2: numpy buffer + imdecode (handles unicode paths)
         if img is None:

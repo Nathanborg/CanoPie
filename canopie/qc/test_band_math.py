@@ -11,6 +11,9 @@ import pytest
 
 from ..utils import eval_band_expression
 
+# Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
+pytestmark = [pytest.mark.extraction]
+
 
 def _img(*bands):
     """Stack 1-D-ish constant bands into a tiny HxWxC image."""

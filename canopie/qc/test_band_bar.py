@@ -14,6 +14,9 @@ from PyQt5 import QtCore, QtGui
 
 from .fixtures_manifest import FIXTURES, fixture_image_path, get_fixture
 
+# Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
+pytestmark = [pytest.mark.viewer]
+
 # One fixture per interesting band count: single-band, 3-band, 8-band, 200-band.
 BAR_FIXTURES = ["gray_8bit_png", "rgb_8bit_untiled",
                 "multiband_8band_ancillary", "hyperspectral_200band"]

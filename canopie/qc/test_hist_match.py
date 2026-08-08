@@ -43,6 +43,9 @@ from ..project_tab import ProjectTab
 from ..image_editor_dialog import cdf_reference_density as _reference_density
 from ..image_editor_dialog import shared_hist_edges
 
+# Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
+pytestmark = [pytest.mark.editor, pytest.mark.extraction]
+
 
 def _cdf_with_flat_run():
     """A stored reference CDF containing a flat run -- what a saturated or

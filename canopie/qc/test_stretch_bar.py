@@ -36,6 +36,9 @@ from PyQt5 import QtGui
 from .fixtures_manifest import fixture_image_path, get_fixture
 from ..project_tab import _StretchParams
 
+# Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
+pytestmark = [pytest.mark.viewer]
+
 # Bands with genuinely DIFFERENT bounds. Every committed fixture spans roughly
 # 0-999 in every band, which would make a per-band range assertion pass even if
 # band selection were ignored entirely -- the same scale-invariance trap

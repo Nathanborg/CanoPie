@@ -86,6 +86,45 @@ FEATURE_MAP = {
     "test_hist_match_nodata": (
         "Histogram matching under NoData",
         "declared GDAL_NODATA honoured, fill sentinel preserved, per-band masking"),
+    "test_contract_band_math": (
+        "CONTRACT: band-math engine equivalence",
+        "FastBandMathEngine == eval_band_expression on hostile inputs; cache cannot leak across images"),
+    "test_contract_ax_consumers": (
+        "CONTRACT: .ax replays agree across consumers",
+        "viewer/CSV/ML/Inspect see identical pixels per .ax op; stats match a NumPy recompute"),
+    "test_perf_budgets": (
+        "Speed and memory budgets",
+        "lazy cube never materialised, bounded windowed reads, peak-memory and latency ceilings"),
+    "test_nodata_expression_per_band": (
+        "Per-band NoData expressions (b2>1) on R/G/B",
+        "a rule naming any band affects THAT band's row; R/G/B no longer collapse onto band 1's mask"),
+    "test_highres_viewport_threading": (
+        "COG zoom refinement (high-res viewport tiles)",
+        "worker-thread tiles reach the GUI via a signal, not a dead QTimer; zoom requests a region"),
+    "test_highres_ax_consistency": (
+        "Editor edits vs the zoom overlay (COG)",
+        "crop/resize/rotate/band math are replayed on the zoom tile; hist match correctly disables it"),
+    "test_highres_ax_freshness": (
+        "Zoom tile uses the CURRENT edits",
+        "the tile resolves image data and .ax per request, so edits are never rendered stale"),
+    "test_editor_refresh_preserves_view": (
+        "Viewer state across Apply All Changes",
+        "the post-editor refresh reaches the stretch-aware renderer instead of silently falling back"),
+    "test_csv_column_order": (
+        "CSV column ordering",
+        "canonical order shared by foreground and background exports; quantiles numeric not alphabetical"),
+    "test_band_math_scene_stats_sampling": (
+        "Band-math Scene Mean/Median/Std on the lazy export path",
+        "no longer NaN, agrees with eager within tolerance, per-band NoData reindexed correctly"),
+    "test_image_editor_ml": (
+        "Image editor / ML integration",
+        "classification mapping, hist-match + crop consistency, model class sync"),
+    "test_image_viewer_ui": (
+        "Viewer overlay toggle",
+        "global overlays_muted flag, bars hide while drawing"),
+    "test_polygon_manager_advanced": (
+        "PolygonManager advanced operations",
+        "nearest-image search, copy/move between roots, multispectral->thermal correction"),
 }
 
 

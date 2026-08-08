@@ -41,6 +41,9 @@ from .generate_fixtures import _rasterize_polygon_mask
 from .project_builder import polygon_group_name
 from ._helpers import load_raw_npz, assert_close
 
+# Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
+pytestmark = [pytest.mark.extraction, pytest.mark.io]
+
 
 def _rows_by_channel(rows):
     return {r.get("Channel"): r for r in rows if isinstance(r, dict)}

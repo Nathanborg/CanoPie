@@ -3770,7 +3770,26 @@ class MachineLearningManager(QtWidgets.QDialog):
         import numpy as np, cv2
         if arr is None:
             return None
-        v = arr
+        if hasattr(arr, "read_window"):
+            try:
+                chans = arr.read_window(0, 0, arr.width, arr.height)
+                if isinstance(chans, list) and len(chans) > 0:
+                    if len(chans) == 1:
+                        v = np.asarray(chans[0])
+                    else:
+                        v = np.dstack([np.asarray(c) for c in chans])
+                else:
+                    v = np.asarray(arr)
+            except Exception as e:
+                import logging
+                logging.warning(f"[_as_8bit_bgr] Failed to materialize LazyChannels: {e}")
+                v = np.asarray(arr)
+        else:
+            v = np.asarray(arr)
+
+        if not hasattr(v, "dtype") or getattr(v, "size", 0) == 0:
+            return None
+
         if v.dtype == np.uint8:
             # If 2D, promote to BGR for drawing
             return cv2.cvtColor(v, cv2.COLOR_GRAY2BGR) if v.ndim == 2 else v

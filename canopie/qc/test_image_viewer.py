@@ -15,6 +15,9 @@ import pytest
 from .fixtures_manifest import FIXTURES, fixture_image_path, get_fixture
 from ._helpers import expected_viewer_loader, load_ground_truth, load_raw_npz, pixel_values_native_order, assert_close
 
+# Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
+pytestmark = [pytest.mark.viewer, pytest.mark.io]
+
 ALL_NAMES = [f["name"] for f in FIXTURES]
 
 
@@ -147,3 +150,125 @@ def test_forced_preview_decimation(synthetic_project, force_preview_decimation):
         ab = lite.image[:eb.shape[0], :eb.shape[1], pos]
         assert ab.shape == eb.shape, f"decimated shape mismatch: {ab.shape} vs {eb.shape}"
         assert np.allclose(ab, eb, atol=1.0), f"decimated band {file_band} values don't match ground_truth[::{step}]"
+
+
+def test_highres_viewport_methods():
+    """Verifies ImageViewer highres viewport API (enable, disable, clear)."""
+    from canopie.image_viewer import ImageViewer
+    from PyQt5 import QtGui, QtCore, QtWidgets
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    viewer = ImageViewer()
+    pix = QtGui.QPixmap(100, 100)
+    pix.fill(QtCore.Qt.red)
+    viewer.set_image(pix)
+
+    called = []
+    def _cb(v, scene_rect):
+        called.append(scene_rect)
+
+    viewer.enable_highres_viewport(_cb)
+    assert viewer._highres_enabled is True
+
+    # Simulate zoom in past fit scale
+    viewer.scale(2.0, 2.0)
+    viewer._on_highres_timer_timeout()
+    assert len(called) == 1
+
+    # Simulate overlay update
+    overlay_pix = QtGui.QPixmap(50, 50)
+    overlay_pix.fill(QtCore.Qt.blue)
+    viewer.update_highres_overlay(overlay_pix, 10, 10, 1.0, 1.0)
+    assert viewer._highres_item is not None
+    assert viewer._highres_item.isVisible()
+
+    viewer.disable_highres_viewport()
+    assert viewer._highres_enabled is False
+    assert viewer._highres_item is None
+
+
+def test_double_buffered_highres_overlay_system():
+    """Verifies Strategy 10: Seamless Double-Buffered Canvas Overlay System.
+    Checks front/back buffer swapping, flicker prevention, Z-order (0.5),
+    property compatibility, and clean item removal across scene changes."""
+    from canopie.image_viewer import ImageViewer
+    from PyQt5 import QtGui, QtCore, QtWidgets
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    viewer = ImageViewer()
+    pix = QtGui.QPixmap(200, 200)
+    pix.fill(QtCore.Qt.red)
+    viewer.set_image(pix)
+
+    # Add a polygon item to verify Z-order relationship
+    poly = QtGui.QPolygonF([QtCore.QPointF(0, 0), QtCore.QPointF(10, 0), QtCore.QPointF(10, 10)])
+    poly_item = viewer.add_polygon_to_scene(poly, "test_poly")
+
+    viewer.enable_highres_viewport(lambda v, r: None)
+
+    # 1. Initial High-Res Update: Patch 1
+    patch1 = QtGui.QPixmap(50, 50)
+    patch1.fill(QtCore.Qt.green)
+    viewer.update_highres_overlay(patch1, 10, 10, 1.0, 1.0)
+
+    front1 = viewer._highres_front_item
+    back1 = viewer._highres_back_item
+
+    assert front1 is not None
+    assert front1.isVisible() is True
+    assert front1.zValue() == 0.5
+    # Z-order check: Base image (0.0) < Overlay (0.5)
+    assert viewer._image.zValue() < front1.zValue()
+
+    # Backward compatibility check
+    assert viewer._highres_item is front1
+
+    # 2. Second High-Res Update: Patch 2 (triggers buffer swap)
+    patch2 = QtGui.QPixmap(50, 50)
+    patch2.fill(QtCore.Qt.yellow)
+    viewer.update_highres_overlay(patch2, 20, 20, 1.0, 1.0)
+
+    front2 = viewer._highres_front_item
+    back2 = viewer._highres_back_item
+
+    assert front2 is not front1
+    assert front2 is not None
+    assert front2.isVisible() is True
+    # The old front item is now the back buffer and is hidden
+    assert back2 is front1
+    assert back2.isVisible() is False
+    assert viewer._highres_item is front2
+
+    # 3. Third High-Res Update: Patch 3 (reuses back buffer without creating new QGraphicsPixmapItem)
+    patch3 = QtGui.QPixmap(50, 50)
+    patch3.fill(QtCore.Qt.blue)
+    viewer.update_highres_overlay(patch3, 30, 30, 1.0, 1.0)
+
+    front3 = viewer._highres_front_item
+    back3 = viewer._highres_back_item
+
+    assert front3 is front1  # Buffer reused!
+    assert front3.isVisible() is True
+    assert back3 is front2
+    assert back3.isVisible() is False
+
+    # 4. Clean scene reset / set_image
+    pix2 = QtGui.QPixmap(300, 300)
+    pix2.fill(QtCore.Qt.white)
+    viewer.set_image(pix2)
+
+    assert viewer._highres_front_item is None
+    assert viewer._highres_back_item is None
+    assert viewer._highres_item is None
+
+    # 5. Re-enable and test disable_highres_viewport cleanup
+    viewer.enable_highres_viewport(lambda v, r: None)
+    viewer.update_highres_overlay(patch1, 5, 5, 1.0, 1.0)
+    assert viewer._highres_front_item is not None
+
+    viewer.disable_highres_viewport()
+    assert viewer._highres_front_item is None
+    assert viewer._highres_back_item is None
+    assert viewer._highres_item is None
+
+

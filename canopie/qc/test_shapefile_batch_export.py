@@ -37,6 +37,9 @@ import tifffile
 from ..shapefile_io import json_polygons_to_features, write_feature_collection
 from .test_shapefile_crs import _write_geotiff, _shape
 
+# Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
+pytestmark = [pytest.mark.io]
+
 
 # ---------------------------------------------------------------------------
 # The background worker path
