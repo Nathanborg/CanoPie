@@ -3081,6 +3081,8 @@ class MachineLearningManager(QtWidgets.QDialog):
         # from that reference size to the actual export image size.
         if polygon_data:
             coord_space = (polygon_data.get('coord_space') or '').lower()
+            if coord_space == 'pixel':
+                coord_space = 'image'   # legacy shapefile-import alias
             if coord_space == 'image':
                 ref = polygon_data.get('image_ref_size') or {}
                 ref_w = int(ref.get('w') or 0)

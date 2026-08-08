@@ -1552,6 +1552,15 @@ def read_shapefile(shp_path, dbf_path=None, encoding='cp1252'):
     return features
 
 
+_image_metadata_cache = {}
+_transformer_cache = {}
+
+def clear_shapefile_io_caches():
+    """Clear metadata and transformer caches."""
+    _image_metadata_cache.clear()
+    _transformer_cache.clear()
+
+
 def reproject_shapefile_geometry_to_image_pixels(
     geo_points,
     shapefile_crs,
@@ -1585,40 +1594,67 @@ def reproject_shapefile_geometry_to_image_pixels(
     if not geo_points:
         return []
 
-    norm_fp = os.path.normpath(target_image_path)
-    raw_h, raw_w = _raw_image_dims(norm_fp)
-    if not raw_w or not raw_h:
-        if ref_size:
-            raw_w = float(ref_size.get('w', 0) or ref_size.get('width', 0) or 1000)
-            raw_h = float(ref_size.get('h', 0) or ref_size.get('height', 0) or 1000)
-        else:
-            raw_w, raw_h = 1000.0, 1000.0
+    pts_arr = np.asarray(geo_points, dtype=np.float64)
+    if pts_arr.ndim == 1:
+        pts_arr = pts_arr.reshape(-1, 2)
 
-    # 1. Obtain image georeferencing transform and image CRS
-    transform, img_crs = None, None
-    if os.path.isfile(norm_fp):
-        transform, img_crs = get_geotiff_transform(norm_fp)
-        if not transform:
-            transform, img_crs = estimate_transform_from_exif(norm_fp, raw_w, raw_h)
+    norm_fp = os.path.normpath(target_image_path)
+    
+    # 1. Obtain image georeferencing transform, dimensions, and image CRS
+    cache_key = (norm_fp, ref_size.get('w') if ref_size else None, ref_size.get('h') if ref_size else None)
+    if cache_key in _image_metadata_cache:
+        raw_w, raw_h, transform, img_crs = _image_metadata_cache[cache_key]
+    else:
+        raw_h, raw_w = _raw_image_dims(norm_fp)
+        if not raw_w or not raw_h:
+            if ref_size:
+                raw_w = float(ref_size.get('w', 0) or ref_size.get('width', 0) or 1000)
+                raw_h = float(ref_size.get('h', 0) or ref_size.get('height', 0) or 1000)
+            else:
+                raw_w, raw_h = 1000.0, 1000.0
+        transform, img_crs = None, None
+        if os.path.isfile(norm_fp):
+            transform, img_crs = get_geotiff_transform(norm_fp)
+            if not transform:
+                transform, img_crs = estimate_transform_from_exif(norm_fp, raw_w, raw_h)
+        _image_metadata_cache[cache_key] = (raw_w, raw_h, transform, img_crs)
 
     # 2. CRS Reprojection if shapefile_crs and img_crs differ
-    pts_to_project = list(geo_points)
     if transform and shapefile_crs and img_crs:
         try:
-            import pyproj
-            src_c = pyproj.CRS.from_user_input(shapefile_crs)
-            dst_c = pyproj.CRS.from_user_input(img_crs)
-            if not (src_c == dst_c or src_c.equals(dst_c)):
-                transformer = pyproj.Transformer.from_crs(src_c, dst_c, always_xy=True)
-                pts_to_project = [transformer.transform(x, y) for x, y in pts_to_project]
+            trans_key = (str(shapefile_crs), str(img_crs))
+            if trans_key in _transformer_cache:
+                transformer = _transformer_cache[trans_key]
+            else:
+                import pyproj
+                src_c = pyproj.CRS.from_user_input(shapefile_crs)
+                dst_c = pyproj.CRS.from_user_input(img_crs)
+                if src_c == dst_c or src_c.equals(dst_c):
+                    transformer = None
+                else:
+                    transformer = pyproj.Transformer.from_crs(src_c, dst_c, always_xy=True)
+                _transformer_cache[trans_key] = transformer
+
+            if transformer is not None:
+                x_out, y_out = transformer.transform(pts_arr[:, 0], pts_arr[:, 1])
+                pts_arr = np.column_stack([x_out, y_out])
         except Exception as e:
             logging.debug("CRS reprojection hook skipped: %s", e)
 
     # 3. Geographic -> RAW pixels via geo_to_pixel
     if transform:
-        raw_pixels = geo_to_pixel(pts_to_project, transform)
-    else:
-        raw_pixels = pts_to_project
+        det = transform[1] * transform[5] - transform[2] * transform[4]
+        if det != 0.0:
+            inv_matrix = np.array([
+                [transform[5] / det, -transform[4] / det],
+                [-transform[2] / det, transform[1] / det]
+            ], dtype=np.float64)
+            origin = np.array([transform[0], transform[3]], dtype=np.float64)
+            pts_arr = (pts_arr - origin) @ inv_matrix
+        else:
+            pts_to_project = [(float(x), float(y)) for x, y in pts_arr]
+            raw_pixels = geo_to_pixel(pts_to_project, transform)
+            pts_arr = np.array(raw_pixels, dtype=np.float64)
 
     # 4. RAW pixels -> MODIFIED (.ax) pixels via matrix M
     M = np.eye(3, dtype=np.float64)
@@ -1629,11 +1665,10 @@ def reproject_shapefile_geometry_to_image_pixels(
         except Exception as e:
             logging.debug("Failed to calculate .ax transform matrix: %s", e)
 
-    mod_pixels = []
-    for col_raw, row_raw in raw_pixels:
-        pt_vec = np.array([col_raw, row_raw, 1.0], dtype=np.float64)
-        pt_mod = M @ pt_vec
-        mod_pixels.append((float(pt_mod[0]), float(pt_mod[1])))
+    N = pts_arr.shape[0]
+    pts_homog = np.hstack([pts_arr, np.ones((N, 1), dtype=np.float64)])
+    mod_homog = pts_homog @ M.T
+    pts_arr = mod_homog[:, :2]
 
     # 5. MODIFIED pixels -> Stored reference pixels
     target_ref_w = float(ref_size.get('w', out_w) if ref_size else out_w)
@@ -1641,11 +1676,159 @@ def reproject_shapefile_geometry_to_image_pixels(
     scale_x = target_ref_w / float(max(out_w, 1))
     scale_y = target_ref_h / float(max(out_h, 1))
 
-    stored_pixels = []
-    for xm, ym in mod_pixels:
-        stored_pixels.append((xm * scale_x, ym * scale_y))
+    pts_arr *= np.array([scale_x, scale_y], dtype=np.float64)
 
-    return stored_pixels
+    return [(float(x), float(y)) for x, y in pts_arr]
+
+
+def _sanitize_dbf_value(val):
+    if val is None:
+        return None
+    if isinstance(val, (int, float, bool, str)):
+        return val
+    try:
+        if isinstance(val, (bytes, bytearray)):
+            return val.decode('utf-8', errors='ignore').strip()
+    except Exception:
+        pass
+    return str(val).strip()
+
+
+def resolve_feature_identity(props, feat_idx, shp_stem="Imported", existing_keys=None):
+    """
+    Resolve unique group key, polygon display name, base class group, root ID,
+    and sanitized DBF properties for a single shapefile feature.
+    """
+    props = props or {}
+    existing_keys = set(existing_keys) if existing_keys else set()
+
+    # 1. Base classification group
+    base_group = None
+    for k in ('GROUP', 'group', 'CLASS', 'class', 'LAYER', 'layer', 
+              'CATEGORY', 'category', 'SPECIES', 'species', 'TYPE', 'type'):
+        if k in props and props[k] is not None and str(props[k]).strip():
+            base_group = str(props[k]).strip()
+            break
+    if not base_group:
+        base_group = shp_stem or "Imported_Polygons"
+
+    # 2. Polygon feature name / ID
+    poly_name = None
+    for k in ('NAME', 'name', 'ID', 'id', 'TREE_ID', 'tree_id', 
+              'POLY_ID', 'poly_id', 'LABEL', 'label', 'TAG', 'tag', 'PLOT_ID'):
+        if k in props and props[k] is not None and str(props[k]).strip():
+            poly_name = str(props[k]).strip()
+            break
+
+    # 3. Disaggregate into a unique entry key for all_polygons
+    if poly_name:
+        if poly_name.startswith(base_group):
+            candidate_key = poly_name
+        else:
+            candidate_key = f"{base_group}_{poly_name}"
+    else:
+        candidate_key = f"{base_group}_{feat_idx:03d}"
+
+    entry_key = candidate_key
+    dup_counter = 1
+    while entry_key in existing_keys:
+        dup_counter += 1
+        entry_key = f"{candidate_key}_{dup_counter:02d}"
+
+    display_name = poly_name if poly_name else entry_key
+
+    root_val = ""
+    for k in ('ROOT', 'root', 'PLANT_ID', 'plant_id', 'PLOT_ID', 'plot_id'):
+        if k in props and props[k] is not None and str(props[k]).strip():
+            root_val = str(props[k]).strip()
+            break
+
+    clean_props = {}
+    for k, v in props.items():
+        clean_props[k] = _sanitize_dbf_value(v)
+
+    return {
+        'entry_key': entry_key,
+        'display_name': display_name,
+        'base_group': base_group,
+        'root_val': root_val,
+        'clean_props': clean_props
+    }
+
+
+def calculate_signed_area(ring):
+    n = len(ring)
+    if n < 3:
+        return 0.0
+    area = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        area += ring[i][0] * ring[j][1]
+        area -= ring[j][0] * ring[i][1]
+    return area / 2.0
+
+
+def classify_and_group_rings(parts_list):
+    if not parts_list:
+        return []
+    if len(parts_list) == 1:
+        return [{'outer': parts_list[0], 'holes': []}]
+
+    outers = []
+    for ring in parts_list:
+        if len(ring) < 3:
+            continue
+        closed_ring = list(ring)
+        if closed_ring[0] != closed_ring[-1]:
+            closed_ring.append(closed_ring[0])
+        outers.append(closed_ring)
+
+    if not outers:
+        return [{'outer': parts_list[0], 'holes': []}]
+
+    # Largest area ring is primary outer boundary
+    outers.sort(key=lambda r: abs(calculate_signed_area(r)), reverse=True)
+    return [{'outer': outers[0], 'holes': outers[1:]}]
+
+
+def decompose_shapefile_features(features):
+    decomposed_features = []
+    for feat_idx, feat in enumerate(features, start=1):
+        raw_geom = feat.get('geometry', [])
+        parts = feat.get('parts', [raw_geom])
+        shape_type = feat.get('shape_type', 5)
+        props = feat.get('properties', {})
+
+        if not raw_geom:
+            continue
+
+        if shape_type in (1, 8):
+            for pt_idx, pt in enumerate(raw_geom, start=1):
+                pt_props = dict(props)
+                if len(raw_geom) > 1:
+                    pt_props['part_index'] = pt_idx
+                decomposed_features.append({
+                    'type': 'point',
+                    'geometry': [pt],
+                    'holes': [],
+                    'properties': pt_props
+                })
+            continue
+
+        grouped_rings = classify_and_group_rings(parts if parts else [raw_geom])
+        for g_idx, group in enumerate(grouped_rings, start=1):
+            poly_props = dict(props)
+            if len(grouped_rings) > 1:
+                poly_props['part_index'] = g_idx
+
+            decomposed_features.append({
+                'type': 'polygon',
+                'geometry': group['outer'],
+                'holes': group['holes'],
+                'properties': poly_props
+            })
+
+    return decomposed_features
 
 
 def shapefile_to_json_polygons(
@@ -1658,60 +1841,43 @@ def shapefile_to_json_polygons(
 ):
     """
     Ingest a Shapefile and map its features to internal CanoPie polygon dictionaries
-    for target project images.
-
-    Returns
-    -------
-    tuple of (dict, list)
-        (imported_all_polygons, warnings_list)
-        where imported_all_polygons is {group_name: {filepath: polygon_dict}}
+    for target project images, disaggregating each feature into a unique polygon entity.
     """
-    stem = os.path.splitext(shp_path)[0]
-    prj_file = stem + ".prj"
+    stem = os.path.splitext(os.path.basename(shp_path))[0]
+    prj_file = os.path.splitext(shp_path)[0] + ".prj"
     shp_crs_wkt, shp_crs_obj = parse_crs_from_prj(prj_file)
 
     features = read_shapefile(shp_path)
     if not features:
         return {}, [f"No features found in {os.path.basename(shp_path)}"]
 
+    decomposed = decompose_shapefile_features(features)
+
     warnings_list = []
     imported_polygons = {}
+    assigned_keys = set()
 
-    target_list = list(target_filepaths) if target_filepaths else []
+    target_list = [os.path.normpath(fp) for fp in target_filepaths] if target_filepaths else []
     if not target_list:
         return {}, ["No target images available in active project."]
 
-    for feat_idx, feat in enumerate(features, start=1):
+    for feat_idx, feat in enumerate(decomposed, start=1):
         raw_geom = feat['geometry']
         props = feat.get('properties', {})
-        shape_type = feat.get('shape_type', 5)
-        parts = feat.get('parts', [raw_geom])
+        type_val = feat.get('type', 'polygon')
 
         if not raw_geom:
             continue
 
-        # Extract group name from DBF or fallback
-        group_name = None
-        for k in ('GROUP', 'group', 'CLASS', 'class', 'LAYER', 'layer', 'CATEGORY', 'category'):
-            if k in props and props[k]:
-                group_name = str(props[k]).strip()
-                break
-        if not group_name:
-            group_name = str(props.get('name') or default_group)
+        identity = resolve_feature_identity(
+            props=props,
+            feat_idx=feat_idx,
+            shp_stem=stem,
+            existing_keys=assigned_keys
+        )
+        entry_key = identity['entry_key']
+        assigned_keys.add(entry_key)
 
-        # Extract polygon name / ID
-        poly_name = None
-        for k in ('NAME', 'name', 'ID', 'id', 'POLY_ID', 'poly_id', 'LABEL', 'label', 'TREE_ID'):
-            if k in props and props[k]:
-                poly_name = str(props[k]).strip()
-                break
-        if not poly_name:
-            poly_name = f"Poly_{feat_idx:03d}"
-
-        # Determine extraction type
-        type_val = "point" if shape_type in (1, 8) or len(raw_geom) == 1 else "polygon"
-
-        # Extract GPS centroid if present
         gps_lat = props.get('gps_lat') or props.get('latitude') or props.get('lat')
         gps_lon = props.get('gps_lon') or props.get('longitude') or props.get('lon')
         try:
@@ -1720,18 +1886,9 @@ def shapefile_to_json_polygons(
         except (ValueError, TypeError):
             lat_f, lon_f = 0.0, 0.0
 
-        root_val = ""
-        for k in ('ROOT', 'root', 'PLANT_ID', 'plant_id', 'PLOT_ID', 'plot_id'):
-            if k in props and props[k]:
-                root_val = str(props[k]).strip()
-                break
-
-        # Map to each target image (or single target image)
-        for tfp in target_list:
-            norm_tfp = os.path.normpath(tfp)
+        for norm_tfp in target_list:
             ref_size = get_ref_size_fn(norm_tfp) if callable(get_ref_size_fn) else None
 
-            # Load .ax sidecar if available
             ax_data = None
             ax_path = None
             if callable(get_ax_path_fn):
@@ -1748,18 +1905,14 @@ def shapefile_to_json_polygons(
                 except Exception:
                     pass
 
-            # Handle multi-ring / multi-part polygons or single ring
-            # If multi-part polygon, process the largest outer ring for canonical polygon
-            ring_to_use = parts[0] if parts else raw_geom
             stored_points = reproject_shapefile_geometry_to_image_pixels(
-                geo_points=ring_to_use,
+                geo_points=raw_geom,
                 shapefile_crs=shp_crs_obj or shp_crs_wkt,
                 target_image_path=norm_tfp,
                 ax_data=ax_data,
                 ref_size=ref_size
             )
 
-            # Strip duplicate closing vertex if present for internal format
             if type_val == 'polygon' and len(stored_points) > 2:
                 if (abs(stored_points[0][0] - stored_points[-1][0]) < 1e-4 and
                     abs(stored_points[0][1] - stored_points[-1][1]) < 1e-4):
@@ -1773,17 +1926,29 @@ def shapefile_to_json_polygons(
                 ref_h = float(raw_h_t or 1000)
 
             poly_dict = {
-                'name': group_name,
-                'root': root_val,
+                'name': identity['display_name'],
+                'group': identity['base_group'],
+                'root': identity['root_val'],
                 'type': type_val,
-                'coord_space': 'pixel',
+                # Every consumer (load_polygons, machine_learning_manager,
+                # _normalize_points_for_save) checks coord_space for the
+                # literal string 'image' to mean "points are in full-res
+                # raster pixel coordinates, scale by image_ref_size". None of
+                # them recognize 'pixel' -- it silently fell into the
+                # else/'scene' branch, which uses the points AS SCENE
+                # COORDINATES with NO scaling at all. For a raster the viewer
+                # displays decimated (any raster over the lazy threshold),
+                # that places every imported polygon far outside the visible
+                # scene rect -- reported as "imported to the polygon manager
+                # but I don't see their paint in the viewer".
+                'coord_space': 'image',
                 'image_ref_size': {'w': ref_w, 'h': ref_h},
                 'points': stored_points,
                 'coordinates': {'latitude': lat_f, 'longitude': lon_f},
-                'properties': dict(props)
+                'properties': identity['clean_props']
             }
 
-            imported_polygons.setdefault(group_name, {})[norm_tfp] = poly_dict
+            imported_polygons.setdefault(entry_key, {})[norm_tfp] = poly_dict
 
     return imported_polygons, warnings_list
 

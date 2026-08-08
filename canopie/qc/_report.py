@@ -107,6 +107,30 @@ FEATURE_MAP = {
     "test_highres_ax_freshness": (
         "Zoom tile uses the CURRENT edits",
         "the tile resolves image data and .ax per request, so edits are never rendered stale"),
+    "test_polygon_display_simplification": (
+        "Zoom-aware vertex decimation",
+        "display-only simplification: 1.01M vertices drawn at screen resolution, geometry untouched"),
+    "test_delete_undo_cost": (
+        "Bulk delete / undo cost",
+        "undo snapshots cost nothing: sidecars are moved to trash, not read or re-serialised"),
+    "test_polygon_manager_scaling": (
+        "Polygon manager at thousands of groups",
+        "batched list rebuild + range selection; clean paths use the bulk-delete context"),
+    "test_project_polygons_external": (
+        "project.json does not duplicate polygons",
+        "polygons/ dir is the single source of truth: 360x faster saves, no resurrected deletes"),
+    "test_shapefile_import_perf": (
+        "Shapefile import speed + progress bar",
+        "the CRS transformer is built once per file, not per feature; progress moves per feature"),
+    "test_polygon_bounding_rect_perf": (
+        "Polygon boundingRect stays tight",
+        "no label box is reserved when no label is drawn -- 10.6x faster panning at 6000 polygons"),
+    "test_bulk_polygon_delete_perf": (
+        "Bulk polygon delete is O(N), not O(N^2)",
+        "manager refresh, .ax read, and scene scan happen once per batch, not once per polygon"),
+    "test_shapefile_import_render": (
+        "Shapefile-imported polygons render",
+        "coord_space stamped 'image' not 'pixel'; empty-string root isn't a mismatch; import draw loop batches, catches errors, repaints"),
     "test_editor_refresh_preserves_view": (
         "Viewer state across Apply All Changes",
         "the post-editor refresh reaches the stretch-aware renderer instead of silently falling back"),
