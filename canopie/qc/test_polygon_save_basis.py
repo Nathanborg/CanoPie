@@ -194,3 +194,33 @@ def test_import_does_not_use_a_post_ax_size(qapp):
         "on_import_shapefile CALLS _size_after_ax_fast_from_file again -- the "
         "import basis must stay the raw raster header so it matches "
         "ProjectTab.polygon_basis_hw")
+
+
+def test_saving_refreshes_the_overview(setup, tmp_path):
+    """A dragged polygon must not reappear at its old position after reopening.
+
+    The overview caches each polygon's DECIMATED display points and the fast
+    load path reads them INSTEAD of the sidecars. save_incremental refreshed
+    it; save_polygons_to_json (the path a refresh takes) did not -- so a
+    polygon could be dragged, written correctly to its sidecar, and still come
+    back at its old position on the next open.
+    """
+    tab, fp, viewer, true_h, true_w = setup
+    tab.all_polygons["crown_0"] = {fp: {
+        "points": [(1000.0, 2000.0), (1200.0, 2000.0), (1200.0, 2300.0)],
+        "coord_space": "image",
+        "image_ref_size": {"w": true_w, "h": true_h},
+        "name": "crown_0", "root": "", "type": "polygon",
+    }}
+    tab._poly_exact_index = {fp: {"crown_0"}}
+    tab._ensure_polygon_index = lambda *a, **k: None
+
+    calls = []
+    tab._write_polygon_overview = lambda *a, **k: calls.append(1)
+
+    tab.save_polygons_to_json(root_name="Root1")
+
+    assert calls, (
+        "save_polygons_to_json wrote sidecars without refreshing the overview; "
+        "the stale display points it leaves behind are what the fast load path "
+        "reads, so a moved polygon reverts on the next open")

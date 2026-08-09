@@ -4235,6 +4235,25 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 arr = _np.array([[p.x(), p.y()] for p in poly], dtype=_np.float64)
             if len(arr) < 2:
                 continue
+
+            # ITEM coordinates -> SCENE coordinates.
+            #
+            # Both sources above are the item's LOCAL geometry. Dragging a
+            # polygon does not rewrite that geometry: Qt moves the item's
+            # pos() and itemChange deliberately leaves the points alone. So a
+            # tile built straight from them draws every dragged polygon at the
+            # position it had BEFORE the drag -- and because tiles only take
+            # over when zoomed out, the polygon appeared to snap back to its
+            # original place the moment you zoomed out.
+            #
+            # sceneTransform() covers pos() and any item transform. It is the
+            # identity for every untouched polygon, so this costs nothing in
+            # the common case.
+            t = it.sceneTransform()
+            if not t.isIdentity():
+                m = _np.array([[t.m11(), t.m12()], [t.m21(), t.m22()]])
+                arr = arr @ m + _np.array([t.dx(), t.dy()])
+
             geoms.append(arr)
             cxs.append(arr[:, 0].mean())
             cys.append(arr[:, 1].mean())
