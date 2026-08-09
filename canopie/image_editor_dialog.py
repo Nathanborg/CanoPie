@@ -3282,11 +3282,9 @@ class ImageEditorDialog(QDialog):
         row_crop.addWidget(crop_label)
         row_crop.addStretch()
         row_crop.addWidget(self.crop_enabled_checkbox)
-        
+
         geo_layout.addLayout(row_crop)
-        
-        geo_layout.addLayout(row_crop)
-        
+
         control_layout.addWidget(geo_group)
 
         # ==========================================================
