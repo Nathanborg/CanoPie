@@ -215,3 +215,74 @@ def test_load_prefers_the_dir_over_an_embedded_copy():
         assert "_load_polygons_from_dir" in src, (
             f"{fn_name} still restores polygons only from the embedded "
             "project.json copy, which is never pruned on delete")
+
+
+# ---------------------------------------------------------------------------
+# The overview is a CACHE, never a FILTER
+# ---------------------------------------------------------------------------
+def _write_overview_covering(tab, tmp_path, groups):
+    """Write an _overview.json that lists ONLY `groups`."""
+    from .. import polygon_lod
+    base = os.path.splitext(os.path.basename(IMG))[0]
+    records = [(g, IMG, {'name': g, 'group': g, 'root': '', 'type': 'polygon',
+                         'coord_space': 'image',
+                         'image_ref_size': {'w': 48031, 'h': 50101},
+                         'points': [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]})
+               for g in groups]
+    polygon_lod.write_overview(str(tmp_path / "polygons"), records)
+
+
+def test_a_polygon_drawn_after_import_survives_a_refresh(tmp_path):
+    """THE data-loss bug, reproduced.
+
+    Import a shapefile (many groups, all listed in the overview), then draw one
+    more polygon. Its sidecar is written correctly, but the overview still lists
+    only the imported ones. The load path used to accept the overview whenever
+    the entry count was within 5% of the file count -- so the drawn polygon was
+    never read, and it vanished on the next refresh while every imported one
+    came back.
+    """
+    imported = [f"crown_{i}" for i in range(200)]
+    _mk(tmp_path, imported)
+    tab = _tab(tmp_path)
+    _write_overview_covering(tab, tmp_path, imported)
+
+    # ...now the user draws one more polygon; on_polygon_drawn writes its file.
+    _mk(tmp_path, ["hand_drawn_tree1"])
+
+    got = tab._load_polygons_from_dir()
+    assert "hand_drawn_tree1" in got, (
+        "the polygon drawn after the import was dropped on load -- the "
+        "overview was treated as the authoritative list of polygons instead "
+        "of a cache of the ones it happens to describe")
+    assert len(got) == len(imported) + 1
+
+
+def test_many_drawn_polygons_survive(tmp_path):
+    """Well inside the old 5% tolerance, so every one of these was lost."""
+    imported = [f"crown_{i}" for i in range(400)]
+    _mk(tmp_path, imported)
+    tab = _tab(tmp_path)
+    _write_overview_covering(tab, tmp_path, imported)
+
+    drawn = [f"drawn_{i}" for i in range(15)]      # 15/415 = 3.6%, under 5%
+    _mk(tmp_path, drawn)
+
+    got = tab._load_polygons_from_dir()
+    for g in drawn:
+        assert g in got, f"{g} was dropped by the overview fast path"
+
+
+def test_overview_covered_polygons_still_load_lazily(tmp_path):
+    """The patching must not cost the fast path its laziness."""
+    from .. import polygon_lod
+    imported = [f"crown_{i}" for i in range(50)]
+    _mk(tmp_path, imported)
+    tab = _tab(tmp_path)
+    _write_overview_covering(tab, tmp_path, imported)
+
+    got = tab._load_polygons_from_dir()
+    rec = got["crown_0"][IMG]
+    assert isinstance(rec, polygon_lod.LazyPolygonRecord), (
+        "overview-covered polygons must still come back as lazy records; "
+        "reading them all eagerly is the 44x regression this path exists to avoid")
