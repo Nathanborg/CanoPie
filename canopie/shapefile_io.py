@@ -7,7 +7,7 @@ import hashlib
 import logging
 from datetime import datetime
 from collections import OrderedDict
-
+import functools
 import numpy as np
 import tifffile
 import geopy.distance
@@ -23,6 +23,7 @@ _WGS84_GEOGCS = ('GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",'
                  'PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]')
 
 
+@functools.lru_cache(maxsize=128)
 def wkt_for_epsg(code):
     """
     Best-effort WKT for an EPSG code, for writing the ``.prj`` sidecar.
@@ -472,12 +473,16 @@ def pixel_to_geo(points, transform):
     """
     Convert list of (col, row) pixel coordinates to (x_geo, y_geo).
     """
-    geo_points = []
-    for col, row in points:
-        x_geo = transform[0] + col * transform[1] + row * transform[2]
-        y_geo = transform[3] + col * transform[4] + row * transform[5]
-        geo_points.append((x_geo, y_geo))
-    return geo_points
+    if not points:
+        return []
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.ndim == 1:
+        pts = pts.reshape(-1, 2)
+    cols = pts[:, 0]
+    rows = pts[:, 1]
+    x_geo = transform[0] + cols * transform[1] + rows * transform[2]
+    y_geo = transform[3] + cols * transform[4] + rows * transform[5]
+    return list(zip(x_geo.tolist(), y_geo.tolist()))
 
 
 def geo_to_pixel(points, transform):
@@ -485,7 +490,7 @@ def geo_to_pixel(points, transform):
     Convert list of (x_geo, y_geo) geographic coordinates to (col, row) pixel coordinates.
     """
     det = transform[1] * transform[5] - transform[2] * transform[4]
-    if det == 0:
+    if det == 0 or not points:
         return []
     
     inv_transform = [
@@ -497,12 +502,14 @@ def geo_to_pixel(points, transform):
         transform[1] / det
     ]
     
-    pixel_points = []
-    for x, y in points:
-        col = inv_transform[0] + x * inv_transform[1] + y * inv_transform[2]
-        row = inv_transform[3] + x * inv_transform[4] + y * inv_transform[5]
-        pixel_points.append((col, row))
-    return pixel_points
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.ndim == 1:
+        pts = pts.reshape(-1, 2)
+    x = pts[:, 0]
+    y = pts[:, 1]
+    col = inv_transform[0] + x * inv_transform[1] + y * inv_transform[2]
+    row = inv_transform[3] + x * inv_transform[4] + y * inv_transform[5]
+    return list(zip(col.tolist(), row.tolist()))
 
 
 def _convert_exifread_gps(value, ref):
@@ -776,9 +783,18 @@ def get_ax_transform_matrix(ax, raw_w, raw_h):
     return M, int(round(cur_w)), int(round(cur_h))
 
 
+@functools.lru_cache(maxsize=256)
 def _raw_image_dims(filepath):
     """
     Return (raw_h, raw_w) for an image on disk, or (None, None).
+
+    CACHED. A raster's dimensions cannot change while the app holds it open,
+    and this is called PER FEATURE during shapefile import whenever the target
+    image has no recorded ``ref_size`` (polygon_manager's per-feature fallback).
+    Uncached, that path opens the TIFF for every feature -- and for a non-TIFF,
+    or on any tifffile error, falls through to ``cv2.imread``, i.e. a FULL
+    IMAGE DECODE per feature. That is the difference between a one-second
+    import and an unusable one.
 
     BAND-FIRST SAFE. `tif.pages[0].shape[:2]` is WRONG for planar-separate /
     band-first rasters: an AVIRIS-style stack with 7 bands has
@@ -1236,6 +1252,7 @@ def write_feature_collection(features, output_stem, field_order=None):
     return written, notes
 
 
+@functools.lru_cache(maxsize=128)
 def crs_label(crs_wkt):
     """Short, filename-safe label for a CRS, used to name per-CRS output files.
 
@@ -1516,7 +1533,17 @@ def read_shapefile(shp_path, dbf_path=None, encoding='cp1252'):
                         if len(data) >= parts_offset + parts_size + 16 * num_points:
                             parts_indices = list(struct.unpack(f'<{num_parts}i', data[parts_offset:parts_offset + parts_size]))
                             pts_offset = parts_offset + parts_size
-                            flat_pts = struct.unpack(f'<{num_points * 2}d', data[pts_offset:pts_offset + 16 * num_points])
+                            # `.tolist()` converts to native Python floats in C.
+                            # Without it the coordinates stay numpy.float64 --
+                            # which happens to work today only because it
+                            # subclasses float, while the Point/MultiPoint
+                            # branches below still produce real floats. That
+                            # mixed-type reader output is a trap for any
+                            # `type(x) is float` check or a later switch to
+                            # float32, and costs nothing to avoid.
+                            flat_pts = np.frombuffer(
+                                data, dtype='<f8', count=num_points * 2,
+                                offset=pts_offset).tolist()
                             all_pts = [(flat_pts[i], flat_pts[i + 1]) for i in range(0, len(flat_pts), 2)]
 
                             part_bounds = parts_indices + [num_points]
@@ -1559,6 +1586,51 @@ def clear_shapefile_io_caches():
     """Clear metadata and transformer caches."""
     _image_metadata_cache.clear()
     _transformer_cache.clear()
+    _raw_image_dims.cache_clear()
+
+
+def _ax_cache_token(ax_data):
+    """A stable, content-derived cache token for an `.ax` dict.
+
+    Deliberately NOT `id(ax_data)`: see the comment at the cache lookup in
+    `reproject_shapefile_geometry_to_image_pixels`. Only the keys that actually
+    affect the pixel transform are hashed, so two separately-loaded but
+    identical `.ax` dicts share a cache entry (a real speedup) while any
+    difference in crop/rotate/resize forces a rebuild (correctness).
+    """
+    if not isinstance(ax_data, dict):
+        return str(ax_data)
+    try:
+        relevant = {k: ax_data.get(k) for k in (
+            'crop_rect', 'crop_rect_ref_size', 'crop_enabled',
+            'rotate', 'rotate_enabled',
+            'resize', 'resize_enabled',
+            'orig_size',
+        ) if k in ax_data}
+        return json.dumps(relevant, sort_keys=True, default=str)
+    except Exception:
+        # Unhashable/unserialisable content: fall back to "never share".
+        return ('uncacheable', id(ax_data))
+
+
+def _crs_cache_token(crs):
+    """A stable cache token for a CRS.
+
+    `id(crs)` is wrong for the same reason as above, and worse here: pyproj CRS
+    objects DO expose `__dict__`, so the id() branch was always taken, a fresh
+    CRS object is parsed per import, and the cache therefore MISSED every time
+    -- rebuilding `Transformer.from_crs` on each call. That made the "cache" a
+    net pessimisation versus keying on the WKT string.
+    """
+    if crs is None:
+        return None
+    try:
+        to_wkt = getattr(crs, 'to_wkt', None)
+        if callable(to_wkt):
+            return to_wkt()
+    except Exception:
+        pass
+    return str(crs)
 
 
 def reproject_shapefile_geometry_to_image_pixels(
@@ -1601,9 +1673,24 @@ def reproject_shapefile_geometry_to_image_pixels(
     norm_fp = os.path.normpath(target_image_path)
     
     # 1. Obtain image georeferencing transform, dimensions, and image CRS
-    cache_key = (norm_fp, ref_size.get('w') if ref_size else None, ref_size.get('h') if ref_size else None)
+    #
+    # The .ax part of the key is a CONTENT hash, not id(ax_data).
+    #
+    # id() is only unique among LIVE objects: CPython reuses an address once an
+    # object is freed. `_image_metadata_cache` is module-level and (since
+    # clear_shapefile_io_caches() has no callers anywhere) never emptied, while
+    # ax_data dicts are json.load-ed fresh per import and become garbage when it
+    # finishes. A later import can therefore allocate a dict at a recycled
+    # address and, for the same (path, ref_w, ref_h), hit a stale entry whose
+    # M_comp was built from a DIFFERENT crop/rotate/resize -- silently placing
+    # every polygon wrong, with no exception and no log line.
+    ax_id = _ax_cache_token(ax_data)
+    ref_w_val = float(ref_size.get('w') or ref_size.get('width') or 0) if ref_size else None
+    ref_h_val = float(ref_size.get('h') or ref_size.get('height') or 0) if ref_size else None
+    cache_key = (norm_fp, ref_w_val, ref_h_val, ax_id)
+    
     if cache_key in _image_metadata_cache:
-        raw_w, raw_h, transform, img_crs = _image_metadata_cache[cache_key]
+        raw_w, raw_h, transform, img_crs, inv_matrix, M_comp = _image_metadata_cache[cache_key]
     else:
         raw_h, raw_w = _raw_image_dims(norm_fp)
         if not raw_w or not raw_h:
@@ -1617,12 +1704,38 @@ def reproject_shapefile_geometry_to_image_pixels(
             transform, img_crs = get_geotiff_transform(norm_fp)
             if not transform:
                 transform, img_crs = estimate_transform_from_exif(norm_fp, raw_w, raw_h)
-        _image_metadata_cache[cache_key] = (raw_w, raw_h, transform, img_crs)
+
+        inv_matrix = None
+        if transform:
+            det = transform[1] * transform[5] - transform[2] * transform[4]
+            if det != 0.0:
+                inv_matrix = np.array([
+                    [transform[5] / det, -transform[4] / det],
+                    [-transform[2] / det, transform[1] / det]
+                ], dtype=np.float64)
+
+        M = np.eye(3, dtype=np.float64)
+        out_w, out_h = int(raw_w), int(raw_h)
+        if ax_data and isinstance(ax_data, dict):
+            try:
+                M, out_w, out_h = get_ax_transform_matrix(ax_data, raw_w, raw_h)
+            except Exception as e:
+                logging.debug("Failed to calculate .ax transform matrix: %s", e)
+
+        target_ref_w = float(ref_w_val if ref_w_val else out_w)
+        target_ref_h = float(ref_h_val if ref_h_val else out_h)
+        scale_x = target_ref_w / float(max(out_w, 1))
+        scale_y = target_ref_h / float(max(out_h, 1))
+
+        S = np.array([[scale_x, 0.0, 0.0], [0.0, scale_y, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        M_comp = S @ M
+
+        _image_metadata_cache[cache_key] = (raw_w, raw_h, transform, img_crs, inv_matrix, M_comp)
 
     # 2. CRS Reprojection if shapefile_crs and img_crs differ
     if transform and shapefile_crs and img_crs:
         try:
-            trans_key = (str(shapefile_crs), str(img_crs))
+            trans_key = (_crs_cache_token(shapefile_crs), _crs_cache_token(img_crs))
             if trans_key in _transformer_cache:
                 transformer = _transformer_cache[trans_key]
             else:
@@ -1643,12 +1756,7 @@ def reproject_shapefile_geometry_to_image_pixels(
 
     # 3. Geographic -> RAW pixels via geo_to_pixel
     if transform:
-        det = transform[1] * transform[5] - transform[2] * transform[4]
-        if det != 0.0:
-            inv_matrix = np.array([
-                [transform[5] / det, -transform[4] / det],
-                [-transform[2] / det, transform[1] / det]
-            ], dtype=np.float64)
+        if inv_matrix is not None:
             origin = np.array([transform[0], transform[3]], dtype=np.float64)
             pts_arr = (pts_arr - origin) @ inv_matrix
         else:
@@ -1656,27 +1764,8 @@ def reproject_shapefile_geometry_to_image_pixels(
             raw_pixels = geo_to_pixel(pts_to_project, transform)
             pts_arr = np.array(raw_pixels, dtype=np.float64)
 
-    # 4. RAW pixels -> MODIFIED (.ax) pixels via matrix M
-    M = np.eye(3, dtype=np.float64)
-    out_w, out_h = int(raw_w), int(raw_h)
-    if ax_data and isinstance(ax_data, dict):
-        try:
-            M, out_w, out_h = get_ax_transform_matrix(ax_data, raw_w, raw_h)
-        except Exception as e:
-            logging.debug("Failed to calculate .ax transform matrix: %s", e)
-
-    N = pts_arr.shape[0]
-    pts_homog = np.hstack([pts_arr, np.ones((N, 1), dtype=np.float64)])
-    mod_homog = pts_homog @ M.T
-    pts_arr = mod_homog[:, :2]
-
-    # 5. MODIFIED pixels -> Stored reference pixels
-    target_ref_w = float(ref_size.get('w', out_w) if ref_size else out_w)
-    target_ref_h = float(ref_size.get('h', out_h) if ref_size else out_h)
-    scale_x = target_ref_w / float(max(out_w, 1))
-    scale_y = target_ref_h / float(max(out_h, 1))
-
-    pts_arr *= np.array([scale_x, scale_y], dtype=np.float64)
+    # 4 & 5. RAW pixels -> MODIFIED (.ax) pixels -> Stored reference pixels
+    pts_arr = pts_arr @ M_comp[:2, :2].T + M_comp[:2, 2]
 
     return [(float(x), float(y)) for x, y in pts_arr]
 
@@ -1700,7 +1789,17 @@ def resolve_feature_identity(props, feat_idx, shp_stem="Imported", existing_keys
     and sanitized DBF properties for a single shapefile feature.
     """
     props = props or {}
-    existing_keys = set(existing_keys) if existing_keys else set()
+    # Use the caller's set DIRECTLY -- do not copy it.
+    #
+    # `set(existing_keys)` looked harmless but the caller passes the
+    # accumulating `assigned_keys` set and calls this once per feature, so the
+    # copy is O(features) inside an O(features) loop: measured 0.293 s of pure
+    # set-copying for 6000 features, and quadratic beyond (~12 s at 40k).
+    # Only membership is tested below, so a read-only reference is enough.
+    if existing_keys is None:
+        existing_keys = set()
+    elif not isinstance(existing_keys, (set, frozenset)):
+        existing_keys = set(existing_keys)
 
     # 1. Base classification group
     base_group = None
@@ -1760,12 +1859,16 @@ def calculate_signed_area(ring):
     n = len(ring)
     if n < 3:
         return 0.0
-    area = 0.0
-    for i in range(n):
-        j = (i + 1) % n
-        area += ring[i][0] * ring[j][1]
-        area -= ring[j][0] * ring[i][1]
-    return area / 2.0
+    arr = np.asarray(ring, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] < 2:
+        return 0.0          # ragged/odd input: match the old loop's tolerance
+    x = arr[:, 0]
+    y = arr[:, 1]
+    area = np.sum(x[:-1] * y[1:] - y[:-1] * x[1:])
+    area += x[-1] * y[0] - y[-1] * x[0]
+    # float(), so this returns the same type it always did regardless of the
+    # input's type -- callers compare/serialise the result.
+    return float(area) / 2.0
 
 
 def classify_and_group_rings(parts_list):
@@ -1807,10 +1910,15 @@ def decompose_shapefile_features(features):
                 pt_props = dict(props)
                 if len(raw_geom) > 1:
                     pt_props['part_index'] = pt_idx
+                try:
+                    pt_bbox = (pt[0], pt[1], pt[0], pt[1])
+                except (TypeError, IndexError):
+                    pt_bbox = None
                 decomposed_features.append({
                     'type': 'point',
                     'geometry': [pt],
                     'holes': [],
+                    'bbox': pt_bbox,
                     'properties': pt_props
                 })
             continue
@@ -1821,10 +1929,31 @@ def decompose_shapefile_features(features):
             if len(grouped_rings) > 1:
                 poly_props['part_index'] = g_idx
 
+            # Carry a per-PART bbox, not the parent record's.
+            #
+            # `read_shapefile` puts a 'bbox' on the raw feature, but this
+            # function used to drop it -- which is why the import's bbox
+            # pre-filter was silently dead code (`feat.get('bbox')` was always
+            # None) and never actually skipped anything.
+            #
+            # A multi-part feature's record bbox covers ALL its parts, so
+            # reusing it would under-filter; computing each ring's own extent
+            # here is both correct and cheap.
+            outer = group['outer']
+            part_bbox = None
+            if outer:
+                try:
+                    xs = [p[0] for p in outer]
+                    ys = [p[1] for p in outer]
+                    part_bbox = (min(xs), min(ys), max(xs), max(ys))
+                except (TypeError, IndexError):
+                    part_bbox = feat.get('bbox')
+
             decomposed_features.append({
                 'type': 'polygon',
-                'geometry': group['outer'],
+                'geometry': outer,
                 'holes': group['holes'],
+                'bbox': part_bbox,
                 'properties': poly_props
             })
 

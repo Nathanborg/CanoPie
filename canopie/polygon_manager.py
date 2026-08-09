@@ -15,6 +15,7 @@ import threading
 import pickle
 import concurrent.futures
 import copy
+import functools
 
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
@@ -60,6 +61,7 @@ logging.basicConfig = _no_file_basicConfig
 # Import necessary classes from our package
 from .machine_learning_manager import MachineLearningManager
 from .loaders import ImageProcessor
+from . import polygon_lod
 
 from .utils import *
 
@@ -94,6 +96,7 @@ class ShapefileImportWorker(QtCore.QObject):
                 reproject_shapefile_geometry_to_image_pixels,
                 resolve_feature_identity,
                 decompose_shapefile_features,
+                get_geotiff_transform,
                 _raw_image_dims
             )
             from .spatial_index import SpatialIndexManager
@@ -109,6 +112,14 @@ class ShapefileImportWorker(QtCore.QObject):
             assigned_keys = set()
             total_files = len(self.file_paths)
 
+            # Features can legitimately be discarded (a shapefile often covers
+            # far more ground than the project). Counting them is what keeps
+            # that from being SILENT data loss -- every one of these is
+            # reported in the import summary below.
+            skipped_outside = 0     # rejected by the cheap bbox pre-filter
+            skipped_no_match = 0    # overlapped no image footprint
+            skipped_offimage = 0    # reprojected outside the target's extent
+
             for f_idx, shp_path in enumerate(self.file_paths, start=1):
                 if self._is_cancelled:
                     break
@@ -119,6 +130,32 @@ class ShapefileImportWorker(QtCore.QObject):
                 stem = os.path.splitext(os.path.basename(shp_path))[0]
                 prj_file = os.path.splitext(shp_path)[0] + ".prj"
                 shp_crs_wkt, shp_crs_obj = parse_crs_from_prj(prj_file)
+
+                if shp_crs_obj is None and shp_crs_wkt is None:
+                    # No .prj. Every downstream step -- footprint matching and
+                    # reprojection alike -- needs SOME source CRS; with none,
+                    # raw shapefile coordinates get compared against WGS84
+                    # footprints, nothing matches, and the whole file is
+                    # discarded.
+                    #
+                    # Assume the coordinates are already in the target imagery's
+                    # CRS. That is overwhelmingly the common case for a
+                    # .prj-less file shipped next to its raster, and it is
+                    # SAFE to attempt because a wrong guess cannot corrupt
+                    # anything: such features reproject outside the image and
+                    # are caught by the extent check, then reported as skipped.
+                    for _info in self.target_images_info:
+                        try:
+                            _t, _img_crs = get_geotiff_transform(_info['filepath'])
+                            if _img_crs:
+                                shp_crs_obj = _img_crs
+                                break
+                        except Exception:
+                            continue
+                    msg = (f"{os.path.basename(shp_path)} has no .prj; assuming its "
+                           "coordinates are already in the imagery's CRS")
+                    logging.warning("[ImportShapefile] %s", msg)
+                    warnings_list.append(msg)
 
                 try:
                     features = read_shapefile(shp_path)
@@ -131,6 +168,18 @@ class ShapefileImportWorker(QtCore.QObject):
                     continue
 
                 decomposed = decompose_shapefile_features(features)
+
+                # Arm the bbox pre-filter ONCE per file: project the whole
+                # project extent into THIS shapefile's CRS so the per-feature
+                # test is four float comparisons instead of a CRS transform
+                # plus a shapely intersection. Returns False (and the filter
+                # stays off) when there is no .prj or no project extent -- in
+                # which case we import everything rather than guess.
+                bbox_filter_on = spatial_mgr.prepare_bbox_filter(shp_crs_obj or shp_crs_wkt)
+                if not bbox_filter_on:
+                    logging.info("[ImportShapefile] bbox pre-filter disabled for %s "
+                                 "(no .prj or no project extent); matching every feature",
+                                 os.path.basename(shp_path))
 
                 # Progress used to be emitted ONCE PER FILE. Importing a single
                 # shapefile -- the normal case -- therefore emitted exactly two
@@ -161,6 +210,15 @@ class ShapefileImportWorker(QtCore.QObject):
                     if not raw_geom:
                         continue
 
+                    # Cheapest possible reject: the feature's own extent, in the
+                    # shapefile's CRS, against the project extent projected into
+                    # that same CRS by prepare_bbox_filter above. Four float
+                    # comparisons, and it skips the CRS transform + shapely
+                    # intersection that dominate the per-feature cost.
+                    if bbox_filter_on and spatial_mgr.bbox_outside_project(feat.get('bbox')):
+                        skipped_outside += 1
+                        continue
+
                     identity = resolve_feature_identity(
                         props=props,
                         feat_idx=feat_idx,
@@ -178,12 +236,12 @@ class ShapefileImportWorker(QtCore.QObject):
                     except (ValueError, TypeError):
                         lat_f, lon_f = 0.0, 0.0
 
-                    # Route feature geometry using SpatialIndexManager
                     matches = spatial_mgr.match_feature_geometry(
                         poly_geom_or_coords=raw_geom,
                         shapefile_crs=shp_crs_obj or shp_crs_wkt,
                         min_overlap_ratio=0.01,
-                        match_all_overlapping=False
+                        match_all_overlapping=False,
+                        allow_fallback=False
                     )
 
                     target_fps = []
@@ -192,10 +250,19 @@ class ShapefileImportWorker(QtCore.QObject):
                             norm_m = os.path.normpath(m_fp)
                             if norm_m in info_by_fp:
                                 target_fps.append(norm_m)
-                    if not target_fps and all_target_fps:
-                        target_fps = [all_target_fps[0]]
 
                     if not target_fps:
+                        # No image overlaps this feature. It is SKIPPED, and
+                        # counted so the summary can say so.
+                        #
+                        # There used to be a `target_fps = [all_target_fps[0]]`
+                        # fallback here, which silently undid the
+                        # `allow_fallback=False` argument three lines above: the
+                        # feature was assigned to whichever image happened to be
+                        # first, reprojected against the wrong georeferencing,
+                        # and then discarded anyway by the extent check below --
+                        # with nothing reported either way.
+                        skipped_no_match += 1
                         continue
 
                     for tfp in target_fps:
@@ -223,16 +290,19 @@ class ShapefileImportWorker(QtCore.QObject):
                             ref_w = float(raw_w_t or 1000)
                             ref_h = float(raw_h_t or 1000)
 
+                        if stored_points:
+                            xs = [p[0] for p in stored_points]
+                            ys = [p[1] for p in stored_points]
+                            margin = 100.0
+                            if max(xs) < -margin or min(xs) > ref_w + margin or max(ys) < -margin or min(ys) > ref_h + margin:
+                                skipped_offimage += 1
+                                continue
+
                         poly_dict = {
                             'name': identity['display_name'],
                             'group': identity['base_group'],
                             'root': identity['root_val'],
                             'type': type_val,
-                            # Must be 'image', not 'pixel' -- see the identical
-                            # fix in shapefile_io.py. No consumer recognizes
-                            # 'pixel'; it falls into the unscaled 'scene'
-                            # branch of load_polygons, placing full-resolution
-                            # pixel coordinates directly in scene space.
                             'coord_space': 'image',
                             'image_ref_size': {'w': ref_w, 'h': ref_h},
                             'points': stored_points,
@@ -241,6 +311,24 @@ class ShapefileImportWorker(QtCore.QObject):
                         }
 
                         imported_all_polygons.setdefault(entry_key, {})[tfp] = poly_dict
+
+            # Report every discarded feature. A shapefile routinely covers more
+            # ground than the project, so skipping is normal -- but it must be
+            # VISIBLE, or a CRS/footprint problem looks identical to "the file
+            # had nothing in it".
+            total_skipped = skipped_outside + skipped_no_match + skipped_offimage
+            if total_skipped:
+                parts = []
+                if skipped_outside:
+                    parts.append(f"{skipped_outside} outside the project extent")
+                if skipped_no_match:
+                    parts.append(f"{skipped_no_match} overlapping no image")
+                if skipped_offimage:
+                    parts.append(f"{skipped_offimage} landing off their image")
+                warnings_list.append(
+                    f"{total_skipped} feature(s) were not imported: " + ", ".join(parts) + ".")
+                logging.info("[ShapefileImportWorker] skipped %d feature(s): %s",
+                             total_skipped, "; ".join(parts))
 
             if not self._is_cancelled:
                 self.progress.emit(100, "Import complete.")
@@ -298,7 +386,9 @@ class PolygonManager(QtWidgets.QDialog):
                 border: 1px solid gray;
             }
         """)
-        self.show_labels_checkbox.setChecked(True)
+        # OFF by default: labels cost 3-5x paint time and break culling at
+        # thousands of polygons. See EditablePolygonItem.__init__.
+        self.show_labels_checkbox.setChecked(False)
         self.show_labels_checkbox.setToolTip("Toggle visibility of polygon labels")
         self.show_labels_checkbox.stateChanged.connect(self._on_show_labels_changed)
         self.top_controls_layout.addWidget(self.show_labels_checkbox)
@@ -1446,17 +1536,24 @@ class PolygonManager(QtWidgets.QDialog):
 
         parent.undo_stack.beginMacro("Delete ALL Polygons")
         try:
-             # Iterate over a copy of group names since we might remove them
-             groups = list(parent.all_polygons.keys())
-             for group_name in groups:
-                 # Iterate over copy of filepaths
-                 filepaths = list(parent.all_polygons[group_name].keys())
-                 for filepath in filepaths:
-                     cmd = DeletePolygonCommand(parent, group_name, filepath)
-                     parent.undo_stack.push(cmd)
+             # Use _bulk_polygon_delete to defer scene scans and manager
+             # rebuilds until the entire batch is done -- without this,
+             # each of the N push(cmd) calls runs redo() immediately,
+             # triggering O(N) scene scans and list-widget rebuilds.
+             bulk_cm = getattr(parent, "_bulk_polygon_delete", None)
+             ctx = bulk_cm() if bulk_cm is not None else nullcontext()
+             with ctx:
+                 # Iterate over a copy of group names since we might remove them
+                 groups = list(parent.all_polygons.keys())
+                 for group_name in groups:
+                     # Iterate over copy of filepaths
+                     filepaths = list(parent.all_polygons[group_name].keys())
+                     for filepath in filepaths:
+                         cmd = DeletePolygonCommand(parent, group_name, filepath)
+                         parent.undo_stack.push(cmd)
                      
-             # Note: We do NOT delete orphaned files (files not in memory) to keep Undo consistent.
-             
+                 # Note: We do NOT delete orphaned files (files not in memory) to keep Undo consistent.
+                 
         finally:
              parent.undo_stack.endMacro()
 
@@ -2034,12 +2131,15 @@ class PolygonManager(QtWidgets.QDialog):
         except Exception as e:
             print(f"Failed to save results to {output_file_path}: {e}")
 
-    def natural_sort_key(self, s):
+    @staticmethod
+    @functools.lru_cache(maxsize=8192)
+    def natural_sort_key(s):
         """
         Generates a sorting key that considers numerical values within strings.
         Splits the input string into a list of strings and integers.
+        LRU-cached to avoid redundant regex work during repeated sorts.
         """
-        return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
+        return tuple(int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s))
 
     def set_polygons(self, polygon_groups):
         """
@@ -2760,73 +2860,55 @@ class PolygonManager(QtWidgets.QDialog):
             return
 
         def _to_scene_pts(vw, img_pts, img_size_hw):
-            scene_pts = []
-            pixitem = getattr(vw, '_image', None)
-            if pixitem is not None:
-                pixmap = pixitem.pixmap()
-                if pixmap and not pixmap.isNull():
-                    pw, ph = max(1, pixmap.width()), max(1, pixmap.height())
-                    h_eff, w_eff = img_size_hw if img_size_hw else (ph, pw)
-                    img_h, img_w = h_eff or ph, w_eff or pw
-                    for (x, y) in img_pts:
-                        x_pix = float(x) * (pw / float(img_w))
-                        y_pix = float(y) * (ph / float(img_h))
-                        scene_pt = pixitem.mapToScene(QtCore.QPointF(x_pix, y_pix))
-                        scene_pts.append(scene_pt)
-            if not scene_pts:
-                scene_pts = [QtCore.QPointF(float(x), float(y)) for (x, y) in img_pts]
-            return scene_pts
+            # Vectorised: one matmul per ring instead of one mapToScene() call
+            # per vertex. See image_viewer.image_points_to_scene.
+            from .image_viewer import image_points_to_scene
+            return image_points_to_scene(
+                getattr(vw, '_image', None), img_pts, img_size_hw)
 
         imported_count = 0
         for group_name, file_dict in imported_data.items():
             parent.all_polygons.setdefault(group_name, {})
             for filepath, poly_payload in file_dict.items():
                 parent.all_polygons[group_name][filepath] = poly_payload
+                if hasattr(parent, "_add_to_polygon_index"):
+                    parent._add_to_polygon_index(group_name, filepath)
                 if hasattr(parent, "_mark_polygon_dirty"):
                     parent._mark_polygon_dirty(group_name, filepath)
                 imported_count += 1
 
-        # Incremental save
-        try:
-            if hasattr(parent, "save_incremental"):
-                parent.save_incremental()
-            else:
-                parent.save_polygons_to_json()
-        except Exception as e:
-            logging.error("[PolygonManager] Saving imported shapefile polygons failed: %s", e)
+        # Incremental save, deferred so a large import does not block the UI.
+        #
+        # It MUST run inside its own try/except. The enclosing try only wraps
+        # the scheduling call, which cannot fail -- the save itself now runs
+        # later, straight off the Qt event loop, where an unhandled Python
+        # exception does not propagate: PyQt aborts the process. A disk-full or
+        # permission error would take the whole app down and lose the polygons
+        # that were just imported, instead of producing one log line.
+        def _deferred_save():
+            try:
+                if hasattr(parent, "save_incremental"):
+                    parent.save_incremental()
+                else:
+                    parent.save_polygons_to_json()
+            except Exception as e:
+                logging.error(
+                    "[PolygonManager] Saving imported shapefile polygons failed: %s",
+                    e, exc_info=True)
 
-        # Update List Widget
+        QtCore.QTimer.singleShot(0, _deferred_save)
+
+        # Update List Widget (set_polygons updates the list_widget directly)
         try:
             self.set_polygons(parent.all_polygons)
-            if hasattr(parent, "update_polygon_manager"):
-                parent.update_polygon_manager()
         except Exception as e:
             logging.error("[PolygonManager] Updating UI list failed: %s", e)
 
         # Update Viewers
         #
-        # This loop touches whichever currently-open viewers happen to be
-        # showing one of the imported images -- most imports will match at
-        # most a handful of viewers, but a single project can have several
-        # open, and a shapefile can carry thousands of features. Three real
-        # bugs lived here, all only visible at that scale:
-        #
-        #   1. No batching. load_polygons() (project_tab.py) blocks signals
-        #      and disables scene indexing before a bulk add and restores
-        #      both after -- this loop did neither, so every one of 3000
-        #      polygons paid full signal-emission + BspTreeIndex-rebalance
-        #      cost individually. That is what made a large import "very
-        #      very slow".
-        #   2. No error handling. A single malformed polygon raised out of
-        #      this loop uncaught, silently abandoning every remaining
-        #      group -- not just for that file, for the rest of the import.
-        #   3. No final repaint. Qt's default viewport update mode does not
-        #      guarantee a redraw after items are added programmatically
-        #      without an intervening event-loop turn; nothing here ever
-        #      called scene.update() / viewport().update(), so polygons
-        #      could sit in the scene, correctly placed, and simply not be
-        #      painted until some unrelated repaint happened to occur.
-        touched = {}   # id(viewer) -> (viewer, scene, old_idx_method)
+        # Pre-build name-to-item index per viewer for O(1) duplicate removal,
+        # avoiding an O(N * M) scene item scan per imported feature.
+        touched = {}   # id(viewer) -> (viewer, scene, old_idx_method, existing_by_name)
         added = 0
         skipped = 0
         for group_name, file_dict in imported_data.items():
@@ -2835,6 +2917,29 @@ class PolygonManager(QtWidgets.QDialog):
                 ref_size = poly_payload.get("image_ref_size", {})
                 th_eff = ref_size.get("h", 0)
                 tw_eff = ref_size.get("w", 0)
+
+                # DISPLAY geometry only: decimate to the same pyramid level the
+                # project-open path uses, so what you see right after importing
+                # matches what you see after reopening -- and so a 612-vertex
+                # crown costs ~30 QPointF objects instead of 612.
+                #
+                # `poly_payload['points']` above keeps the EXACT coordinates;
+                # those are what get saved, exported and measured. The item is
+                # flagged is_lod so the first drag upgrades it back to the real
+                # outline (_upgrade_item_to_full_geometry) before any edit can
+                # be written -- the record it reads is already in
+                # parent.all_polygons by this point.
+                display_pts = pts_image
+                is_lod_pts = False
+                try:
+                    if len(pts_image) >= polygon_lod.MIN_POINTS_FOR_LOD:
+                        red = polygon_lod.decimate(
+                            pts_image, 2.0 ** polygon_lod.OVERVIEW_LEVEL)
+                        if len(red) < len(pts_image):
+                            display_pts = red
+                            is_lod_pts = True
+                except Exception:
+                    display_pts, is_lod_pts = pts_image, False
 
                 for vw_widget, viewer in self._iter_viewers():
                     idata = vw_widget.get("image_data") if isinstance(vw_widget, dict) else None
@@ -2849,24 +2954,44 @@ class PolygonManager(QtWidgets.QDialog):
                         if scene:
                             scene.blockSignals(True)
                             scene.setItemIndexMethod(QtWidgets.QGraphicsScene.NoIndex)
-                        touched[id(viewer)] = (viewer, scene, old_idx)
+                        # name -> LIST of items, not a single item.
+                        #
+                        # A scene can already hold several items sharing a name;
+                        # the scan this index replaced removed ALL of them, so a
+                        # dict keeping only the last one silently left
+                        # duplicates behind on re-import.
+                        existing_by_name = {}
+                        if hasattr(viewer, "get_all_polygons"):
+                            for item in viewer.get_all_polygons():
+                                nm = getattr(item, "name", None)
+                                if nm:
+                                    existing_by_name.setdefault(nm, []).append(item)
+                        touched[id(viewer)] = (viewer, scene, old_idx, existing_by_name)
+                    else:
+                        existing_by_name = touched[id(viewer)][3]
 
                     try:
-                        # Remove existing item with same name
-                        if hasattr(viewer, "get_all_polygons"):
-                            for item in list(viewer.get_all_polygons()):
-                                if getattr(item, "name", None) == group_name:
-                                    try:
-                                        viewer._scene.removeItem(item)
-                                    except Exception:
-                                        pass
+                        # O(1) removal of every existing item with this name.
+                        # `pop` so a repeated group name later in the same
+                        # import cannot re-remove an already-detached item.
+                        for old_item in existing_by_name.pop(group_name, ()):
+                            if getattr(viewer, "_scene", None) is not None:
+                                try:
+                                    viewer._scene.removeItem(old_item)
+                                except Exception:
+                                    pass
 
-                        scene_pts = _to_scene_pts(viewer, pts_image, img_size_hw=(th_eff, tw_eff))
-                        qpoly = QtGui.QPolygonF(scene_pts)
+                        qpoly = _to_scene_pts(viewer, display_pts, img_size_hw=(th_eff, tw_eff))
+                        new_item = None
                         if hasattr(viewer, "add_polygon_to_scene"):
-                            viewer.add_polygon_to_scene(qpoly, group_name)
+                            new_item = viewer.add_polygon_to_scene(
+                                qpoly, group_name, is_lod=is_lod_pts)
                         elif hasattr(viewer, "add_polygon"):
                             viewer.add_polygon(qpoly, group_name)
+                        # Keep the index truthful: if this name comes round
+                        # again, the item just added is the one to replace.
+                        if new_item is not None:
+                            existing_by_name[group_name] = [new_item]
                         added += 1
                     except Exception as e:
                         skipped += 1
@@ -2874,7 +2999,7 @@ class PolygonManager(QtWidgets.QDialog):
                             "[ImportShapefile] Failed to draw '%s' onto open viewer for %s: %s",
                             group_name, os.path.basename(filepath), e)
 
-        for viewer, scene, old_idx in touched.values():
+        for viewer, scene, old_idx, _ in touched.values():
             try:
                 if scene is not None:
                     # Restore the pre-batch index method. NoIndex is only for
@@ -3797,25 +3922,12 @@ class PolygonManager(QtWidgets.QDialog):
                                 except Exception:
                                     pass
 
-                    # Map image coords to scene coords through the pixmap
-                    scene_pts = []
-                    pixitem = getattr(viewer, '_image', None)
-                    if pixitem is not None:
-                        pixmap = pixitem.pixmap()
-                        if pixmap and not pixmap.isNull():
-                            pw, ph = max(1, pixmap.width()), max(1, pixmap.height())
-                            img_h, img_w = th_eff or ph, tw_eff or pw
-                            for (x, y) in pts_image:
-                                x_pix = float(x) * (pw / float(img_w))
-                                y_pix = float(y) * (ph / float(img_h))
-                                scene_pt = pixitem.mapToScene(QtCore.QPointF(x_pix, y_pix))
-                                scene_pts.append(scene_pt)
-                    
-                    if not scene_pts:
-                        # Fallback: use image coords directly
-                        scene_pts = [QtCore.QPointF(x, y) for (x, y) in pts_image]
-                    
-                    qpoly = QtGui.QPolygonF(scene_pts)
+                    # Map image coords to scene coords through the pixmap.
+                    # Vectorised -- see image_viewer.image_points_to_scene.
+                    from .image_viewer import image_points_to_scene
+                    qpoly = image_points_to_scene(
+                        getattr(viewer, '_image', None), pts_image,
+                        img_size_hw=(th_eff, tw_eff))
                     if hasattr(viewer, "add_polygon_to_scene"):
                         viewer.add_polygon_to_scene(qpoly, name)
                     else:

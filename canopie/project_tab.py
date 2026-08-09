@@ -2924,12 +2924,21 @@ class DeletePolygonCommand(QUndoCommand):
         # The sidecar on disk IS the snapshot, and `redo()` opens that exact
         # file to delete it, so the content is captured there instead --
         # turning construction into pure bookkeeping.
-        if self.json_content is None and self.json_path is None:
-            import os
-            base = os.path.splitext(os.path.basename(self.filepath))[0]
-            pf = getattr(self.tab, "project_folder", None) or os.getcwd()
-            self.json_path = os.path.join(pf, "polygons", f"{self.group_name}_{base}_polygons.json")
+        if self.json_content is None:
+            if self.json_path is None:
+                import os
+                base = os.path.splitext(os.path.basename(self.filepath))[0]
+                pf = getattr(self.tab, "project_folder", None) or os.getcwd()
+                self.json_path = os.path.join(pf, "polygons", f"{self.group_name}_{base}_polygons.json")
             #: Nothing captured yet -- redo() must snapshot before deleting.
+            #
+            # Keyed on json_content ALONE, deliberately. It used to also require
+            # json_path is None, which meant a caller that resolved the path
+            # itself but left the content unread (the cheap thing to do) got
+            # `_snapshot_pending == False` -- so redo() plain-deleted the file
+            # with no snapshot at all and undo silently restored nothing. The
+            # honest invariant is "we have no content yet, so capture it at
+            # redo time", regardless of who computed the path.
             self._snapshot_pending = True
 
     def _refresh_viewer_sync(self, viewer):
@@ -3115,15 +3124,20 @@ class DeletePolygonCommand(QUndoCommand):
             if self.json_content:
                 poly_data = json.loads(self.json_content)
             elif self.json_path and os.path.exists(self.json_path):
-                # Restored via the trash rename above: nothing was ever read
-                # into memory, so read it back now. This is ONE file, on an
-                # explicit user undo -- not the per-polygon cost that made
-                # bulk deletes slow.
+                # Restored via the trash rename above. Do NOT read it back
+                # eagerly: undoing a 4111-polygon "Clean Root" would then cost
+                # 4111 file opens (~28 ms each on Windows) -- measured 121 s,
+                # i.e. undo far slower than the 5 s delete it reverses.
+                #
+                # The file is on disk again, so hand back a LazyPolygonRecord
+                # that reads it only if something actually asks for geometry.
+                # This is the same mechanism project load uses.
                 try:
-                    with open(self.json_path, 'r', encoding='utf-8') as f:
-                        poly_data = json.load(f)
+                    poly_data = polygon_lod.LazyPolygonRecord(
+                        {'name': self.label, 'group': self.group_name},
+                        self.json_path)
                 except Exception as e:
-                    logging.error("[UndoStack] Undo: could not read restored %s: %s",
+                    logging.error("[UndoStack] Undo: could not restore %s: %s",
                                   self.json_path, e)
             elif self.item_points:
                 # Reconstruct data for unsaved polygon
@@ -3162,10 +3176,38 @@ class DeletePolygonCommand(QUndoCommand):
         except:
             pass
 
-        # 4. Refresh Manager (Sidebar)
+        # 4/5. Refresh Manager + Viewers.
+        #
+        # Undoing a BULK delete replays one command per polygon, exactly like
+        # redo() does -- so it needs the same batching escape hatch, and it did
+        # not have one. Without this, undoing a 4111-polygon "Clean Root" runs
+        # 4111 polygon-manager rebuilds AND 4111 viewer refreshes; because the
+        # clean paths no longer carry `item_points`, each of those refreshes is
+        # a full load_polygons() reload. That would make undo far slower than
+        # the delete it reverses.
+        #
+        # Under the bulk context the tab does one manager refresh and one
+        # viewer reload for the whole batch (_flush_bulk_delete_pending),
+        # which is also where the restored polygons get drawn.
+        if getattr(self.tab, '_bulk_delete_depth', 0) > 0:
+            try:
+                # NOTE the asymmetry with redo(): redo records LABELS TO REMOVE
+                # from the scene, but undo is putting polygons BACK, so reusing
+                # that same set would delete exactly what we just restored.
+                # Undo instead marks the viewer for a single full reload, which
+                # rebuilds it from the (now restored) all_polygons.
+                reload_set = self.tab._bulk_reload_viewers
+                for widget_dict in getattr(self.tab, 'viewer_widgets', []) or []:
+                    viewer = widget_dict.get('viewer')
+                    if viewer and viewer.image_data and hasattr(viewer.image_data, 'filepath'):
+                        if os.path.normpath(viewer.image_data.filepath) == os.path.normpath(self.filepath):
+                            reload_set[id(viewer)] = viewer
+            except Exception as e:
+                logging.debug(f"[UndoStack] Undo bulk bookkeeping failed: {e}")
+            return
+
         self.tab.update_polygon_manager()
-        
-        # 5. Refresh Viewers - DIRECT ADDITION (Instant)
+
         if hasattr(self.tab, 'viewer_widgets'):
             for widget_dict in self.tab.viewer_widgets:
                 viewer = widget_dict.get('viewer')
@@ -3466,20 +3508,29 @@ class ProjectTab(QtWidgets.QWidget):
         self._raw_cache_lock = threading.Lock()
 
     def undo(self):
+        # Wrapped in the bulk context because ONE undo can replay thousands of
+        # commands: undoing a "Clean Root" macro re-runs
+        # DeletePolygonCommand.undo() once per polygon. The context is what
+        # collapses that into a single manager refresh and a single viewer
+        # reload -- opening it only around the original delete is not enough,
+        # since Ctrl+Z happens long afterwards.
         if hasattr(self, 'undo_stack'):
-            self.undo_stack.undo()
+            with self._bulk_polygon_delete():
+                self.undo_stack.undo()
         else:
             logging.warning("Undo stack not initialized.")
 
     def redo(self):
         if hasattr(self, 'undo_stack'):
-            self.undo_stack.redo()
+            with self._bulk_polygon_delete():
+                self.undo_stack.redo()
         else:
              logging.warning("Undo stack not initialized.")
 
     def delete_polygon_command(self, item, image_filepath):
         """
         Entry point for ImageViewer to delete a polygon via Command.
+        Wrapped in _bulk_polygon_delete to ensure deferred scene cleanup.
         """
         label = item.name or ""
         group, json_path = self._locate_polygon_file(label, image_filepath)
@@ -3495,10 +3546,15 @@ class ProjectTab(QtWidgets.QWidget):
         # Extract geometry (backup)
         item_points = item.polygon
         
-        # Create and push command
-        cmd = DeletePolygonCommand(self, label, image_filepath, json_path, json_content, item_points, group)
-        if cmd:
-            self.undo_stack.push(cmd)
+        # Create and push command inside bulk context
+        self.undo_stack.beginMacro(f"Delete Polygon '{label}'")
+        try:
+            with self._bulk_polygon_delete():
+                cmd = DeletePolygonCommand(self, label, image_filepath, json_path, json_content, item_points, group)
+                if cmd:
+                    self.undo_stack.push(cmd)
+        finally:
+            self.undo_stack.endMacro()
 
     def delete_group_command(self, group_name):
         """
@@ -3553,20 +3609,21 @@ class ProjectTab(QtWidgets.QWidget):
         if not tasks:
             return
 
-        # Push macro
+        # Push macro with bulk context to defer scene scans and manager rebuilds
         self.undo_stack.beginMacro(f"Delete Group '{group_name}'")
         try:
-            for t in tasks:
-                 cmd = DeletePolygonCommand(
-                     project_tab=self,
-                     label=t["label"],
-                     filepath=t["filepath"],
-                     json_path=t["json_path"],
-                     json_content=t["json_content"],
-                     item_points=t["item_points"],
-                     group_name=t["group_name"]
-                 )
-                 self.undo_stack.push(cmd)
+            with self._bulk_polygon_delete():
+                for t in tasks:
+                     cmd = DeletePolygonCommand(
+                         project_tab=self,
+                         label=t["label"],
+                         filepath=t["filepath"],
+                         json_path=t["json_path"],
+                         json_content=t["json_content"],
+                         item_points=t["item_points"],
+                         group_name=t["group_name"]
+                     )
+                     self.undo_stack.push(cmd)
         except Exception as e:
             logging.error(f"[DeleteGroup] Macro failed: {e}")
         finally:
@@ -3619,18 +3676,23 @@ class ProjectTab(QtWidgets.QWidget):
 
     def _remove_polygon_from_memory(self, group, filepath, label):
         if group in self.all_polygons:
-             key_to_remove = None
-             for k in self.all_polygons[group]:
-                 if os.path.normpath(k) == os.path.normpath(filepath):
-                     key_to_remove = k
-                     break
-             if key_to_remove:
-                 self.all_polygons[group].pop(key_to_remove, None)
-                 # CRITICAL: Also remove from polygon index for O(1) lookup consistency
-                 if hasattr(self, '_remove_from_polygon_index'):
-                     self._remove_from_polygon_index(group, key_to_remove)
-                 if not self.all_polygons[group]:
-                     del self.all_polygons[group]
+            group_dict = self.all_polygons[group]
+            # Fast path: O(1) direct key lookup (covers the common case)
+            key_to_remove = filepath if filepath in group_dict else None
+            if key_to_remove is None:
+                # Slow path: normpath fallback for mismatched separators
+                fp_norm = os.path.normpath(filepath)
+                for k in group_dict:
+                    if os.path.normpath(k) == fp_norm:
+                        key_to_remove = k
+                        break
+            if key_to_remove:
+                group_dict.pop(key_to_remove, None)
+                # CRITICAL: Also remove from polygon index for O(1) lookup consistency
+                if hasattr(self, '_remove_from_polygon_index'):
+                    self._remove_from_polygon_index(group, key_to_remove)
+                if not group_dict:
+                    del self.all_polygons[group]
 
     def reload_polygons_for_file(self, filepath):
         if not self.project_folder: return
@@ -7932,6 +7994,25 @@ class ProjectTab(QtWidgets.QWidget):
 
             finally:
                 # --- 4. RESTORE STATE ---
+                # RECORD WHAT THIS LOAD WAS RESPONSIBLE FOR.
+                #
+                # update_all_polygons infers "the user deleted this polygon"
+                # from "no scene item carries its name". That inference is only
+                # valid for polygons this load actually TRIED to draw. A
+                # polygon that was filtered out (root mismatch), skipped, or
+                # simply not part of this load has no item for reasons that
+                # have nothing to do with the user -- and treating it as
+                # deleted trashes its file.
+                #
+                # That is what emptied C:\New Folder185: each refresh loaded
+                # one subset, the purge removed the other from memory, the save
+                # moved 3318 sidecars to polygons/.trash/, and the overview was
+                # rewritten from the survivors -- so the next refresh flipped
+                # which half survived.
+                try:
+                    viewer._loaded_polygon_names = set(existing_names)
+                except Exception:
+                    pass
                 t_draw = time.perf_counter() - t0
                 
                 if scene:
@@ -20013,6 +20094,147 @@ class ProjectTab(QtWidgets.QWidget):
 
         return polys
 
+    def migrate_polygon_basis(self, dry_run=True):
+        """Rescale polygons that were saved against a decimated PREVIEW basis.
+
+        Before polygon_basis_hw existed, anything drawn on a COG-backed viewer
+        was stamped with the preview size (3001x3131 on the real BCI project)
+        instead of the raster size (48031x50101). Those files are intact and
+        self-describing -- each records the `image_ref_size` it used -- so the
+        repair is exact: scale by raster/recorded, per axis.
+
+        IDEMPOTENT: a file whose recorded basis already equals the raster
+        header is left untouched, so running this twice cannot double-apply.
+
+        Returns (n_fixed, n_skipped, details).
+        """
+        import os, json, glob
+        from .shapefile_io import _raw_image_dims
+
+        polygons_dir = os.path.join(self.project_folder or "", "polygons")
+        if not os.path.isdir(polygons_dir):
+            return (0, 0, ["no polygons dir"])
+
+        known_bases = {}
+        for groups in ((getattr(self, "image_data_groups", {}) or {}),
+                       (getattr(self, "multispectral_image_data_groups", {}) or {}),
+                       (getattr(self, "thermal_rgb_image_data_groups", {}) or {})):
+            for paths in groups.values():
+                for pth in (paths or []):
+                    known_bases[os.path.splitext(os.path.basename(pth))[0]] = pth
+        if not known_bases:
+            return (0, 0, ["no images registered in this project"])
+
+        n_fixed = n_skip = 0
+        details = []
+        for path in glob.glob(os.path.join(polygons_dir, "*_polygons.json")):
+            if os.path.basename(path).startswith("_"):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception as e:
+                details.append(f"unreadable {os.path.basename(path)}: {e}")
+                continue
+
+            ref = data.get("image_ref_size") or {}
+            rw, rh = ref.get("w"), ref.get("h")
+            pts = data.get("points") or []
+            if not (rw and rh and pts):
+                n_skip += 1
+                continue
+
+            # Which image does this sidecar belong to? The filename is
+            # "<group>_<image base>_polygons.json", so match the longest known
+            # image base that the stem ends with -- group names contain
+            # underscores too, which is why this cannot just split on "_".
+            stem = os.path.basename(path)[:-len("_polygons.json")]
+            fp = None
+            for base, cand in sorted(known_bases.items(),
+                                     key=lambda kv: -len(kv[0])):
+                if stem.endswith(base):
+                    fp = cand
+                    break
+            true_h, true_w = _raw_image_dims(fp) if fp else (None, None)
+            if not (true_h and true_w):
+                n_skip += 1
+                continue
+
+            # Already on the raster basis (within rounding) -> nothing to do.
+            if abs(float(rw) - true_w) <= 1.0 and abs(float(rh) - true_h) <= 1.0:
+                n_skip += 1
+                continue
+
+            sx = true_w / float(rw)
+            sy = true_h / float(rh)
+            if dry_run:
+                details.append(f"{os.path.basename(path)}: {rw}x{rh} -> "
+                               f"{true_w}x{true_h} (x{sx:.3f}, x{sy:.3f})")
+                n_fixed += 1
+                continue
+
+            data["points"] = [[float(x) * sx, float(y) * sy] for x, y in pts]
+            data["image_ref_size"] = {"w": int(true_w), "h": int(true_h)}
+            data.pop("lod", None)          # pyramids were built on the old basis
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, path)
+            n_fixed += 1
+
+        logging.info("[migrate_polygon_basis] %s: %d rescaled, %d already correct",
+                     "DRY RUN" if dry_run else "APPLIED", n_fixed, n_skip)
+        return (n_fixed, n_skip, details)
+
+    def polygon_basis_hw(self, viewer, image_data=None):
+        """(H, W) that polygon coordinates are expressed in. ONE authority.
+
+        This must be the FULL-RESOLUTION raster, never what the viewer happens
+        to be displaying.
+
+        For a COG, `image_data.image` is a decimated PREVIEW -- on the real BCI
+        project, 3001x3131 for a 48031x50101 raster, a ~16x factor. Everything
+        that stamped `image_ref_size` from the viewer image therefore wrote
+        polygons in preview pixels, while shapefile import (which probes the
+        file header) wrote them in raster pixels. Two incompatible bases in one
+        project, which produced all of:
+
+          * newly drawn polygons "disappearing" -- rescaled by ~16 on load and
+            landing far outside the image,
+          * a dragged polygon snapping back -- the preview LEVEL changes with
+            zoom, so the same polygon got re-encoded against a different basis
+            than it was read with,
+          * drawn and imported polygons never lining up.
+
+        The header is the same authority shapefile import uses
+        (shapefile_io._raw_image_dims, cached), so the two agree by
+        construction.
+        """
+        if image_data is None:
+            image_data = getattr(viewer, "image_data", None)
+        fp = getattr(image_data, "filepath", None)
+
+        if fp:
+            try:
+                from .shapefile_io import _raw_image_dims
+                h, w = _raw_image_dims(fp)
+                if h and w:
+                    return int(h), int(w)
+            except Exception:
+                pass
+
+        # No file to probe (unsaved/synthetic image): the in-memory array IS
+        # the full resolution, so the old behaviour is correct here.
+        try:
+            img = getattr(image_data, "image", None)
+            if img is not None and hasattr(img, "shape"):
+                h, w = img.shape[:2]
+                if h and w:
+                    return int(h), int(w)
+        except Exception:
+            pass
+        return (0, 0)
+
     def scene_to_image_coords(self, viewer, scene_point):
         """
         Map scene -> image pixels using the pixmap item’s own transform.
@@ -20022,7 +20244,12 @@ class ProjectTab(QtWidgets.QWidget):
             return scene_point
 
         pixitem = viewer._image
-        img_h, img_w = viewer.image_data.image.shape[:2]
+        # FULL-RESOLUTION basis -- see polygon_basis_hw. Using
+        # viewer.image_data.image.shape here meant a COG's decimated preview
+        # defined the coordinate space that polygons were saved in.
+        img_h, img_w = self.polygon_basis_hw(viewer)
+        if not (img_h and img_w):
+            img_h, img_w = viewer.image_data.image.shape[:2]
         pixmap = pixitem.pixmap()
         pw, ph = max(1, pixmap.width()), max(1, pixmap.height())
 
@@ -20040,7 +20267,12 @@ class ProjectTab(QtWidgets.QWidget):
             return image_point
 
         pixitem = viewer._image
-        img_h, img_w = viewer.image_data.image.shape[:2]
+        # FULL-RESOLUTION basis -- see polygon_basis_hw. Using
+        # viewer.image_data.image.shape here meant a COG's decimated preview
+        # defined the coordinate space that polygons were saved in.
+        img_h, img_w = self.polygon_basis_hw(viewer)
+        if not (img_h and img_w):
+            img_h, img_w = viewer.image_data.image.shape[:2]
         pixmap = pixitem.pixmap()
         pw, ph = max(1, pixmap.width()), max(1, pixmap.height())
 
@@ -20269,11 +20501,13 @@ class ProjectTab(QtWidgets.QWidget):
             # This ensures consistency with scene_to_image_coords which uses viewer.image_data.image.shape.
             # Using _effective_hw_for_file() first caused coordinate mismatch after reset/refresh
             # because it could return stale cached values or simulate from deleted .ax files.
+            # The basis polygons are stored in. MUST match what
+            # scene_to_image_coords maps into, and what shapefile import
+            # stamps -- see polygon_basis_hw for what went wrong when this
+            # read the (decimated) viewer image instead.
             eff_h, eff_w = (0, 0)
             try:
-                img = getattr(image_data, "image", None)
-                if img is not None and hasattr(img, "shape"):
-                    eff_h, eff_w = img.shape[:2]
+                eff_h, eff_w = self.polygon_basis_hw(viewer, image_data)
             except Exception:
                 pass
             if not (eff_h and eff_w):
@@ -20330,7 +20564,19 @@ class ProjectTab(QtWidgets.QWidget):
                         groups_with_this_file.add((gn, orig_fp))
                 
                 # Now only process the groups that actually have this file
+                # Only polygons this viewer's last load actually drew may be
+                # inferred as user-deleted. See the matching comment in
+                # load_polygons: without this, anything the load filtered out
+                # or never attempted is destroyed on the next save.
+                loadable = getattr(viewer, "_loaded_polygon_names", None)
+
                 for group_name, stored_fp in groups_with_this_file:
+                    # No record at all -> we cannot tell a deletion from a
+                    # polygon that was simply never loaded, and guessing wrong
+                    # destroys the file. Refuse. A stale polygon reappearing is
+                    # a nuisance; 3318 trashed sidecars is not.
+                    if loadable is None or group_name not in loadable:
+                        continue        # never drawn by this load -> not a deletion
                     if group_name not in present_names:
                         # This polygon was deleted from viewer - remove from memory
                         try:
@@ -20664,6 +20910,10 @@ class ProjectTab(QtWidgets.QWidget):
         self._bulk_delete_depth = getattr(self, '_bulk_delete_depth', 0) + 1
         if not hasattr(self, '_bulk_delete_pending'):
             self._bulk_delete_pending = {}  # id(viewer) -> [viewer, set(labels)]
+        if not hasattr(self, '_bulk_reload_viewers'):
+            #: id(viewer) -> viewer, for UNDO (which restores rather than
+            #: removes, so it cannot share the label-removal set above).
+            self._bulk_reload_viewers = {}
         try:
             yield
         finally:
@@ -20677,19 +20927,34 @@ class ProjectTab(QtWidgets.QWidget):
         block: ONE scan of each touched viewer's scene (removing every
         pending label in that single pass, rather than one scan per label),
         ONE viewport repaint per touched viewer, and ONE polygon-manager
-        refresh for the entire batch."""
+        refresh for the entire batch.
+
+        Scene indexing is temporarily switched to NoIndex during item
+        removal to avoid per-item BSP tree rebalancing overhead."""
+        from PyQt5 import QtWidgets as _QtW
+
         pending = getattr(self, '_bulk_delete_pending', None) or {}
         for viewer, labels in pending.values():
             if not labels:
                 continue
             try:
+                sc = viewer._scene
                 items_to_remove = []
-                for it in list(viewer._scene.items()):
+                for it in list(sc.items()):
                     nm = (getattr(it, 'name', '') or '').strip()
                     if nm in labels:
                         items_to_remove.append(it)
-                for it in items_to_remove:
-                    viewer._scene.removeItem(it)
+
+                # Batch-remove with indexing disabled to avoid per-item
+                # BSP tree rebalancing (O(N log N) -> O(N))
+                if items_to_remove:
+                    old_idx = sc.itemIndexMethod()
+                    sc.setItemIndexMethod(_QtW.QGraphicsScene.NoIndex)
+                    try:
+                        for it in items_to_remove:
+                            sc.removeItem(it)
+                    finally:
+                        sc.setItemIndexMethod(old_idx)
 
                 if hasattr(viewer, 'polygons'):
                     viewer.polygons = [p for p in viewer.polygons
@@ -20702,6 +20967,43 @@ class ProjectTab(QtWidgets.QWidget):
                 logging.error(f"[UndoStack] Bulk-delete flush failed for a viewer: {e}")
 
         self._bulk_delete_pending = {}
+
+        # UNDO side: viewers marked for a full reload because polygons were put
+        # BACK. One reload per viewer for the whole macro, instead of one
+        # load_polygons() per restored polygon.
+        reloads = getattr(self, '_bulk_reload_viewers', None) or {}
+        if reloads:
+            # The records undo just put back are bare LazyPolygonRecords with no
+            # `display_points`, so drawing them would materialise every one --
+            # the per-file read cost we just avoided, moved into the repaint.
+            # Re-read the coarse overview ONCE (~0.1 s for thousands of
+            # polygons) so the restored records come back display-ready.
+            try:
+                fresh = self._load_polygons_from_dir()
+                for gname, fmap in (fresh or {}).items():
+                    cur = self.all_polygons.get(gname)
+                    if not isinstance(cur, dict):
+                        continue
+                    for fp, rec in fmap.items():
+                        existing = cur.get(fp)
+                        if isinstance(existing, polygon_lod.LazyPolygonRecord) \
+                                and not existing.is_materialised \
+                                and not dict.get(existing, 'display_points'):
+                            cur[fp] = rec
+            except Exception as e:
+                logging.debug(f"[UndoStack] overview refresh after undo failed: {e}")
+
+        for viewer in reloads.values():
+            try:
+                idata = getattr(viewer, 'image_data', None)
+                if idata is not None and hasattr(self, 'load_polygons'):
+                    ax = getattr(idata, '_ax_cfg', None) or getattr(idata, 'ax_cfg', None)
+                    self.load_polygons(viewer, idata, ax_cfg=ax)
+                    if hasattr(viewer, 'viewport'):
+                        viewer.viewport().update()
+            except Exception as e:
+                logging.error(f"[UndoStack] Bulk-undo viewer reload failed: {e}")
+        self._bulk_reload_viewers = {}
 
         try:
             self.update_polygon_manager()
@@ -25555,34 +25857,18 @@ class ProjectTab(QtWidgets.QWidget):
                          base_fn = os.path.splitext(os.path.basename(key_found))[0]
                          json_path = os.path.join(polygons_dir, f"{g}_{base_fn}_polygons.json")
 
-                         # Read the sidecar FIRST: it is everything undo needs.
-                         # Only when there is no file do we fall back to the
-                         # in-memory geometry -- which for a lazily loaded
-                         # polygon means paging its full coordinates in, so
-                         # doing it unconditionally read every polygon file
-                         # TWICE (once here, once via `points`).
-                         json_content = None
-                         if os.path.exists(json_path):
-                             try:
-                                 with open(json_path, 'r', encoding='utf-8') as f:
-                                     json_content = f.read()
-                             except Exception:
-                                 pass
-
-                         qpoly = None
-                         if json_content is None:
-                             points = poly_data.get("points", [])
-                             if not points:
-                                 continue
-                             qpoly = QtGui.QPolygonF([QtCore.QPointF(x, y) for x, y in points])
-
+                         # Do not read the sidecar (or `points`) here -- redo()
+                         # snapshots for undo with a trash rename instead. See
+                         # the matching comment in clean_all_polygons: reading
+                         # per polygon costs ~28 ms each on Windows and is what
+                         # made cleaning a large root take minutes.
                          cmd = DeletePolygonCommand(
                              project_tab=self,
                              label=dict.get(poly_data, "name", g),
                              filepath=key_found,
                              json_path=json_path,
-                             json_content=json_content,
-                             item_points=qpoly,
+                             json_content=None,
+                             item_points=None,
                              group_name=g
                          )
                          self.undo_stack.push(cmd)
@@ -25660,35 +25946,29 @@ class ProjectTab(QtWidgets.QWidget):
                         base_fn = os.path.splitext(os.path.basename(key))[0]
                         json_path = os.path.join(polygons_dir, f"{g}_{base_fn}_polygons.json")
 
-                        # Sidecar first -- see the matching comment in the
-                        # per-viewer clean above. Reading `points` up front
-                        # materialises every lazily loaded polygon, doubling
-                        # the file reads this operation performs.
-                        json_content = None
-                        if os.path.exists(json_path):
-                            try:
-                                with open(json_path, 'r', encoding='utf-8') as f:
-                                    json_content = f.read()
-                            except Exception:
-                                pass
-
-                        qpoly = None
-                        if json_content is None:
-                            points = poly_data.get("points", [])
-                            if not points:
-                                continue
-                            try:
-                                qpoly = QtGui.QPolygonF([QtCore.QPointF(x, y) for x, y in points])
-                            except TypeError:
-                                continue    # malformed points
-
+                        # Do NOT read the sidecar here.
+                        #
+                        # redo() captures it for undo by MOVING it into
+                        # polygons/.trash/ -- a metadata rename (~0.6 ms) that
+                        # preserves the exact bytes. Reading it here instead
+                        # costs a full open per polygon, which on Windows (AV
+                        # scan on open) measured ~28 ms each: for the 4111
+                        # sidecars in a real project that is ~115 s of pure
+                        # file-open time, before anything is deleted.
+                        #
+                        # Passing json_content=None is what arms that fast path
+                        # (see DeletePolygonCommand.__init__).
+                        #
+                        # `points` is likewise NOT touched -- on a lazily loaded
+                        # polygon it would materialise the record, re-reading
+                        # the very file we are avoiding.
                         cmd = DeletePolygonCommand(
                             project_tab=self,
                             label=dict.get(poly_data, "name", g),
                             filepath=key,
                             json_path=json_path,
-                            json_content=json_content,
-                            item_points=qpoly,
+                            json_content=None,
+                            item_points=None,
                             group_name=g
                         )
                         self.undo_stack.push(cmd)
@@ -26672,6 +26952,7 @@ class ProjectTab(QtWidgets.QWidget):
         if entries:
             result = {}
             n_lazy = 0
+            covered = set()
             for e in entries:
                 group = e.get('g')
                 fp = e.get('f')
@@ -26681,6 +26962,7 @@ class ProjectTab(QtWidgets.QWidget):
                 src = os.path.join(polygons_dir, f"{group}_{base}_polygons.json")
                 if not os.path.exists(src):
                     continue        # file deleted since the overview was written
+                covered.add(os.path.basename(src))
                 result.setdefault(group, {})[fp] = polygon_lod.LazyPolygonRecord({
                     'name': e.get('n', group),
                     'group': group,
@@ -26693,10 +26975,32 @@ class ProjectTab(QtWidgets.QWidget):
                     'full_point_count': e.get('np', 0),
                 }, src)
                 n_lazy += 1
-            # An overview that has drifted far from the directory (mass delete
-            # or import since it was written) is not trustworthy; fall through
-            # and rebuild it from the files.
-            if n_lazy and abs(n_lazy - len(fnames)) <= max(1, len(fnames) // 20):
+            # THE OVERVIEW IS A CACHE, NOT A FILTER.
+            #
+            # This used to return `result` whenever the entry count was within
+            # 5% of the file count -- so a sidecar the overview did not list
+            # was simply never read. Draw a polygon into a project holding 6191
+            # imported ones and its file is written correctly, but the next
+            # refresh loads only what the overview knows: the drawn polygon
+            # DISAPPEARS while every imported one comes back. Silent, and it
+            # took up to ~309 new polygons before the tolerance noticed.
+            #
+            # Any sidecar the overview does not cover is now read directly.
+            # That is self-healing (cost is proportional to what is missing,
+            # not to the directory size) and removes the tolerance heuristic
+            # from the correctness path entirely -- it now only decides whether
+            # patching or a full rebuild is CHEAPER, never what gets loaded.
+            missing = [f for f in fnames if f not in covered]
+            if n_lazy and len(missing) <= max(1, len(fnames) // 5):
+                if missing:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
+                        for item in ex.map(_read, missing):
+                            if item:
+                                m_group, m_fp, m_data = item
+                                result.setdefault(m_group, {})[m_fp] = m_data
+                    logging.info("[load_polygons_from_dir] overview missed %d "
+                                 "sidecar(s) (newly drawn?); read them directly",
+                                 len(missing))
                 logging.info("[load_polygons_from_dir] overview: %d group(s) "
                              "lazily in %.3fs (level %s)",
                              len(result), time.perf_counter() - t0, level)

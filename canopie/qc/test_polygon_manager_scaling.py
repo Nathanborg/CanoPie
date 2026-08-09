@@ -182,19 +182,58 @@ def test_clean_paths_use_the_bulk_delete_context(fn_name):
 
 
 @pytest.mark.parametrize("fn_name", ["clean_all_polygons", "delete_polygons_for_viewer"])
-def test_clean_paths_prefer_the_sidecar_over_paging_in_geometry(fn_name):
-    """THE double-read. Undo only needs the sidecar; reading `points` first
-    materialises every lazily loaded polygon, so each file was read twice."""
+def test_clean_paths_do_not_read_any_polygon_file(fn_name):
+    """THE clean-root cost, at the mechanism level.
+
+    An earlier revision of this test asserted the OPPOSITE -- that these paths
+    must read the sidecar (`f.read()`) to snapshot it for undo. That was the
+    slow design: reading costs a full file open per polygon, ~28 ms each under
+    Windows AV scanning, i.e. ~115 s for the 4111 sidecars in a real project,
+    all before a single file is deleted.
+
+    Reading is also unnecessary. `DeletePolygonCommand.redo()` snapshots by
+    MOVING the sidecar into polygons/.trash/ -- a metadata rename that
+    preserves the exact bytes -- but that path only arms when `json_content`
+    is None. So these callers must hand over NEITHER the content nor `points`
+    (which, on a lazily loaded polygon, would materialise the record and
+    re-read the very file being avoided).
+    """
     from ..project_tab import ProjectTab
 
     fn = getattr(ProjectTab, fn_name, None)
     if fn is None:
         pytest.skip(f"{fn_name} not present in this build")
     src = textwrap.dedent(inspect.getsource(fn))
-    read_at = src.find("f.read()")
-    points_at = src.find('poly_data.get("points"')
-    assert read_at != -1, f"{fn_name} no longer snapshots the sidecar for undo"
-    if points_at != -1:
-        assert read_at < points_at, (
-            f"{fn_name} reads `points` before the sidecar, materialising every "
-            "lazily loaded polygon and reading each file twice")
+
+    assert "f.read()" not in src, (
+        f"{fn_name} reads every polygon sidecar to snapshot it for undo. That "
+        "is ~28 ms per file on Windows (~115 s for 4111 polygons) and is "
+        "redundant -- redo() preserves the file by renaming it into .trash")
+    assert 'poly_data.get("points"' not in src, (
+        f"{fn_name} touches `points`, which materialises every lazily loaded "
+        "polygon and re-reads the file the rename exists to avoid")
+    assert "json_content=None" in src, (
+        f"{fn_name} must pass json_content=None so redo()'s trash-rename fast "
+        "path arms (see DeletePolygonCommand.__init__)")
+
+
+def test_undo_batches_under_the_bulk_context():
+    """Undo replays one command per polygon, exactly as redo does, so it needs
+    the same escape hatch.
+
+    Without it, undoing a 4111-polygon "Clean Root" runs 4111 polygon-manager
+    rebuilds AND 4111 viewer refreshes -- and because the clean paths no longer
+    carry `item_points`, each refresh is a full load_polygons() reload. Undo
+    would then be far slower than the delete it reverses.
+    """
+    from ..project_tab import DeletePolygonCommand
+
+    src = textwrap.dedent(inspect.getsource(DeletePolygonCommand.undo))
+    assert "_bulk_delete_depth" in src, (
+        "DeletePolygonCommand.undo has no bulk-batching guard, so undoing a "
+        "large delete does one manager rebuild and one viewer reload per "
+        "polygon")
+    assert "_bulk_reload_viewers" in src, (
+        "undo must record viewers for a RELOAD, not reuse redo's "
+        "label-removal set -- that set removes items, which would delete "
+        "exactly the polygons undo just restored")

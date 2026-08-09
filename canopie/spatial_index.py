@@ -121,6 +121,65 @@ class SpatialIndexManager:
         # shares one CRS, so this is built at most once per import -- see the
         # comment there for why that matters so much.
         self._wgs84_transformer_cache: Dict[Any, Any] = {}
+        self.project_bbox_wgs84: Optional[Tuple[float, float, float, float]] = None
+
+    def prepare_bbox_filter(self, shapefile_crs) -> bool:
+        """Project the whole-project extent into the SHAPEFILE's CRS, once.
+
+        This is what makes the per-feature pre-filter both correct and cheap.
+        A shapefile record's bbox is in the shapefile's own coordinates (UTM
+        metres, say 620000) while the project extent is WGS84 degrees (-79.8);
+        comparing them directly matches nothing. Rather than reproject every
+        feature's bbox into WGS84 (4 points per feature), reproject the single
+        project bbox into the feature CRS once and then compare raw numbers.
+
+        Returns True if a usable filter was built. When it returns False the
+        caller must NOT filter -- see `bbox_outside_project`.
+        """
+        self._filter_bbox = None
+        if not self.project_bbox_wgs84:
+            return False
+        if shapefile_crs is None:
+            # No .prj: coordinates are in an unknown system, so any comparison
+            # would be a guess. Import everything rather than risk dropping it.
+            return False
+        try:
+            import pyproj
+            src = pyproj.CRS.from_user_input(shapefile_crs)
+            if src.to_epsg() == 4326:
+                self._filter_bbox = self.project_bbox_wgs84
+            else:
+                t = pyproj.Transformer.from_crs("EPSG:4326", src, always_xy=True)
+                min_lon, min_lat, max_lon, max_lat = self.project_bbox_wgs84
+                self._filter_bbox = t.transform_bounds(min_lon, min_lat, max_lon, max_lat)
+            if not all(np.isfinite(v) for v in self._filter_bbox):
+                self._filter_bbox = None
+                return False
+        except Exception as e:
+            logging.debug("bbox pre-filter unavailable: %s", e)
+            self._filter_bbox = None
+            return False
+        return True
+
+    def bbox_outside_project(self, bbox) -> bool:
+        """True only when `bbox` provably cannot touch any project image.
+
+        Fails OPEN: with no prepared filter, or a malformed bbox, this returns
+        False so the caller keeps the feature. Dropping data must require
+        positive evidence, never a missing precondition -- the earlier version
+        returned "no intersection" when the project extent was unknown, which
+        would have silently discarded every feature.
+        """
+        fb = getattr(self, '_filter_bbox', None)
+        if not fb or not bbox or len(bbox) < 4:
+            return False
+        try:
+            b_min_x, b_min_y, b_max_x, b_max_y = (float(v) for v in bbox[:4])
+        except (TypeError, ValueError):
+            return False
+        min_x, min_y, max_x, max_y = fb
+        return (b_max_x < min_x or b_min_x > max_x or
+                b_max_y < min_y or b_min_y > max_y)
 
     @staticmethod
     def _crs_cache_key(shapefile_crs) -> Any:
@@ -177,6 +236,7 @@ class SpatialIndexManager:
         self.image_records.clear()
         self.footprint_polygons.clear()
         self.kd_coordinates.clear()
+        self.project_bbox_wgs84 = None
 
         for rec in image_records:
             fp_path = rec['filepath']
@@ -216,6 +276,11 @@ class SpatialIndexManager:
 
         # Build Tier 1 STRtree
         if self.footprint_polygons:
+            min_lon = min(p.bounds[0] for p in self.footprint_polygons)
+            min_lat = min(p.bounds[1] for p in self.footprint_polygons)
+            max_lon = max(p.bounds[2] for p in self.footprint_polygons)
+            max_lat = max(p.bounds[3] for p in self.footprint_polygons)
+            self.project_bbox_wgs84 = (min_lon, min_lat, max_lon, max_lat)
             self.str_tree = STRtree(self.footprint_polygons)
 
         # Build Tier 2 KDTree
@@ -240,7 +305,8 @@ class SpatialIndexManager:
         poly_geom_or_coords: Union[Polygon, Point, List[Tuple[float, float]], Any],
         shapefile_crs: Any = None,
         min_overlap_ratio: float = 0.01,
-        match_all_overlapping: bool = False
+        match_all_overlapping: bool = False,
+        allow_fallback: bool = False
     ) -> List[Tuple[str, float, str]]:
         """
         Independently matches a single vector feature geometry to target image(s).
@@ -283,14 +349,22 @@ class SpatialIndexManager:
             candidate_indices = self.str_tree.query(geom_wgs84)
             if hasattr(candidate_indices, '__len__') and len(candidate_indices) > 0:
                 poly_area = geom_wgs84.area
+                g_b = geom_wgs84.bounds
                 for idx in candidate_indices:
                     footprint = self.footprint_polygons[idx]
+                    fp_b = footprint.bounds
+                    if g_b[2] < fp_b[0] or g_b[0] > fp_b[2] or g_b[3] < fp_b[1] or g_b[1] > fp_b[3]:
+                        continue
                     try:
-                        inter = geom_wgs84.intersection(footprint)
-                        inter_area = inter.area
-                        ioa = (inter_area / poly_area) if poly_area > 0 else (1.0 if not inter.is_empty else 0.0)
-                        if ioa >= min_overlap_ratio:
-                            matches.append((self.image_records[idx]['filepath'], ioa, "footprint_overlap"))
+                        if min_overlap_ratio <= 0.0:
+                            if footprint.intersects(geom_wgs84) or geom_wgs84.intersects(footprint):
+                                matches.append((self.image_records[idx]['filepath'], 1.0, "footprint_overlap"))
+                        elif footprint.intersects(geom_wgs84) or geom_wgs84.intersects(footprint):
+                            inter = geom_wgs84.intersection(footprint)
+                            inter_area = inter.area
+                            ioa = (inter_area / poly_area) if poly_area > 0 else (1.0 if not inter.is_empty else 0.0)
+                            if ioa >= min_overlap_ratio:
+                                matches.append((self.image_records[idx]['filepath'], ioa, "footprint_overlap"))
                     except Exception:
                         pass
 
@@ -307,7 +381,7 @@ class SpatialIndexManager:
                     matches.append((closest_rec['filepath'], dist_meters, "kdtree_distance"))
 
         # Default fallback to first image
-        if not matches and self.image_records:
+        if not matches and allow_fallback and self.image_records:
             matches.append((self.image_records[0]['filepath'], 0.0, "fallback_first"))
 
         if match_all_overlapping and len(matches) > 1:

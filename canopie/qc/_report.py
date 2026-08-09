@@ -119,6 +119,9 @@ FEATURE_MAP = {
     "test_project_polygons_external": (
         "project.json does not duplicate polygons",
         "polygons/ dir is the single source of truth: 360x faster saves, no resurrected deletes"),
+    "test_shapefile_import_worker": (
+        "Shapefile import, end to end",
+        "the worker actually runs; bbox pre-filter is CRS-correct and fails open; skips are counted"),
     "test_shapefile_import_perf": (
         "Shapefile import speed + progress bar",
         "the CRS transformer is built once per file, not per feature; progress moves per feature"),
@@ -146,6 +149,15 @@ FEATURE_MAP = {
     "test_image_viewer_ui": (
         "Viewer overlay toggle",
         "global overlays_muted flag, bars hide while drawing"),
+    "test_label_defaults_and_mapping": (
+        "Label defaults + image->scene mapping",
+        "labels OFF by default (3-5x zoomed-in paint, culling not defeated); mapping bit-identical to Qt incl. rotation"),
+    "test_polygon_coordinate_basis": (
+        "Polygon coordinate basis (COG preview vs raster)",
+        "image_ref_size is always the full raster, stable across preview levels; migration rescales and is idempotent"),
+    "test_polygon_batch_layer": (
+        "Tiled batch rendering above ~800 polygons",
+        "items hidden not removed (no autosave purge), tight cullable tile rects, lazy LOD levels, 11x faster zoomed out"),
     "test_polygon_manager_advanced": (
         "PolygonManager advanced operations",
         "nearest-image search, copy/move between roots, multispectral->thermal correction"),

@@ -388,3 +388,77 @@ def test_load_polygons_restores_the_scene_index_after_a_large_batch(
         for g in groups:
             synthetic_project.all_polygons.pop(g, None)
         synthetic_project._poly_norm_index_invalid = True
+
+
+# ---------------------------------------------------------------------------
+# Import draws DECIMATED geometry but must persist the EXACT coordinates
+# ---------------------------------------------------------------------------
+def test_import_draws_decimated_geometry_but_saves_exact(
+        synthetic_project, viewer_factory, monkeypatch):
+    """The import live-draw pass builds one QPointF per vertex, and the BCI
+    crown map carries 2,147,273 of them -- 3.22 s of pure object construction.
+
+    Drawing the same pyramid level the project-open path already uses keeps
+    7.5% of the vertices on real crown geometry and cuts that to 0.91 s. The
+    invariant that makes it safe: the DISPLAYED outline may be coarse, but
+    all_polygons must still hold the exact coordinates (they are what gets
+    saved, exported and measured), and the item must be flagged is_lod so the
+    first drag upgrades it before any edit can be written back.
+    """
+    import numpy as np
+    from ..polygon_manager import PolygonManager
+    from .. import polygon_lod
+    from .fixtures_manifest import fixture_image_path
+
+    found = synthetic_project.findChildren(PolygonManager)
+    if not found:
+        pytest.skip("no PolygonManager instance attached to this ProjectTab build")
+    pm = found[0]
+
+    fp = fixture_image_path("rgb_8bit_untiled")
+    viewer = viewer_factory()
+    imgd = synthetic_project._imagedata_or_fallback(fp)
+    viewer.image_data = imgd
+    pixmap = synthetic_project.convert_cv_to_pixmap(imgd.image)
+    viewer.set_image(pixmap)
+    monkeypatch.setattr(pm, "_iter_viewers",
+                        lambda: [({"image_data": imgd}, viewer)])
+    monkeypatch.setattr(QtWidgets.QMessageBox, "information", lambda *a, **k: None)
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *a, **k: None)
+
+    class _Progress:
+        def close(self):
+            pass
+
+    # A dense smooth ring, like a real crown outline: many vertices far closer
+    # together than the level-4 (16 px) tolerance.
+    n = 900
+    a = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    exact = [(float(32 + 28 * np.cos(t)), float(32 + 28 * np.sin(t))) for t in a]
+    assert n >= polygon_lod.MIN_POINTS_FOR_LOD
+
+    imported_data = {
+        "crown_lod": {fp: {'name': 'crown_lod', 'points': exact,
+                           'image_ref_size': {'w': 64, 'h': 64}, 'root': ''}},
+    }
+    try:
+        pm._on_shapefile_import_finished(imported_data, [], _Progress())
+
+        rec = synthetic_project.all_polygons["crown_lod"][fp]
+        assert rec['points'] == exact, (
+            "import stored the DECIMATED outline -- the exact coordinates must "
+            "survive, they are what gets saved and measured")
+
+        items = [p for p in viewer.polygons if p.get('name') == 'crown_lod']
+        assert items, "the imported polygon was never drawn"
+        item = items[0]['item']
+        assert len(item.polygon) < n, (
+            f"display geometry was not decimated ({len(item.polygon)} of {n} "
+            f"vertices) -- the import draw loop is still building every point")
+        assert item.is_lod_geometry is True, (
+            "a decimated item MUST be flagged is_lod, otherwise a drag would "
+            "edit the coarse outline and update_all_polygons would write it "
+            "back over the real one")
+    finally:
+        synthetic_project.all_polygons.pop("crown_lod", None)
+        synthetic_project._poly_norm_index_invalid = True
