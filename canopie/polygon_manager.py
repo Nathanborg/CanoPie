@@ -72,16 +72,17 @@ class ShapefileImportWorker(QtCore.QObject):
     Parses .shp/.dbf/.prj binary structures, reprojects geometries, and matches
     features to target images via spatial indexing.
     """
-    progress = QtCore.pyqtSignal(int, str)
+    progress = QtCore.pyqtSignal(int, int, int, str)
     finished = QtCore.pyqtSignal(dict, list)  # (imported_all_polygons, warnings_list)
     error = QtCore.pyqtSignal(str)
 
-    def __init__(self, file_paths, project_folder, target_images_info, default_group="Imported_Polygons"):
+    def __init__(self, file_paths, project_folder, target_images_info, default_group="Imported_Polygons", import_options=None):
         super(ShapefileImportWorker, self).__init__()
         self.file_paths = file_paths
         self.project_folder = project_folder
         self.target_images_info = target_images_info
         self.default_group = default_group
+        self.import_options = import_options or {}
         self._is_cancelled = False
 
     def cancel(self):
@@ -97,7 +98,8 @@ class ShapefileImportWorker(QtCore.QObject):
                 resolve_feature_identity,
                 decompose_shapefile_features,
                 get_geotiff_transform,
-                _raw_image_dims
+                _raw_image_dims,
+                simplify_polygon_points
             )
             from .spatial_index import SpatialIndexManager
 
@@ -111,6 +113,9 @@ class ShapefileImportWorker(QtCore.QObject):
             warnings_list = []
             assigned_keys = set()
             total_files = len(self.file_paths)
+            
+            processed_count = 0
+            error_count = 0
 
             # Features can legitimately be discarded (a shapefile often covers
             # far more ground than the project). Counting them is what keeps
@@ -125,7 +130,7 @@ class ShapefileImportWorker(QtCore.QObject):
                     break
 
                 pct = int((f_idx - 1) / float(max(total_files, 1)) * 100)
-                self.progress.emit(pct, f"Reading {os.path.basename(shp_path)} ({f_idx}/{total_files})...")
+                self.progress.emit(pct, processed_count, error_count, f"Reading {os.path.basename(shp_path)} ({f_idx}/{total_files})...")
 
                 stem = os.path.splitext(os.path.basename(shp_path))[0]
                 prj_file = os.path.splitext(shp_path)[0] + ".prj"
@@ -200,6 +205,7 @@ class ShapefileImportWorker(QtCore.QObject):
                     if feat_idx % step == 0 or feat_idx == n_feats:
                         self.progress.emit(
                             int(file_base + file_span * (feat_idx / float(max(n_feats, 1)))),
+                            processed_count, error_count,
                             f"{os.path.basename(shp_path)}: feature {feat_idx}/{n_feats}"
                             + (f" (file {f_idx}/{total_files})" if total_files > 1 else ""))
 
@@ -223,7 +229,10 @@ class ShapefileImportWorker(QtCore.QObject):
                         props=props,
                         feat_idx=feat_idx,
                         shp_stem=stem,
-                        existing_keys=assigned_keys
+                        existing_keys=assigned_keys,
+                        name_field=self.import_options.get('name_field'),
+                        group_field=self.import_options.get('group_field'),
+                        selected_properties=self.import_options.get('selected_properties')
                     )
                     entry_key = identity['entry_key']
                     assigned_keys.add(entry_key)
@@ -278,6 +287,10 @@ class ShapefileImportWorker(QtCore.QObject):
                             ref_size=ref_size
                         )
 
+                        simplify_tol = self.import_options.get('simplify_tolerance')
+                        if simplify_tol is not None:
+                            stored_points = simplify_polygon_points(stored_points, simplify_tol)
+
                         if type_val == 'polygon' and len(stored_points) > 2:
                             if (abs(stored_points[0][0] - stored_points[-1][0]) < 1e-4 and
                                 abs(stored_points[0][1] - stored_points[-1][1]) < 1e-4):
@@ -331,7 +344,7 @@ class ShapefileImportWorker(QtCore.QObject):
                              total_skipped, "; ".join(parts))
 
             if not self._is_cancelled:
-                self.progress.emit(100, "Import complete.")
+                self.progress.emit(100, processed_count, error_count, "Import complete.")
                 self.finished.emit(imported_all_polygons, warnings_list)
 
         except Exception as e:
@@ -2714,6 +2727,15 @@ class PolygonManager(QtWidgets.QDialog):
         if not file_paths:
             return
 
+        from .shapefile_import_dialog import inspect_shapefile_schema, ShapefileImportDialog, ShapefileImportProgressDialog
+        fields = inspect_shapefile_schema(file_paths)
+        import_options = {}
+        if fields:
+            dialog = ShapefileImportDialog(fields, parent=self)
+            if dialog.exec_() != QtWidgets.QDialog.Accepted:
+                return
+            import_options = dialog.get_options()
+
         # Gather target image filepaths and metadata across active viewers and roots
         target_images_info = []
         seen_fps = set()
@@ -2754,15 +2776,23 @@ class PolygonManager(QtWidgets.QDialog):
                 return
             seen_fps.add(norm_fp)
 
+            # The basis imported polygons are stamped with MUST be the same one
+            # ProjectTab.polygon_basis_hw resolves -- the raw raster header --
+            # or imported and drawn polygons end up in different coordinate
+            # spaces in the same project.
+            #
+            # This used to try `parent._size_after_ax_fast_from_file` first, to
+            # get a POST-.ax (post-crop/resize) size. That call has never run:
+            # `_size_after_ax_fast_from_file` is a nested function inside two
+            # other methods, never a method on ProjectTab, so the hasattr guard
+            # is always False and it silently fell through to the raw header.
+            # The right basis happened by accident. Making it explicit, because
+            # promoting that helper to a real method would otherwise silently
+            # start stamping a different basis than every other writer.
             ref_size = {}
-            if hasattr(parent, '_size_after_ax_fast_from_file'):
-                h, w = parent._size_after_ax_fast_from_file(norm_fp)
-                if h and w:
-                    ref_size = {'w': int(w), 'h': int(h)}
-            if not ref_size:
-                raw_h, raw_w = _raw_image_dims(norm_fp)
-                if raw_w and raw_h:
-                    ref_size = {'w': int(raw_w), 'h': int(raw_h)}
+            raw_h, raw_w = _raw_image_dims(norm_fp)
+            if raw_w and raw_h:
+                ref_size = {'w': int(raw_w), 'h': int(raw_h)}
 
             ax_data = None
             base_ax = os.path.splitext(os.path.basename(norm_fp))[0] + ".ax"
@@ -2799,20 +2829,18 @@ class PolygonManager(QtWidgets.QDialog):
             return
 
         # Create progress dialog
-        progress_dlg = QtWidgets.QProgressDialog("Preparing Shapefile import...", "Cancel", 0, 100, self)
-        progress_dlg.setWindowTitle("Importing Shapefile")
-        progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
-        progress_dlg.setMinimumDuration(0)
-        progress_dlg.setValue(0)
+        progress_dlg = ShapefileImportProgressDialog(self)
+        progress_dlg.show()
 
-        self._start_shapefile_import_worker(file_paths, project_folder, target_images_info, progress_dlg)
+        self._start_shapefile_import_worker(file_paths, project_folder, target_images_info, import_options, progress_dlg)
 
-    def _start_shapefile_import_worker(self, file_paths, project_folder, target_images_info, progress_dlg):
+    def _start_shapefile_import_worker(self, file_paths, project_folder, target_images_info, import_options, progress_dlg):
         thread = QtCore.QThread(self)
         worker = ShapefileImportWorker(
             file_paths=file_paths,
             project_folder=project_folder,
-            target_images_info=target_images_info
+            target_images_info=target_images_info,
+            import_options=import_options
         )
         worker.moveToThread(thread)
 
@@ -2827,9 +2855,8 @@ class PolygonManager(QtWidgets.QDialog):
             thread.deleteLater()
 
         thread.started.connect(worker.run)
-        worker.progress.connect(progress_dlg.setValue)
-        worker.progress.connect(lambda val, msg: progress_dlg.setLabelText(msg))
-        progress_dlg.canceled.connect(worker.cancel)
+        worker.progress.connect(progress_dlg.update_progress)
+        progress_dlg.cancel_requested.connect(worker.cancel)
 
         worker.finished.connect(
             lambda data, warns: self._on_shapefile_import_finished(data, warns, progress_dlg)

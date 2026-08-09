@@ -24364,33 +24364,39 @@ class ProjectTab(QtWidgets.QWidget):
 
         def _viewer_effective_hw(fp: str):
             """
-            Prefer the *live* image basis if this file is currently open in any viewer.
-            Fallback to self._effective_hw_for_file(fp) if available.
-            Returns (H, W) or (None, None).
+            The basis polygons are SAVED in. Returns (H, W) or (None, None).
+
+            This must be the FULL RASTER, not what a viewer happens to be
+            displaying. _normalize_points_for_save rescales every polygon into
+            whatever this returns:
+
+                sx = eff_w / basis_w
+
+            so on a COG -- where image_data.image is a ~16x decimated preview
+            -- returning the preview size divided every imported polygon's
+            coordinates by 16 and collapsed 3504 crowns into a small blob in
+            the top-left corner. It fired the moment ANY polygon was drawn,
+            because that marks the root dirty and saves the whole root.
+
+            polygon_basis_hw is the single authority (probes the file header,
+            the same source shapefile import stamps), so save, load,
+            scene_to_image_coords and on_polygon_drawn all agree.
             """
-            # Try a specific viewer
             try:
                 v = self.get_viewer_by_filepath(fp)
                 if v is not None:
-                    idata = getattr(v, "image_data", None)
-                    img = getattr(idata, "image", None)
-                    if img is not None and hasattr(img, "shape"):
-                        h, w = img.shape[:2]
-                        if h and w:
-                            return int(h), int(w)
+                    h, w = self.polygon_basis_hw(v)
+                    if h and w:
+                        return int(h), int(w)
             except Exception:
                 pass
 
-            # Scan viewer_widgets (if multiple viewers)
+            # No live viewer: resolve straight from the file header.
             try:
-                for w in getattr(self, "viewer_widgets", []) or []:
-                    idata = w.get("image_data") if isinstance(w, dict) else None
-                    if idata is not None and getattr(idata, "filepath", None) == fp:
-                        img = getattr(idata, "image", None)
-                        if img is not None and hasattr(img, "shape"):
-                            h, w = img.shape[:2]
-                            if h and w:
-                                return int(h), int(w)
+                from .shapefile_io import _raw_image_dims
+                h, w = _raw_image_dims(fp)
+                if h and w:
+                    return int(h), int(w)
             except Exception:
                 pass
 
@@ -24918,12 +24924,17 @@ class ProjectTab(QtWidgets.QWidget):
             ip = self.scene_to_image_coords(sender_viewer, p)
             img_points.append((float(ip.x()), float(ip.y())))
 
-        # CRITICAL FIX: Use the EXACT same dimensions that scene_to_image_coords uses internally.
-        # scene_to_image_coords uses viewer.image_data.image.shape, so we MUST use the same.
-        # Using _effective_hw_for_file() caused coordinate mismatch because it could return
-        # different values (from cache, .ax file, or a different viewer) after reset/refresh.
-        viewer_img = sender_viewer.image_data.image
-        eff_h, eff_w = viewer_img.shape[:2]
+        # The basis MUST be whatever scene_to_image_coords mapped into just
+        # above -- polygon_basis_hw is the single authority for that, and for
+        # a COG it is the full raster, NOT the decimated preview the viewer is
+        # displaying. Reading image_data.image.shape here is what stamped
+        # drawn polygons with a 3001x3131 basis while their coordinates were
+        # in 48031x50101 space: on load they were rescaled by ~16 again and
+        # landed six times outside the image.
+        eff_h, eff_w = self.polygon_basis_hw(sender_viewer)
+        if not (eff_h and eff_w):
+            viewer_img = sender_viewer.image_data.image
+            eff_h, eff_w = viewer_img.shape[:2]
         image_ref_size = {
             'w': int(eff_w),
             'h': int(eff_h),
@@ -24991,12 +25002,21 @@ class ProjectTab(QtWidgets.QWidget):
         filepath = getattr(viewer.image_data, "filepath", None)
         if not filepath: return
         
-        # Capture current image reference size for coordinate scaling
+        # Capture the reference size the points below will be expressed in.
+        # scene_to_image_coords maps into the FULL RASTER basis, so this must
+        # be polygon_basis_hw, not the decimated preview the viewer shows --
+        # otherwise a dragged polygon is stored with a basis ~16x off from its
+        # own coordinates and jumps back on the next load.
         eff_h, eff_w = 0, 0
         try:
-            eff_h, eff_w = viewer.image_data.image.shape[:2]
+            eff_h, eff_w = self.polygon_basis_hw(viewer)
         except Exception:
             pass
+        if not (eff_h and eff_w):
+            try:
+                eff_h, eff_w = viewer.image_data.image.shape[:2]
+            except Exception:
+                pass
             
         # Map scene points directly back to image coordinates for storage
         old_img_pts = []
@@ -25076,16 +25096,22 @@ class ProjectTab(QtWidgets.QWidget):
 
         scene_pts = [(float(p.x()), float(p.y())) for p in scene_poly]
 
-        # CRITICAL FIX: Use the EXACT same dimensions that scene_to_image_coords uses internally.
-        # This ensures image_ref_size matches the coordinate conversion basis.
-        # Using _effective_hw_for_file() first caused coordinate mismatch after reset/refresh.
+        # Must match the basis scene_to_image_coords maps into -- see
+        # polygon_basis_hw. On a COG, viewer.image_data.image is the decimated
+        # preview, so reading its shape here recorded a basis ~16x off from the
+        # coordinates actually being stored.
         H, W = (None, None)
         try:
-            img = viewer.image_data.image
-            if img is not None:
-                H, W = img.shape[:2]
+            H, W = self.polygon_basis_hw(viewer)
         except Exception:
             pass
+        if not (H and W):
+            try:
+                img = viewer.image_data.image
+                if img is not None:
+                    H, W = img.shape[:2]
+            except Exception:
+                pass
         if not (H and W):
             return  # cannot normalize reliably
 

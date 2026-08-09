@@ -152,6 +152,9 @@ FEATURE_MAP = {
     "test_label_defaults_and_mapping": (
         "Label defaults + image->scene mapping",
         "labels OFF by default (3-5x zoomed-in paint, culling not defeated); mapping bit-identical to Qt incl. rotation"),
+    "test_polygon_save_basis": (
+        "Saving never rebases polygons onto the viewer preview",
+        "save_polygons_to_json keeps the raster basis; repeated saves do not walk polygons toward the origin; a genuinely stale basis is still repaired"),
     "test_polygon_coordinate_basis": (
         "Polygon coordinate basis (COG preview vs raster)",
         "image_ref_size is always the full raster, stable across preview levels; migration rescales and is idempotent"),
