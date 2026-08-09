@@ -486,3 +486,62 @@ def test_temp_drawing_item_is_above_the_highres_cog_tile(qapp):
         f"the in-progress drawing sits at z={item.zValue()}, at or below the "
         f"high-res COG tile at z={HIGHRES_TILE_Z} -- the tile paints over it "
         f"and the user sees nothing while drawing")
+
+
+# ---------------------------------------------------------------------------
+# A dragged polygon must not snap back when the tiles take over
+# ---------------------------------------------------------------------------
+def test_tiles_follow_a_dragged_polygon(qapp):
+    """THE snap-back bug.
+
+    Dragging does NOT rewrite an item's geometry -- Qt moves its pos() and
+    EditablePolygonItem.itemChange deliberately leaves the points alone. The
+    tile builder read that item-LOCAL geometry, so every dragged polygon was
+    drawn where it used to be. Tiles only take over when zoomed out, which is
+    why the polygon appeared to jump back the moment you zoomed out.
+    """
+    v = _viewer_with(qapp, 900, img=2000)
+    item = v.polygons[0]['item']
+
+    before = item.mapToScene(item.polygon).boundingRect().center()
+    item.setPos(500.0, 300.0)          # the drag
+    after = item.mapToScene(item.polygon).boundingRect().center()
+    assert (after.x() - before.x(), after.y() - before.y()) == pytest.approx((500.0, 300.0))
+
+    v.rebuild_polygon_batch()
+    assert v._batch_tiles
+
+    # Find the tile geometry nearest the polygon's TRUE scene position.
+    best = None
+    for t in v._batch_tiles:
+        for arr in t._polygons:
+            d = abs(arr[:, 0].mean() - after.x()) + abs(arr[:, 1].mean() - after.y())
+            if best is None or d < best:
+                best = d
+    assert best is not None
+    assert best < 2.0, (
+        f"no tile geometry sits at the polygon's dragged position "
+        f"({after.x():.0f}, {after.y():.0f}); nearest is {best:.0f} scene units "
+        f"away -- the tiles are still drawing the pre-drag coordinates")
+
+
+def test_untouched_polygons_are_unaffected_by_the_transform_step(qapp):
+    """sceneTransform() is the identity for every polygon nobody moved, so the
+    mapping must be a no-op there -- otherwise it would cost a matmul per
+    polygon on the common path."""
+    v = _viewer_with(qapp, 900, img=2000)
+    item = v.polygons[0]['item']
+    assert item.sceneTransform().isIdentity()
+
+    expected = np.array([[p.x(), p.y()] for p in item.polygon], dtype=float)
+    v.rebuild_polygon_batch()
+
+    found = False
+    for t in v._batch_tiles:
+        for arr in t._polygons:
+            if arr.shape == expected.shape and np.allclose(arr, expected):
+                found = True
+                break
+        if found:
+            break
+    assert found, "an untouched polygon's tile geometry no longer matches its own points"

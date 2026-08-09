@@ -24590,6 +24590,19 @@ class ProjectTab(QtWidgets.QWidget):
             
             success_count = sum(1 for r in results if r)
             logging.info("Saved %d polygon files (multithreaded).", success_count)
+
+            # Refresh the coarse-geometry index, exactly as save_incremental
+            # does. The overview caches each polygon's DECIMATED display
+            # points, and the fast load path reads them instead of the
+            # sidecars -- so leaving it stale here meant a polygon could be
+            # dragged, saved correctly to its sidecar, and then reappear at
+            # its OLD position on the next open, because that is what the
+            # overview still described.
+            if success_count:
+                try:
+                    self._write_polygon_overview()
+                except Exception as e:
+                    logging.warning("[save_polygons_to_json] overview refresh failed: %s", e)
         else:
             logging.info("No polygons to save.")
 
