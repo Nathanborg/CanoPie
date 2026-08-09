@@ -124,3 +124,57 @@ def test_update_all_polygons_consults_the_record():
         "the purge guard is gone: update_all_polygons will again infer "
         "'user deleted this' for polygons the load never attempted to draw, "
         "which is what moved 3318 sidecars to polygons/.trash/")
+
+
+# ---------------------------------------------------------------------------
+# The load record must not outlive the scene it describes
+# ---------------------------------------------------------------------------
+def test_clearing_the_scene_invalidates_the_load_record(qapp):
+    """THE refresh bug, reproduced at the viewer level.
+
+    set_image() calls clear_polygons() on every refresh. If the record of
+    "what the last load drew" survives that, then for a moment the scene is
+    empty while the record still names every polygon -- and update_all_polygons
+    reads all of them as user deletions.
+
+    Observed on a fresh project (New Folder190): import 3504 crowns, draw one
+    polygon, refresh -> the 3504 vanished and only the drawn one remained. The
+    drawn one survived precisely because it was NOT in the stale record.
+    """
+    from PyQt5 import QtGui, QtCore
+    from ..image_viewer import ImageViewer
+
+    v = ImageViewer()
+    pm = QtGui.QPixmap(400, 400)
+    pm.fill(QtCore.Qt.darkGreen)
+    v.set_image(pm)
+    v.polygons = []
+    for i in range(5):
+        v.add_polygon_to_scene(
+            QtGui.QPolygonF([QtCore.QPointF(10 + i, 10), QtCore.QPointF(20 + i, 10),
+                             QtCore.QPointF(20 + i, 20)]), name=f"crown_{i}")
+
+    # ProjectTab.load_polygons stamps this after drawing.
+    v._loaded_polygon_names = {f"crown_{i}" for i in range(5)}
+
+    v.clear_polygons()
+    assert getattr(v, "_loaded_polygon_names", "MISSING") is None, (
+        "the load record survived clear_polygons -- update_all_polygons will "
+        "now read every name in it as a user deletion, because the scene it "
+        "described has been emptied")
+
+
+def test_set_image_invalidates_the_load_record(qapp):
+    """set_image is the path a refresh actually takes."""
+    from PyQt5 import QtGui, QtCore
+    from ..image_viewer import ImageViewer
+
+    v = ImageViewer()
+    pm = QtGui.QPixmap(400, 400)
+    pm.fill(QtCore.Qt.darkGreen)
+    v.set_image(pm)
+    v._loaded_polygon_names = {"crown_0", "crown_1"}
+
+    v.set_image(pm)          # a refresh
+    assert getattr(v, "_loaded_polygon_names", "MISSING") is None, (
+        "refreshing left a stale load record behind")

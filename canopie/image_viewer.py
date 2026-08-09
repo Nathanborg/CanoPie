@@ -4072,6 +4072,24 @@ class ImageViewer(QtWidgets.QGraphicsView):
         self.pending_group_name = None
         self.clear_polygon_batch()
 
+        # INVALIDATE THE LOAD RECORD.
+        #
+        # ProjectTab.load_polygons stamps `_loaded_polygon_names` with what it
+        # drew, and update_all_polygons uses it to decide which polygons a
+        # missing scene item may be read as "the user deleted this". Once the
+        # scene has been emptied that record describes a load that no longer
+        # exists -- every name in it is now absent, so the purge would treat
+        # ALL of them as deletions.
+        #
+        # set_image() calls this method, so it runs on every refresh: the
+        # shapefile-derived polygons were purged from memory in the window
+        # between the clear and load_polygons repopulating the scene, while a
+        # just-drawn polygon (not in the stale record) survived. Dropping the
+        # record here makes the purge refuse until a fresh load re-establishes
+        # it, which is the same safe default it already applies when no record
+        # was ever taken.
+        self._loaded_polygon_names = None
+
         # Only invalidate if we had items to remove (skip for huge images with no polygons)
         if all_items:
             try:
