@@ -11,6 +11,7 @@ import functools
 import numpy as np
 import tifffile
 import geopy.distance
+import shapely.geometry
 from canopie.utils import get_exif_data_exiftool_multiple
 
 WGS84_WKT = 'GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]'
@@ -1783,7 +1784,7 @@ def _sanitize_dbf_value(val):
     return str(val).strip()
 
 
-def resolve_feature_identity(props, feat_idx, shp_stem="Imported", existing_keys=None):
+def resolve_feature_identity(props, feat_idx, shp_stem="Imported", existing_keys=None, name_field=None, group_field=None, selected_properties=None):
     """
     Resolve unique group key, polygon display name, base class group, root ID,
     and sanitized DBF properties for a single shapefile feature.
@@ -1803,21 +1804,27 @@ def resolve_feature_identity(props, feat_idx, shp_stem="Imported", existing_keys
 
     # 1. Base classification group
     base_group = None
-    for k in ('GROUP', 'group', 'CLASS', 'class', 'LAYER', 'layer', 
-              'CATEGORY', 'category', 'SPECIES', 'species', 'TYPE', 'type'):
-        if k in props and props[k] is not None and str(props[k]).strip():
-            base_group = str(props[k]).strip()
-            break
+    if group_field and group_field in props and props[group_field] is not None and str(props[group_field]).strip():
+        base_group = str(props[group_field]).strip()
+    else:
+        for k in ('GROUP', 'group', 'CLASS', 'class', 'LAYER', 'layer', 
+                  'CATEGORY', 'category', 'SPECIES', 'species', 'TYPE', 'type'):
+            if k in props and props[k] is not None and str(props[k]).strip():
+                base_group = str(props[k]).strip()
+                break
     if not base_group:
         base_group = shp_stem or "Imported_Polygons"
 
     # 2. Polygon feature name / ID
     poly_name = None
-    for k in ('NAME', 'name', 'ID', 'id', 'TREE_ID', 'tree_id', 
-              'POLY_ID', 'poly_id', 'LABEL', 'label', 'TAG', 'tag', 'PLOT_ID'):
-        if k in props and props[k] is not None and str(props[k]).strip():
-            poly_name = str(props[k]).strip()
-            break
+    if name_field and name_field in props and props[name_field] is not None and str(props[name_field]).strip():
+        poly_name = str(props[name_field]).strip()
+    else:
+        for k in ('NAME', 'name', 'ID', 'id', 'TREE_ID', 'tree_id', 
+                  'POLY_ID', 'poly_id', 'LABEL', 'label', 'TAG', 'tag', 'PLOT_ID'):
+            if k in props and props[k] is not None and str(props[k]).strip():
+                poly_name = str(props[k]).strip()
+                break
 
     # 3. Disaggregate into a unique entry key for all_polygons
     if poly_name:
@@ -1844,6 +1851,8 @@ def resolve_feature_identity(props, feat_idx, shp_stem="Imported", existing_keys
 
     clean_props = {}
     for k, v in props.items():
+        if selected_properties is not None and k not in selected_properties:
+            continue
         clean_props[k] = _sanitize_dbf_value(v)
 
     return {
@@ -1853,6 +1862,26 @@ def resolve_feature_identity(props, feat_idx, shp_stem="Imported", existing_keys
         'root_val': root_val,
         'clean_props': clean_props
     }
+
+def simplify_polygon_points(points, tolerance):
+    """
+    Reduces the number of vertices in a polygon using the Douglas-Peucker algorithm.
+    :param points: List of (x, y) coordinates.
+    :param tolerance: Simplification tolerance.
+    :return: Simplified list of (x, y) coordinates.
+    """
+    if tolerance <= 0 or len(points) < 4:
+        return points
+    try:
+        poly = shapely.geometry.Polygon(points)
+        simplified = poly.simplify(tolerance, preserve_topology=True)
+        # Shapely simplify on a polygon returns a Polygon (if it doesn't collapse).
+        if isinstance(simplified, shapely.geometry.Polygon):
+            return list(simplified.exterior.coords)
+        return points
+    except Exception as e:
+        print(f"Error simplifying polygon: {e}")
+        return points
 
 
 def calculate_signed_area(ring):
