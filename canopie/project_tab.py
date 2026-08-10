@@ -20570,6 +20570,7 @@ class ProjectTab(QtWidgets.QWidget):
                 # or never attempted is destroyed on the next save.
                 loadable = getattr(viewer, "_loaded_polygon_names", None)
 
+                _purged = 0
                 for group_name, stored_fp in groups_with_this_file:
                     # No record at all -> we cannot tell a deletion from a
                     # polygon that was simply never loaded, and guessing wrong
@@ -20586,8 +20587,17 @@ class ProjectTab(QtWidgets.QWidget):
                                 _index_needs_rebuild = True  # Structure changed - deletion
                             if not gdict:
                                 del self.all_polygons[group_name]
+                            _purged += 1
                         except Exception:
                             pass
+                if _purged:
+                    logging.warning("[update_all_polygons] PURGED %d polygon(s) from "
+                                    "memory for %s (scene had %d item(s), load record "
+                                    "had %s). If these were not deleted by the user, "
+                                    "this is the bug.",
+                                    _purged, os.path.basename(filepath),
+                                    len(present_names),
+                                    len(loadable) if loadable is not None else "no record")
             except Exception as e:
                 logging.debug(f"update_all_polygons: prune step failed: {e}")
 
@@ -27101,6 +27111,21 @@ class ProjectTab(QtWidgets.QWidget):
                     }))
                 else:
                     records.append((group, fp, data))
+        # DIAGNOSTIC + SAFETY: this rebuilds the whole overview from MEMORY.
+        # If memory is ever incomplete when a save runs, the overview shrinks to
+        # match, and the fast load path then reads the smaller set. Refuse and
+        # say so rather than silently narrowing what the project describes.
+        try:
+            on_disk = len([f for f in os.listdir(polygons_dir)
+                           if f.endswith('_polygons.json') and not f.startswith('_')])
+            if on_disk and len(records) < on_disk * 0.9:
+                logging.warning("[overview] REFUSING to rewrite: memory has %d polygon(s) "
+                                "but %d sidecar(s) exist on disk. Writing would hide %d of "
+                                "them from the fast load path.",
+                                len(records), on_disk, on_disk - len(records))
+                return 0
+        except Exception:
+            pass
         return polygon_lod.write_overview(polygons_dir, records)
 
     def _upgrade_item_to_full_geometry(self, viewer, item):
@@ -30471,14 +30496,23 @@ class ProjectTab(QtWidgets.QWidget):
         def go(v=viewer, idata=image_data, expected_seq=nav_seq):
             # If navigation happened after this was scheduled → bail
             if expected_seq is not None and expected_seq != getattr(self, "_nav_seq", 0):
+                # DIAGNOSTIC: this silently skips loading a viewer's polygons.
+                # If polygons are missing after a refresh, this is one of only
+                # two places the load can be dropped without a trace.
+                logging.info("[poly_load] SKIPPED %s: nav_seq changed (%s -> %s)",
+                             os.path.basename(getattr(idata, "filepath", "?") or "?"),
+                             expected_seq, getattr(self, "_nav_seq", 0))
                 return
 
             # If the viewer has already switched files → bail (your existing guard)
             try:
                 fp_now = getattr(getattr(v, "image_data", None), "filepath", None)
             except Exception:
+                logging.info("[poly_load] SKIPPED: viewer has no image_data")
                 return
             if not fp_now or fp_now != getattr(idata, "filepath", None):
+                logging.info("[poly_load] SKIPPED: viewer file is %r, expected %r",
+                             fp_now, getattr(idata, "filepath", None))
                 return
 
             sc = getattr(v, "scene", lambda: None)()
