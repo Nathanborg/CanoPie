@@ -7677,6 +7677,9 @@ class ProjectTab(QtWidgets.QWidget):
                     vh, vw = (None, None)
             
             if not (vh and vw):
+                logging.warning("[load_polygons] ABORT %s: cannot determine viewer "
+                                "dimensions (vh=%r vw=%r). The scene stays empty.",
+                                os.path.basename(filepath), vh, vw)
                 return  # Cannot determine viewer dimensions
                 
             to_w, to_h = vw, vh # Target dimensions for the viewer
@@ -7778,9 +7781,28 @@ class ProjectTab(QtWidgets.QWidget):
             t_disk = time.perf_counter() - t0 if not memory_hit else 0
 
             if not polygons_to_draw:
+                # ALWAYS log. This used to be gated on t_total > 0.1s, and the
+                # failing case returns in ~2 ms -- so the one path that leaves a
+                # refreshed viewer empty was also the one path that said nothing.
                 t_total = time.perf_counter() - t_start
-                if t_total > 0.1:
-                    logging.info(f"[load_polygons] {os.path.basename(filepath)}: no polygons, total={t_total:.3f}s (ax={t_ax:.3f}s, setup={t_setup:.3f}s, lookup={t_lookup:.3f}s)")
+                try:
+                    fp_norm = os.path.normpath(filepath).lower() if filepath else ""
+                    ex = getattr(self, "_poly_exact_index", {}) or {}
+                    nm = getattr(self, "_poly_norm_index", {}) or {}
+                    logging.warning("[load_polygons] NO POLYGONS for %s (total=%.3fs)",
+                                    os.path.basename(filepath), t_total)
+                    logging.warning("    looked up  : %r", filepath)
+                    logging.warning("    normalised : %r", fp_norm)
+                    logging.warning("    in exact index: %s  (index has %d key(s))",
+                                    filepath in ex, len(ex))
+                    logging.warning("    in norm  index: %s  (index has %d key(s))",
+                                    fp_norm in nm, len(nm))
+                    logging.warning("    all_polygons groups: %d", len(self.all_polygons or {}))
+                    logging.warning("    sample exact key: %r", next(iter(ex), None))
+                    logging.warning("    sample norm  key: %r", next(iter(nm), None))
+                except Exception:
+                    logging.warning("[load_polygons] NO POLYGONS for %s (diagnostic failed)",
+                                    os.path.basename(filepath))
                 return
 
             # --- 3. BATCH DRAWING OPTIMIZATION ---
