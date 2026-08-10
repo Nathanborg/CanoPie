@@ -7611,7 +7611,9 @@ class ProjectTab(QtWidgets.QWidget):
 
             filepath = image_data.filepath
             if not filepath:
+                logging.warning("[load_polygons] ABORTED: image_data has no filepath")
                 return
+            logging.info("[load_polygons] ENTER %s", os.path.basename(filepath))
 
             # --- [FIX] Sync Label Visibility from PolygonManager ---
             try:
@@ -10687,6 +10689,9 @@ class ProjectTab(QtWidgets.QWidget):
         import os, threading
 
         if getattr(self, "_load_busy", False):
+            logging.warning("[load_image_group] BUSY: deferring '%s' and cancelling the "
+                            "in-flight load. If the viewer ends up with no polygons, "
+                            "this is why.", root_name)
             self._pending_root = root_name
             try:
                 if self._load_stop_event is not None:
@@ -23942,14 +23947,25 @@ class ProjectTab(QtWidgets.QWidget):
 
         def _fire_when_idle(seq=self._nav_seq):
             if seq != getattr(self, "_nav_seq", 0):
+                # THE bail-out that leaves a refreshed viewer with no polygons:
+                # set_image() has already cleared the scene, and nothing else
+                # ever calls load_polygons for it.
+                logging.warning("[poly_load] NOT SCHEDULED: nav_seq moved %s -> %s "
+                                "between the refresh and the idle timer. The scene "
+                                "was cleared and no polygon load will follow.",
+                                seq, getattr(self, "_nav_seq", 0))
                 return
+            n = 0
             for rec in list(self.viewer_widgets):
                 v = rec.get('viewer'); idata = rec.get('image_data')
                 if v and idata:
+                    n += 1
                     try:
-                        self._schedule_polygons_for_viewer(v, idata, delay_ms=0)
+                        self._schedule_polygons_for_viewer(v, idata, delay_ms=0, nav_seq=seq)
                     except TypeError:
                         self._schedule_polygons_for_viewer(v, idata)
+            logging.info("[poly_load] scheduled %d viewer(s) (nav_seq=%s, "
+                         "viewer_widgets=%d)", n, seq, len(self.viewer_widgets))
 
         self._poly_idle_timer.timeout.connect(_fire_when_idle)
         self._poly_idle_timer.start(50)
