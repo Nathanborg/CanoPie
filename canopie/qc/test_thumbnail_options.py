@@ -63,6 +63,7 @@ DEFAULT_OPTS = {
     'draw_outline': True,
     'tile_enabled': False,
     'tile_size': 256,
+    'tiles_inside_only': False,
 }
 
 
@@ -271,6 +272,209 @@ def test_tiling_replaces_the_single_thumbnail(qapp):
     assert len(out) > 1
     assert all(t.shape[:2] == (128, 128) for _n, t in out)
     assert not any(n == "a.jpg" for n, _ in out)
+
+
+# ---------------------------------------------------------------------------
+# "only squares that fit inside the polygon"
+# ---------------------------------------------------------------------------
+def _square(x0, y0, side):
+    return [(x0, y0), (x0 + side, y0), (x0 + side, y0 + side), (x0 + y0 * 0 + x0 * 0 + x0, y0 + side)]
+
+
+def test_inside_only_keeps_only_fully_contained_squares(qapp):
+    """Every kept tile must be entirely interior, not merely overlapping."""
+    from ..machine_learning_manager import _tiles_fully_inside
+    import cv2
+
+    # A 400x400 square polygon inside a 512x512 grid at tile=64.
+    pts = [(100, 100), (500, 100), (500, 500), (100, 500)]
+    gx, gy, gw, gh = 60, 60, 512, 512
+    keep = _tiles_fully_inside(pts, gx, gy, gw, gh, 64)
+
+    mask = np.zeros((gh, gw), np.uint8)
+    cv2.fillPoly(mask, np.array([[[px - gx, py - gy] for px, py in pts]], np.int32), 1)
+    for r in range(keep.shape[0]):
+        for c in range(keep.shape[1]):
+            block = mask[r * 64:(r + 1) * 64, c * 64:(c + 1) * 64]
+            assert keep[r, c] == bool(block.all()), (
+                f"tile ({r},{c}) kept={keep[r, c]} but interior={bool(block.all())}")
+    assert keep.any() and not keep.all(), "the fixture must have both kinds of tile"
+
+
+def test_inside_only_is_a_strict_subset_of_the_full_grid(qapp):
+    img = _scene(1024, 1024)
+    m = _mlm()
+    pts = [(300, 300), (700, 300), (700, 700), (300, 700)]
+    args = (_FakeSrc(img), pts, 300, 300, 400, 400, img.shape[1], img.shape[0], COLOR)
+
+    allt = m._render_thumbnail_outputs(*args, _opts(tile_enabled=True, tile_size=64), "a.jpg")
+    inside = m._render_thumbnail_outputs(
+        *args, _opts(tile_enabled=True, tile_size=64, tiles_inside_only=True), "a.jpg")
+
+    names_all = {n for n, _ in allt}
+    names_in = {n for n, _ in inside}
+    assert names_in and names_in < names_all, (
+        "inside-only did not reduce the grid, or produced names outside it")
+    # A kept tile is byte-identical to the same cell of the unfiltered grid:
+    # this is a filter, not a different grid.
+    by_name = dict(allt)
+    for n, t in inside:
+        assert np.array_equal(t, by_name[n])
+
+
+def test_inside_only_keeps_grid_positions_in_the_names(qapp):
+    """Names keep their (row, col), so gaps appear rather than a renumbering."""
+    img = _scene(1024, 1024)
+    out = _mlm()._render_thumbnail_outputs(
+        _FakeSrc(img), [(300, 300), (700, 300), (700, 700), (300, 700)],
+        300, 300, 400, 400, img.shape[1], img.shape[0], COLOR,
+        _opts(tile_enabled=True, tile_size=64, tiles_inside_only=True), "a.jpg")
+    names = [n for n, _ in out]
+    assert names[0] != "a_r00c00.jpg", (
+        "the first kept tile is at grid origin; the fixture polygon does not "
+        "reach the grid edge, so an interior-only run must start later")
+    assert sorted(names) == names
+
+
+def test_polygon_narrower_than_a_tile_keeps_nothing(qapp):
+    """The documented cost of the option -- and why the dialog estimates it."""
+    img = _scene(1024, 1024)
+    out = _mlm()._render_thumbnail_outputs(
+        _FakeSrc(img), [(500, 500), (560, 500), (560, 560), (500, 560)],
+        500, 500, 84, 84, img.shape[1], img.shape[0], COLOR,
+        _opts(tile_enabled=True, tile_size=128, tiles_inside_only=True), "a.jpg")
+    assert out == [], "a 60 px polygon cannot contain a 128 px square"
+
+
+def test_inside_only_off_is_unchanged(qapp):
+    """The new flag must not disturb the existing tiled path."""
+    img = _scene(1024, 1024)
+    m = _mlm()
+    args = (_FakeSrc(img), PTS, 100, 100, 300, 300, img.shape[1], img.shape[0], COLOR)
+    a = m._render_thumbnail_outputs(*args, _opts(tile_enabled=True, tile_size=128), "a.jpg")
+    b = m._render_thumbnail_outputs(
+        *args, _opts(tile_enabled=True, tile_size=128, tiles_inside_only=False), "a.jpg")
+    assert [n for n, _ in a] == [n for n, _ in b]
+    assert all(np.array_equal(x, y) for (_n, x), (_m2, y) in zip(a, b))
+
+
+# ---------------------------------------------------------------------------
+# the live estimate
+# ---------------------------------------------------------------------------
+def _bbox_args(pts, zoom, W, H):
+    """The (x0, y0, new_w, new_h) generate_thumbnails derives for a polygon.
+
+    Written out here rather than imported so the estimate is checked against
+    the documented geometry, not against whatever the estimator happens to do.
+    """
+    import cv2
+    x, y, w, h = cv2.boundingRect(np.array(pts, dtype=np.int32))
+    nw = max(16, int(round(w * zoom)))
+    nh = max(16, int(round(h * zoom)))
+    x0 = max(0, min(int(round(x + w / 2.0 - nw / 2.0)), W - nw))
+    y0 = max(0, min(int(round(y + h / 2.0 - nh / 2.0)), H - nh))
+    return x0, y0, nw, nh
+
+
+def test_estimate_matches_what_the_run_actually_writes(qapp):
+    """The readout must not promise a number the render path won't deliver."""
+    from ..machine_learning_manager import estimate_tile_yield
+
+    img = _scene(1024, 1024)
+    m = _mlm()
+    pts = [(300, 300), (700, 300), (700, 700), (300, 700)]
+    polys = [(pts, 1024, 1024)]
+    x0, y0, nw, nh = _bbox_args(pts, 1.4, 1024, 1024)
+
+    for tile in (64, 128, 256):
+        for inside in (False, True):
+            est = estimate_tile_yield(polys, tile, 1.4, inside, sample_cap=None)
+            out = m._render_thumbnail_outputs(
+                _FakeSrc(img), pts, x0, y0, nw, nh, 1024, 1024, COLOR,
+                _opts(tile_enabled=True, tile_size=tile, tiles_inside_only=inside),
+                "a.jpg")
+            assert est['tiles'] == len(out), (
+                f"tile={tile} inside={inside}: estimate said {est['tiles']}, "
+                f"the render produced {len(out)}")
+
+
+def test_estimate_falls_as_the_tile_grows(qapp):
+    """'the number will vary with the window size' -- monotonically."""
+    from ..machine_learning_manager import estimate_tile_yield
+    pts = [(1000, 1000), (1400, 1000), (1400, 1400), (1000, 1400)]
+    polys = [(pts, 5000, 5000)] * 20
+
+    counts = [estimate_tile_yield(polys, t, 1.4, False, sample_cap=None)['tiles']
+              for t in (64, 128, 256, 512)]
+    assert counts == sorted(counts, reverse=True) and counts[0] > counts[-1], counts
+
+    inside = [estimate_tile_yield(polys, t, 1.4, True, sample_cap=None)['tiles']
+              for t in (64, 128, 256, 512)]
+    assert inside[-1] == 0, "a 512 square cannot fit inside a 400 px crown"
+    assert all(i <= a for i, a in zip(inside, counts))
+
+
+def test_estimate_reports_polygons_that_yield_nothing(qapp):
+    from ..machine_learning_manager import estimate_tile_yield
+    small = [([(0, 0), (60, 0), (60, 60), (0, 60)], 5000, 5000)] * 10
+    est = estimate_tile_yield(small, 128, 1.4, True, sample_cap=None)
+    assert est['tiles'] == 0
+    assert est['empty'] == 10, (
+        "polygons that produce no tile are not being counted; that number is "
+        "the whole point of the readout")
+
+
+def test_estimate_scales_from_a_sample(qapp):
+    from ..machine_learning_manager import estimate_tile_yield
+    pts = [(1000, 1000), (1400, 1000), (1400, 1400), (1000, 1400)]
+    polys = [(pts, 5000, 5000)] * 1000
+    exact = estimate_tile_yield(polys, 128, 1.4, False, sample_cap=None)
+    sampled = estimate_tile_yield(polys, 128, 1.4, False, sample_cap=50)
+    assert sampled['sampled'] == 50 and sampled['total'] == 1000
+    assert sampled['tiles'] == exact['tiles'], (
+        "identical polygons must extrapolate exactly")
+
+
+def test_dialog_shows_a_live_estimate_that_moves_with_tile_size(qapp):
+    from ..thumbnail_options_dialog import ThumbnailOptionsDialog
+    pts = [(1000, 1000), (1400, 1000), (1400, 1400), (1000, 1400)]
+    d = ThumbnailOptionsDialog([(pts, 5000, 5000)] * 30)
+
+    d.tile_cb.setChecked(True)
+    d.tile_spin.setValue(64)
+    d.update_estimate()
+    at64 = d.estimate_lbl.text()
+    d.tile_spin.setValue(256)
+    d.update_estimate()
+    at256 = d.estimate_lbl.text()
+    assert at64 and at256 and at64 != at256, (
+        f"the estimate does not change with the tile size ({at64!r} at 64 vs "
+        f"{at256!r} at 256)")
+
+    d.inside_cb.setChecked(True)
+    d.update_estimate()
+    assert "without the inside-only filter" in d.estimate_lbl.text()
+    assert d.get_options()['tiles_inside_only'] is True
+
+
+def test_inside_only_defaults_off_and_needs_tiling(qapp):
+    from ..thumbnail_options_dialog import ThumbnailOptionsDialog
+    d = ThumbnailOptionsDialog()
+    assert d.get_options()['tiles_inside_only'] is False
+    assert d.inside_cb.isEnabled() is False, (
+        "the inside-only box is usable while tiling is off, where it does nothing")
+    d.tile_cb.setChecked(True)
+    assert d.inside_cb.isEnabled() is True
+
+
+def test_dialog_works_without_polygons(qapp):
+    """The estimate is optional; the dialog must not require it."""
+    from ..thumbnail_options_dialog import ThumbnailOptionsDialog
+    d = ThumbnailOptionsDialog()
+    d.tile_cb.setChecked(True)
+    d.update_estimate()
+    assert d.estimate_lbl.text() == ""
+    assert d.get_options()['tile_enabled'] is True
 
 
 # ---------------------------------------------------------------------------
