@@ -60,6 +60,241 @@ from .utils import *
 from .loaders import ImageProcessor, ImageLoaderWorker
 from .image_data import ImageData
 
+#: Above this, an 8-bit whole-frame preview is refused rather than attempted.
+#: The BCI COG's frame is 4.48 GiB PER BAND on a 15.7 GiB machine.
+_WHOLE_FRAME_VIS_MAX_BYTES = 256 * 1024 * 1024
+
+#: Budget for the sampled read that fixes thumbnail contrast (see
+#: MachineLearningManager._lazy_bgr_scale).
+_VIS_SCALE_SAMPLE_BYTES = 64 * 1024 * 1024
+
+#: OpenCV refuses to encode images past CV_IO_MAX_IMAGE_PIXELS (default 2**30).
+#: The BCI COG's mask is 2.41 Gpx -- 2.24x over -- so cv2.imwrite CANNOT write
+#: it as PNG at any memory budget. Masks past this are written as tiled,
+#: Deflate-compressed BigTIFF instead, built one strip at a time.
+try:
+    _MASK_PNG_MAX_PIXELS = int(os.environ.get("CV_IO_MAX_IMAGE_PIXELS", 1 << 30))
+except Exception:
+    _MASK_PNG_MAX_PIXELS = 1 << 30
+
+#: Row height of the strip a large mask is rasterised through, and the tile
+#: size it is stored with. 512 rows x 48031 px x uint16 = 49 MB resident.
+_MASK_TILE = 512
+
+
+class _ThumbSource:
+    """Per-polygon 8-bit BGR crops, without ever holding the whole frame.
+
+    generate_thumbnails used to build one whole-image 8-bit BGR preview
+    (`_as_8bit_bgr`) and slice small crops out of it. For an ordinary image
+    that is cheap. For a lazily-read COG it materialises the entire raster --
+    the reported crash, `Unable to allocate 4.48 GiB for an array with shape
+    (1, 50101, 48031)` -- purely to throw all but a few 200x200 crops away.
+
+    Eager arrays keep the old path EXACTLY: the same _as_8bit_bgr output,
+    sliced the same way, so thumbnails for every image that works today are
+    unchanged byte for byte. Only a lazily-read raster takes the windowed
+    path, and there the old code produced nothing at all.
+    """
+
+    def __init__(self, mlm, img):
+        self._img = img
+        self._vis = None
+        self._scale = None
+        self._lazy = hasattr(img, "read_window") and hasattr(img, "width")
+        if not self._lazy:
+            self._vis = mlm._as_8bit_bgr(img)
+        else:
+            try:
+                self._scale = mlm._lazy_bgr_scale(img)
+            except Exception as e:
+                logging.warning("[_ThumbSource] contrast sample failed: %s", e)
+                self._scale = None
+
+    @property
+    def ok(self):
+        return self._vis is not None or self._lazy
+
+    def crop(self, x0, y0, w, h):
+        """8-bit BGR crop of [y0:y0+h, x0:x0+w], read on demand when lazy."""
+        import numpy as np
+        if not self._lazy:
+            if self._vis is None:
+                return None
+            return self._vis[y0:y0 + h, x0:x0 + w].copy()
+        chans = self._img.read_window(x0, y0, x0 + w, y0 + h)
+        if not chans:
+            return None
+        return _bgr_from_channels([np.asarray(c) for c in chans], self._scale)
+
+
+def _bgr_from_channels(chans, scale=None):
+    """List of 2D bands -> 8-bit image, EXACTLY as _as_8bit_bgr would.
+
+    That function's branches are mirrored here rather than tidied, because a
+    crop taken this way has to equal the same crop taken out of its whole-frame
+    output. In particular it has an asymmetry worth stating plainly:
+
+      * uint8 input is returned UNCHANGED, keeping its native (R,G,B,...)
+        channel order and channel COUNT -- it never reorders to BGR;
+      * anything else is min/max normalised per channel and the first three
+        channels are then reversed into BGR.
+
+    `scale` supplies per-channel (lo, hi) so a crop is stretched against the
+    whole frame instead of against itself. The arithmetic reproduces
+    cv2.normalize(NORM_MINMAX) followed by astype(uint8), truncation included.
+    """
+    import numpy as np, cv2
+    if not chans:
+        return None
+
+    # --- uint8 fast path: _as_8bit_bgr returns `v` untouched here ------------
+    if all(getattr(c, "dtype", None) == np.uint8 for c in chans):
+        if len(chans) == 1:
+            return cv2.cvtColor(chans[0], cv2.COLOR_GRAY2BGR)
+        return np.dstack(chans)
+
+    out = []
+    for i, ch in enumerate(chans):
+        f = ch.astype(np.float32)
+        if scale and i < len(scale):
+            lo, hi = scale[i]
+        else:
+            lo, hi = float(np.nanmin(f)), float(np.nanmax(f))
+        if hi > lo:
+            f = (f - lo) * (255.0 / (hi - lo))
+        else:
+            f = np.zeros_like(f)
+        out.append(np.clip(f, 0, 255).astype(np.uint8))
+
+    if len(out) == 1:
+        return cv2.cvtColor(out[0], cv2.COLOR_GRAY2BGR)
+    # Export order is R,G,B,(extras) -- OpenCV draws/writes BGR.
+    vis = cv2.merge([out[2], out[1], out[0]]) if len(out) >= 3 else cv2.merge(out)
+    if vis.ndim == 2:
+        vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
+    elif vis.shape[2] == 1:
+        vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
+    return vis
+
+
+def _fill_mask_shape(canvas, pts_img, label, H, W):
+    """Draw one labelled shape into a full-size mask canvas.
+
+    Verbatim the original single-canvas code, including the np.int32
+    truncation, so the small-image PNG path is unchanged. `_stamp_mask_shape`
+    is the strip-wise equivalent and is asserted to agree with this.
+    """
+    import numpy as np, cv2
+    if not pts_img:
+        return
+    if len(pts_img) == 1:
+        x, y = pts_img[0]
+        if 0 <= y < H and 0 <= x < W:
+            canvas[int(y), int(x)] = label
+    else:
+        arr = np.array([pts_img], dtype=np.int32)
+        cv2.fillPoly(canvas, arr, int(label))
+
+
+def _stamp_mask_shape(strip, pts_img, label, ty, H, W):
+    """Composite one shape into mask rows [ty, ty + strip.shape[0]).
+
+    The polygon is rasterised into its OWN bounding box and the overlapping
+    rows are copied out, rather than being handed to cv2.fillPoly with the
+    strip as canvas.
+
+    That distinction is the whole correctness of the strip path. fillPoly
+    CLIPS its polygon to the canvas, and clipping against a strip edge is not
+    the same as clipping against the image edge: the cut adds boundary pixels
+    the full-canvas fill never produces. Measured on 120 test polygons, letting
+    it clip per strip filled 4 702 872 pixels where a single-allocation build
+    filled 4 699 770 -- 3102 wrong pixels, silently, in training data.
+
+    Filling a bbox instead is an exact integer translation of the full-canvas
+    result (fillPoly is translation-invariant), and the bbox is clipped to the
+    IMAGE, so any genuine out-of-frame clipping still happens exactly where the
+    dense build would do it. A crown's bbox is a few hundred pixels, so this is
+    also cheaper than rasterising against the full width.
+    """
+    import numpy as np, cv2
+    if not pts_img:
+        return
+    sh = strip.shape[0]
+    if len(pts_img) == 1:
+        x, y = pts_img[0]
+        if 0 <= y < H and 0 <= x < W:
+            yy = int(y) - ty
+            if 0 <= yy < sh:
+                strip[yy, int(x)] = label
+        return
+
+    arr = np.array([pts_img], dtype=np.int32)
+    xs, ys = arr[0, :, 0], arr[0, :, 1]
+    bx0 = max(0, int(xs.min())); bx1 = min(W, int(xs.max()) + 1)
+    by0 = max(0, int(ys.min())); by1 = min(H, int(ys.max()) + 1)
+    if bx1 <= bx0 or by1 <= by0:
+        return
+
+    ry0 = max(by0, ty); ry1 = min(by1, ty + sh)
+    if ry1 <= ry0:
+        return
+
+    sub = np.zeros((by1 - by0, bx1 - bx0), dtype=strip.dtype)
+    a = arr.copy()
+    a[..., 0] -= bx0
+    a[..., 1] -= by0
+    cv2.fillPoly(sub, a, int(label))
+
+    src = sub[ry0 - by0: ry1 - by0, :]
+    dst = strip[ry0 - ty: ry1 - ty, bx0:bx1]
+    # Later labels overwrite earlier ones only where they actually paint --
+    # the same result as successive fillPoly calls on one canvas.
+    np.copyto(dst, src, where=(src != 0))
+
+
+def _write_mask_tiled(path, H, W, shapes, tile=_MASK_TILE):
+    """Write a full-resolution uint16 mask as a tiled, Deflate BigTIFF.
+
+    Rasterises one `tile`-row strip at a time and streams tiles to tifffile, so
+    peak memory is one strip (512 x 48031 x uint16 = 49 MB) rather than the
+    whole 4.48 GiB mask. Masks are mostly zeros, so Deflate makes the file
+    small -- a 40 MB test mask compressed to 64 KB.
+    """
+    import numpy as np
+    import tifffile
+
+    # Pre-compute each shape's row span once; a strip only redraws the shapes
+    # that actually reach it (3504 crowns x 98 strips otherwise).
+    spans = []
+    for lbl, pts in shapes:
+        if not pts:
+            continue
+        ys = [int(p[1]) for p in pts]
+        spans.append((lbl, pts, min(ys), max(ys)))
+
+    def _tiles():
+        for ty in range(0, H, tile):
+            sh = min(tile, H - ty)
+            strip = np.zeros((sh, W), dtype=np.uint16)
+            for lbl, pts, ymin, ymax in spans:
+                if ymax < ty or ymin >= ty + sh:
+                    continue
+                _stamp_mask_shape(strip, pts, lbl, ty, H, W)
+            for tx in range(0, W, tile):
+                sub = strip[:, tx:tx + tile]
+                if sub.shape == (tile, tile):
+                    yield sub
+                else:
+                    pad = np.zeros((tile, tile), dtype=np.uint16)
+                    pad[:sub.shape[0], :sub.shape[1]] = sub
+                    yield pad
+
+    with tifffile.TiffWriter(path, bigtiff=True) as tw:
+        tw.write(_tiles(), shape=(H, W), dtype=np.uint16,
+                 tile=(tile, tile), compression="deflate")
+
+
 class MachineLearningManager(QtWidgets.QDialog):
     """
     Viewer-independent CSV/mask exporter:
@@ -2575,6 +2810,139 @@ class MachineLearningManager(QtWidgets.QDialog):
         img, C = self._apply_ax_geometry_only(raw, ax)
         return img, C
 
+    def _geometry_shape_after_ax(self, shape_hwc, ax):
+        """(H, W, C) that _apply_ax_geometry_only would produce, as arithmetic.
+
+        Mirrors that function's rotate/crop/resize shape maths exactly, without
+        touching a pixel. Kept adjacent to it deliberately: if one changes the
+        other must, and test_ml_manager_cog_windowed asserts they agree.
+        """
+        h, w, c = int(shape_hwc[0]), int(shape_hwc[1]), int(shape_hwc[2])
+        ax = ax or {}
+
+        try:
+            rot = int(ax.get("rotate", 0)) % 360
+        except Exception:
+            rot = 0
+        crop_rect = ax.get("crop_rect") or None
+        crop_ref = ax.get("crop_rect_ref_size") or None
+        resize = ax.get("resize") or None
+        rotate_enabled = ax.get("rotate_enabled", True)
+        crop_enabled = ax.get("crop_enabled", True)
+        resize_enabled = ax.get("resize_enabled", True)
+
+        raw_h, raw_w = h, w
+        rotated_w, rotated_h = (raw_h, raw_w) if rot in (90, 270) else (raw_w, raw_h)
+
+        do_rotate_first = True
+        if crop_rect and rot in (90, 180, 270):
+            if isinstance(crop_ref, dict) and "w" in crop_ref and "h" in crop_ref:
+                ref_w = int(crop_ref.get("w", 0)) or 0
+                ref_h = int(crop_ref.get("h", 0)) or 0
+                if ref_w > 0 and ref_h > 0:
+                    if (ref_w, ref_h) == (raw_w, raw_h):
+                        do_rotate_first = False
+                    elif (ref_w, ref_h) == (rotated_w, rotated_h):
+                        do_rotate_first = True
+
+        def _rotate():
+            nonlocal h, w
+            if rotate_enabled and rot in (90, 270):
+                h, w = w, h
+
+        def _crop():
+            nonlocal h, w
+            if not crop_enabled or not crop_rect or h <= 0 or w <= 0:
+                return
+            if isinstance(crop_ref, dict) and "w" in crop_ref and "h" in crop_ref:
+                ref_w = int(crop_ref.get("w") or w)
+                ref_h = int(crop_ref.get("h") or h)
+            else:
+                ref_w, ref_h = w, h
+            x = int(crop_rect.get("x", 0))
+            y = int(crop_rect.get("y", 0))
+            cw = int(crop_rect.get("width", w))
+            ch = int(crop_rect.get("height", h))
+            if ref_w != w or ref_h != h:
+                sx = w / float(max(1, ref_w))
+                sy = h / float(max(1, ref_h))
+                x = int(round(x * sx)); y = int(round(y * sy))
+                cw = int(round(cw * sx)); ch = int(round(ch * sy))
+            x0 = max(0, min(x, w));      y0 = max(0, min(y, h))
+            x1 = max(0, min(x + cw, w)); y1 = max(0, min(y + ch, h))
+            if x1 > x0 and y1 > y0:
+                h, w = y1 - y0, x1 - x0
+
+        if do_rotate_first:
+            _rotate(); _crop()
+        else:
+            _crop(); _rotate()
+
+        # resize (always last)
+        if resize_enabled and isinstance(resize, dict) and resize and h > 0 and w > 0:
+            h0, w0 = h, w
+            if ("px_w" in resize) or ("px_h" in resize):
+                tw = int(resize.get("px_w", 0) or 0)
+                th = int(resize.get("px_h", 0) or 0)
+                if tw > 0 and th > 0:
+                    new_w, new_h = tw, th
+                elif tw > 0:
+                    s = tw / float(w0); new_w = tw; new_h = max(1, int(round(h0 * s)))
+                elif th > 0:
+                    s = th / float(h0); new_h = th; new_w = max(1, int(round(w0 * s)))
+                else:
+                    new_w, new_h = w0, h0
+            elif "scale" in resize:
+                s = float(resize.get("scale", 100.0)) / 100.0
+                new_w = max(1, int(round(w0 * s)))
+                new_h = max(1, int(round(h0 * s)))
+            else:
+                pw = float(resize.get("width", 100.0)) / 100.0
+                ph = float(resize.get("height", 100.0)) / 100.0
+                new_w = max(1, int(round(w0 * pw)))
+                new_h = max(1, int(round(h0 * ph)))
+            h, w = new_h, new_w
+
+        return (h, w, c)
+
+    def _geometry_only_shape(self, filepath):
+        """(H, W, C) of the geometry-only export frame WITHOUT decoding pixels.
+
+        generate_segmentation_images needs this shape and nothing else -- it
+        never reads a single pixel of the image, it only allocates a mask of
+        that size and maps polygon coordinates into it. Going through
+        _get_geometry_only_image to learn it called _load_raw_image, i.e.
+        tifffile.asarray() over the WHOLE file: 17.93 GiB for the BCI COG on a
+        15.7 GiB machine, then float32 conversion on top. It could never
+        succeed, and every byte of it was thrown away.
+
+        Falls back to the old full read only when the header cannot be probed
+        (non-TIFF, or a format raster_reader does not handle).
+        """
+        try:
+            from .raster_reader import probe
+            p = probe(filepath)
+        except Exception:
+            p = None
+
+        if p is not None and p.width and p.height:
+            try:
+                ax = self._load_ax_mods(filepath) or {}
+            except Exception:
+                ax = {}
+            try:
+                return self._geometry_shape_after_ax(
+                    (int(p.height), int(p.width), int(p.count)), ax)
+            except Exception as e:
+                logging.warning("[_geometry_only_shape] shape maths failed for %s: %s",
+                                filepath, e)
+
+        img, C = self._get_geometry_only_image(filepath)
+        if img is None:
+            return None
+        h, w = img.shape[:2]
+        return (int(h), int(w), int(C))
+
     def _apply_ax_geometry_only(self, raw_img, ax):
         """
         Apply ONLY geometric operations from .ax: crop, rotate, resize.
@@ -3768,11 +4136,29 @@ class MachineLearningManager(QtWidgets.QDialog):
     def _as_8bit_bgr(self, arr):
         """
         Convert any 2D/3D array (possibly uint16/float) to an 8-bit BGR image safe for JPEG.
+
+        WHOLE-FRAME ONLY. On a lazily-read raster this materialises the entire
+        image, so it now refuses rather than trying: for the BCI COG the read
+        below asked for 1 band x 50101 x 48031 = 4.48 GiB (and the
+        `except` branch's np.asarray fallback asks for exactly the same thing,
+        so it cannot rescue itself). Callers that only need crops must use
+        _ThumbSource, which reads one polygon's window at a time.
         """
         import numpy as np, cv2
         if arr is None:
             return None
         if hasattr(arr, "read_window"):
+            try:
+                need = (int(getattr(arr, "width", 0)) * int(getattr(arr, "height", 0))
+                        * max(1, len(arr)) * np.dtype(arr.dtype).itemsize)
+                if need > _WHOLE_FRAME_VIS_MAX_BYTES:
+                    logging.error(
+                        "[_as_8bit_bgr] refusing a %.2f GiB whole-frame read for %s; "
+                        "use _ThumbSource for per-polygon crops",
+                        need / 2**30, getattr(arr, "shape", "?"))
+                    return None
+            except Exception:
+                pass
             try:
                 chans = arr.read_window(0, 0, arr.width, arr.height)
                 if isinstance(chans, list) and len(chans) > 0:
@@ -3783,7 +4169,11 @@ class MachineLearningManager(QtWidgets.QDialog):
                 else:
                     v = np.asarray(arr)
             except Exception as e:
-                import logging
+                # NOTE: no `import logging` here. The module already imports it,
+                # and a function-local import bound the name for the WHOLE
+                # function -- so the size guard above, which logs before this
+                # point, died with UnboundLocalError into its own `except` and
+                # silently let the 4.48 GiB read proceed anyway.
                 logging.warning(f"[_as_8bit_bgr] Failed to materialize LazyChannels: {e}")
                 v = np.asarray(arr)
         else:
@@ -3816,7 +4206,38 @@ class MachineLearningManager(QtWidgets.QDialog):
             elif vis.shape[2] == 1:
                 vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
             return vis
-    
+
+    def _lazy_bgr_scale(self, arr):
+        """Per-channel (lo, hi) for 8-bit conversion of a lazily-read raster.
+
+        _as_8bit_bgr normalises each channel with cv2.NORM_MINMAX, i.e. against
+        the WHOLE frame's min/max. Reading crops instead would normalise each
+        thumbnail against its own extremes, so every thumbnail would come out
+        differently stretched. Fixing the scale once here keeps them mutually
+        comparable and keeps the drawn outline colours meaningful.
+
+        The extremes come from LazyChannels.sample_bands -- the same sampler
+        the scene-statistics path uses, which prefers a coarse pyramid level
+        and otherwise reads a few scattered tile-aligned windows. That is an
+        APPROXIMATION of the true frame min/max; the exact value would cost the
+        19 GB read this whole change exists to avoid, and this path currently
+        produces no thumbnails at all. Eager (small) images keep using
+        _as_8bit_bgr and are unaffected.
+        """
+        import numpy as np
+        bands = list(getattr(arr, "_order", None) or range(len(arr)))
+        samp = np.asarray(arr.sample_bands(bands, max_bytes=_VIS_SCALE_SAMPLE_BYTES))
+        if samp.ndim == 2:
+            samp = samp[..., None]
+        out = []
+        for i in range(samp.shape[2]):
+            ch = samp[..., i]
+            lo = float(np.nanmin(ch)) if ch.size else 0.0
+            hi = float(np.nanmax(ch)) if ch.size else 0.0
+            out.append((lo, hi))
+        return out
+
+
     def generate_thumbnails(self):
         """
         Thumbnails from the same export image (RAW + .ax scientific steps),
@@ -3879,8 +4300,14 @@ class MachineLearningManager(QtWidgets.QDialog):
                 else:
                     color = (0, 255, 0)     # green
 
-                # Prepare an 8-bit BGR preview source for drawing/saving
-                vis_full = self._as_8bit_bgr(img)
+                # Per-polygon 8-bit BGR crop source. For an eager array this is
+                # the same whole-frame preview as before; for a lazily-read
+                # raster it reads one polygon's window at a time instead of
+                # materialising 4.48 GiB per band. See _ThumbSource.
+                src = _ThumbSource(self, img)
+                if not src.ok:
+                    logging.warning("Could not build a preview for %s", filepath)
+                    continue
 
                 # Loop over polygons in this file
                 for idx, poly in enumerate(polys, start=1):
@@ -3916,7 +4343,7 @@ class MachineLearningManager(QtWidgets.QDialog):
                     x0 = max(0, min(x0, W - new_w))
                     y0 = max(0, min(y0, H - new_h))
 
-                    crop = vis_full[y0:y0+new_h, x0:x0+new_w].copy()
+                    crop = src.crop(x0, y0, new_w, new_h)
                     if crop is None or crop.size == 0:
                         continue
 
@@ -4066,16 +4493,27 @@ class MachineLearningManager(QtWidgets.QDialog):
                 W.writerow(['object_id', 'group_name', 'image_file', 'polygon_index'])
 
                 for filepath, polys in filepath_to_polygons.items():
-                    # FIX: Use geometry-only export to get correct dimensions
-                    # This ensures the mask matches the image dimensions when polygons were drawn,
-                    # without histogram matching or band expressions that could cause misalignment.
-                    img, _C = self._get_geometry_only_image(filepath)
-                    if img is None:
+                    # Geometry-only dimensions, so the mask matches the frame
+                    # polygons were drawn in (no histogram matching or band
+                    # expressions, which could misalign it).
+                    #
+                    # ONLY THE SHAPE IS NEEDED -- not one pixel of this image is
+                    # ever read below. Obtaining it via _get_geometry_only_image
+                    # called _load_raw_image, i.e. tifffile.asarray() over the
+                    # whole file: 17.93 GiB for the BCI COG on a 15.7 GiB
+                    # machine, then float32 on top of that. It could not
+                    # succeed, and all of it was discarded.
+                    shape = self._geometry_only_shape(filepath)
+                    if shape is None:
                         logging.warning(f"Could not open image at {filepath}")
                         continue
-                    H, Wimg = img.shape[:2]
-                    mask = np.zeros((H, Wimg), dtype=np.uint16)
+                    H, Wimg, Cimg = shape
 
+                    # --- pass 1: map every polygon and emit its CSV row -------
+                    # Separated from rasterising so a mask too large to hold in
+                    # memory can be drawn strip by strip below without mapping
+                    # the polygons again per strip.
+                    shapes = []          # (label, pts_img)
                     label = 1
                     poly_idx = 1
                     for group_name, poly_points in polys:
@@ -4085,7 +4523,8 @@ class MachineLearningManager(QtWidgets.QDialog):
                             continue
                         # map without viewer, using SNAPSHOT payload
                         pdata = polygons_by_group.get(group_name, {}).get(filepath, {})
-                        pts_img = self._map_points_scene_to_image(filepath, parsed, img.shape, polygon_data=pdata)
+                        pts_img = self._map_points_scene_to_image(
+                            filepath, parsed, (H, Wimg, Cimg), polygon_data=pdata)
 
                         # --- NEW: collapse decorated "point" shapes to a single pixel
                         is_point_shape = str(pdata.get("type", "")).lower() == "point"
@@ -4094,21 +4533,35 @@ class MachineLearningManager(QtWidgets.QDialog):
                             cy = int(round(sum(y for _, y in pts_img) / len(pts_img)))
                             pts_img = [(cx, cy)]
 
-                        if len(pts_img) == 1:
-                            x, y = pts_img[0]
-                            if 0 <= y < H and 0 <= x < Wimg:
-                                mask[y, x] = label
-                        else:
-                            arr = np.array([pts_img], dtype=np.int32)
-                            cv2.fillPoly(mask, arr, int(label))
-
+                        shapes.append((label, pts_img))
                         W.writerow([label, group_name, filepath, poly_idx])
                         label += 1
                         poly_idx += 1
 
-                    out = os.path.join(save_dir, f"{os.path.splitext(os.path.basename(filepath))[0]}_mask.png")
-                    if not cv2.imwrite(out, mask):
-                        logging.error(f"Failed to write mask {out}")
+                    # --- pass 2: rasterise ------------------------------------
+                    stem = os.path.splitext(os.path.basename(filepath))[0]
+                    if H * Wimg <= _MASK_PNG_MAX_PIXELS:
+                        mask = np.zeros((H, Wimg), dtype=np.uint16)
+                        for lbl, pts_img in shapes:
+                            _fill_mask_shape(mask, pts_img, lbl, H, Wimg)
+                        out = os.path.join(save_dir, f"{stem}_mask.png")
+                        if not cv2.imwrite(out, mask):
+                            logging.error(f"Failed to write mask {out}")
+                    else:
+                        # Past OpenCV's CV_IO_MAX_IMAGE_PIXELS cv2.imwrite
+                        # cannot encode a PNG at all, whatever the memory
+                        # budget -- the BCI COG's mask is 2.41 Gpx, 2.24x the
+                        # cap. Full resolution still matters (a segmentation
+                        # mask has to align pixel-for-pixel with the source),
+                        # so it is written as a tiled BigTIFF instead.
+                        out = os.path.join(save_dir, f"{stem}_mask.tif")
+                        try:
+                            _write_mask_tiled(out, H, Wimg, shapes)
+                            logging.info("[segmentation] %s: %d x %d exceeds the PNG "
+                                         "pixel cap; wrote tiled TIFF %s",
+                                         stem, Wimg, H, os.path.basename(out))
+                        except Exception as e:
+                            logging.error(f"Failed to write mask {out}: {e}")
         except Exception as e:
             logging.critical(f"Failed to write segmentation CSV/masks: {e}")
             QMessageBox.critical(self, "Export Failed", f"Error exporting segmentation:\n{e}")
