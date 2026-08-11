@@ -164,6 +164,9 @@ FEATURE_MAP = {
     "test_polygon_manager_advanced": (
         "PolygonManager advanced operations",
         "nearest-image search, copy/move between roots, multispectral->thermal correction"),
+    "test_ml_manager_cog_windowed": (
+        "Thumbnails and segmentation masks stay windowed on a COG",
+        "per-polygon crops instead of a whole-frame preview (eager crops byte-identical); geometry-only shape without decoding; full-res masks built in strips, pixel-exact vs a dense build"),
     "test_polygon_path_key_shadowing": (
         "Two spellings of one image path must not hide each other",
         "polygon lookups union the exact and normalised indices, so one drawn polygon cannot hide every imported one; saving finds polygons keyed under normpath; untouched pyramid records are not paged in"),
