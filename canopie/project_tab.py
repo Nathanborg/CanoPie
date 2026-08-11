@@ -7712,25 +7712,18 @@ class ProjectTab(QtWidgets.QWidget):
             
             # PERFORMANCE FIX: ALWAYS use O(1) lookup with lazy-built index
             # Never iterate through all 50,000 groups - that's the whole point!
+            #
+            # The lookup takes the UNION of the exact and normalised indices.
+            # It used to consult the normalised one only `if not memory_hit`,
+            # which let a single polygon drawn under the viewer's spelling of
+            # the path shadow every polygon imported under os.path.normpath's
+            # spelling of the SAME path -- the viewer went from 3505 polygons
+            # to 1 on the first refresh after a draw. See _poly_index_lookup.
             if self.all_polygons:
-                # Ensure index is built
-                self._ensure_polygon_index()
-                
-                # O(1) lookup using exact path index (most common case)
-                if filepath in self._poly_exact_index:
-                    for gn in self._poly_exact_index[filepath]:
-                        if gn in self.all_polygons and filepath in self.all_polygons[gn]:
-                            polygons_to_draw.append((self.all_polygons[gn][filepath], gn))
-                            memory_hit = True
-                
-                # Fallback: O(1) lookup using normalized path index
-                if not memory_hit:
-                    filepath_norm = os.path.normpath(filepath).lower() if filepath else ""
-                    if filepath_norm in self._poly_norm_index:
-                        for gn, orig_fp in self._poly_norm_index[filepath_norm]:
-                            if gn in self.all_polygons and orig_fp in self.all_polygons[gn]:
-                                polygons_to_draw.append((self.all_polygons[gn][orig_fp], gn))
-                                memory_hit = True
+                for gn, stored_fp in self._poly_index_lookup(filepath):
+                    if gn in self.all_polygons and stored_fp in self.all_polygons[gn]:
+                        polygons_to_draw.append((self.all_polygons[gn][stored_fp], gn))
+                        memory_hit = True
             t_lookup = time.perf_counter() - t0
 
             # B) Slow Path: Check Disk (Only if memory returned nothing AND we have a project folder)
@@ -8078,10 +8071,22 @@ class ProjectTab(QtWidgets.QWidget):
                 if scene:
                     scene.update()
                 
-                # Log timing if slow
+                # ALWAYS log the COUNT; gate only the timing breakdown.
+                #
+                # This line used to be gated on t_total > 0.1 in its entirety,
+                # which made it silent in exactly the case that mattered:
+                # drawing one polygon and refreshing took ~1 ms, so a load that
+                # found 1 polygon instead of 3505 printed nothing at all after
+                # its ENTER line. That silence was then read as "load_polygons
+                # never completed" and sent a whole debugging session after the
+                # async refresh chain, when the load had completed fine and
+                # simply looked up the wrong index. The count is the one number
+                # that distinguishes those two, so it is never suppressed.
                 t_total = time.perf_counter() - t_start
                 if t_total > 0.1:
                     logging.info(f"[load_polygons] {os.path.basename(filepath)}: {len(polygons_to_draw)} polys, total={t_total:.3f}s (ax={t_ax:.3f}s, setup={t_setup:.3f}s, lookup={t_lookup:.3f}s, draw={t_draw:.3f}s)")
+                else:
+                    logging.info(f"[load_polygons] {os.path.basename(filepath)}: {len(polygons_to_draw)} polys, total={t_total:.3f}s")
 
     # =========================================================================
     # BACKUP: Original load_polygons implementation (preserved for rollback)
@@ -8577,15 +8582,10 @@ class ProjectTab(QtWidgets.QWidget):
         
         relevant_groups = set()
         for src_fp in src_files_set:
-            # Check exact index first
-            if src_fp in self._poly_exact_index:
-                relevant_groups.update(self._poly_exact_index[src_fp])
-            else:
-                # Fallback to normalized index
-                fp_norm = os.path.normpath(src_fp).lower() if src_fp else ""
-                if fp_norm in self._poly_norm_index:
-                    for gn, _ in self._poly_norm_index[fp_norm]:
-                        relevant_groups.add(gn)
+            # UNION of both indices -- see _poly_index_lookup for why the old
+            # exact-then-else form silently hid whole key spellings.
+            for gn, _stored_fp in self._poly_index_lookup(src_fp):
+                relevant_groups.add(gn)
 
         # ---------- copy (OPTIMIZED: Multithreaded Calc + Main Thread Apply) ----------
         import concurrent.futures
@@ -10495,21 +10495,20 @@ class ProjectTab(QtWidgets.QWidget):
         if not filepath:
             return
         
-        # PERFORMANCE FIX: Use O(1) index lookup
-        self._ensure_polygon_index()
-        
-        groups_to_update = self._poly_exact_index.get(filepath, [])
-        
-        for group_name in groups_to_update:
+        # PERFORMANCE FIX: Use O(1) index lookup.
+        # UNION of both key spellings (see _poly_index_lookup) -- the exact
+        # index alone skips every polygon stored under os.path.normpath's
+        # spelling of this same file, e.g. everything shapefile import wrote.
+        for group_name, stored_fp in self._poly_index_lookup(filepath):
             files = self.all_polygons.get(group_name, {})
-            if filepath in files:
-                files[filepath]["pixmap_size"] = list(pm_size)
-               
+            if stored_fp in files:
+                files[stored_fp]["pixmap_size"] = list(pm_size)
+
                 try:
                     exp_img, _meta = self._get_export_image(filepath)
                     if exp_img is not None:
                         h, w = exp_img.shape[:2]
-                        files[filepath]["image_size"] = [w, h]   # (W,H) to match how scale above
+                        files[stored_fp]["image_size"] = [w, h]   # (W,H) to match how scale above
                 except Exception:
                     pass
 
@@ -20423,6 +20422,73 @@ class ProjectTab(QtWidgets.QWidget):
                 except (ValueError, KeyError):
                     pass
 
+    def _poly_index_lookup(self, filepath: str):
+        """Every (group_name, storage_key) that holds polygons for `filepath`.
+
+        THE UNION of the exact and normalised indices -- never a fallback.
+
+        all_polygons is keyed by filepath STRING, and one project routinely
+        holds two spellings of the same file:
+
+            project.json / viewer   'C:/Users/x/y.tif'   (QFileDialog form)
+            shapefile import        'C:\\Users\\x\\y.tif' (os.path.normpath)
+
+        Measured on the real BCI project: _overview.json keys all 3504
+        imported crowns with backslashes, while
+        multispectral_image_data_groups -- and therefore
+        viewer.image_data.filepath -- uses forward slashes.
+
+        Every call site used to try the exact index FIRST and consult the
+        normalised one only `if not memory_hit` / `else` / `elif`. That makes
+        the two MUTUALLY EXCLUSIVE, and the exact index wins with whatever
+        happens to be registered under the viewer's spelling. So: import 3504
+        crowns (backslash key, found via the normalised index, drawn
+        correctly), then draw ONE polygon -- on_polygon_drawn registers it
+        under the viewer's forward-slash key -- and the next refresh's exact
+        lookup now succeeds with that single group, sets memory_hit, and skips
+        the normalised index entirely. The viewer draws 1 polygon instead of
+        3505 while the Polygon Manager still lists every group, because
+        all_polygons was never touched.
+
+        Returning the union is what makes the key spelling stop mattering.
+        Order is exact-index first so behaviour is unchanged for the projects
+        where only one spelling exists.
+        """
+        self._ensure_polygon_index()
+
+        # Read both indices defensively. _ensure_polygon_index early-returns
+        # when it believes the index is still valid, and callers/tests may
+        # hand-seed only one of the two -- neither must turn a lookup into an
+        # AttributeError.
+        exact = getattr(self, "_poly_exact_index", None) or {}
+        norm = getattr(self, "_poly_norm_index", None) or {}
+
+        out = []
+        seen = set()
+
+        for gn in (exact.get(filepath) or ()):
+            key = (gn, filepath)
+            if key not in seen:
+                seen.add(key)
+                out.append(key)
+
+        # Must match how BOTH _ensure_polygon_index and _add_to_polygon_index
+        # build this key: normpath THEN lower. update_all_polygons used to
+        # look up with normpath alone, which cannot match a lowered key for
+        # any path containing an uppercase letter -- i.e. never, on Windows.
+        try:
+            fp_norm = os.path.normpath(filepath).lower() if filepath else ""
+        except Exception:
+            fp_norm = str(filepath).lower()
+
+        for gn, orig_fp in (norm.get(fp_norm) or ()):
+            key = (gn, orig_fp)
+            if key not in seen:
+                seen.add(key)
+                out.append(key)
+
+        return out
+
     def _get_polygons_for_filepath(self, filepath: str, polygon_names: list = None):
         """
         O(1) lookup to get all polygons for a specific filepath.
@@ -20438,38 +20504,22 @@ class ProjectTab(QtWidgets.QWidget):
         if not filepath or not self.all_polygons:
             return []
         
-        # Ensure index is built
-        self._ensure_polygon_index()
-        
         results = []
-        
-        # Try exact match first (O(1))
-        if filepath in self._poly_exact_index:
-            for gn in self._poly_exact_index[filepath]:
-                if gn in self.all_polygons and filepath in self.all_polygons[gn]:
-                    poly_data = self.all_polygons[gn][filepath]
-                    if polygon_names is None:
+
+        # UNION of both indices (see _poly_index_lookup). The normalised half
+        # used to run only `if not results`, so one entry stored under the
+        # viewer's spelling of the path hid every entry stored under
+        # os.path.normpath's spelling of the same path.
+        for gn, stored_fp in self._poly_index_lookup(filepath):
+            if gn in self.all_polygons and stored_fp in self.all_polygons[gn]:
+                poly_data = self.all_polygons[gn][stored_fp]
+                if polygon_names is None:
+                    results.append((gn, poly_data))
+                else:
+                    # Filter by name
+                    poly_name = poly_data.get('name', gn) if isinstance(poly_data, dict) else gn
+                    if poly_name in polygon_names:
                         results.append((gn, poly_data))
-                    else:
-                        # Filter by name
-                        poly_name = poly_data.get('name', gn) if isinstance(poly_data, dict) else gn
-                        if poly_name in polygon_names:
-                            results.append((gn, poly_data))
-        
-        # Try normalized match if no exact match found
-        if not results:
-            import os
-            fp_norm = os.path.normpath(filepath).lower() if filepath else ""
-            if fp_norm in self._poly_norm_index:
-                for gn, orig_fp in self._poly_norm_index[fp_norm]:
-                    if gn in self.all_polygons and orig_fp in self.all_polygons[gn]:
-                        poly_data = self.all_polygons[gn][orig_fp]
-                        if polygon_names is None:
-                            results.append((gn, poly_data))
-                        else:
-                            poly_name = poly_data.get('name', gn) if isinstance(poly_data, dict) else gn
-                            if poly_name in polygon_names:
-                                results.append((gn, poly_data))
         
         return results
 
@@ -20580,16 +20630,13 @@ class ProjectTab(QtWidgets.QWidget):
             # (This fixes "clear polygons but they come back after zoom/reload")
             # PERFORMANCE FIX: Use O(1) index lookup (index is ensured at function start)
             try:
-                groups_with_this_file = set()
-                
-                # Use exact index (always available since we called _ensure_polygon_index at start)
-                if filepath in self._poly_exact_index:
-                    for gn in self._poly_exact_index[filepath]:
-                        groups_with_this_file.add((gn, filepath))
-                elif fp_norm in self._poly_norm_index:
-                    for gn, orig_fp in self._poly_norm_index[fp_norm]:
-                        groups_with_this_file.add((gn, orig_fp))
-                
+                # UNION of both indices. This used to be exact-then-`elif`, and
+                # the elif could never fire anyway: it looked up `fp_norm`,
+                # which _norm() builds with normpath but WITHOUT .lower(),
+                # while the index is keyed normpath-then-lower. On Windows any
+                # path with an uppercase letter (i.e. every "C:\...") missed.
+                groups_with_this_file = set(self._poly_index_lookup(filepath))
+
                 # Now only process the groups that actually have this file
                 # Only polygons this viewer's last load actually drew may be
                 # inferred as user-deleted. See the matching comment in
@@ -24546,21 +24593,54 @@ class ProjectTab(QtWidgets.QWidget):
             
             # PERFORMANCE FIX: O(1) lookup per file using index
             # Old approach: scanned 55,000 polygon entries to filter for 10 files
-            # New approach: use exact index for O(1) lookup per file
+            # New approach: use the index for O(1) lookup per file.
+            #
+            # The lookup is the UNION of both key spellings. Using the exact
+            # index alone meant a root whose filepaths came from
+            # image_data_groups ('C:/x/y.tif') never matched anything
+            # shapefile import had stored under os.path.normpath's spelling
+            # ('C:\\x\\y.tif'), so imported polygons were NEVER written. That
+            # is why dragging an imported crown "snapped back": the move was
+            # applied in memory by update_all_polygons, the save silently
+            # skipped it, and the next load restored the old position from the
+            # untouched sidecar. See _poly_index_lookup.
             to_save = {}
             all_polys = getattr(self, "all_polygons", {}) or {}
-            
-            # Ensure index is built
-            self._ensure_polygon_index()
-            
+            n_lazy_skipped = 0
+
             for fp in filepaths_in_root:
-                if fp in self._poly_exact_index:
-                    for g in self._poly_exact_index[fp]:
-                        if g in all_polys and fp in all_polys[g]:
-                            if g not in to_save:
-                                to_save[g] = {}
-                            to_save[g][fp] = all_polys[g][fp]
-            
+                for g, stored_fp in self._poly_index_lookup(fp):
+                    if not (g in all_polys and stored_fp in all_polys[g]):
+                        continue
+                    record = all_polys[g][stored_fp]
+
+                    # An unmodified pyramid record must not be paged in just to
+                    # write it back out unchanged.
+                    #
+                    # A LazyPolygonRecord that has never materialised has never
+                    # had its geometry read, so by construction nothing has
+                    # changed it -- the same argument _write_polygon_overview
+                    # already relies on. Saving it anyway would call
+                    # _normalize_points_for_save, whose first line asks for
+                    # 'points' and therefore materialises it: on the real BCI
+                    # project that is 3504 files, ~90 MB and ~5 s of JSON
+                    # parsing, on the GUI thread, every time a single polygon
+                    # is drawn (drawing marks the whole root dirty). The
+                    # pyramid exists precisely to avoid that.
+                    if isinstance(record, polygon_lod.LazyPolygonRecord) and \
+                            not record.is_materialised:
+                        n_lazy_skipped += 1
+                        continue
+
+                    if g not in to_save:
+                        to_save[g] = {}
+                    to_save[g][stored_fp] = record
+
+            if n_lazy_skipped:
+                logging.info("[save_polygons_to_json] skipped %d untouched "
+                             "polygon(s) still served from the pyramid",
+                             n_lazy_skipped)
+
             # Clear dirty flag for this root after save
             if dirty_roots is not None:
                 dirty_roots.discard(root_name)
@@ -25898,16 +25978,10 @@ class ProjectTab(QtWidgets.QWidget):
              
              # Use index for performance if available, otherwise scan matches
              groups_to_process = set()
-             if hasattr(self, '_ensure_polygon_index'):
-                 self._ensure_polygon_index()
-                 # Exact match
-                 if filepath in self._poly_exact_index:
-                     groups_to_process.update(self._poly_exact_index[filepath])
-                 # Norm match
-                 fp_lower = os.path.normpath(filepath).lower()
-                 if fp_lower in self._poly_norm_index:
-                     for g, orig in self._poly_norm_index[fp_lower]:
-                         groups_to_process.add(g)
+             if hasattr(self, '_poly_index_lookup'):
+                 # UNION of both key spellings -- see _poly_index_lookup.
+                 for g, _orig in self._poly_index_lookup(filepath):
+                     groups_to_process.add(g)
              else:
                  # Fallback linear scan
                  fp_norm = os.path.normpath(filepath).lower()
@@ -26001,24 +26075,14 @@ class ProjectTab(QtWidgets.QWidget):
             polygons_dir = os.path.join(self.project_folder, "polygons") if self.project_folder else os.path.join(os.getcwd(), "polygons")
 
             # Identify groups and keys to delete using index
-            if hasattr(self, '_ensure_polygon_index'):
-                self._ensure_polygon_index()
-            
             # Map: group_name -> set of filepaths (keys) to delete
             deletions = defaultdict(set) # group -> keys
 
-            # We iterate filepaths in this root and check index
+            # We iterate filepaths in this root and check index.
+            # UNION of both key spellings -- see _poly_index_lookup.
             for fp in current_filepaths:
-                # Exact
-                if hasattr(self, '_poly_exact_index') and fp in self._poly_exact_index:
-                    for g in self._poly_exact_index[fp]:
-                        deletions[g].add(fp)
-                
-                # Norm
-                fp_lower = os.path.normpath(fp).lower()
-                if hasattr(self, '_poly_norm_index') and fp_lower in self._poly_norm_index:
-                    for g, orig in self._poly_norm_index[fp_lower]:
-                        deletions[g].add(orig)
+                for g, stored_fp in self._poly_index_lookup(fp):
+                    deletions[g].add(stored_fp)
 
             # Perform deletions
             for g, keys in deletions.items():
@@ -30765,34 +30829,19 @@ class ProjectTab(QtWidgets.QWidget):
         # --------- gather polygons for this file ----------
         polys = []  # list of (group_name, polygon_dict)
         try:
-            # PERFORMANCE FIX: Use O(1) index lookup instead of O(n) iteration
-            self._ensure_polygon_index()
-            
+            # PERFORMANCE FIX: Use O(1) index lookup instead of O(n) iteration.
+            # UNION of both key spellings -- see _poly_index_lookup. (The
+            # hand-rolled version here also probed a bare filepath.lower()
+            # key, which the index never contains: it is always keyed
+            # normpath-then-lower.)
             groups_for_file = set()
             filepath_keys = {}  # group_name -> actual filepath key
-            
-            # Try exact path first
-            if filepath in self._poly_exact_index:
-                for gn in self._poly_exact_index[filepath]:
+
+            for gn, stored_fp in self._poly_index_lookup(filepath):
+                if gn not in groups_for_file:
                     groups_for_file.add(gn)
-                    filepath_keys[gn] = filepath
-            
-            # Also check normalized index
-            fp_lower = filepath.lower() if filepath else ""
-            if fp_lower in self._poly_norm_index:
-                for gn, orig_fp in self._poly_norm_index[fp_lower]:
-                    if gn not in groups_for_file:
-                        groups_for_file.add(gn)
-                        filepath_keys[gn] = orig_fp
-            
-            # Also try full normpath
-            fp_norm = os.path.normpath(filepath).lower()
-            if fp_norm != fp_lower and fp_norm in self._poly_norm_index:
-                for gn, orig_fp in self._poly_norm_index[fp_norm]:
-                    if gn not in groups_for_file:
-                        groups_for_file.add(gn)
-                        filepath_keys[gn] = orig_fp
-            
+                    filepath_keys[gn] = stored_fp
+
             # Now gather polygon data from found groups
             for group_name in groups_for_file:
                 fp_key = filepath_keys.get(group_name)
