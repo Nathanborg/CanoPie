@@ -249,6 +249,99 @@ def _tile_grid(crop, tile):
             yield r, c, sub
 
 
+def _tiles_fully_inside(pts_img, gx, gy, gw, gh, tile):
+    """Boolean (rows, cols) grid: is each tile square wholly inside the polygon?
+
+    A tile counts only when EVERY pixel of it is interior -- corner tests are
+    not enough for the concave, lobed outlines real tree crowns have, where a
+    square can have all four corners inside and still straddle a notch.
+
+    The polygon is rasterised once into the grid's own frame and reduced with a
+    reshape, so the cost is one fill plus one pass over the crop regardless of
+    how many tiles there are.
+    """
+    import numpy as np, cv2
+    tile = max(1, int(tile))
+    rows, cols = int(gh) // tile, int(gw) // tile
+    if rows <= 0 or cols <= 0 or not pts_img:
+        return np.zeros((max(0, rows), max(0, cols)), dtype=bool)
+
+    mask = np.zeros((int(gh), int(gw)), dtype=np.uint8)
+    ring = np.array([[[int(round(px - gx)), int(round(py - gy))]
+                      for px, py in pts_img]], dtype=np.int32)
+    cv2.fillPoly(mask, ring, 1)
+    block = mask[:rows * tile, :cols * tile].reshape(rows, tile, cols, tile)
+    return block.all(axis=(1, 3))
+
+
+def _polygon_tile_yield(pts_img, tile, zoom, W, H, inside_only):
+    """(kept, grid_total) tiles a single polygon would produce.
+
+    Mirrors what _render_thumbnail_outputs actually does -- same bounding rect,
+    same zoom, same grown grid -- so the dialog's estimate cannot promise a
+    number the run does not deliver.
+    """
+    import numpy as np, cv2
+    if not pts_img:
+        return 0, 0
+    pts_np = np.array(pts_img, dtype=np.int32)
+    if len(pts_img) == 1:
+        x, y, w, h = int(pts_np[0][0]), int(pts_np[0][1]), 1, 1
+    else:
+        x, y, w, h = cv2.boundingRect(pts_np)
+
+    new_w = max(16, int(round(w * zoom)))
+    new_h = max(16, int(round(h * zoom)))
+    x0 = max(0, min(int(round(x + w / 2.0 - new_w / 2.0)), max(0, W - new_w)))
+    y0 = max(0, min(int(round(y + h / 2.0 - new_h / 2.0)), max(0, H - new_h)))
+
+    gx, gy, gw, gh = _grow_to_tile_grid(x0, y0, new_w, new_h, tile, W, H)
+    total = (gh // max(1, int(tile))) * (gw // max(1, int(tile)))
+    if not inside_only:
+        return total, total
+    return int(_tiles_fully_inside(pts_img, gx, gy, gw, gh, tile).sum()), total
+
+
+def estimate_tile_yield(polys, tile, zoom, inside_only, sample_cap=200):
+    """Estimate the tile count for a whole run, for the dialog's live readout.
+
+    `polys` is [(points, W, H), ...]. Only the first `sample_cap` are measured
+    and the result is scaled up -- rasterising 3504 crowns on every spin-box
+    tick would make the dialog unusable, and this is labelled an estimate.
+
+    Returns {'sampled', 'total', 'tiles', 'grid', 'empty'}, where `empty`
+    counts polygons that yield NO tile at all. That number is the one worth
+    looking at: with "inside only" on, any polygon narrower than the tile
+    produces nothing, and at tile=512 that was 66.9% of the real BCI crowns.
+    """
+    polys = list(polys or [])
+    total = len(polys)
+    if not total:
+        return {'sampled': 0, 'total': 0, 'tiles': 0, 'grid': 0, 'empty': 0}
+
+    step = max(1, total // sample_cap) if sample_cap else 1
+    sample = polys[::step][:sample_cap] if sample_cap else polys
+
+    kept = grid = empty = 0
+    for pts, W, H in sample:
+        k, g = _polygon_tile_yield(pts, tile, zoom,
+                                   W or 10 ** 7, H or 10 ** 7, inside_only)
+        kept += k
+        grid += g
+        if k == 0:
+            empty += 1
+
+    n = len(sample) or 1
+    scale = total / float(n)
+    return {
+        'sampled': n,
+        'total': total,
+        'tiles': int(round(kept * scale)),
+        'grid': int(round(grid * scale)),
+        'empty': int(round(empty * scale)),
+    }
+
+
 def _fill_mask_shape(canvas, pts_img, label, H, W):
     """Draw one labelled shape into a full-size mask canvas.
 
@@ -4309,6 +4402,48 @@ class MachineLearningManager(QtWidgets.QDialog):
         return out
 
 
+    def _polygons_for_estimate(self, selected_groups, polygons_by_group):
+        """[(points, W, H), ...] for ThumbnailOptionsDialog's live estimate.
+
+        Read straight from the snapshot, so the dialog can be shown without
+        decoding a single image. The frame comes from each record's own
+        `image_ref_size` -- the basis its points are stored in -- rather than
+        from the export image, which is not loaded until after the dialog
+        closes. On the projects this matters for the two are the same full
+        raster anyway, and the readout is labelled an estimate.
+        """
+        out = []
+        for group_name in selected_groups:
+            for _fp, pdata in (polygons_by_group.get(group_name, {}) or {}).items():
+                raw_pts = (pdata or {}).get("points") or []
+                if not raw_pts:
+                    continue
+                ref = (pdata.get("image_ref_size") or {}) if isinstance(pdata, dict) else {}
+                try:
+                    W = int(ref.get("w") or 0)
+                    H = int(ref.get("h") or 0)
+                except Exception:
+                    W = H = 0
+
+                # Same normalisation the generation loop below uses.
+                first = raw_pts[0]
+                if isinstance(first, (list, tuple)) and len(first) == 2 \
+                        and not isinstance(first[0], (list, tuple)):
+                    rings = [raw_pts]
+                elif isinstance(first, (list, tuple)) and len(first) == 2 \
+                        and isinstance(first[0], (list, tuple)):
+                    rings = raw_pts
+                else:
+                    parsed = self.parse_polygon_points(raw_pts)
+                    rings = [parsed] if parsed else []
+
+                for ring in rings:
+                    pts = self.parse_polygon_points(ring)
+                    if pts:
+                        out.append(([(float(p[0]), float(p[1])) for p in pts],
+                                    W or 10 ** 7, H or 10 ** 7))
+        return out
+
     def _render_thumbnail_outputs(self, src, pts_img, x0, y0, new_w, new_h,
                                   W, H, color, opts, base_name):
         """Render one polygon's output image(s). Returns [(filename, array), ...].
@@ -4372,8 +4507,24 @@ class MachineLearningManager(QtWidgets.QDialog):
         if crop is None or crop.size == 0:
             return []
         _draw(crop, gx, gy)
-        return [(f"{root}_r{r:02d}c{c:02d}{ext}", tile)
-                for r, c, tile in _tile_grid(crop, tile_size)]
+
+        # "Only tiles fully inside the polygon" is a FILTER over the same grid,
+        # not a different grid: a kept tile keeps its (row, col), so the names
+        # stay positionally meaningful and simply have gaps where a square
+        # crossed the outline. A polygon narrower than one tile keeps nothing,
+        # which is the point of the option -- the dialog's estimate says how
+        # many polygons that silences before the run starts.
+        keep = None
+        if opts.get("tiles_inside_only", False):
+            keep = _tiles_fully_inside(pts_img, gx, gy, gw, gh, tile_size)
+
+        out = []
+        for r, c, tile in _tile_grid(crop, tile_size):
+            if keep is not None:
+                if r >= keep.shape[0] or c >= keep.shape[1] or not keep[r, c]:
+                    continue
+            out.append((f"{root}_r{r:02d}c{c:02d}{ext}", tile))
+        return out
 
     def generate_thumbnails(self):
         """
@@ -4397,7 +4548,8 @@ class MachineLearningManager(QtWidgets.QDialog):
             return
 
         from .thumbnail_options_dialog import ThumbnailOptionsDialog
-        dlg = ThumbnailOptionsDialog(self)
+        dlg = ThumbnailOptionsDialog(
+            self._polygons_for_estimate(selected_groups, polygons_by_group), self)
         if dlg.exec_() != QtWidgets.QDialog.Accepted:
             return
         opts = dlg.get_options()

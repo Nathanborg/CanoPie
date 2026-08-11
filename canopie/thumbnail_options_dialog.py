@@ -10,6 +10,7 @@ often a grid of fixed-size patches rather than one variable-shaped crop.
 The defaults here reproduce the old behaviour exactly, so pressing Generate
 without touching anything writes what it always did.
 """
+from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                              QCheckBox, QSpinBox, QDoubleSpinBox,
                              QDialogButtonBox)
@@ -28,12 +29,19 @@ LEGACY_OUTLINE_THICKNESS = 2
 class ThumbnailOptionsDialog(QDialog):
     """Output size, outline, and DL tiling options for thumbnail generation."""
 
-    def __init__(self, parent=None):
+    def __init__(self, polygons=None, parent=None):
+        """`polygons` is [(points, W, H), ...] for the live tile estimate.
+
+        Optional: without it the dialog still works, it just cannot say how
+        many tiles a run will produce.
+        """
         super().__init__(parent)
+        self._polygons = list(polygons or [])
         self.setWindowTitle("Thumbnail Options")
         self.setMinimumWidth(380)
         self.setup_ui()
         self.apply_style()
+        self.update_estimate()
 
     # ------------------------------------------------------------------
     def setup_ui(self):
@@ -104,6 +112,29 @@ class ThumbnailOptionsDialog(QDialog):
         row_tile.addWidget(self.tile_spin)
         row_tile.addStretch()
         tile_box.content_layout.addLayout(row_tile)
+
+        self.inside_cb = QCheckBox("Only squares that fit inside the polygon")
+        self.inside_cb.setChecked(False)
+        self.inside_cb.setEnabled(False)
+        self.inside_cb.setToolTip(
+            "Keep a tile only when the whole square lies inside the outline.\n"
+            "Tiles that straddle the edge, and any polygon narrower than one\n"
+            "tile, produce nothing -- watch the estimate below.")
+        self.inside_cb.toggled.connect(self._schedule_estimate)
+        tile_box.content_layout.addWidget(self.inside_cb)
+
+        self.estimate_lbl = QLabel("")
+        self.estimate_lbl.setWordWrap(True)
+        self.estimate_lbl.setStyleSheet("color: #006400; font-size: 12px;")
+        tile_box.content_layout.addWidget(self.estimate_lbl)
+
+        # The estimate moves with every input that changes the grid. Debounced,
+        # because with "inside only" on it rasterises the sampled polygons --
+        # ~150 ms on the real 3504-crown project, which held down a spin-box
+        # arrow would queue up faster than it can be served.
+        self.tile_spin.valueChanged.connect(self._schedule_estimate)
+        self.zoom_spin.valueChanged.connect(self._schedule_estimate)
+
         layout.addWidget(tile_box)
 
         # Sections open by default -- CollapsibleBox starts collapsed, which
@@ -164,10 +195,64 @@ class ThumbnailOptionsDialog(QDialog):
     # ------------------------------------------------------------------
     def on_tiling_toggled(self, checked):
         self.tile_spin.setEnabled(checked)
+        self.inside_cb.setEnabled(checked)
         # Tiles are tile_size square by construction, so an output width/height
         # would simply not be honoured -- disable rather than silently ignore.
         self.width_spin.setEnabled(not checked)
         self.height_spin.setEnabled(not checked)
+        self._schedule_estimate()
+
+    def _schedule_estimate(self, *_):
+        """Coalesce rapid control changes into one recompute."""
+        timer = getattr(self, "_est_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self.update_estimate)
+            self._est_timer = timer
+        timer.start(120)
+
+    def update_estimate(self, *_):
+        """Refresh the live tile-count readout.
+
+        Deliberately shows how many polygons yield NOTHING as well as the tile
+        total. With "only squares inside" on, anything narrower than one tile
+        is silently dropped, and on the real BCI crowns that reaches two thirds
+        of them at tile=512 -- a number the user should see while choosing the
+        size, not discover afterwards in a short output folder.
+        """
+        if not hasattr(self, "estimate_lbl"):
+            return
+        if not self._polygons:
+            self.estimate_lbl.setText("")
+            return
+        if not self.tile_cb.isChecked():
+            n = len(self._polygons)
+            self.estimate_lbl.setText(f"{n:,} polygon(s) -> {n:,} thumbnail(s).")
+            return
+
+        # Lazy import: machine_learning_manager imports this module for its
+        # LEGACY_* constants, so a module-level import here would be circular.
+        from .machine_learning_manager import estimate_tile_yield
+        try:
+            est = estimate_tile_yield(self._polygons,
+                                      int(self.tile_spin.value()),
+                                      float(self.zoom_spin.value()),
+                                      bool(self.inside_cb.isChecked()))
+        except Exception as e:
+            self.estimate_lbl.setText(f"(estimate unavailable: {e})")
+            return
+
+        approx = "~" if est['sampled'] < est['total'] else ""
+        parts = [f"{approx}{est['tiles']:,} tile(s) from {est['total']:,} polygon(s)"]
+        if self.inside_cb.isChecked():
+            parts.append(f"{approx}{est['grid']:,} without the inside-only filter")
+        if est['empty']:
+            pct = 100.0 * est['empty'] / max(1, est['total'])
+            parts.append(f"{approx}{est['empty']:,} polygon(s) ({pct:.0f}%) yield none")
+        if est['sampled'] < est['total']:
+            parts.append(f"estimated from {est['sampled']:,} sampled")
+        self.estimate_lbl.setText("  |  ".join(parts) + ".")
 
     def get_options(self):
         """Plain dict of the chosen options (see module docstring for defaults)."""
@@ -178,4 +263,5 @@ class ThumbnailOptionsDialog(QDialog):
             'draw_outline': bool(self.outline_cb.isChecked()),
             'tile_enabled': bool(self.tile_cb.isChecked()),
             'tile_size': int(self.tile_spin.value()),
+            'tiles_inside_only': bool(self.inside_cb.isChecked()),
         }
