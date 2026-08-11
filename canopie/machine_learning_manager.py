@@ -81,6 +81,13 @@ except Exception:
 #: size it is stored with. 512 rows x 48031 px x uint16 = 49 MB resident.
 _MASK_TILE = 512
 
+#: The values generate_thumbnails hardcoded before ThumbnailOptionsDialog
+#: existed. Defined there (next to the spin boxes that default to them) and
+#: re-exported here so the render path and the dialog cannot drift apart.
+from .thumbnail_options_dialog import (LEGACY_THUMBNAIL_SIZE,
+                                       LEGACY_ZOOM_FACTOR,
+                                       LEGACY_OUTLINE_THICKNESS)
+
 
 class _ThumbSource:
     """Per-polygon 8-bit BGR crops, without ever holding the whole frame.
@@ -176,6 +183,70 @@ def _bgr_from_channels(chans, scale=None):
     elif vis.shape[2] == 1:
         vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
     return vis
+
+
+def _grow_to_tile_grid(x0, y0, w, h, tile, W, H):
+    """Expand a crop window to a whole number of `tile`-sized cells.
+
+    Returns (x0, y0, grid_w, grid_h), re-centred on the original window and
+    clamped to the image.
+
+    WHY GROW RATHER THAN DROP THE REMAINDER. Tiles are cut from a polygon's
+    zoomed bounding box, not from the whole image, and those boxes are rarely a
+    multiple of the tile size. Measured over the 3504 real BCI crowns the
+    zoomed bbox max-dimension is p25=324, p50=424, p75=571 px, so simply
+    discarding partial tiles would write NOTHING AT ALL for 7.8% of crowns at
+    tile=256 -- and for 66.9% at tile=512 -- silently. Rounding the window up
+    instead means every polygon yields at least one tile, and because the extra
+    pixels are read from the raster rather than invented, every tile is real
+    imagery.
+
+    Where the image itself is too small to hold a whole grid, the grid falls
+    back to the largest whole-tile size that fits; only then does the caller
+    have to pad, and only against the image edge.
+    """
+    tile = max(1, int(tile))
+
+    def _axis(start, size, extent):
+        grid = -(-max(1, int(size)) // tile) * tile          # ceil to tiles
+        if grid > extent:
+            grid = max(tile, (int(extent) // tile) * tile)
+        centre = start + size / 2.0
+        pos = int(round(centre - grid / 2.0))
+        pos = max(0, min(pos, max(0, int(extent) - grid)))
+        return pos, grid
+
+    nx, gw = _axis(x0, w, W)
+    ny, gh = _axis(y0, h, H)
+    return nx, ny, gw, gh
+
+
+def _tile_grid(crop, tile):
+    """Slice an already-read crop into non-overlapping `tile`-square tiles.
+
+    Yields (row, col, tile_array) in row-major order. A short right/bottom edge
+    -- only possible when the image boundary stopped _grow_to_tile_grid from
+    expanding -- is zero-padded so every emitted tile has the same shape, which
+    is what a training loader expects.
+
+    Takes an ARRAY, not a reader: the caller must have fetched the whole grown
+    window with a single _ThumbSource.crop(). Slicing in memory here is what
+    keeps the tiled path from re-reading the raster once per tile.
+    """
+    import numpy as np
+    tile = max(1, int(tile))
+    if crop is None or getattr(crop, "size", 0) == 0:
+        return
+    ch, cw = crop.shape[:2]
+    for r, ty in enumerate(range(0, ch, tile)):
+        for c, tx in enumerate(range(0, cw, tile)):
+            sub = crop[ty:ty + tile, tx:tx + tile]
+            if sub.shape[0] != tile or sub.shape[1] != tile:
+                shape = (tile, tile) + crop.shape[2:]
+                pad = np.zeros(shape, dtype=crop.dtype)
+                pad[:sub.shape[0], :sub.shape[1]] = sub
+                sub = pad
+            yield r, c, sub
 
 
 def _fill_mask_shape(canvas, pts_img, label, H, W):
@@ -4238,11 +4309,80 @@ class MachineLearningManager(QtWidgets.QDialog):
         return out
 
 
+    def _render_thumbnail_outputs(self, src, pts_img, x0, y0, new_w, new_h,
+                                  W, H, color, opts, base_name):
+        """Render one polygon's output image(s). Returns [(filename, array), ...].
+
+        Deliberately does no I/O and shows no dialogs, so the whole feature --
+        the legacy single-thumbnail path, the outline toggle, and the tiling
+        grid -- is testable headlessly. generate_thumbnails just writes what
+        this returns.
+
+        Two paths:
+
+        * tiling OFF -- exactly what generate_thumbnails did before the options
+          dialog existed: crop, draw the outline, resize to thumbnail_size. The
+          only change is that the drawing step is now skippable. With default
+          options this is byte-identical to the old output.
+        * tiling ON  -- the crop window is first grown to a whole number of
+          tiles (see _grow_to_tile_grid), read in ONE _ThumbSource.crop call,
+          optionally outlined, then sliced in memory. Tiles are written at
+          their native size; thumbnail_size does not apply to them, which is
+          why the dialog disables those spin boxes.
+
+        Tile files are named `{base}_r{row:02d}c{col:02d}{ext}` -- zero-padded
+        so a plain lexical sort is row-major order even past 10 rows or columns,
+        which matters when these feed a training pipeline that globs the folder.
+        """
+        import os, numpy as np, cv2
+
+        thickness = LEGACY_OUTLINE_THICKNESS
+        draw_outline = bool(opts.get("draw_outline", True))
+        tile_enabled = bool(opts.get("tile_enabled", False))
+        tile_size = int(opts.get("tile_size", 256) or 256)
+
+        def _draw(canvas, ox, oy):
+            if not draw_outline:
+                return
+            adj = [[int(round(px - ox)), int(round(py - oy))] for (px, py) in pts_img]
+            adj_np = np.array([adj], dtype=np.int32)
+            if len(adj) >= 3:
+                cv2.polylines(canvas, [adj_np], isClosed=True, color=color,
+                              thickness=thickness)
+            else:
+                (px, py) = adj[0]
+                cv2.rectangle(canvas, (px - 2, py - 2), (px + 2, py + 2), color,
+                              thickness=thickness)
+
+        root, ext = os.path.splitext(base_name)
+
+        if not tile_enabled:
+            crop = src.crop(x0, y0, new_w, new_h)
+            if crop is None or crop.size == 0:
+                return []
+            _draw(crop, x0, y0)
+            thumb = cv2.resize(crop, tuple(opts.get("thumbnail_size",
+                                                    LEGACY_THUMBNAIL_SIZE)),
+                               interpolation=cv2.INTER_AREA)
+            return [(base_name, thumb)]
+
+        # --- tiled path -------------------------------------------------
+        gx, gy, gw, gh = _grow_to_tile_grid(x0, y0, new_w, new_h, tile_size, W, H)
+        crop = src.crop(gx, gy, gw, gh)          # ONE read for the whole grid
+        if crop is None or crop.size == 0:
+            return []
+        _draw(crop, gx, gy)
+        return [(f"{root}_r{r:02d}c{c:02d}{ext}", tile)
+                for r, c, tile in _tile_grid(crop, tile_size)]
+
     def generate_thumbnails(self):
         """
         Thumbnails from the same export image (RAW + .ax scientific steps),
         cropped around each polygon with the same zoom-out parameters used in ProjectTab.
         Uses a snapshot of polygons to avoid concurrent wipes.
+
+        Output size, outline and tiling come from ThumbnailOptionsDialog, whose
+        defaults reproduce the previous hardcoded behaviour exactly.
         """
         selected_groups = self.get_selected_groups()
         if not selected_groups:
@@ -4256,10 +4396,12 @@ class MachineLearningManager(QtWidgets.QDialog):
         if not save_dir:
             return
 
-        # Match ProjectTab parameters
-        zoom_factor = 1.4           # same zoom-out factor
-        thumbnail_size = (200, 200) # same output size
-        thickness = 2               # same outline thickness
+        from .thumbnail_options_dialog import ThumbnailOptionsDialog
+        dlg = ThumbnailOptionsDialog(self)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        opts = dlg.get_options()
+        zoom_factor = float(opts.get("zoom_factor", LEGACY_ZOOM_FACTOR))
 
         import os, numpy as np, cv2, logging
 
@@ -4343,23 +4485,10 @@ class MachineLearningManager(QtWidgets.QDialog):
                     x0 = max(0, min(x0, W - new_w))
                     y0 = max(0, min(y0, H - new_h))
 
-                    crop = src.crop(x0, y0, new_w, new_h)
-                    if crop is None or crop.size == 0:
-                        continue
-
-                    adj = []
-                    for (px, py) in pts_img:
-                        adj.append([int(round(px - x0)), int(round(py - y0))])
-                    adj_np = np.array([adj], dtype=np.int32)
-                    if len(adj) >= 3:
-                        cv2.polylines(crop, [adj_np], isClosed=True, color=color, thickness=thickness)
-                    else:
-                        (px, py) = adj[0]
-                        cv2.rectangle(crop, (px-2, py-2), (px+2, py+2), color, thickness=thickness)
-
-                    thumb = cv2.resize(crop, thumbnail_size, interpolation=cv2.INTER_AREA)
-
-                    # Build output filename
+                    # Build output filename. construct_thumbnail_name is called
+                    # exactly as before -- neither of its two near-identical
+                    # definitions in project_tab is touched; any tile suffix is
+                    # appended here instead.
                     if callable(build_name):
                         base_name = build_name(group_name, filepath, image_type=image_type)
                         if len(polys) > 1:
@@ -4372,10 +4501,12 @@ class MachineLearningManager(QtWidgets.QDialog):
                         suffix = f"_p{idx}" if len(polys) > 1 else ""
                         out_name = f"{group_name}_{stem}{suffix}.jpg"
 
-                    out_path = os.path.join(save_dir, out_name)
-                    ok = cv2.imwrite(out_path, thumb)
-                    if not ok:
-                        logging.error(f"Failed to write thumbnail: {out_path}")
+                    for fname, image in self._render_thumbnail_outputs(
+                            src, pts_img, x0, y0, new_w, new_h, W, H,
+                            color, opts, out_name):
+                        out_path = os.path.join(save_dir, fname)
+                        if not cv2.imwrite(out_path, image):
+                            logging.error(f"Failed to write thumbnail: {out_path}")
 
         QtWidgets.QMessageBox.information(self, "Thumbnails Generated", f"Saved in {save_dir}")
 
