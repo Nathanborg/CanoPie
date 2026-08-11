@@ -164,6 +164,9 @@ FEATURE_MAP = {
     "test_polygon_manager_advanced": (
         "PolygonManager advanced operations",
         "nearest-image search, copy/move between roots, multispectral->thermal correction"),
+    "test_thumbnail_options": (
+        "Thumbnail options dialog and DL tiling",
+        "dialog defaults reproduce the old hardcoded 200x200/1.4/outline behaviour exactly; outline toggle skips drawing; every polygon yields at least one tile (crop grown, not dropped); zero-padded row-major tile names; the crop is read once, not once per tile"),
     "test_ml_manager_cog_windowed": (
         "Thumbnails and segmentation masks stay windowed on a COG",
         "per-polygon crops instead of a whole-frame preview (eager crops byte-identical); geometry-only shape without decoding; full-res masks built in strips, pixel-exact vs a dense build"),
