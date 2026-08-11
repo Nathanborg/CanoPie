@@ -164,6 +164,9 @@ FEATURE_MAP = {
     "test_polygon_manager_advanced": (
         "PolygonManager advanced operations",
         "nearest-image search, copy/move between roots, multispectral->thermal correction"),
+    "test_polygon_path_key_shadowing": (
+        "Two spellings of one image path must not hide each other",
+        "polygon lookups union the exact and normalised indices, so one drawn polygon cannot hide every imported one; saving finds polygons keyed under normpath; untouched pyramid records are not paged in"),
 }
 
 
