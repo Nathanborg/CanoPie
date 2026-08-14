@@ -318,3 +318,101 @@ def test_only_one_sample_for_stats_definition():
     assert src.count("    def _sample_for_stats(self, arr):") == 1, (
         "_sample_for_stats is defined more than once; the LAST definition wins "
         "and the earlier, correct one becomes dead code")
+
+
+# ---------------------------------------------------------------------------
+# The EDITOR UI must adopt the declared NoData too
+#
+# Reported from the real project C:\PCA_climate_soil_panama, whose .ax carries
+# `nodata_values: []` / `nodata_enabled: true` while the raster declares
+# GDAL_NODATA = -9999 (the same shape as the New Folder176 case above).
+#
+# Export, ML extraction and histogram matching all UNION the declared value in
+# (effective_nodata_values / hist_nodata_values, covered above), but
+# ImageEditorDialog._sync_ui_from_modifications read ONLY the .ax list. So the
+# editor's NoData box came up EMPTY -- and since _get_effective_nodata_values()
+# parses that box, the editor's own preview and statistics masked NOTHING while
+# CSV export masked -9999 correctly. The viewer therefore disagreed with export
+# on the same image, and there was no visible sign the value had been detected,
+# which is exactly why it was reported as "-9999 is not recognised
+# automatically".
+# ---------------------------------------------------------------------------
+def _editor_nodata_stub(filepath, ax):
+    """The minimum surface of ImageEditorDialog that the NoData sync touches.
+
+    A real ImageEditorDialog needs a full ProjectTab parent and loads pixels;
+    this exercises the actual unbound methods against a stub instead, so the
+    test stays fast and headless-safe.
+    """
+    import types
+    from PyQt5 import QtWidgets
+    from ..image_editor_dialog import ImageEditorDialog as IED
+
+    stub = types.SimpleNamespace()
+    stub.image_filepath = str(filepath)
+    stub.modifications = dict(ax)
+    stub.nodata_input = QtWidgets.QLineEdit()
+    stub.nodata_enabled_checkbox = QtWidgets.QCheckBox()
+    stub._parse_nodata_values = IED._parse_nodata_values.__get__(stub, IED)
+    return stub, IED
+
+
+def _raster_declaring_nodata(tmp_path, name="declared_ui.tif"):
+    import tifffile
+    fp = tmp_path / name
+    tifffile.imwrite(str(fp), _stack_with_mixed_fill(),
+                     extratags=[(42113, 's', 0, "-9999", True)])
+    return fp
+
+
+def test_editor_adopts_declared_nodata_when_ax_lists_none(tmp_path, qapp):
+    """THE reported bug: empty NoData box on a file that declares -9999."""
+    fp = _raster_declaring_nodata(tmp_path)
+    stub, IED = _editor_nodata_stub(fp, {"nodata_values": [], "nodata_enabled": True})
+
+    IED._sync_ui_from_modifications(stub)
+
+    assert stub.nodata_input.text().strip(), (
+        "the NoData box is still empty on a raster that declares "
+        "GDAL_NODATA = -9999 -- the user has no way to see it was detected, "
+        "and the editor preview will mask nothing")
+    assert IED._get_effective_nodata_values(stub) == [FILL]
+
+
+def test_editor_and_export_agree_on_nodata(tmp_path, qapp):
+    """The invariant that actually matters: the editor's effective NoData must
+    match what the export/hist-match paths use for the same file, or the
+    viewer and the CSV disagree about which pixels are real."""
+    fp = _raster_declaring_nodata(tmp_path, "agree.tif")
+    ax = {"nodata_values": [], "nodata_enabled": True}
+    stub, IED = _editor_nodata_stub(fp, ax)
+
+    IED._sync_ui_from_modifications(stub)
+
+    assert IED._get_effective_nodata_values(stub) == hist_nodata_values(ax, str(fp))
+    assert IED._get_effective_nodata_values(stub) == declared_file_nodata(str(fp))
+
+
+def test_editor_keeps_explicit_ax_values(tmp_path, qapp):
+    """An explicit .ax list must still win/round-trip -- the declared value is
+    a FALLBACK for an empty list, not an override."""
+    fp = _raster_declaring_nodata(tmp_path, "explicit.tif")
+    stub, IED = _editor_nodata_stub(fp, {"nodata_values": [-1, 255], "nodata_enabled": True})
+
+    IED._sync_ui_from_modifications(stub)
+
+    assert IED._get_effective_nodata_values(stub) == [-1, 255], (
+        "an explicit .ax NoData list was overwritten by the declared value")
+
+
+def test_editor_respects_nodata_disabled(tmp_path, qapp):
+    """`nodata_enabled: false` is a deliberate opt-out and must not be
+    resurrected by the declared-value fallback."""
+    fp = _raster_declaring_nodata(tmp_path, "disabled.tif")
+    stub, IED = _editor_nodata_stub(fp, {"nodata_values": [], "nodata_enabled": False})
+
+    IED._sync_ui_from_modifications(stub)
+
+    assert stub.nodata_input.text().strip() == "", (
+        "NoData is disabled for this file but the box was populated anyway")
+    assert IED._get_effective_nodata_values(stub) == []

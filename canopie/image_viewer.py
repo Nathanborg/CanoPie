@@ -296,6 +296,92 @@ TEMP_DRAWING_Z   = 1e6     # in-progress rubber-band polygon
 LABEL_Z          = 1e7     # name labels, always on top
 
 
+class PolygonPropertiesDialog(QtWidgets.QDialog):
+    """Property (key/value) editor for a single polygon/point.
+
+    Populates from `parent.all_polygons[group][filepath]['properties']`
+    (see ImageViewer.edit_polygon_properties) and hands back a plain dict on
+    accept. Purely metadata: no repaint or geometry work happens here, so
+    there is nothing performance-sensitive about this dialog.
+    """
+
+    def __init__(self, properties=None, title="Edit Properties", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumSize(420, 360)
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        self.table = QtWidgets.QTableWidget(0, 2, self)
+        self.table.setHorizontalHeaderLabels(["Property", "Value"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        layout.addWidget(self.table)
+
+        for k, v in (properties or {}).items():
+            self._append_row(str(k), "" if v is None else str(v))
+
+        btn_row = QtWidgets.QHBoxLayout()
+        self.add_btn = QtWidgets.QPushButton("Add Property")
+        self.remove_btn = QtWidgets.QPushButton("Remove Selected")
+        btn_row.addWidget(self.add_btn)
+        btn_row.addWidget(self.remove_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        self.add_btn.clicked.connect(lambda: self._append_row("", ""))
+        self.remove_btn.clicked.connect(self._remove_selected)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _append_row(self, key, value):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(key))
+        self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(value))
+
+    def _remove_selected(self):
+        rows = sorted({idx.row() for idx in self.table.selectedIndexes()}, reverse=True)
+        for r in rows:
+            self.table.removeRow(r)
+
+    @staticmethod
+    def _coerce(value_str):
+        """Cast a string back to int/float where it round-trips cleanly, else
+        keep it as a string. Prevents numeric DBF columns being silently
+        coerced to text on export (shapefile_io.write_dbf infers column type
+        from the Python type of the first non-null value it sees)."""
+        s = value_str.strip()
+        if s == "":
+            return ""
+        try:
+            return int(s)
+        except ValueError:
+            pass
+        try:
+            return float(s)
+        except ValueError:
+            pass
+        return value_str
+
+    def get_properties(self):
+        """Return the edited {key: value} dict, empty keys stripped."""
+        out = {}
+        for row in range(self.table.rowCount()):
+            key_item = self.table.item(row, 0)
+            val_item = self.table.item(row, 1)
+            key = (key_item.text().strip() if key_item else "")
+            if not key:
+                continue
+            val = (val_item.text() if val_item else "")
+            out[key] = self._coerce(val)
+        return out
+
+
 # -------------------------------------------------------------------
 # Editable overlay items
 # -------------------------------------------------------------------
@@ -314,6 +400,28 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
         self.name = name
         self.is_rgb = is_rgb  # Determines polygon appearance
         self.is_mask_polygon = is_mask_polygon  # If True, draw with solid fill
+
+        # ---- Filtering / coloring (PolygonManager "Filter & Color") ----
+        #: Arbitrary imported/user attributes for this polygon, mirrored from
+        #: all_polygons[group][filepath]['properties']. Populated by whoever
+        #: draws/loads the item; never required to be non-empty.
+        self.properties = {}
+        #: QColor override for the outline, or None to use the default
+        #: red(RGB)/blue(multispectral) pen. Set by PolygonManager's filter
+        #: rules; cleared by "Clear Filters".
+        self.current_color = None
+        #: True when a filter rule hid this polygon. Distinct from Qt's own
+        #: isVisible(): the LOD batch path (PolygonTileItem) and the "Show
+        #: Polys" checkbox both toggle visibility too, and a filtered-out
+        #: polygon must stay hidden through either of those without losing
+        #: track of WHY, so it can come back when the filter is cleared.
+        self._filtered_hidden = False
+
+        # ---- Locking (PolygonManager "Lock Polygons") ----
+        #: When True, mousePressEvent blocks drag-start and offers to unlock.
+        #: New items inherit the owning viewer's global_polygons_locked at
+        #: creation time (see ImageViewer.add_polygon_to_scene).
+        self.is_locked = False
 
         # Explicitly above the high-res zoom overlay -- see the Z constants at
         # the top of this module. Left at the default 0 these were covered by
@@ -662,7 +770,18 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
         """Lazily build cached QPen objects.  Called once or after geometry invalidation."""
         if self._pen_base is not None:
             return
-        if self.is_mask_polygon:
+        if self.current_color is not None:
+            # A filter rule assigned an explicit color -- it wins over both
+            # the mask-polygon orange and the default red/blue, so the user's
+            # rule is always visibly in effect.
+            self._pen_base = QtGui.QPen(self.current_color)
+            self._fill_base = (QtGui.QColor(self.current_color.red(), self.current_color.green(),
+                                             self.current_color.blue(), 80)
+                                if self.is_mask_polygon else QtCore.Qt.transparent)
+            self._pen_highlight = QtGui.QPen(QtCore.Qt.magenta)
+            self._fill_highlight = (QtGui.QColor(255, 0, 255, 100) if self.is_mask_polygon
+                                     else QtCore.Qt.transparent)
+        elif self.is_mask_polygon:
             self._pen_base = QtGui.QPen(QtGui.QColor(255, 165, 0))
             self._fill_base = QtGui.QColor(255, 165, 0, 80)
             self._pen_highlight = QtGui.QPen(QtCore.Qt.magenta)
@@ -673,6 +792,26 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
             self._fill_base = QtCore.Qt.transparent
             self._pen_highlight = QtGui.QPen(QtCore.Qt.magenta)
             self._fill_highlight = QtCore.Qt.transparent
+
+    def set_filter_style(self, visible, color=None):
+        """Apply a PolygonManager filter/color rule result to this item.
+
+        `visible=False` hides the polygon and remembers WHY (see
+        `_filtered_hidden`) so "Show Polys" and LOD batching do not
+        accidentally reveal it again; `color=None` restores the default
+        red/blue outline.
+        """
+        self._filtered_hidden = not bool(visible)
+        self.current_color = color
+        self._pen_base = None  # clear the pen cache -- see _ensure_pens
+        try:
+            scn = self.scene()
+            v = scn.views()[0] if scn and scn.views() else None
+        except Exception:
+            v = None
+        want_visible = bool(visible) and (v is None or v.are_polygons_visible())
+        self.setVisible(want_visible)
+        self.update()
 
     def paint(self, painter, option, widget=None):
         # --- current zoom scale ---
@@ -775,6 +914,14 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
 
     def mousePressEvent(self, event):
         if event.button() == QtCore.Qt.LeftButton:
+            # Locked polygons refuse to start a drag. Checked here -- at the
+            # very top, before selection/undo bookkeeping -- rather than
+            # inside a running drag, because interrupting an ALREADY-active
+            # Qt drag is what causes the item to glitch/snap.
+            if getattr(self, "is_locked", False) and not _prompt_unlock_click(self):
+                event.ignore()
+                return
+
             # An item drawn from a coarse pyramid level must be upgraded to its
             # real coordinates BEFORE any edit begins -- otherwise the user
             # would be dragging a decimated outline and that outline is what
@@ -916,6 +1063,10 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
         menu.addSeparator()
         a_edit_vertices = menu.addAction("Edit vertices")
         menu.addSeparator()
+        a_props = menu.addAction("Edit properties")
+        a_lock = menu.addAction("Unlock this polygon" if getattr(self, "is_locked", False)
+                                 else "Lock this polygon")
+        menu.addSeparator()
         a_delete   = menu.addAction("Delete this polygon")
         a_delete_all = menu.addAction("Delete all polygons in this group")
 
@@ -942,11 +1093,50 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
         elif chosen == a_edit_vertices and hasattr(v, "start_vertex_editing"):
             v.start_vertex_editing(self)
 
+        elif chosen == a_props and hasattr(v, "edit_polygon_properties"):
+            v.edit_polygon_properties(self)
+
+        elif chosen == a_lock:
+            # Per-polygon toggle -- independent of PolygonManager's global
+            # "Lock Polygons" checkbox, which sets every polygon at once.
+            # This is the individual counterpart: lock/unlock just this one.
+            self.is_locked = not getattr(self, "is_locked", False)
+
         elif chosen == a_delete and hasattr(v, "delete_polygon_for_this_file"):
             v.delete_polygon_for_this_file(self)
 
         elif chosen == a_delete_all and hasattr(v, "delete_all_polygons_in_group"):
             v.delete_all_polygons_in_group(self)
+
+
+def _prompt_unlock_click(item):
+    """Shared lock-click handler for EditablePolygonItem / EditablePointItem.
+
+    Returns True if the click should proceed as a normal press (item is now
+    unlocked one way or another), False if it must be swallowed.
+    """
+    box = QtWidgets.QMessageBox(QtWidgets.QMessageBox.Question, "Polygon Locked",
+                                 f"'{getattr(item, 'name', '') or 'This polygon'}' is locked.",
+                                 parent=None)
+    btn_this = box.addButton("Unlock This", QtWidgets.QMessageBox.AcceptRole)
+    btn_group = box.addButton("Unlock Group", QtWidgets.QMessageBox.AcceptRole)
+    box.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+    box.exec_()
+    clicked = box.clickedButton()
+
+    if clicked is btn_this:
+        item.is_locked = False
+        return True
+    if clicked is btn_group:
+        try:
+            scn = item.scene()
+            v = scn.views()[0] if scn and scn.views() else None
+            if v is not None and hasattr(v, "unlock_group"):
+                v.unlock_group(getattr(item, "name", None))
+        except Exception:
+            logging.debug("[lock] unlock_group failed", exc_info=True)
+        return not getattr(item, "is_locked", False)
+    return False
 
 
 def image_points_to_scene(pixitem, img_pts, img_size_hw=None):
@@ -1033,9 +1223,15 @@ class PolygonTileItem(QtWidgets.QGraphicsItem):
     def __init__(self, rect, polygons, is_rgb=True):
         super().__init__()
         self._rect = rect
-        self._polygons = polygons          # list[np.ndarray(N,2)]
-        self._cache = {}                   # level -> QPainterPath
+        # list[(np.ndarray(N,2), QColor-or-None)]. None means "use the
+        # default red(RGB)/blue(multispectral) outline" -- kept as None
+        # rather than resolving it here so the overwhelmingly common case
+        # (no filter/color rule active) still hashes to a single dict entry
+        # below instead of comparing QColor objects.
+        self._polygons = polygons
+        self._cache = {}                   # level -> {color_key: (QPainterPath, QColor)}
         self._is_rgb = is_rgb
+        self._default_color = QtGui.QColor(QtCore.Qt.red if is_rgb else QtCore.Qt.blue)
         self.setZValue(POLYGON_Z)
         # Purely decorative: hit-testing and editing go through the real
         # EditablePolygonItem that gets promoted on click.
@@ -1054,31 +1250,48 @@ class PolygonTileItem(QtWidgets.QGraphicsItem):
         return best
 
     def _path_for(self, level):
-        path = self._cache.get(level)
-        if path is not None:
-            return path
+        """Return {color_key: (QPainterPath, QColor)} for this LOD level.
+
+        Grouped by color rather than one path for the whole tile: a
+        PolygonManager color rule can put different polygons in the same
+        tile under different outline colors, and QPainterPath only supports
+        one pen per drawPath() call. With no active color rule every polygon
+        shares the `None` -> default-color group, so this degrades to the
+        original single-path/single-drawPath behavior.
+        """
+        group = self._cache.get(level)
+        if group is not None:
+            return group
         from .polygon_lod import decimate
-        path = QtGui.QPainterPath()
+        group = {}
         tol = 2.0 ** level
-        for pts in self._polygons:
+        for pts, color in self._polygons:
             d = decimate(pts, tol) if level > 0 else pts
-            path.addPolygon(QtGui.QPolygonF(
+            c = color if color is not None else self._default_color
+            key = c.rgba()
+            entry = group.get(key)
+            if entry is None:
+                entry = (QtGui.QPainterPath(), c)
+                group[key] = entry
+            entry[0].addPolygon(QtGui.QPolygonF(
                 [QtCore.QPointF(float(x), float(y)) for x, y in d]))
-            path.closeSubpath()
-        self._cache[level] = path
-        return path
+            entry[0].closeSubpath()
+        self._cache[level] = group
+        return group
 
     def paint(self, painter, option, widget=None):
         t = painter.worldTransform()
         scale = (t.m11() ** 2 + t.m12() ** 2) ** 0.5 or 1.0
-        pen = QtGui.QPen(QtCore.Qt.red if self._is_rgb else QtCore.Qt.blue)
-        # Width 1, cosmetic: Qt's thin-line fast path. Anything >= 2 invokes the
-        # full stroker and costs ~14x more -- see EditablePolygonItem.paint.
-        pen.setCosmetic(True)
-        pen.setWidthF(1.0)
-        painter.setPen(pen)
         painter.setBrush(QtCore.Qt.NoBrush)
-        painter.drawPath(self._path_for(self._level_for(scale)))
+        for path, color in self._path_for(self._level_for(scale)).values():
+            pen = QtGui.QPen(color)
+            # Width 1, cosmetic: Qt's thin-line fast path. Anything >= 2
+            # invokes the full stroker and costs ~14x more -- see
+            # EditablePolygonItem.paint.
+            pen.setCosmetic(True)
+            pen.setWidthF(1.0)
+            painter.setPen(pen)
+            painter.drawPath(path)
 
 
 class EditablePointItem(QtWidgets.QGraphicsObject):
@@ -1096,6 +1309,13 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
         self.is_rgb = is_rgb
         self.pixmap_item = pixmap_item
         self.points_are_pixmap_local = points_are_pixmap_local
+
+        # Same filtering/locking state as EditablePolygonItem -- see its
+        # __init__ for the rationale.
+        self.properties = {}
+        self.current_color = None
+        self._filtered_hidden = False
+        self.is_locked = False
 
         # Same stacking rule as EditablePolygonItem.
         self.setZValue(POLYGON_Z)
@@ -1271,6 +1491,21 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
                     scene.update(scene_rect)
         return super().itemChange(change, value)
 
+    def set_filter_style(self, visible, color=None):
+        """Apply a PolygonManager filter/color rule result to this point item."""
+        self._filtered_hidden = not bool(visible)
+        self.current_color = color
+        self._brush_color = color if color is not None else (
+            QtCore.Qt.red if self.is_rgb else QtCore.Qt.blue)
+        try:
+            scn = self.scene()
+            v = scn.views()[0] if scn and scn.views() else None
+        except Exception:
+            v = None
+        want_visible = bool(visible) and (v is None or v.are_polygons_visible())
+        self.setVisible(want_visible)
+        self.update()
+
     def paint(self, painter, option, widget=None):
         painter.setPen(QtCore.Qt.NoPen)
         painter.setBrush(self._brush_color)
@@ -1328,6 +1563,10 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
 
     def mousePressEvent(self, event):
         if event.button() == QtCore.Qt.LeftButton:
+            if getattr(self, "is_locked", False) and not _prompt_unlock_click(self):
+                event.ignore()
+                return
+
             # IMPORTANT: call BEFORE is_moving changes boundingRect()
             self.prepareGeometryChange()
 
@@ -1394,6 +1633,10 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
         a_copy = menu.addAction("Copy points")
         a_repl = menu.addAction("Replicate to all viewers")
         menu.addSeparator()
+        a_props = menu.addAction("Edit properties")
+        a_lock = menu.addAction("Unlock this polygon" if getattr(self, "is_locked", False)
+                                 else "Lock this polygon")
+        menu.addSeparator()
         a_delete   = menu.addAction("Delete this polygon")
         a_delete_all = menu.addAction("Delete all polygons in this group")
 
@@ -1410,6 +1653,12 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
             selected = [it for it in self.scene().selectedItems()
                         if isinstance(it, (EditablePolygonItem, EditablePointItem))]
             v.replicate_toviewer(selected or [self])
+
+        elif chosen == a_props and hasattr(v, "edit_polygon_properties"):
+            v.edit_polygon_properties(self)
+
+        elif chosen == a_lock:
+            self.is_locked = not getattr(self, "is_locked", False)
 
         elif chosen == a_delete and hasattr(v, "delete_polygon_for_this_file"):
             v.delete_polygon_for_this_file(self)
@@ -1473,8 +1722,29 @@ class ImageViewer(QtWidgets.QGraphicsView):
         self.setOptimizationFlag(QtWidgets.QGraphicsView.DontAdjustForAntialiasing, True)
         # Skip painter state save/restore overhead
         self.setOptimizationFlag(QtWidgets.QGraphicsView.DontSavePainterState, True)
-        # Cache the background (the image) for faster repaints
-        self.setCacheMode(QtWidgets.QGraphicsView.CacheBackground)
+        # NO viewport cache.
+        #
+        # This used to be CacheBackground, with the comment "cache the
+        # background (the image) for faster repaints". That premise is wrong:
+        # CacheBackground caches what `drawBackground()` paints, and this class
+        # neither overrides drawBackground nor sets a backgroundBrush -- the
+        # image is a QGraphicsPixmapItem, i.e. an ITEM, which the background
+        # cache never touches. So it cached an empty background while still
+        # allocating a viewport-sized pixmap and re-rendering it every time the
+        # transform changed, which is exactly what a wheel zoom does on every
+        # tick.
+        #
+        # Measured on an 8000x6000 image at 1200x900 viewport, median of 5
+        # interleaved runs (ms per wheel tick / per pan step, lower is better):
+        #
+        #                        CacheBackground   CacheNone
+        #     zoom, 0 polygons        19.20           14.27    1.35x
+        #     zoom, 1500 polygons     57.66           53.83    1.07x
+        #     pan,  0 polygons         6.76            5.92    1.14x
+        #     pan,  1500 polygons     60.19           44.67    1.35x
+        #
+        # Faster in every case, so there is no zoom/pan trade-off to balance.
+        self.setCacheMode(QtWidgets.QGraphicsView.CacheNone)
         # Disable antialiasing on the view for speed (polygons have their own)
         self.setRenderHint(QtGui.QPainter.Antialiasing, False)
         self.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, False)
@@ -1482,12 +1752,14 @@ class ImageViewer(QtWidgets.QGraphicsView):
         # --- Drag repaint mode ---
         # With stable boundingRects (items keep the same bounding rect during
         # drag), SmartViewportUpdate is sufficient to avoid ghost labels and
-        # is MUCH cheaper than FullViewportUpdate.  We also keep CacheBackground
-        # during drag since the image itself doesn't change.
+        # is MUCH cheaper than FullViewportUpdate.  The cache mode is left
+        # alone during drag for the same reason it is CacheNone above: there
+        # is no background to cache, so switching to CacheBackground here only
+        # bought a viewport-sized pixmap allocation.
         self._normal_viewport_update_mode = self.viewportUpdateMode()
         self._normal_cache_mode = self.cacheMode()
         self._drag_viewport_update_mode = QtWidgets.QGraphicsView.SmartViewportUpdate
-        self._drag_cache_mode = QtWidgets.QGraphicsView.CacheBackground
+        self._drag_cache_mode = QtWidgets.QGraphicsView.CacheNone
         self._drag_active_count = 0
 
         # For drawing
@@ -1799,7 +2071,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
             self._drag_active_count = max(0, cnt - 1)
             if self._drag_active_count == 0:
                 self.setViewportUpdateMode(getattr(self, "_normal_viewport_update_mode", QtWidgets.QGraphicsView.MinimalViewportUpdate))
-                self.setCacheMode(getattr(self, "_normal_cache_mode", QtWidgets.QGraphicsView.CacheBackground))
+                self.setCacheMode(getattr(self, "_normal_cache_mode", QtWidgets.QGraphicsView.CacheNone))
                 scn = self.scene()
                 if scn:
                     scn.invalidate(scn.sceneRect(), QtWidgets.QGraphicsScene.AllLayers)
@@ -3668,6 +3940,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 is_rgb = True
         polygon_item = EditablePolygonItem(polygon, name, is_rgb, is_mask_polygon=is_mask_polygon)
         polygon_item.is_lod_geometry = bool(is_lod)
+        polygon_item.is_locked = self.global_polygons_locked
         self._scene.addItem(polygon_item)
         polygon_item.polygon_modified.connect(self.on_polygon_modified)
         self.polygons.append({'polygon': polygon, 'name': name, 'item': polygon_item, 'type': 'polygon', 'is_mask_polygon': is_mask_polygon})
@@ -3704,6 +3977,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
             pixmap_item=self._image,
             points_are_pixmap_local=True
         )
+        point_item.is_locked = self.global_polygons_locked
         self._scene.addItem(point_item)
         point_item.point_modified.connect(self.on_polygon_modified)
 
@@ -4004,10 +4278,12 @@ class ImageViewer(QtWidgets.QGraphicsView):
             return
         for item in self.get_all_polygons():
             try:
-                item.setVisible(visible)
+                # A filter rule's hide stays in effect even when polygons are
+                # globally re-shown -- only "Clear Filters" restores it.
+                item.setVisible(visible and not getattr(item, "_filtered_hidden", False))
             except Exception:
                 pass
-    
+
     def set_labels_visible(self, visible):
         """
         Show or hide labels for all polygon/point items.
@@ -4023,6 +4299,119 @@ class ImageViewer(QtWidgets.QGraphicsView):
     def are_polygons_visible(self):
         """Return current polygon visibility state (default True)."""
         return getattr(self, "_polygons_visible", True)
+
+    # ------------------------------------------------------------------
+    # Polygon locking ("Lock Polygons" in PolygonManager)
+    # ------------------------------------------------------------------
+    #: Persisted on the viewer (not just applied to current items) so that
+    #: polygons spawned later -- by drawing, import, zoom/pan re-render,
+    #: replication to this viewer -- inherit the correct lock state instead
+    #: of defaulting to unlocked. See add_polygon_to_scene/add_point_to_scene.
+    global_polygons_locked = False
+
+    def set_polygons_locked(self, locked: bool):
+        """Lock or unlock every polygon/point currently in this viewer."""
+        self.global_polygons_locked = bool(locked)
+        for item in self.get_all_polygons():
+            item.is_locked = self.global_polygons_locked
+
+    def unlock_group(self, group_name):
+        """Unlock only the polygons/points named `group_name` in this viewer."""
+        if not group_name:
+            return
+        for item in self.get_all_polygons():
+            if getattr(item, "name", None) == group_name:
+                item.is_locked = False
+
+    # ------------------------------------------------------------------
+    # Filter & Color (PolygonManager "Filter & Color Polygons")
+    # ------------------------------------------------------------------
+    def apply_polygon_style_map(self, style_map, key_for_item=None):
+        """Apply a `{(group_name, filepath): {'visible': bool, 'color': QColor|None}}`
+        mapping (built off-thread by PolygonManager's filter worker) to every
+        polygon/point currently in this viewer, then keep the LOD tile batch
+        (if active) consistent with the new visibility.
+
+        `key_for_item` lets a caller override key resolution; by default the
+        key is `(item.name, this viewer's current image filepath)`, matching
+        how `all_polygons[group][filepath]` is addressed elsewhere.
+        """
+        fp = getattr(getattr(self, "image_data", None), "filepath", None)
+        touched_batch = False
+        for item in self.get_all_polygons():
+            key = key_for_item(item) if key_for_item else (getattr(item, "name", None), fp)
+            style = style_map.get(key)
+            if style is None:
+                # No rule matched -- restore the default appearance rather
+                # than leaving a stale filter result in place.
+                if getattr(item, "current_color", None) is not None or getattr(item, "_filtered_hidden", False):
+                    item.set_filter_style(True, None)
+                    touched_batch = True
+                continue
+            item.set_filter_style(style.get("visible", True), style.get("color"))
+            touched_batch = True
+
+        if touched_batch and getattr(self, "_batch_tiles", None):
+            # Tiles bake filtered-out polygons out of their geometry (see
+            # rebuild_polygon_batch), so a changed filter must force a
+            # rebuild -- merely re-toggling visibility would leave a
+            # newly-hidden polygon drawn in the tile until the next
+            # unrelated rebuild.
+            self.rebuild_polygon_batch()
+            self._set_batch_active(True)
+
+    def clear_polygon_style(self):
+        """Undo every filter/color rule in this viewer -- restores default
+        red/blue outlines and full visibility."""
+        self.apply_polygon_style_map({})
+
+    # ------------------------------------------------------------------
+    # Properties editor (right-click "Edit properties")
+    # ------------------------------------------------------------------
+    def edit_polygon_properties(self, item):
+        """Open PolygonPropertiesDialog for `item` and persist edits back to
+        `all_polygons[group][filepath]['properties']`."""
+        owner = self._find_project_owner()
+        if owner is None:
+            QtWidgets.QMessageBox.warning(self, "Unavailable", "No owning project found.")
+            return
+
+        group = getattr(item, "name", None) or ""
+        fp = getattr(getattr(self, "image_data", None), "filepath", None)
+        if not group or not fp:
+            QtWidgets.QMessageBox.warning(self, "Unavailable",
+                                           "This polygon is not yet associated with a saved image/group.")
+            return
+
+        entry = (owner.all_polygons.get(group, {}) or {}).get(fp)
+        if entry is None:
+            QtWidgets.QMessageBox.warning(self, "Unavailable",
+                                           "Could not find this polygon's stored data.")
+            return
+
+        props = dict(entry.get('properties') or {})
+
+        dlg = PolygonPropertiesDialog(props, title=f"Properties — {group}", parent=self)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+
+        new_props = dlg.get_properties()
+        entry['properties'] = new_props
+        item.properties = new_props
+
+        try:
+            if hasattr(owner, "_mark_polygon_dirty"):
+                owner._mark_polygon_dirty(group, fp)
+        except Exception:
+            logging.debug("[properties] _mark_polygon_dirty failed", exc_info=True)
+
+        try:
+            if hasattr(owner, "request_save_polygons"):
+                owner.request_save_polygons()
+            elif hasattr(owner, "save_incremental"):
+                owner.save_incremental()
+        except Exception:
+            logging.exception("[properties] saving polygon properties failed")
 
     def update_polygon_mask_status(self, mask_polygon_names):
         """
@@ -4199,9 +4588,11 @@ class ImageViewer(QtWidgets.QGraphicsView):
         self._batch_active = False
         if was_active:
             # The items were hidden on our behalf; nothing is drawing them now.
+            # A polygon a filter rule hid stays hidden -- the batch toggle
+            # must not un-hide it just because it is no longer tiled.
             visible = self.are_polygons_visible()
             for it in self._batch_source_items():
-                it.setVisible(visible)
+                it.setVisible(visible and not getattr(it, "_filtered_hidden", False))
 
     def rebuild_polygon_batch(self):
         """(Re)build the tile items from the current polygon items."""
@@ -4222,8 +4613,14 @@ class ImageViewer(QtWidgets.QGraphicsView):
             is_rgb = True
 
         # Collect geometry once, as arrays, with each polygon's centroid.
-        geoms, cxs, cys = [], [], []
+        geoms, cxs, cys, colors = [], [], [], []
         for it in items:
+            # A polygon a filter rule hid must not reappear the moment the
+            # LOD batch takes over -- exclude it from the tile entirely
+            # rather than relying on a visibility flag the tile does not
+            # have per-polygon.
+            if getattr(it, "_filtered_hidden", False):
+                continue
             # Reuse the array the item already keeps for decimation. Rebuilding
             # it here from the QPolygonF costs a Python loop over every vertex
             # -- 4.46 M of them on the BCI crown map, measured at 4.3 s.
@@ -4255,6 +4652,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 arr = arr @ m + _np.array([t.dx(), t.dy()])
 
             geoms.append(arr)
+            colors.append(getattr(it, "current_color", None))
             cxs.append(arr[:, 0].mean())
             cys.append(arr[:, 1].mean())
         if not geoms:
@@ -4281,16 +4679,16 @@ class ImageViewer(QtWidgets.QGraphicsView):
 
         buckets = {}
         for k, (gx, gy) in enumerate(zip(ix, iy)):
-            buckets.setdefault((int(gx), int(gy)), []).append(geoms[k])
+            buckets.setdefault((int(gx), int(gy)), []).append((geoms[k], colors[k]))
 
         for polys in buckets.values():
             # TIGHT rect from the real geometry, not the tile grid -- the rect
             # is what lets Qt cull, and a loose one is how the naive
             # single-item version ended up 10x slower when zoomed in.
-            minx = min(float(p[:, 0].min()) for p in polys)
-            maxx = max(float(p[:, 0].max()) for p in polys)
-            miny = min(float(p[:, 1].min()) for p in polys)
-            maxy = max(float(p[:, 1].max()) for p in polys)
+            minx = min(float(p[:, 0].min()) for p, _c in polys)
+            maxx = max(float(p[:, 0].max()) for p, _c in polys)
+            miny = min(float(p[:, 1].min()) for p, _c in polys)
+            maxy = max(float(p[:, 1].max()) for p, _c in polys)
             rect = QtCore.QRectF(minx, miny, maxx - minx, maxy - miny)
             tile = PolygonTileItem(rect, polys, is_rgb=is_rgb)
             tile.setVisible(False)
@@ -4331,7 +4729,11 @@ class ImageViewer(QtWidgets.QGraphicsView):
         for t in getattr(self, "_batch_tiles", []):
             t.setVisible(bool(active) and visible)
         for it in items:
-            it.setVisible((not active) and visible)
+            # A filter-hidden polygon is excluded from the tile geometry
+            # (see rebuild_polygon_batch), so it must also stay hidden in the
+            # per-item representation -- otherwise it would flicker back into
+            # view every time zoom crosses the batch threshold.
+            it.setVisible((not active) and visible and not getattr(it, "_filtered_hidden", False))
         self._batch_active = bool(active)
 
     def paintEvent(self, event):

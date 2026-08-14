@@ -89,6 +89,155 @@ from .thumbnail_options_dialog import (LEGACY_THUMBNAIL_SIZE,
                                        LEGACY_OUTLINE_THICKNESS)
 
 
+
+# ---------------------------------------------------------------------------
+# Vectorized pixel-gather helpers for export_csv_data / _CsvExportWorker
+# ---------------------------------------------------------------------------
+# These replace a per-pixel Python loop over paired (row, col) coordinate
+# arrays that called a bounds-checking function once PER PIXEL PER CHANNEL
+# and allocated one dict per pixel. On a large polygon/export that is tens of
+# millions of Python-level calls; on this machine, 2M pixels x 4 bands
+# measured ~14 s that way versus ~0.3 s through the helpers below (see
+# test_ml_manager_csv_export_perf.py).
+#
+# The loop count these helpers pay for is O(channels) or O(channels x k^2)
+# for a window -- independent of pixel count -- not O(pixels). What remains
+# per-pixel is the unavoidable "hand a precomputed row to csv.writer" step in
+# _CsvExportWorker itself, exactly as project_tab.py's own ExportWorker does
+# one `writer.writerow()` per output row; the expensive per-pixel work (dict
+# allocation, bounds-checked scalar extraction, whole-row hashing) is what
+# moved out of any per-pixel loop, not the act of writing a CSV row.
+#
+# Must work for TWO band representations, both real in this codebase:
+#   * a plain dense 2D ndarray (small/eager files), and
+#   * a raster_reader.OffsetBand (large files routed through the lazy/
+#     windowed read path -- see LazyChannels.read_window_offset). An
+#     OffsetBand reports the FULL image .shape but only holds a small
+#     windowed sub-array; it supports [y, x] tuple/scalar indexing but NOT a
+#     single boolean-array key (`ch[mask]` raises TypeError). The PRE-existing
+#     "Average Pixel Value" mode's `chans[i][valid_mask]` already hit this on
+#     a lazily-read file with a multi-point polygon -- the helpers below fix
+#     that too, since they replace that call site as well.
+
+def _csvexp_is_offset_band(ch):
+    """Duck-typed OffsetBand check -- avoids importing raster_reader just for
+    isinstance, matching this module's existing hasattr-based lazy-channel
+    detection (see export_csv_data's read_window_offset guard)."""
+    return hasattr(ch, "origin") and hasattr(ch, "local")
+
+
+def _csvexp_gather_paired(ch, ys, xs):
+    """Vectorized ch[ys[i], xs[i]] for every i, for ONE channel.
+
+    ys/xs are FULL-IMAGE-frame integer coordinate arrays (same length,
+    paired -- NOT an outer product). Returns float32, NaN nowhere (callers
+    are expected to have already bounds-checked/masked; OffsetBand indices
+    are defensively clipped into its local window rather than raising, to be
+    at least as safe as the scalar `ch[yi, xi]` path it replaces).
+    """
+    ys = np.asarray(ys)
+    xs = np.asarray(xs)
+    if _csvexp_is_offset_band(ch):
+        ox, oy = ch.origin
+        local = ch.local
+        ly = np.clip(ys - oy, 0, local.shape[0] - 1)
+        lx = np.clip(xs - ox, 0, local.shape[1] - 1)
+        return np.asarray(local)[ly, lx].astype(np.float32, copy=False)
+    return np.asarray(ch)[ys, xs].astype(np.float32, copy=False)
+
+
+def _csvexp_gather_all_channels(any_rgb, max_extras, max_small, chans, ys, xs):
+    """Vectorized replacement for repeated `_align_point_values` calls.
+
+    Returns a list of 1D float32 arrays, one per output column, each of
+    length len(ys) == len(xs) -- same column order _align_point_values used
+    to produce (RGB first when any_rgb, then extras/small channels,
+    NaN-padded out to max_extras/max_small for files with fewer bands than
+    the widest selected file).
+    """
+    n = len(ys)
+
+    def _col(ch):
+        return (_csvexp_gather_paired(ch, ys, xs) if ch is not None
+                else np.full(n, np.nan, dtype=np.float32))
+
+    cols = []
+    if any_rgb:
+        for i in range(3):
+            cols.append(_col(chans[i] if i < len(chans) else None))
+        actual_extras = max(0, len(chans) - 3)
+        for i in range(max_extras):
+            cols.append(_col(chans[3 + i] if i < actual_extras else None))
+    else:
+        for i in range(max_small):
+            cols.append(_col(chans[i] if i < len(chans) else None))
+    return cols
+
+
+def _csvexp_reflect_index_vec(i, n):
+    """Vectorized OpenCV BORDER_REFLECT: fedcba|abcdefgh|hgfedcb (index -1 -> 0)."""
+    i = np.asarray(i)
+    if n <= 1:
+        return np.zeros_like(i)
+    period = 2 * n
+    m = np.mod(i, period)
+    return np.where(m < n, m, period - 1 - m)
+
+
+def _csvexp_gather_window_all_channels(any_rgb, max_extras, max_small, chans, ys, xs, k, H, W):
+    """Vectorized replacement for repeated `_align_window_values` calls.
+
+    For each of the k*k window cells, computes ONE reflected row/col index
+    array covering every requested point at once, then gathers per channel --
+    O(channels * k^2) numpy calls total, independent of len(ys). Column order
+    matches `_align_window_values`: channel-major, row-major within each
+    channel's k x k window.
+    """
+    n = len(ys)
+    ys = np.asarray(ys)
+    xs = np.asarray(xs)
+    pad = k // 2
+    offsets = [(dy, dx) for dy in range(-pad, pad + 1) for dx in range(-pad, pad + 1)]
+    row_idx = [_csvexp_reflect_index_vec(ys + dy, H) for dy, _dx in offsets]
+    col_idx = [_csvexp_reflect_index_vec(xs + dx, W) for _dy, dx in offsets]
+
+    def _channel_windows(ch):
+        if ch is None:
+            return [np.full(n, np.nan, dtype=np.float32) for _ in offsets]
+        return [_csvexp_gather_paired(ch, row_idx[i], col_idx[i]) for i in range(len(offsets))]
+
+    cols = []
+    if any_rgb:
+        for i in range(3):
+            cols.extend(_channel_windows(chans[i] if i < len(chans) else None))
+        actual_extras = max(0, len(chans) - 3)
+        for i in range(max_extras):
+            cols.extend(_channel_windows(chans[3 + i] if i < actual_extras else None))
+    else:
+        for i in range(max_small):
+            cols.extend(_channel_windows(chans[i] if i < len(chans) else None))
+    return cols
+
+
+def _csvexp_dedupe_points_locally(yi_arr, xi_arr, W):
+    """Indices (into the ORIGINAL arrays, in original-order) that survive a
+    first-occurrence dedup on (yi, xi) pairs.
+
+    Vectorized equivalent of "iterate in order, keep a pixel's row only the
+    first time (group, filepath, x, y) is seen" -- restricted to (x, y),
+    since within one (group, filepath) processing pass the group/filepath
+    are constant, so they add nothing to the key (see the dedup design note
+    in _CsvExportWorker). Encodes each (yi, xi) pair as one int64 so
+    np.unique can find first-occurrence indices in one vectorized pass
+    instead of a per-point Python loop building a set of tuples.
+    """
+    if len(yi_arr) == 0:
+        return np.empty(0, dtype=np.int64)
+    key = yi_arr.astype(np.int64) * np.int64(W) + xi_arr.astype(np.int64)
+    _, first_idx = np.unique(key, return_index=True)
+    return np.sort(first_idx)
+
+
 class _ThumbSource:
     """Per-polygon 8-bit BGR crops, without ever holding the whole frame.
 
@@ -457,6 +606,448 @@ def _write_mask_tiled(path, H, W, shapes, tile=_MASK_TILE):
     with tifffile.TiffWriter(path, bigtiff=True) as tw:
         tw.write(_tiles(), shape=(H, W), dtype=np.uint16,
                  tile=(tile, tile), compression="deflate")
+
+
+class _CsvExportWorker(QtCore.QThread):
+    """Background worker for MachineLearningManager.export_csv_data.
+
+    Root cause of the freeze this replaces: the extraction loop called a
+    bounds-checking function ONCE PER PIXEL PER CHANNEL and allocated one
+    dict per pixel (one `dict(zip(header, row))` call per pixel), then hashed
+    every column of every row to deduplicate. For a large polygon that is
+    tens of millions of Python-level operations on the GUI thread.
+
+    This worker fixes that in two independent ways:
+      1. The per-pixel loop is gone -- see the `_csvexp_gather_*` module
+         functions above, which do O(channels) or O(channels * k^2) numpy
+         calls per file instead of O(pixels).
+      2. What remains runs on a Qt worker thread, not the GUI thread, so a
+         file that is still slow (a great many files, or genuinely enormous
+         polygons) does not freeze repaints/Cancel/the progress dialog.
+
+    Streams rows directly to the destination CSV as each file finishes --
+    never holds more than one file's pixel columns in memory, unlike the
+    original `all_rows` list which held a dict per pixel for EVERY file for
+    the whole export.
+
+    Thread safety: only ever calls plain data-processing methods on `mgr`
+    (image I/O + array math), never touches a QWidget. The one method that
+    could -- `_map_points_scene_to_image`'s legacy live-viewer fallback --
+    guards itself against being called off the GUI thread; see its
+    docstring. This mirrors project_tab.py's ExportWorker, whose own
+    docstring states the same rule: "Never consult a live viewer during
+    export, even on the GUI thread."
+
+    Deduplication design note: the original whole-row hash-and-set pass
+    only ever does useful work in ONE situation -- a point-SHAPE entry where
+    two distinct scene-space points round to the same integer pixel (e.g. a
+    tightly packed "generate random points" batch). It is a structural
+    no-op for polygon-shape entries (`np.where()` on a boolean mask cannot
+    produce a duplicate coordinate pair) and for cross-FILE duplicates
+    (`all_entries` is built from a dict's keys per group, so a given
+    (group, filepath) pair is processed exactly once -- see
+    export_csv_data). So dedup here is local to one point-shape entry
+    (`_csvexp_dedupe_points_locally`), vectorized, and never accumulates
+    across the export -- cheaper than even the plan's own suggestion of a
+    small persistent (group, filepath, x, y) set, and exactly as correct.
+    """
+
+    progress = QtCore.pyqtSignal(int, int, str)          # done, total, message
+    finished_export = QtCore.pyqtSignal(bool, str, int)  # success, message, rows_written
+
+    def __init__(self, mgr, output_path, all_entries, polygons_by_group,
+                 extraction_mode, window_size, header, any_rgb, max_extras, max_small,
+                 parent=None):
+        super().__init__(parent)
+        self.mgr = mgr
+        self.output_path = output_path
+        self.all_entries = all_entries
+        self.polygons_by_group = polygons_by_group
+        self.extraction_mode = extraction_mode
+        self.window_size = window_size
+        self.header = header
+        self.any_rgb = any_rgb
+        self.max_extras = max_extras
+        self.max_small = max_small
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        import os, csv, gc, logging, traceback
+
+        # Same thread-oversubscription guards ExportWorker/process_polygon
+        # use in project_tab.py -- nested OpenCV/BLAS threading inside a
+        # QThread is a documented Windows crash risk in this codebase.
+        try:
+            os.environ.setdefault("OMP_NUM_THREADS", "1")
+            os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+            os.environ.setdefault("MKL_NUM_THREADS", "1")
+            os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+            os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+            os.environ.setdefault("BLIS_NUM_THREADS", "1")
+        except Exception:
+            pass
+        try:
+            cv2.setNumThreads(0)
+        except Exception:
+            pass
+
+        total = len(self.all_entries)
+        rows_written = 0
+
+        try:
+            with open(self.output_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(self.header)
+
+                for idx, (group_name, filepath) in enumerate(self.all_entries, start=1):
+                    if self._cancelled:
+                        break
+                    self.progress.emit(idx, total, os.path.basename(filepath))
+                    try:
+                        rows_written += self._process_one_file(group_name, filepath, writer)
+                    except Exception as e:
+                        logging.error(f"[CSV export] Error processing {filepath}: {e}", exc_info=True)
+                    if idx % 5 == 0:
+                        gc.collect()
+
+            if self._cancelled:
+                self.finished_export.emit(
+                    True, f"Cancelled -- partial export saved ({rows_written} row(s)) to:\n{self.output_path}",
+                    rows_written)
+            else:
+                self.finished_export.emit(
+                    True, f"CSV exported to:\n{self.output_path}\n\n{rows_written} row(s) written.",
+                    rows_written)
+        except Exception as e:
+            logging.exception("[CSV export] Fatal error")
+            self.finished_export.emit(
+                False, f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}", rows_written)
+
+    # ---- per-file extraction (fully vectorized pixel gathering) ----------
+
+    def _process_one_file(self, group_name, filepath, writer):
+        import os, json, logging
+        import numpy as np
+
+        mgr = self.mgr
+        polydata = self.polygons_by_group.get(group_name, {}).get(filepath, {})
+        raw_pts = polydata.get("points", [])
+        poly_type = str(polydata.get("type", "")).lower()
+
+        img, _C = mgr._get_export_image(filepath)
+        if img is None:
+            logging.warning(f"Could not load/export image for {filepath}")
+            return 0
+
+        H, W = img.shape[:2]
+        chans = mgr._channels_in_export_order(img)
+
+        # Lazily-read cubes: fetch just the bounding box of this file's
+        # points once, then keep full-image indexing via OffsetBand.
+        #
+        # `window_size` is None outside "All Pixels with Surrounding
+        # Window" mode. The original code did `int(window_size)` unguarded
+        # here -- inside a bare `except Exception`, so on every OTHER mode
+        # that TypeError was silently swallowed and this optimization never
+        # engaged at all for a lazily-read file: `chans` stayed a raw
+        # LazyChannels, whose __getitem__ reads a band's FULL FRAME on every
+        # access. That was survivable under the old per-pixel loop only
+        # because `chans[i]` doesn't get re-evaluated per PIXEL there either
+        # -- but it's still a full extra decode per channel this fixes for
+        # free. `window_size or 1` makes the windowing apply uniformly.
+        if hasattr(chans, "read_window_offset") and raw_pts:
+            try:
+                pad = max(1, int(self.window_size or 1) // 2) + 1
+                xs0 = [int(round(p[0])) for p in raw_pts]
+                ys0 = [int(round(p[1])) for p in raw_pts]
+                chans = chans.read_window_offset(
+                    min(xs0) - pad, min(ys0) - pad,
+                    max(xs0) + pad + 1, max(ys0) + pad + 1)
+            except Exception as e:
+                logging.warning("[export_csv_data] windowed read failed for %s: %s",
+                                os.path.basename(filepath), e)
+
+        # ---------- NoData: identical semantics to the pre-rewrite version,
+        # INCLUDING the documented gap (only .ax nodata_values are honored,
+        # not the raster's own GDAL_NODATA tag -- see
+        # test_gdal_nodata_tag_ignored_by_ml_export). Not this task's scope. ----------
+        nodata_values = []
+        try:
+            base = os.path.splitext(os.path.basename(filepath))[0] + ".ax"
+            pf = getattr(mgr, "project_folder", None)
+            ax_candidates = []
+            if pf:
+                ax_candidates.append(os.path.join(os.fspath(pf), base))
+                ax_candidates.append(os.path.join(os.fspath(pf), "global.ax"))
+            ax_candidates.append(os.path.join(os.path.dirname(filepath), base))
+            ax_candidates.append(os.path.join(os.path.dirname(filepath), "global.ax"))
+            for axp in ax_candidates:
+                if os.path.exists(axp):
+                    with open(axp, "r", encoding="utf-8") as f:
+                        ax_data = json.load(f) or {}
+                    if ax_data.get("nodata_enabled", True):
+                        nodata_values = list(ax_data.get("nodata_values", []) or [])
+                        if nodata_values:
+                            logging.info(f"[export_csv_data] Loaded nodata_values={nodata_values} from {axp}")
+                    break
+        except Exception as e:
+            logging.debug(f"[export_csv_data] Could not load .ax for {filepath}: {e}")
+
+        nd_mask = np.zeros((H, W), dtype=bool)
+        if nodata_values:
+            pt = getattr(mgr, "parent_tab", None)
+            tracked_mask = getattr(pt, "_last_export_nodata_mask", None) if pt else None
+            tracked_fp = getattr(pt, "_last_export_nodata_filepath", None) if pt else None
+            fp_key = os.path.normcase(os.path.abspath(filepath))
+            if (tracked_mask is not None and tracked_fp and
+                    tracked_mask.shape == (H, W) and
+                    os.path.normcase(os.path.abspath(tracked_fp)) == fp_key):
+                nd_mask = tracked_mask.copy()
+                logging.info(f"[export_csv_data] Using tracked NoData mask from ProjectTab ({nd_mask.sum()} masked pixels)")
+            else:
+                for ch in chans:
+                    nd_mask |= self._build_nodata_mask_2d(ch, nodata_values)
+                nd_count = nd_mask.sum()
+                if nd_count > 0:
+                    logging.info(f"[export_csv_data] Rebuilt NoData mask with {nd_count} masked pixels for {os.path.basename(filepath)}")
+
+        if poly_type == "point":
+            return self._emit_points(mgr, group_name, filepath, polydata, raw_pts,
+                                      img, chans, H, W, nd_mask, nodata_values, writer)
+
+        polys = mgr._normalize_to_polygons(raw_pts)
+        if not polys:
+            logging.warning(f"Unable to parse points/polygons for file {filepath}")
+            return 0
+
+        rows_here = 0
+        for poly in polys:
+            pts_img = mgr._map_points_scene_to_image(filepath, poly, img.shape, polygon_data=polydata)
+            if not pts_img:
+                continue
+            rows_here += self._emit_polygon(group_name, filepath, chans, H, W,
+                                             nd_mask, nodata_values, pts_img, writer)
+        return rows_here
+
+    def _emit_points(self, mgr, group_name, filepath, polydata, raw_pts, img, chans, H, W,
+                      nd_mask, nodata_values, writer):
+        """Point-SHAPE entries: a "point set" can hold anywhere from one to
+        thousands of independently-drawn points (e.g. Random Shapes' "Point"
+        mode), each becoming its own row -- so this is vectorized the same
+        way the polygon path is, not left as a per-point loop."""
+        import logging
+        import numpy as np
+
+        pts_raw = []
+        try:
+            if isinstance(raw_pts, dict) and 'x' in raw_pts and 'y' in raw_pts:
+                pts_raw = [(raw_pts['x'], raw_pts['y'])]
+            elif isinstance(raw_pts, (list, tuple)):
+                if len(raw_pts) > 0 and isinstance(raw_pts[0], dict) and 'x' in raw_pts[0] and 'y' in raw_pts[0]:
+                    pts_raw = [(p['x'], p['y']) for p in raw_pts]
+                elif len(raw_pts) > 0 and isinstance(raw_pts[0], (list, tuple)) and len(raw_pts[0]) == 2 \
+                        and not isinstance(raw_pts[0][0], (list, tuple)):
+                    pts_raw = [(p[0], p[1]) for p in raw_pts]
+                else:
+                    parsed = mgr.parse_polygon_points(raw_pts)
+                    if parsed:
+                        pts_raw = [(x, y) for (x, y) in parsed]
+        except Exception as e:
+            logging.warning(f"Could not parse point list for {filepath}: {e}")
+            pts_raw = []
+
+        if not pts_raw:
+            logging.warning(f"No valid points found for {filepath}")
+            return 0
+
+        pts_img_list = mgr._map_points_scene_to_image(filepath, pts_raw, img.shape, polygon_data=polydata)
+        if not pts_img_list:
+            return 0
+
+        xi_arr = np.array([p[0] for p in pts_img_list], dtype=np.int64)
+        yi_arr = np.array([p[1] for p in pts_img_list], dtype=np.int64)
+
+        in_bounds = (xi_arr >= 0) & (xi_arr < W) & (yi_arr >= 0) & (yi_arr < H)
+        if nodata_values and in_bounds.any():
+            xi_c = np.clip(xi_arr, 0, W - 1)
+            yi_c = np.clip(yi_arr, 0, H - 1)
+            is_nodata = nd_mask[yi_c, xi_c]
+        else:
+            is_nodata = np.zeros_like(in_bounds)
+
+        valid = in_bounds & ~is_nodata
+        xi_arr, yi_arr = xi_arr[valid], yi_arr[valid]
+        if xi_arr.size == 0:
+            return 0
+
+        # Dedup: two distinct scene points can legitimately round to the
+        # same integer pixel. The polygon path never needs this -- see the
+        # class docstring's dedup design note.
+        keep = _csvexp_dedupe_points_locally(yi_arr, xi_arr, W)
+        xi_arr, yi_arr = xi_arr[keep], yi_arr[keep]
+
+        any_rgb, max_extras, max_small = self.any_rgb, self.max_extras, self.max_small
+        mode = self.extraction_mode
+
+        if mode == "Average Pixel Value":
+            # "Average" for a POINT shape is not actually an aggregate --
+            # matches the original: one row per point, per-channel value AT
+            # that pixel, just without x/y columns (see header construction).
+            cols = _csvexp_gather_all_channels(any_rgb, max_extras, max_small, chans, yi_arr, xi_arr)
+            value_rows = np.stack(cols, axis=1).tolist()
+            writer.writerows([group_name, filepath] + vals for vals in value_rows)
+            return len(value_rows)
+
+        if mode == "All Pixel Values":
+            cols = _csvexp_gather_all_channels(any_rgb, max_extras, max_small, chans, yi_arr, xi_arr)
+        else:  # window
+            cols = _csvexp_gather_window_all_channels(
+                any_rgb, max_extras, max_small, chans, yi_arr, xi_arr, self.window_size, H, W)
+
+        value_rows = np.stack(cols, axis=1).tolist()
+        xs_list, ys_list = xi_arr.tolist(), yi_arr.tolist()
+        writer.writerows([group_name, filepath, x, y] + vals
+                          for x, y, vals in zip(xs_list, ys_list, value_rows))
+        return len(value_rows)
+
+    def _emit_polygon(self, group_name, filepath, chans, H, W, nd_mask, nodata_values, pts_img, writer):
+        import numpy as np
+
+        any_rgb, max_extras, max_small = self.any_rgb, self.max_extras, self.max_small
+        mode = self.extraction_mode
+
+        if len(pts_img) == 1:
+            xi, yi = pts_img[0]
+            if not (0 <= xi < W and 0 <= yi < H):
+                return 0
+            if nodata_values and nd_mask[yi, xi]:
+                return 0
+
+            if mode == "Average Pixel Value":
+                vals = self._scalar_channel_values(chans, xi, yi, any_rgb, max_extras, max_small)
+                writer.writerow([group_name, filepath] + vals)
+                return 1
+            if mode == "All Pixel Values":
+                cols = _csvexp_gather_all_channels(any_rgb, max_extras, max_small, chans,
+                                                    np.array([yi]), np.array([xi]))
+                vals = [c[0] for c in cols]
+                writer.writerow([group_name, filepath, int(xi), int(yi)] + vals)
+                return 1
+            # window
+            cols = _csvexp_gather_window_all_channels(any_rgb, max_extras, max_small, chans,
+                                                        np.array([yi]), np.array([xi]),
+                                                        self.window_size, H, W)
+            vals = [c[0] for c in cols]
+            writer.writerow([group_name, filepath, int(xi), int(yi)] + vals)
+            return 1
+
+        # Real (multi-point) polygon.
+        mask = self._poly_mask_np(pts_img, H, W)
+        valid_mask = (mask == 255) & (~nd_mask) if nodata_values else (mask == 255)
+
+        if mode == "Average Pixel Value":
+            ys, xs = np.where(valid_mask)
+            means = []
+            n_ch = 3 if any_rgb else max_small
+            n_extra = max_extras if any_rgb else 0
+            for i in range(n_ch):
+                if i < len(chans) and ys.size:
+                    vals = _csvexp_gather_paired(chans[i], ys, xs)
+                    means.append(float(np.nanmean(vals)) if vals.size else float('nan'))
+                else:
+                    means.append(float('nan'))
+            for i in range(n_extra):
+                idx = 3 + i
+                if idx < len(chans) and ys.size:
+                    vals = _csvexp_gather_paired(chans[idx], ys, xs)
+                    means.append(float(np.nanmean(vals)) if vals.size else float('nan'))
+                else:
+                    means.append(float('nan'))
+            writer.writerow([group_name, filepath] + means)
+            return 1
+
+        ys, xs = np.where(valid_mask)
+        if ys.size == 0:
+            return 0
+
+        # np.where() on a boolean mask cannot produce a duplicate (y, x)
+        # pair -- no dedup needed here, unlike the point-shape path.
+        if mode == "All Pixel Values":
+            cols = _csvexp_gather_all_channels(any_rgb, max_extras, max_small, chans, ys, xs)
+        else:  # window
+            cols = _csvexp_gather_window_all_channels(
+                any_rgb, max_extras, max_small, chans, ys, xs, self.window_size, H, W)
+
+        value_rows = np.stack(cols, axis=1).tolist()
+        xs_list, ys_list = xs.astype(np.int64).tolist(), ys.astype(np.int64).tolist()
+        writer.writerows([group_name, filepath, x, y] + vals
+                          for x, y, vals in zip(xs_list, ys_list, value_rows))
+        return len(xs_list)
+
+    @staticmethod
+    def _scalar_channel_values(chans, xi, yi, any_rgb, max_extras, max_small):
+        """O(1) scalar extraction for a single pixel. `ch[yi, xi]` with plain
+        scalars is a safe, already-correct access pattern on BOTH a dense
+        ndarray and an OffsetBand (see OffsetBand.__getitem__'s tuple-of-
+        scalars branch) -- only the ARRAY-key access pattern (`ch[mask]`)
+        needed the gather helpers above, so this single-pixel case is left
+        as direct indexing rather than routed through them."""
+        if any_rgb:
+            vals = [float(chans[i][yi, xi]) if i < len(chans) else float('nan') for i in range(3)]
+            vals += [float(chans[3 + i][yi, xi]) if 3 + i < len(chans) else float('nan')
+                     for i in range(max_extras)]
+        else:
+            vals = [float(chans[i][yi, xi]) if i < len(chans) else float('nan') for i in range(max_small)]
+        return vals
+
+    @staticmethod
+    def _poly_mask_np(pts, H, W):
+        mask = np.zeros((H, W), dtype=np.uint8)
+        if len(pts) == 1:
+            xi, yi = pts[0]
+            if 0 <= yi < H and 0 <= xi < W:
+                mask[yi, xi] = 255
+        elif len(pts) >= 3:
+            arr = np.array([pts], dtype=np.int32)
+            cv2.fillPoly(mask, arr, 255)
+        return mask
+
+    @staticmethod
+    def _build_nodata_mask_2d(ch, nd_vals):
+        """Boolean mask (True = NoData) in FULL-image coordinates.
+
+        `ch` may be an OffsetBand, which reports the full image size as
+        `.shape` but only holds the points' bounding-box window. Handing it
+        straight to build_nodata_mask -- which starts with
+        `np.asarray(img, np.float32)` -- hits OffsetBand.__array__ and raises
+        TypeError, aborting the whole file with
+        "[CSV export] Error processing ...". That is why NoData-carrying
+        exports failed only on the lazy/windowed path (big or stacked images,
+        where the reader does not materialize the full band) while the same
+        polygons exported fine from a small image.
+
+        Mask the window that actually exists, then place it back at the
+        window's origin. Pixels outside the window stay False, which is
+        correct here: the window IS the bounding box of every point this
+        export will sample.
+        """
+        from .utils import build_nodata_mask as _shared_build_nodata_mask
+        H, W = (getattr(ch, "shape", None) or (0, 0))[:2]
+
+        if not _csvexp_is_offset_band(ch):
+            m = _shared_build_nodata_mask(ch, nd_vals, bgr_input=True)
+            return m if m is not None else np.zeros((H, W), dtype=bool)
+
+        full = np.zeros((H, W), dtype=bool)
+        win = _shared_build_nodata_mask(ch.local, nd_vals, bgr_input=True)
+        if win is not None:
+            x0, y0 = ch.origin
+            h, w = win.shape[:2]
+            full[y0:y0 + h, x0:x0 + w] = win
+        return full
 
 
 class MachineLearningManager(QtWidgets.QDialog):
@@ -3647,7 +4238,27 @@ class MachineLearningManager(QtWidgets.QDialog):
 
         # 1) Try live viewer mapping (scene -> item pixmap -> image pixels)
         # This path is used when coord_space is 'scene' or not specified
-        viewer = getattr(self.parent_tab, "get_viewer_by_filepath", lambda _p: None)(filepath)
+        #
+        # THREAD SAFETY: viewer/_image below are live QGraphicsView/
+        # QGraphicsPixmapItem objects. Touching them off the GUI thread is
+        # unsafe -- Qt widgets are not thread-safe, and export_csv_data's
+        # background worker (_CsvExportWorker) calls this method from a
+        # QThread precisely so bulk pixel extraction doesn't block the UI.
+        # Skip straight to the offline fallbacks (2/3 below) when not on the
+        # GUI thread; every polygon stored in the modern format (coord_space
+        # == 'image', branch 0 above) never reaches here at all, so this only
+        # affects legacy scene-space polygons exported off-thread, and those
+        # still get a coordinate -- just via the pixmap_size/raw-coords path
+        # instead of consulting the live viewer.
+        app = QtWidgets.QApplication.instance()
+        on_gui_thread = app is not None and QtCore.QThread.currentThread() is app.thread()
+        viewer = (getattr(self.parent_tab, "get_viewer_by_filepath", lambda _p: None)(filepath)
+                  if on_gui_thread else None)
+        if not on_gui_thread and points:
+            logging.debug(
+                "[_map_points_scene_to_image] off GUI thread for %s with legacy "
+                "(non-'image') coord_space -- using offline fallback, not the live viewer",
+                os.path.basename(filepath))
         if viewer is not None and getattr(viewer, "_image", None) is not None:
             pm = viewer._image.pixmap()
             pw = float(max(1, pm.width()))
@@ -3746,6 +4357,21 @@ class MachineLearningManager(QtWidgets.QDialog):
         """
         Export REAL pixel values after RAW + .ax (crop/resize/expr) re-application.
         Snapshot polygons up front to avoid races with UI deletes/clears.
+
+        The actual per-pixel extraction runs on a background QThread
+        (_CsvExportWorker) so a large export does not freeze the UI -- see
+        that class's docstring for why (vectorized gathering + off the GUI
+        thread). This method itself stays entirely on the GUI thread for
+        every dialog, and BLOCKS until the worker's `finished_export` signal
+        fires -- via a local QEventLoop, not a tight Python loop -- so this
+        remains a synchronous call from the caller's point of view (the CSV
+        is fully written and closed by the time this method returns, exactly
+        as before). Qt's event loop keeps running while parked in
+        `loop.exec_()`: repaints, the progress dialog's animation, and
+        Cancel all keep working. That is the actual freeze fix; blocking the
+        CALLER is fine and preserves the existing calling convention
+        (test_ml_manager_csv_and_training.py calls this and reads the output
+        CSV immediately after it returns).
         """
         try:
             # ---- 1) Pick groups ----------------------------------------------------
@@ -3795,104 +4421,7 @@ class MachineLearningManager(QtWidgets.QDialog):
                                               "No files found in the selected groups.")
                 return
 
-            import numpy as np, csv, cv2, os, logging
-
-            # ---- helpers -----------------------------------------------------------
-            def make_hashable(val):
-                if isinstance(val, list):
-                    return tuple(make_hashable(x) for x in val)
-                if isinstance(val, dict):
-                    return tuple(sorted((k, make_hashable(v)) for k, v in val.items()))
-                return val
-
-            def _in_bounds(W, H, xi, yi):
-                return (0 <= xi < W) and (0 <= yi < H)
-
-            def _align_point_values(any_rgb, max_extras, max_small, chans, xi, yi):
-                vals = []
-                if any_rgb:
-                    # RGB first
-                    rgb = [np.nan, np.nan, np.nan]
-                    if len(chans) >= 1 and _in_bounds(chans[0].shape[1], chans[0].shape[0], xi, yi):
-                        rgb[0] = float(chans[0][yi, xi])
-                    if len(chans) >= 2 and _in_bounds(chans[1].shape[1], chans[1].shape[0], xi, yi):
-                        rgb[1] = float(chans[1][yi, xi])
-                    if len(chans) >= 3 and _in_bounds(chans[2].shape[1], chans[2].shape[0], xi, yi):
-                        rgb[2] = float(chans[2][yi, xi])
-                    vals.extend(rgb)
-                    # extra bands (4..N)
-                    actual_extras = max(0, len(chans) - 3)
-                    for i in range(max_extras):
-                        idx = 3 + i
-                        if i < actual_extras:
-                            ch = chans[idx]
-                            vals.append(float(ch[yi, xi]) if _in_bounds(ch.shape[1], ch.shape[0], xi, yi) else np.nan)
-                        else:
-                            vals.append(np.nan)
-                else:
-                    # 1..max_small channels
-                    for i in range(max_small):
-                        if i < len(chans):
-                            ch = chans[i]
-                            vals.append(float(ch[yi, xi]) if _in_bounds(ch.shape[1], ch.shape[0], xi, yi) else np.nan)
-                        else:
-                            vals.append(np.nan)
-                return vals
-
-            def _reflect_index(i, n):
-                """OpenCV BORDER_REFLECT: fedcba|abcdefgh|hgfedcb (index -1 -> 0)."""
-                if n <= 1:
-                    return 0
-                period = 2 * n
-                i = i % period
-                return i if i < n else period - 1 - i
-
-            def _align_window_values(any_rgb, max_extras, max_small, chans, xi, yi, k):
-                # Gather the k x k neighbourhood directly instead of padding whole
-                # channels. The old version ran cv2.copyMakeBorder over every
-                # channel of the full image for *every point*; reflecting the
-                # indices gives identical values for a fraction of the work, and
-                # is what lets this work on windowed (OffsetBand) reads at all.
-                pad = k // 2
-                ys = [_reflect_index(yi + dy, H) for dy in range(-pad, pad + 1)]
-                xs = [_reflect_index(xi + dx, W) for dx in range(-pad, pad + 1)]
-
-                def wflat(ch):
-                    take = getattr(ch, "take_yx", None)
-                    if take is not None:                  # OffsetBand
-                        win = take(ys, xs)
-                    else:
-                        win = np.asarray(ch)[np.ix_(ys, xs)]
-                    return win.reshape(-1).tolist()
-
-                padded = chans
-                out = []
-                if any_rgb:
-                    # 3 RGB windows
-                    for i in range(3):
-                        out += wflat(padded[i]) if i < len(padded) else [np.nan] * (k * k)
-                    # extra bands
-                    actual_extras = max(0, len(padded) - 3)
-                    used = min(actual_extras, max_extras)
-                    for i in range(used):
-                        out += wflat(padded[3 + i])
-                    if max_extras > used:
-                        out += [np.nan] * ((max_extras - used) * k * k)
-                else:
-                    for i in range(max_small):
-                        out += wflat(padded[i]) if i < len(padded) else [np.nan] * (k * k)
-                return out
-
-            def _poly_mask(pts, H, W):
-                mask = np.zeros((H, W), dtype=np.uint8)
-                if len(pts) == 1:
-                    xi, yi = pts[0]
-                    if 0 <= yi < H and 0 <= xi < W:
-                        mask[yi, xi] = 255
-                elif len(pts) >= 3:
-                    arr = np.array([pts], dtype=np.int32)
-                    cv2.fillPoly(mask, arr, 255)
-                return mask
+            import logging
 
             # Detect export channel layout across files.
             # This only needs the band COUNT, so read it from the TIFF header
@@ -3935,7 +4464,7 @@ class MachineLearningManager(QtWidgets.QDialog):
                 else:
                     max_small = max(max_small, C)
 
-            # Headers (kept identical to your original logic)
+            # Headers (kept identical to the original logic)
             if extraction_mode == "Average Pixel Value":
                 prefix = ["group_name", "image_file"]
             else:
@@ -3956,317 +4485,48 @@ class MachineLearningManager(QtWidgets.QDialog):
             else:
                 header = list(prefix) + channel_names
 
-            # ---- 6) Extract rows ----------------------------------------------------
-            all_rows = []
+            # ---- 5) Extract + write, on a background thread ------------------------
             progress = QtWidgets.QProgressDialog("Extracting pixels…", "Cancel", 0, len(all_entries), self)
             progress.setWindowModality(QtCore.Qt.WindowModal)
             progress.setMinimumDuration(0)
 
-            for idx, (group_name, filepath) in enumerate(all_entries, start=1):
-                if progress.wasCanceled():
-                    break
-                progress.setValue(idx)
+            worker = _CsvExportWorker(
+                self, save_path, all_entries, polygons_by_group,
+                extraction_mode, window_size, header, any_rgb, max_extras, max_small,
+            )
 
-                # READ FROM SNAPSHOT, not from live state
-                polydata = polygons_by_group.get(group_name, {}).get(filepath, {})
-                raw_pts = polydata.get("points", [])
-                poly_type = str(polydata.get("type", "")).lower()
+            loop = QtCore.QEventLoop(self)
+            result = {}
 
-                img, _C = self._get_export_image(filepath)
-                if img is None:
-                    logging.warning(f"Could not load/export image for {filepath}")
-                    continue
+            def _on_progress(done, total, message):
+                progress.setMaximum(max(1, total))
+                progress.setValue(done)
+                progress.setLabelText(message)
 
-                H, W = img.shape[:2]
-                chans = self._channels_in_export_order(img)
+            def _on_finished(success, message, rows_written):
+                result["success"] = success
+                result["message"] = message
+                result["rows_written"] = rows_written
+                loop.quit()
 
-                # Lazily-read cubes: fetch just the bounding box of this file's
-                # points once, then keep full-image indexing via OffsetBand.
-                # Without this, every chans[b][yi, xi] below would decode a whole
-                # band -- 284 band reads per point.
-                if hasattr(chans, "read_window_offset") and raw_pts:
-                    try:
-                        pad = max(1, int(window_size) // 2) + 1
-                        xs = [int(round(p[0])) for p in raw_pts]
-                        ys = [int(round(p[1])) for p in raw_pts]
-                        chans = chans.read_window_offset(
-                            min(xs) - pad, min(ys) - pad,
-                            max(xs) + pad + 1, max(ys) + pad + 1)
-                    except Exception as e:
-                        logging.warning("[export_csv_data] windowed read failed for %s: %s",
-                                        os.path.basename(filepath), e)
+            worker.progress.connect(_on_progress)
+            worker.finished_export.connect(_on_finished)
+            progress.canceled.connect(worker.cancel)
 
+            worker.start()
+            loop.exec_()
+            progress.close()
 
-                # ---------- Load NoData values from .ax file ----------
-                nodata_values = []
-                try:
-                    import json as json_mod
-                    base = os.path.splitext(os.path.basename(filepath))[0] + ".ax"
-                    pf = getattr(self, "project_folder", None)
-                    ax_candidates = []
-                    if pf:
-                        ax_candidates.append(os.path.join(os.fspath(pf), base))
-                        ax_candidates.append(os.path.join(os.fspath(pf), "global.ax"))
-                    ax_candidates.append(os.path.join(os.path.dirname(filepath), base))
-                    ax_candidates.append(os.path.join(os.path.dirname(filepath), "global.ax"))
-                    for axp in ax_candidates:
-                        if os.path.exists(axp):
-                            with open(axp, "r", encoding="utf-8") as f:
-                                ax_data = json_mod.load(f) or {}
-                            if ax_data.get("nodata_enabled", True):
-                                nodata_values = list(ax_data.get("nodata_values", []) or [])
-                                if nodata_values:
-                                    logging.info(f"[export_csv_data] Loaded nodata_values={nodata_values} from {axp}")
-                            break
-                except Exception as e:
-                    logging.debug(f"[export_csv_data] Could not load .ax for {filepath}: {e}")
-                
-                # ---------- Build NoData mask ----------
-                def _is_nodata_pixel(val, nd_vals):
-                    """Check if a pixel value matches any NoData value."""
-                    if not nd_vals:
-                        return False
-                    if not np.isfinite(val):
-                        return True
-                    for nd in nd_vals:
-                        try:
-                            nd_val = float(nd)
-                            abs_nd = abs(nd_val)
-                            if abs_nd > 1e+30:
-                                tol = abs_nd * 0.01
-                            elif abs_nd > 1e+10:
-                                tol = abs_nd * 0.001
-                            elif abs_nd > 100:
-                                tol = abs_nd * 0.001
-                            else:
-                                tol = 0.01
-                            if abs(val - nd_val) < tol:
-                                return True
-                        except Exception:
-                            pass
-                    return False
-                
-                def _build_nodata_mask_2d(ch, nd_vals):
-                    """Build boolean mask where True = NoData pixel. Uses shared utility supporting expressions."""
-                    from .utils import build_nodata_mask as _shared_build_nodata_mask
-                    # build_nodata_mask expects HxW or HxWxC; for 2D we'll rely on it handling 2D arrays
-                    # NOTE: must be an explicit `is None` test. `mask or default` evaluates
-                    # bool(mask), which raises "truth value of an array ... is ambiguous"
-                    # for any multi-element array — i.e. every time a mask was actually built.
-                    m = _shared_build_nodata_mask(ch, nd_vals, bgr_input=True)
-                    return m if m is not None else np.zeros(ch.shape, dtype=bool)
-                
-                # Build combined NoData mask (any channel has NoData)
-                nd_mask = np.zeros((H, W), dtype=bool)
-                if nodata_values:
-                    # CRITICAL FIX: Prefer the tracked mask from ProjectTab's _apply_ax_to_raw
-                    # over rebuilding from transformed pixels. Boolean expressions like "b1<50"
-                    # will evaluate differently on interpolated pixels after resize.
-                    pt = getattr(self, "parent_tab", None)
-                    tracked_mask = getattr(pt, "_last_export_nodata_mask", None) if pt else None
-                    tracked_fp = getattr(pt, "_last_export_nodata_filepath", None) if pt else None
-                    fp_key = os.path.normcase(os.path.abspath(filepath))
-                    
-                    if (tracked_mask is not None and tracked_fp and 
-                        tracked_mask.shape == (H, W) and
-                        os.path.normcase(os.path.abspath(tracked_fp)) == fp_key):
-                        # Use the tracked mask - it was built on original pixels and transformed correctly
-                        nd_mask = tracked_mask.copy()
-                        logging.info(f"[export_csv_data] Using tracked NoData mask from ProjectTab ({nd_mask.sum()} masked pixels)")
-                    else:
-                        # Fallback: rebuild mask from transformed image (for non-boolean expressions or if tracking failed)
-                        for ch in chans:
-                            nd_mask |= _build_nodata_mask_2d(ch, nodata_values)
-                        nd_count = nd_mask.sum()
-                        if nd_count > 0:
-                            logging.info(f"[export_csv_data] Rebuilt NoData mask with {nd_count} masked pixels for {os.path.basename(filepath)}")
+            # The worker's own event (finished_export) fires when run() is
+            # about to return, but this ensures the QThread has fully
+            # stopped (not merely signaled) before its Python object can be
+            # garbage-collected -- required by Qt.
+            worker.wait()
 
-                # ---------- POINT SHAPES: treat each point independently ----------
-                if poly_type == "point":
-                    # Coerce raw points into a flat list of (x, y)
-                    pts_raw = []
-                    try:
-                        if isinstance(raw_pts, dict) and 'x' in raw_pts and 'y' in raw_pts:
-                            pts_raw = [(raw_pts['x'], raw_pts['y'])]
-                        elif isinstance(raw_pts, (list, tuple)):
-                            if len(raw_pts) > 0 and isinstance(raw_pts[0], dict) and 'x' in raw_pts[0] and 'y' in raw_pts[0]:
-                                pts_raw = [(p['x'], p['y']) for p in raw_pts]
-                            elif len(raw_pts) > 0 and isinstance(raw_pts[0], (list, tuple)) and len(raw_pts[0]) == 2 \
-                                 and not isinstance(raw_pts[0][0], (list, tuple)):
-                                pts_raw = [(p[0], p[1]) for p in raw_pts]
-                            else:
-                                # Fallback: parse, then treat each pair as an individual point
-                                parsed = self.parse_polygon_points(raw_pts)
-                                if parsed:
-                                    pts_raw = [(x, y) for (x, y) in parsed]
-                    except Exception as e:
-                        logging.warning(f"Could not parse point list for {filepath}: {e}")
-                        pts_raw = []
-
-                    if not pts_raw:
-                        logging.warning(f"No valid points found for {filepath}")
-                        continue
-
-                    pts_img_list = self._map_points_scene_to_image(filepath, pts_raw, img.shape, polygon_data=polydata)
-
-                    for (xi, yi) in pts_img_list:
-                        if not _in_bounds(W, H, xi, yi):
-                            continue
-                        
-                        # Skip NoData pixels
-                        if nodata_values and nd_mask[yi, xi]:
-                            logging.debug(f"[export_csv_data] Skipping NoData pixel at ({xi}, {yi})")
-                            continue
-
-                        if extraction_mode == "Average Pixel Value":
-                            # one row per point with per-channel value at that pixel
-                            if any_rgb:
-                                vals = []
-                                for i in range(3):
-                                    vals.append(float(chans[i][yi, xi]) if i < len(chans) else np.nan)
-                                for i in range(max_extras):
-                                    b = 3 + i
-                                    vals.append(float(chans[b][yi, xi]) if b < len(chans) else np.nan)
-                            else:
-                                vals = [float(chans[i][yi, xi]) if i < len(chans) else np.nan
-                                        for i in range(max_small)]
-                            row = [group_name, filepath] + vals
-                            all_rows.append(dict(zip(header, row)))
-
-                        elif extraction_mode == "All Pixel Values":
-                            vals = _align_point_values(any_rgb, max_extras, max_small, chans, xi, yi)
-                            row = [group_name, filepath, xi, yi] + vals
-                            all_rows.append(dict(zip(header, row)))
-
-                        else:  # "All Pixels with Surrounding Window"
-                            k = window_size
-                            vals = _align_window_values(any_rgb, max_extras, max_small, chans, xi, yi, k)
-                            row = [group_name, filepath, xi, yi] + vals
-                            all_rows.append(dict(zip(header, row)))
-
-                    # Done with this file's point-shape entry
-                    continue
-
-                # ---------- POLYGONS (original behavior) ----------
-                polys = self._normalize_to_polygons(raw_pts)
-                if not polys:
-                    logging.warning(f"Unable to parse points/polygons for file {filepath}")
-                    continue
-
-                for poly in polys:
-                    pts_img = self._map_points_scene_to_image(filepath, poly, img.shape, polygon_data=polydata)
-                    if not pts_img:
-                        continue
-
-                    if extraction_mode == "Average Pixel Value":
-                        if len(pts_img) == 1:
-                            xi, yi = pts_img[0]
-                            if not _in_bounds(W, H, xi, yi):
-                                continue
-                            # Skip NoData pixel
-                            if nodata_values and nd_mask[yi, xi]:
-                                continue
-                            if any_rgb:
-                                vals = []
-                                for i in range(3):
-                                    vals.append(float(chans[i][yi, xi]) if i < len(chans) else np.nan)
-                                for i in range(max_extras):
-                                    b = 3 + i
-                                    vals.append(float(chans[b][yi, xi]) if b < len(chans) else np.nan)
-                            else:
-                                vals = [float(chans[i][yi, xi]) if i < len(chans) else np.nan
-                                        for i in range(max_small)]
-                            row = [group_name, filepath] + vals
-                            all_rows.append(dict(zip(header, row)))
-                        else:
-                            mask = _poly_mask(pts_img, H, W)
-                            # Combine with NoData mask: valid pixels are inside polygon AND not NoData
-                            if nodata_values:
-                                valid_mask = (mask == 255) & (~nd_mask)
-                            else:
-                                valid_mask = (mask == 255)
-                            means = []
-                            if any_rgb:
-                                for i in range(3):
-                                    vals = chans[i][valid_mask] if i < len(chans) else np.array([])
-                                    means.append(float(np.nanmean(vals)) if vals.size else np.nan)
-                                for i in range(max_extras):
-                                    b = 3 + i
-                                    vals = chans[b][valid_mask] if b < len(chans) else np.array([])
-                                    means.append(float(np.nanmean(vals)) if vals.size else np.nan)
-                            else:
-                                for i in range(max_small):
-                                    vals = chans[i][valid_mask] if i < len(chans) else np.array([])
-                                    means.append(float(np.nanmean(vals)) if vals.size else np.nan)
-
-                            row = [group_name, filepath] + means
-                            all_rows.append(dict(zip(header, row)))
-
-                    elif extraction_mode == "All Pixel Values":
-                        if len(pts_img) == 1:
-                            xi, yi = pts_img[0]
-                            if not _in_bounds(W, H, xi, yi):
-                                continue
-                            # Skip NoData pixel
-                            if nodata_values and nd_mask[yi, xi]:
-                                continue
-                            vals = _align_point_values(any_rgb, max_extras, max_small, chans, xi, yi)
-                            row = [group_name, filepath, xi, yi] + vals
-                            all_rows.append(dict(zip(header, row)))
-                        else:
-                            mask = _poly_mask(pts_img, H, W)
-                            # Combine with NoData mask
-                            if nodata_values:
-                                valid_mask = (mask == 255) & (~nd_mask)
-                            else:
-                                valid_mask = (mask == 255)
-                            ys, xs = np.where(valid_mask)
-                            for yi, xi in zip(ys, xs):
-                                vals = _align_point_values(any_rgb, max_extras, max_small, chans, xi, yi)
-                                row = [group_name, filepath, xi, yi] + vals
-                                all_rows.append(dict(zip(header, row)))
-
-                    else:  # window
-                        k = window_size
-                        if len(pts_img) == 1:
-                            xi, yi = pts_img[0]
-                            if not _in_bounds(W, H, xi, yi):
-                                continue
-                            # Skip NoData pixel
-                            if nodata_values and nd_mask[yi, xi]:
-                                continue
-                            vals = _align_window_values(any_rgb, max_extras, max_small, chans, xi, yi, k)
-                            row = [group_name, filepath, xi, yi] + vals
-                            all_rows.append(dict(zip(header, row)))
-                        else:
-                            mask = _poly_mask(pts_img, H, W)
-                            # Combine with NoData mask
-                            if nodata_values:
-                                valid_mask = (mask == 255) & (~nd_mask)
-                            else:
-                                valid_mask = (mask == 255)
-                            ys, xs = np.where(valid_mask)
-                            for yi, xi in zip(ys, xs):
-                                vals = _align_window_values(any_rgb, max_extras, max_small, chans, xi, yi, k)
-                                row = [group_name, filepath, xi, yi] + vals
-                                all_rows.append(dict(zip(header, row)))
-
-            progress.setValue(len(all_entries))
-
-            # ---- 7) Dedupe + write --------------------------------------------------
-            unique_rows, seen = [], set()
-            for row in all_rows:
-                key = tuple(sorted((k, make_hashable(v)) for k, v in row.items()))
-                if key not in seen:
-                    seen.add(key)
-                    unique_rows.append(row)
-
-            with open(save_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=header)
-                writer.writeheader()
-                writer.writerows(unique_rows)
-
-            QtWidgets.QMessageBox.information(self, "Export Complete", f"CSV exported to:\n{save_path}")
+            if result.get("success"):
+                QtWidgets.QMessageBox.information(self, "Export Complete", result.get("message", ""))
+            else:
+                QtWidgets.QMessageBox.critical(self, "Export Failed", result.get("message", "Unknown error"))
 
         except Exception as e:
             import traceback, logging
