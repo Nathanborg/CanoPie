@@ -353,6 +353,137 @@ class ShapefileImportWorker(QtCore.QObject):
             self.error.emit(str(e))
 
 
+def _polygon_shoelace_area(points):
+    """Pixel area of a polygon's `points` ([[x,y], ...]) via the shoelace
+    formula. Plain-Python/no-Qt so it is safe to call from a worker thread."""
+    n = len(points) if points else 0
+    if n < 3:
+        return 0.0
+    area = 0.0
+    for i in range(n):
+        x1, y1 = points[i][0], points[i][1]
+        x2, y2 = points[(i + 1) % n][0], points[(i + 1) % n][1]
+        area += x1 * y2 - x2 * y1
+    return abs(area) / 2.0
+
+
+class PolygonFilterWorker(QtCore.QObject):
+    """Background evaluator for PolygonManager's Filter & Color rules.
+
+    Runs entirely against a plain-Python snapshot of `parent.all_polygons`
+    (no Qt/GUI objects touched), so it can execute on a worker QThread
+    without freezing the LOD-rendered viewers -- see the module-level
+    architecture note in the class docstring below to know why that
+    matters at CanoPie's polygon counts.
+
+    Emits `finished({(group, filepath): {'visible': bool, 'color': (r,g,b)}}, dict)`
+    -- the second dict is `{(group, filepath): area}` for any polygon whose
+    area was computed here (missing from stored properties), so the caller
+    can persist it back without recomputing.
+    """
+    progress = QtCore.pyqtSignal(int, int)  # (done, total)
+    finished = QtCore.pyqtSignal(dict, dict)
+    error = QtCore.pyqtSignal(str)
+
+    def __init__(self, all_polygons_snapshot, rules, hide_unmatched=False):
+        """
+        all_polygons_snapshot: {group: {filepath: polygon_dict}} — a snapshot
+            (not the live dict) so a save/edit on the GUI thread mid-evaluation
+            cannot race this thread.
+        rules: ordered list of {'expression': str, 'color': (r,g,b), 'hide': bool}.
+            First matching rule wins for a polygon. A matching rule with
+            'hide' True HIDES the polygon (color is irrelevant); otherwise it
+            is shown in 'color'.
+        hide_unmatched: when True, a polygon that matches NO rule is hidden
+            instead of staying visible with the default color -- this is
+            what makes "Filter" actually filter rather than only recolor.
+        """
+        super().__init__()
+        self._snapshot = all_polygons_snapshot
+        self._rules = rules or []
+        self._hide_unmatched = bool(hide_unmatched)
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            style_map = {}
+            computed_areas = {}
+            total = sum(len(files) for files in self._snapshot.values())
+            done = 0
+            step = max(1, total // 100)
+
+            # Pre-compile once; a broken expression is reported for THAT
+            # rule only, not the whole batch, so one typo doesn't blank out
+            # every other rule's coloring.
+            compiled = []
+            for rule in self._rules:
+                expr = (rule.get('expression') or '').strip()
+                color = rule.get('color') or (255, 0, 0)
+                hide = bool(rule.get('hide'))
+                try:
+                    compiled.append((compile(expr, '<filter_rule>', 'eval'), color, hide, expr))
+                except SyntaxError as e:
+                    compiled.append((None, color, hide, expr))
+                    logging.warning("[PolygonFilter] bad expression %r: %s", expr, e)
+
+            for group, files in self._snapshot.items():
+                for fp, poly in files.items():
+                    done += 1
+                    if done % step == 0 or done == total:
+                        self.progress.emit(done, total)
+
+                    props = dict(poly.get('properties') or {})
+                    if 'area' not in props or props.get('area') in (None, ''):
+                        pts = poly.get('points') or []
+                        area = _polygon_shoelace_area(pts)
+                        props['area'] = area
+                        computed_areas[(group, fp)] = area
+
+                    # Sanitized eval locals: only the polygon's own
+                    # properties plus a couple of always-present aliases, and
+                    # NO builtins -- this is user-authored text from a form
+                    # field, evaluated per-polygon, so it must not be able to
+                    # reach the filesystem/interpreter.
+                    local_ns = dict(props)
+                    local_ns.setdefault('name', poly.get('name') or group)
+                    local_ns.setdefault('group', group)
+                    safe_globals = {'__builtins__': {}}
+
+                    # Default when NO rule matches: visible unless the user
+                    # opted into "Hide non-matching polygons", in which case
+                    # this polygon is filtered OUT rather than merely left
+                    # with the default color.
+                    visible, color = not self._hide_unmatched, None
+                    for code, rule_color, rule_hide, expr_text in compiled:
+                        if code is None:
+                            continue
+                        try:
+                            if eval(code, safe_globals, local_ns):
+                                visible, color = (not rule_hide), (None if rule_hide else rule_color)
+                                break
+                        except Exception as e:
+                            # A rule referencing a property this polygon
+                            # doesn't have (e.g. `species == "oak"` on a
+                            # polygon with no `species`) is expected and
+                            # common -- treat as "rule doesn't match", not
+                            # an error to surface per-polygon.
+                            logging.debug("[PolygonFilter] rule %r failed on %s/%s: %s",
+                                          expr_text, group, fp, e)
+                            continue
+
+                    key = (group, fp)
+                    style_map[key] = {
+                        'visible': visible,
+                        'color': QtGui.QColor(*color) if color else None,
+                    }
+
+            self.finished.emit(style_map, computed_areas)
+        except Exception as e:
+            import traceback
+            logging.error("[PolygonFilterWorker] Exception: %s\n%s", e, traceback.format_exc())
+            self.error.emit(str(e))
+
+
 class PolygonManager(QtWidgets.QDialog):
     clear_all_polygons_signal = QtCore.pyqtSignal()  # Signal to clear all polygons across all images
     edit_group_signal = QtCore.pyqtSignal(str)       # Signal to initiate editing of a specific group
@@ -405,6 +536,26 @@ class PolygonManager(QtWidgets.QDialog):
         self.show_labels_checkbox.setToolTip("Toggle visibility of polygon labels")
         self.show_labels_checkbox.stateChanged.connect(self._on_show_labels_changed)
         self.top_controls_layout.addWidget(self.show_labels_checkbox)
+
+        # Lock Polygons Checkbox — global drag-prevention toggle.
+        self.lock_polys_checkbox = QtWidgets.QCheckBox("Lock Polygons")
+        self.lock_polys_checkbox.setStyleSheet("""
+            QCheckBox::indicator:checked {
+                background-color: #FFD700;
+                border: 1px solid #006400;
+            }
+            QCheckBox::indicator:unchecked {
+                background-color: white;
+                border: 1px solid gray;
+            }
+        """)
+        self.lock_polys_checkbox.setChecked(False)
+        self.lock_polys_checkbox.setToolTip(
+            "Prevent accidental drags. Locked polygons can still be unlocked "
+            "individually (or by group) from a prompt shown on click."
+        )
+        self.lock_polys_checkbox.stateChanged.connect(self._on_lock_polys_changed)
+        self.top_controls_layout.addWidget(self.lock_polys_checkbox)
         self.top_controls_layout.addStretch()
 
         # === List ===
@@ -478,9 +629,12 @@ class PolygonManager(QtWidgets.QDialog):
         self.layout.addWidget(self.import_project_button)
         self.import_project_button.clicked.connect(self.on_import_polygons_from_project)
 
-        # Hide the old, now-redundant controls 
+        # Hide the old, now-redundant controls
         self.find_nearest_button.setVisible(False)
         self.correction_group.setVisible(False)
+
+        # === Filter & Color Polygons ===
+        self._build_filter_color_ui()
 
         # === Misc buttons ===
         self.clear_all_button = QtWidgets.QPushButton("Clear All Groups")
@@ -519,6 +673,256 @@ class PolygonManager(QtWidgets.QDialog):
         for vw_widget, viewer in self._iter_viewers():
             if hasattr(viewer, "set_labels_visible"):
                 viewer.set_labels_visible(checked)
+
+    def _on_lock_polys_changed(self):
+        """Called when 'Lock Polygons' checkbox is toggled.
+        Applies the global lock/unlock to every active viewer."""
+        checked = self.lock_polys_checkbox.isChecked()
+        for vw_widget, viewer in self._iter_viewers():
+            if hasattr(viewer, "set_polygons_locked"):
+                viewer.set_polygons_locked(checked)
+
+    # ------------------------------------------------------------------
+    # Filter & Color Polygons
+    # ------------------------------------------------------------------
+    def _build_filter_color_ui(self):
+        """Build the collapsible rules table + Apply/Clear controls.
+
+        Evaluation always happens on a background QThread (PolygonFilterWorker)
+        against a snapshot of `all_polygons`, never on the GUI thread -- with
+        thousands of polygons, even a millisecond-per-polygon `eval()` would
+        freeze the LOD-rendered viewers for seconds. See PolygonFilterWorker.
+
+        Collapsed by default: this section is used occasionally, and a
+        QGroupBox left permanently expanded pushes the polygon list (the
+        thing actually used on every open) further down every time the
+        dialog is shown.
+        """
+        outer = QtWidgets.QVBoxLayout()
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self.layout.addLayout(outer)
+
+        self.filter_toggle_button = QtWidgets.QToolButton()
+        self.filter_toggle_button.setText(" Filter && Color Polygons")
+        self.filter_toggle_button.setCheckable(True)
+        self.filter_toggle_button.setChecked(False)  # collapsed by default
+        self.filter_toggle_button.setArrowType(QtCore.Qt.RightArrow)
+        self.filter_toggle_button.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self.filter_toggle_button.setStyleSheet(
+            "QToolButton { border: none; font-weight: 600; padding: 4px; } "
+            "QToolButton:hover { background: rgba(0,0,0,0.06); }"
+        )
+        self.filter_toggle_button.clicked.connect(self._on_filter_section_toggled)
+        outer.addWidget(self.filter_toggle_button)
+
+        self.filter_content = QtWidgets.QWidget()
+        self.filter_content.setVisible(False)  # collapsed by default
+        flay = QtWidgets.QVBoxLayout(self.filter_content)
+        flay.setContentsMargins(8, 4, 8, 8)
+        outer.addWidget(self.filter_content)
+
+        hint = QtWidgets.QLabel(
+            "Rules are evaluated top-to-bottom; the first matching rule wins. "
+            "Check \"Hide\" to filter a match OUT instead of coloring it. "
+            "Example: area > 100"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: gray; font-size: 11px;")
+        flay.addWidget(hint)
+
+        self.filter_rules_table = QtWidgets.QTableWidget(0, 4)
+        self.filter_rules_table.setHorizontalHeaderLabels(["Expression", "Hide", "Color", ""])
+        self.filter_rules_table.horizontalHeader().setStretchLastSection(False)
+        self.filter_rules_table.horizontalHeader().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.Stretch)
+        self.filter_rules_table.setColumnWidth(1, 40)
+        self.filter_rules_table.setColumnWidth(2, 55)
+        self.filter_rules_table.setColumnWidth(3, 30)
+        self.filter_rules_table.setMaximumHeight(160)
+        flay.addWidget(self.filter_rules_table)
+
+        rule_btn_row = QtWidgets.QHBoxLayout()
+        self.add_rule_button = QtWidgets.QPushButton("Add Rule")
+        self.add_rule_button.clicked.connect(lambda: self._add_filter_rule_row("area > 100", QtGui.QColor(0, 170, 0)))
+        rule_btn_row.addWidget(self.add_rule_button)
+        rule_btn_row.addStretch()
+        flay.addLayout(rule_btn_row)
+
+        self.hide_unmatched_checkbox = QtWidgets.QCheckBox("Hide polygons that match no rule")
+        self.hide_unmatched_checkbox.setToolTip(
+            "When checked, a polygon matching none of the rules above is "
+            "hidden instead of staying visible with the default color."
+        )
+        flay.addWidget(self.hide_unmatched_checkbox)
+
+        apply_row = QtWidgets.QHBoxLayout()
+        self.apply_filters_button = QtWidgets.QPushButton("Apply Filters")
+        self.apply_filters_button.setStyleSheet("background:#1565c0; color:white; font-weight:600; padding:6px; border-radius:4px;")
+        self.apply_filters_button.clicked.connect(self._apply_filters)
+        apply_row.addWidget(self.apply_filters_button)
+
+        self.clear_filters_button = QtWidgets.QPushButton("Clear Filters")
+        self.clear_filters_button.clicked.connect(self._clear_filters)
+        apply_row.addWidget(self.clear_filters_button)
+        flay.addLayout(apply_row)
+
+        self.filter_status_label = QtWidgets.QLabel("")
+        self.filter_status_label.setStyleSheet("color: gray; font-size: 11px;")
+        flay.addWidget(self.filter_status_label)
+
+        self._active_filter_threads = set()
+
+    def _on_filter_section_toggled(self):
+        expanded = self.filter_toggle_button.isChecked()
+        self.filter_content.setVisible(expanded)
+        self.filter_toggle_button.setArrowType(
+            QtCore.Qt.DownArrow if expanded else QtCore.Qt.RightArrow)
+
+    def _add_filter_rule_row(self, expression="", color=None):
+        color = color or QtGui.QColor(0, 170, 0)
+        row = self.filter_rules_table.rowCount()
+        self.filter_rules_table.insertRow(row)
+        self.filter_rules_table.setItem(row, 0, QtWidgets.QTableWidgetItem(expression))
+
+        hide_item = QtWidgets.QTableWidgetItem()
+        hide_item.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled)
+        hide_item.setCheckState(QtCore.Qt.Unchecked)
+        hide_item.setTextAlignment(QtCore.Qt.AlignCenter)
+        hide_item.setToolTip("Hide polygons matching this rule (color is ignored)")
+        self.filter_rules_table.setItem(row, 1, hide_item)
+
+        color_btn = QtWidgets.QPushButton()
+        color_btn.setStyleSheet(f"background-color: {color.name()};")
+        color_btn.setProperty("rule_color", color)
+        color_btn.clicked.connect(partial(self._pick_rule_color, color_btn))
+        self.filter_rules_table.setCellWidget(row, 2, color_btn)
+
+        remove_btn = QtWidgets.QPushButton("✕")
+        remove_btn.setToolTip("Remove this rule")
+        remove_btn.clicked.connect(partial(self._remove_filter_rule_row, remove_btn))
+        self.filter_rules_table.setCellWidget(row, 3, remove_btn)
+
+    def _pick_rule_color(self, color_btn):
+        current = color_btn.property("rule_color") or QtGui.QColor(0, 170, 0)
+        chosen = QtWidgets.QColorDialog.getColor(current, self, "Choose Rule Color")
+        if chosen.isValid():
+            color_btn.setProperty("rule_color", chosen)
+            color_btn.setStyleSheet(f"background-color: {chosen.name()};")
+
+    def _remove_filter_rule_row(self, remove_btn):
+        for row in range(self.filter_rules_table.rowCount()):
+            if self.filter_rules_table.cellWidget(row, 3) is remove_btn:
+                self.filter_rules_table.removeRow(row)
+                return
+
+    def _collect_filter_rules(self):
+        rules = []
+        for row in range(self.filter_rules_table.rowCount()):
+            expr_item = self.filter_rules_table.item(row, 0)
+            expr = (expr_item.text().strip() if expr_item else "")
+            if not expr:
+                continue
+            hide_item = self.filter_rules_table.item(row, 1)
+            hide = bool(hide_item and hide_item.checkState() == QtCore.Qt.Checked)
+            color_btn = self.filter_rules_table.cellWidget(row, 2)
+            color = color_btn.property("rule_color") if color_btn else QtGui.QColor(0, 170, 0)
+            rules.append({
+                'expression': expr,
+                'color': (color.red(), color.green(), color.blue()),
+                'hide': hide,
+            })
+        return rules
+
+    def _apply_filters(self):
+        parent = self.parent()
+        if parent is None or not getattr(parent, "all_polygons", None):
+            QtWidgets.QMessageBox.information(self, "No Polygons", "There are no polygons to filter.")
+            return
+
+        rules = self._collect_filter_rules()
+        if not rules:
+            QtWidgets.QMessageBox.information(self, "No Rules", "Add at least one rule first.")
+            return
+
+        # Deep-copy snapshot: the worker thread must never touch the live
+        # dict the GUI thread (and autosave) can mutate concurrently -- same
+        # discipline as ProjectTab._snapshot_polygons_by_group for export.
+        snapshot = copy.deepcopy(parent.all_polygons)
+        hide_unmatched = self.hide_unmatched_checkbox.isChecked()
+
+        self.apply_filters_button.setEnabled(False)
+        self.filter_status_label.setText("Evaluating filters...")
+
+        thread = QtCore.QThread(self)
+        worker = PolygonFilterWorker(snapshot, rules, hide_unmatched=hide_unmatched)
+        worker.moveToThread(thread)
+        self._active_filter_threads.add(thread)
+
+        def _cleanup():
+            self._active_filter_threads.discard(thread)
+            worker.deleteLater()
+            thread.deleteLater()
+            self.apply_filters_button.setEnabled(True)
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_filter_progress)
+        worker.finished.connect(self._on_filter_finished)
+        worker.error.connect(self._on_filter_error)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        thread.finished.connect(_cleanup)
+        thread.start()
+
+    def _on_filter_progress(self, done, total):
+        self.filter_status_label.setText(f"Evaluating filters... {done}/{total}")
+
+    def _on_filter_finished(self, style_map, computed_areas):
+        """Apply the worker's {(group, filepath): {visible, color}} mapping
+        to every open viewer, and persist any area it had to compute."""
+        parent = self.parent()
+
+        # Persist areas the worker computed (properties were missing them),
+        # so re-filtering — or a shapefile export — doesn't recompute every
+        # time and DOES export the value the user just filtered on.
+        if parent is not None and computed_areas:
+            for (group, fp), area in computed_areas.items():
+                entry = (parent.all_polygons.get(group, {}) or {}).get(fp)
+                if entry is not None:
+                    entry.setdefault('properties', {})['area'] = area
+                    if hasattr(parent, '_mark_polygon_dirty'):
+                        try:
+                            parent._mark_polygon_dirty(group, fp)
+                        except Exception:
+                            pass
+
+        n_visible = sum(1 for s in style_map.values() if s.get('visible'))
+        n_hidden = len(style_map) - n_visible
+        self.filter_status_label.setText(
+            f"Applied to {len(style_map)} polygon(s): {n_visible} visible, {n_hidden} hidden."
+        )
+
+        for _, viewer in self._iter_viewers():
+            if hasattr(viewer, "apply_polygon_style_map"):
+                viewer.apply_polygon_style_map(style_map)
+
+        if parent is not None:
+            try:
+                if hasattr(parent, "save_incremental"):
+                    parent.save_incremental(show_status=False)
+            except Exception:
+                logging.debug("[PolygonFilter] incremental save after filter failed", exc_info=True)
+
+    def _on_filter_error(self, err):
+        self.filter_status_label.setText("")
+        QtWidgets.QMessageBox.critical(self, "Filter Error", f"Filtering failed:\n{err}")
+
+    def _clear_filters(self):
+        """Restore default visibility/color on every open viewer."""
+        for _, viewer in self._iter_viewers():
+            if hasattr(viewer, "clear_polygon_style"):
+                viewer.clear_polygon_style()
+        self.filter_status_label.setText("Filters cleared.")
 
     def _select_group_in_viewers(self, group_name: str, additive: bool = False, center: bool = True):
         """

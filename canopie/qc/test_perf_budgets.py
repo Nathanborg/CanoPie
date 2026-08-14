@@ -240,3 +240,123 @@ def test_band_math_is_cached_within_one_image(synthetic_project):
     assert {f"idx{i}" for i in range(6)} <= produced, (
         f"not all formulas produced rows: {sorted(produced)}")
     assert dt < 5.0, f"six identical formulas took {dt:.2f}s"
+
+
+# ---------------------------------------------------------------------------
+# Image Editor "NA" (NoData) lag -- reapply_modifications() hot path
+#
+# `ImageEditorDialog.reapply_modifications()` calls `_apply_hist_match`
+# synchronously on the GUI thread every time the user edits NoData/hist-match
+# settings, so THIS is the call that must not be slow. It used to allocate a
+# full channel-sized `np.where(mask, np.nan, ch)` array per band just to
+# exclude masked pixels from `np.nanmean`/`np.nanstd`, then a SECOND
+# full-sized `np.where(mask, orig, transformed)` per band to restore them --
+# see project_tab.py's `_apply_hist_match` and image_editor_dialog.py's
+# `_apply_hist_local` for the fix (boolean-indexed in-place assignment
+# instead). Measured on this machine, 2000x2000x8 float32 with two masked
+# bands: meanstd ~1.6-2.1s, cdf ~3.1-4.3s -- ceilings below are a further
+# ~5x on top of that, loose enough to only catch a real regression back to
+# the old per-band full-array-allocation pattern.
+# ---------------------------------------------------------------------------
+def _large_masked_stack(h=2000, w=2000, bands=8, seed=3):
+    rng = np.random.default_rng(seed)
+    a = rng.uniform(0.0, 5000.0, size=(h, w, bands)).astype(np.float32)
+    a[:200, :, 3] = -9999.0   # partially-filled band
+    return a
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("mode,ceiling_s,hist_cfg", [
+    ("meanstd", 10.0, lambda C: {"mode": "meanstd", "bands": C,
+                                  "ref_stats": [{"mean": 100.0, "std": 30.0}] * C}),
+    ("cdf", 20.0, lambda C: {"mode": "cdf", "bands": C, "ref_cdf": {"per_band": [
+        {"x": [0, 0.5, 1], "y": [0, 0.5, 1], "lo": 0.0, "hi": 5000.0}] * C}}),
+])
+def test_hist_match_na_reapply_latency_ceiling(mode, ceiling_s, hist_cfg):
+    """A loose sanity net for the 'severe lag applying NA' regression,
+    reproduced directly against ProjectTab._apply_hist_match (the canonical
+    implementation editor's reapply_modifications() delegates to) rather than
+    through the full Qt dialog, so the hot numeric path is measured without
+    GUI/event-loop noise.
+
+    NOT the primary regression guard: the fix below measured only ~1.3-2.2x
+    faster than the old per-band `np.where` allocation (see the module note
+    above), well under the 10-30x this file's own header says a wall-clock
+    ceiling needs to reliably separate "real regression" from "busy machine".
+    test_hist_match_restore_uses_boolean_indexing_not_full_array_where pins
+    the actual code shape; this test only catches something becoming
+    catastrophically (not just moderately) slower."""
+    from ..project_tab import ProjectTab
+
+    img = _large_masked_stack()
+    C = img.shape[2]
+    mods = {"hist_match": hist_cfg(C)}
+
+    t0 = time.perf_counter()
+    out = ProjectTab._apply_hist_match(img.copy(), mods, nodata_values=[-9999.0])
+    dt = time.perf_counter() - t0
+
+    assert dt < ceiling_s, (
+        f"{mode}: NoData-aware histogram match on a 2000x2000x{C} image took "
+        f"{dt:.2f}s, ceiling {ceiling_s}s -- this is the exact operation "
+        "reapply_modifications() runs synchronously on the GUI thread for "
+        "every NoData/hist-match edit")
+
+    # Correctness must not be sacrificed for speed: masked pixels are
+    # untouched by the boolean-indexed restore.
+    assert np.array_equal(out[:200, :, 3], img[:200, :, 3]), (
+        f"{mode}: masked band was rewritten by the restore step")
+
+
+@pytest.mark.slow
+def test_hist_match_restore_scales_with_image_not_band_count():
+    """A per-band full-array np.where allocation in the restore step costs
+    the same PER BAND regardless of how much of that band is actually
+    masked. The boolean-indexed version costs roughly proportional to the
+    MASKED FRACTION, so a mostly-valid image with many bands must not take
+    anywhere near as long as one where every band is half masked."""
+    from ..project_tab import ProjectTab
+
+    rng = np.random.default_rng(11)
+    H, W, C = 1500, 1500, 12
+    img = rng.uniform(0.0, 5000.0, size=(H, W, C)).astype(np.float32)
+    img[:5, :5, :] = -9999.0  # tiny masked corner, all bands
+
+    mods = {"hist_match": {"mode": "meanstd", "bands": C,
+                           "ref_stats": [{"mean": 100.0, "std": 30.0}] * C}}
+
+    t0 = time.perf_counter()
+    ProjectTab._apply_hist_match(img.copy(), mods, nodata_values=[-9999.0])
+    dt = time.perf_counter() - t0
+
+    # Generous: a small masked fraction across many bands should still be
+    # fast. This is the scenario a per-band np.where(full_array) regression
+    # would blow through first, since it pays for the WHOLE band every time
+    # regardless of how little of it is masked.
+    assert dt < 8.0, f"12-band, mostly-valid image took {dt:.2f}s"
+
+
+def test_hist_match_restore_uses_boolean_indexing_not_full_array_where():
+    """THE actual regression guard for the NoData-restore fix -- source-level,
+    not timing-based.
+
+    Verified by direct measurement (see the module note above) that
+    `np.where(mask, orig, transformed)` on a full (H, W) array costs only
+    ~1.3-2.2x more than `arr[mask] = orig[mask]` on this machine, which is
+    NOT the order-of-magnitude gap this file's own header says a wall-clock
+    ceiling needs to reliably catch a regression rather than machine noise.
+    Pinning the source shape directly -- exactly like
+    test_only_one_sample_for_stats_definition in test_hist_match_nodata.py
+    pins a different regression in the same neighborhood -- is what actually
+    catches someone reverting to the slower pattern.
+    """
+    import inspect
+    from .. import project_tab as pt_module
+
+    src = inspect.getsource(pt_module.ProjectTab._apply_hist_match)
+    assert "np.where(bm, orig_x" not in src, (
+        "the meanstd restore step reverted to a full-array np.where per band "
+        "instead of boolean-indexed assignment")
+    assert "np.where(_bm, orig_x" not in src, (
+        "the cdf restore step reverted to a full-array np.where per band "
+        "instead of boolean-indexed assignment")

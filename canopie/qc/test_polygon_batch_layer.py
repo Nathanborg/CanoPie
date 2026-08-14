@@ -512,9 +512,11 @@ def test_tiles_follow_a_dragged_polygon(qapp):
     assert v._batch_tiles
 
     # Find the tile geometry nearest the polygon's TRUE scene position.
+    # PolygonTileItem._polygons holds (points, color) pairs since tiles gained
+    # per-polygon colouring; the colour is irrelevant here, only the geometry.
     best = None
     for t in v._batch_tiles:
-        for arr in t._polygons:
+        for arr, _color in t._polygons:
             d = abs(arr[:, 0].mean() - after.x()) + abs(arr[:, 1].mean() - after.y())
             if best is None or d < best:
                 best = d
@@ -538,7 +540,7 @@ def test_untouched_polygons_are_unaffected_by_the_transform_step(qapp):
 
     found = False
     for t in v._batch_tiles:
-        for arr in t._polygons:
+        for arr, _color in t._polygons:   # (points, color) pairs -- see above
             if arr.shape == expected.shape and np.allclose(arr, expected):
                 found = True
                 break

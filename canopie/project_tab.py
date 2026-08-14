@@ -4407,11 +4407,21 @@ class ProjectTab(QtWidgets.QWidget):
 
             # Restore nodata values, per band -- so a band that is entirely fill
             # cannot freeze every OTHER band's pixels back to their originals.
+            #
+            # PERF: boolean-indexed in-place assignment rather than an
+            # np.where() call across the whole (H, W) band. That call would
+            # allocate a brand new array just to recombine two arrays already
+            # sitting in memory; indexing both sides by the same mask instead
+            # produces the identical result while only touching the masked
+            # positions. This is the hot path for full-precision (16-bit /
+            # float) images -- the common case for multispectral/hyperspectral
+            # rasters -- called synchronously from the editor on every
+            # NoData/hist-match change.
             if per_band_masks is not None and orig_x is not None:
                 for c in range(C2):
                     bm = _band_mask(c)
                     if bm is not None:
-                        x[:, :, c] = np.where(bm, orig_x[:, :, c], x[:, :, c])
+                        x[:, :, c][bm] = orig_x[:, :, c][bm]
 
             out = x[..., 0] if twoD else x
             if np.issubdtype(src_dtype, np.integer):
@@ -4491,12 +4501,15 @@ class ProjectTab(QtWidgets.QWidget):
                 # Apply LUT and denormalize
                 new_vals = xprime_norm[idx_full] * (hi - lo) + lo
                 
-                # Restore nodata values
+                # Restore nodata values. Write the transform result in full,
+                # then patch back only the masked positions -- avoids the
+                # extra (H, W) allocation `np.where` would make to recombine
+                # two arrays already in memory (same reasoning as the
+                # meanstd branch above).
                 _bm = _band_mask(c)
+                ch[:] = new_vals
                 if _bm is not None and orig_x is not None:
-                    ch[:] = np.where(_bm, orig_x[..., c], new_vals)
-                else:
-                    ch[:] = new_vals
+                    ch[_bm] = orig_x[..., c][_bm]
 
             out = x[..., 0] if twoD else x
             if np.issubdtype(src_dtype, np.integer):
@@ -7615,7 +7628,7 @@ class ProjectTab(QtWidgets.QWidget):
                 return
             logging.info("[load_polygons] ENTER %s", os.path.basename(filepath))
 
-            # --- [FIX] Sync Label Visibility from PolygonManager ---
+            # --- [FIX] Sync Label Visibility / Lock state from PolygonManager ---
             try:
                 from .polygon_manager import PolygonManager
                 # Find the manager instance (modeless dialog) attached to this tab
@@ -7625,6 +7638,11 @@ class ProjectTab(QtWidgets.QWidget):
                     if hasattr(pm, "show_labels_checkbox"):
                         # Apply the user's preference to this viewer
                         viewer.set_labels_visible(pm.show_labels_checkbox.isChecked())
+                    if hasattr(pm, "lock_polys_checkbox") and hasattr(viewer, "set_polygons_locked"):
+                        # A viewer created (or given a fresh image) AFTER "Lock
+                        # Polygons" was checked would otherwise default to
+                        # unlocked -- see ImageViewer.global_polygons_locked.
+                        viewer.set_polygons_locked(pm.lock_polys_checkbox.isChecked())
             except Exception:
                 pass
 

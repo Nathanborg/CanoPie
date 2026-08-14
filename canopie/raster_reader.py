@@ -281,12 +281,52 @@ def _parse_band_metadata(page, count):
     return names, wavelengths
 
 
+#: Numeric TIFF tag ID for GDAL_NODATA (GDALMetadata's sibling GDAL_NODATA
+#: ASCII tag). Used as a fallback lookup below -- see _parse_nodata.
+_GDAL_NODATA_TAG_ID = 42113
+
+
 def _parse_nodata(page):
+    """Extract the raster's declared NoData value from the GDAL_NODATA tag.
+
+    tifffile normally decodes this ASCII tag to a clean Python ``str``, but
+    on files where the tag was written (or re-tagged) with a mismatched TIFF
+    field type -- BYTE or SHORT array instead of ASCII -- it comes back as
+    ``bytes`` (often null-terminated, e.g. ``b'-9999\\x00'``) or a ``tuple``
+    of character codes instead (reproduced here against real files such as
+    the ones under ``C:\\New Folder201``). Feeding either straight through
+    ``str(...)`` produces the Python *repr* of the bytes/tuple
+    (``"b'-9999\\x00'"`` or ``"(45, 57, 57, 57, 57, 0)"``), which ``float()``
+    cannot parse -- so the bare ``except Exception`` below swallowed the
+    resulting ``ValueError`` and returned ``None``, silently disabling NoData
+    masking for every one of those files.
+    """
     try:
         tag = page.tags.get("GDAL_NODATA")
+        if tag is None:
+            # Some tifffile versions/paths do not register the tag under its
+            # ASCII name; the numeric TIFF tag ID is the fallback of last
+            # resort for the same tag.
+            tag = page.tags.get(_GDAL_NODATA_TAG_ID)
         if tag is None or tag.value is None:
             return None
-        raw = str(tag.value).strip()
+
+        value = tag.value
+        if isinstance(value, bytes):
+            raw = value.decode("utf-8", errors="ignore")
+        elif isinstance(value, (tuple, list)):
+            # A SHORT/LONG array of character codes -- rebuild the bytes it
+            # was meant to represent before decoding.
+            raw = bytes(int(v) & 0xFF for v in value).decode("utf-8", errors="ignore")
+        else:
+            raw = str(value)
+
+        # Strip embedded/trailing NUL bytes (not just whitespace) -- a
+        # null-terminated C string decodes to e.g. '-9999\x00', which
+        # float() rejects just as it would the byte-repr.
+        raw = raw.replace("\x00", "").strip()
+        if not raw:
+            return None
         if raw.lower() in ("nan", "-nan", "+nan"):
             return float("nan")
         return float(raw)
@@ -714,10 +754,45 @@ class TiledRasterReader:
             fh.seek(offset)
             raw = fh.read(nbytes)
             data = lv["page"].decode(raw, seg_index, **lv.get("decode_kwargs", {}))[0]
-            arr = np.squeeze(np.asarray(data))
-            # Squeeze can flatten a legitimate single-band trailing axis.
-            if lv["planar"] == 1 and arr.ndim == 2 and lv["count"] > 1:
-                arr = arr[..., None]
+            arr = self._normalise_segment(np.asarray(data), lv)
+        return arr
+
+    @staticmethod
+    def _normalise_segment(arr, lv):
+        """Reshape one decoded segment to this module's tile convention:
+        ``(h, w, samples)`` for planar=1 (contig) and ``(h, w)`` for planar=2
+        (separate) -- matching the sparse-segment branch above.
+
+        tifffile's ``TiffPage.decode`` always returns four axes,
+        ``(depth, height, width, samples)``. This used to be normalised with a
+        blind ``np.squeeze``, which drops EVERY length-1 axis -- including a
+        geometry axis that is legitimately 1. A raster with
+        ``rowsperstrip == 1`` therefore decoded ``(1, 1, W, S)`` down to
+        ``(W, S)``, i.e. the WIDTH axis silently took the row axis's place;
+        the follow-up ``arr[..., None]`` then made it ``(W, S, 1)``, so
+        ``read_window`` sliced rows out of the width axis and raised
+        ``could not broadcast input array from shape (1,S) into shape (1,w)``.
+        Every windowed read of such a file failed, and callers fell back to
+        full-resolution reads (slow) or lost the data entirely.
+
+        That is not an exotic layout: GDAL/Earth-Engine GeoTIFF exports
+        routinely use one row per strip. Reproduced on a real 2031x2350x20
+        LZW export (``pca_scores_Panama_soil_terrain.tif``).
+
+        Dropping only the LEADING depth axis, and the trailing sample axis
+        only for planar=2 (where a segment is one plane by definition), keeps
+        every axis whose length is data-dependent.
+        """
+        # Leading depth axis (always present, always 1 for the 2D pages here).
+        while arr.ndim > 3 and arr.shape[0] == 1:
+            arr = arr[0]
+        if lv["planar"] == 2:
+            # One sample per segment; the trailing axis is structurally 1.
+            if arr.ndim == 3 and arr.shape[-1] == 1:
+                arr = arr[..., 0]
+        elif arr.ndim == 2:
+            # Contig segment that arrived without its sample axis.
+            arr = arr[..., None]
         return arr
 
     def _decode_many(self, level, seg_indices, workers):

@@ -1127,6 +1127,15 @@ def json_polygons_to_features(all_polygons, project_folder,
                         geo_pt = pixel_to_geo([(px, py)], transform)[0] if transform else (px, py)
 
                         props = _base_props(polygon_data.get('name', group_name), 'point')
+                        # User/imported attributes (PolygonManager's "Edit
+                        # properties") -- merged BEFORE stats so a CSV/stats
+                        # column of the same name still wins, matching the
+                        # precedence stats already has over the identity
+                        # fields below.
+                        for k, v in (polygon_data.get('properties') or {}).items():
+                            if k in props:
+                                continue
+                            props[k] = _sanitize_dbf_value(v)
                         r = row_for_idx.get(i)
                         if r:
                             for k, v in r.items():
@@ -1159,6 +1168,12 @@ def json_polygons_to_features(all_polygons, project_folder,
                     geo_points.append(geo_points[0])
 
                 props = _base_props(polygon_data.get('name', group_name), extraction_type)
+                # User/imported attributes -- see the point-shape branch above
+                # for why this is merged before stats.
+                for k, v in (polygon_data.get('properties') or {}).items():
+                    if k in props:
+                        continue
+                    props[k] = _sanitize_dbf_value(v)
                 if rows:
                     if len(rows) > 1:
                         warnings_list.append(
