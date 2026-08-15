@@ -79,6 +79,127 @@ def test_image_ref_size_preserved(synthetic_project):
     assert ref.get("h") == spec["ax"]["crop_rect"]["height"]
 
 
+# --------------------------------------------------------------------------
+# `properties` surviving the disk round trip
+#
+# save_polygons_to_json and save_incremental each build their on-disk record
+# from a hardcoded dict literal that never included a 'properties' key --
+# so every property edit made through the viewer's "Edit properties" dialog
+# (image_viewer.py's edit_polygon_properties, which always falls through to
+# save_incremental() since ProjectTab has no request_save_polygons method)
+# was silently discarded on the very next save. The in-memory copy looked
+# fine until the next disk sync, at which point the edit was gone with no
+# error anywhere. These tests pin the fix directly against the real
+# ProjectTab writers, not a reimplementation of them.
+# --------------------------------------------------------------------------
+
+def _poly_with_properties(name, fp, ref_w=100, ref_h=100, properties=None):
+    d = {
+        'points': [[0, 0], [10, 0], [10, 10]], 'name': name, 'root': '1',
+        'coordinates': {'latitude': 0.0, 'longitude': 0.0}, 'type': 'polygon',
+        'coord_space': 'image', 'image_ref_size': {'w': ref_w, 'h': ref_h},
+    }
+    if properties is not None:
+        d['properties'] = properties
+    return d
+
+
+def _sidecar_path(project_folder, group, filepath):
+    base = os.path.splitext(os.path.basename(filepath))[0]
+    return os.path.join(project_folder, 'polygons', f"{group}_{base}_polygons.json")
+
+
+def _any_existing_fixture_filepath(synthetic_project):
+    for file_map in synthetic_project.all_polygons.values():
+        for fp in file_map:
+            return fp
+    raise AssertionError("synthetic_project has no polygons to borrow a filepath from")
+
+
+def test_properties_survive_save_polygons_to_json(synthetic_project):
+    fp = _any_existing_fixture_filepath(synthetic_project)
+    group = "__prop_roundtrip_save_json__"
+    props = {"DBH_CM": 31.5, "SPECIES": "Ceiba"}
+    synthetic_project.all_polygons[group] = {fp: _poly_with_properties(group, fp, properties=props)}
+    jf = _sidecar_path(synthetic_project.project_folder, group, fp)
+    try:
+        synthetic_project.save_polygons_to_json()
+        data = json.load(open(jf, encoding="utf-8"))
+        assert data.get("properties") == props, (
+            f"properties dropped by save_polygons_to_json: wrote {data.get('properties')!r}")
+    finally:
+        synthetic_project.all_polygons.pop(group, None)
+        if os.path.exists(jf):
+            os.remove(jf)
+
+
+def test_properties_survive_save_incremental(synthetic_project):
+    fp = _any_existing_fixture_filepath(synthetic_project)
+    group = "__prop_roundtrip_save_incremental__"
+    props = {"DBH_CM": 42.0, "PLOT": "p9"}
+    synthetic_project.all_polygons[group] = {fp: _poly_with_properties(group, fp, properties=props)}
+    jf = _sidecar_path(synthetic_project.project_folder, group, fp)
+    try:
+        synthetic_project._mark_polygon_dirty(group, fp)
+        synthetic_project.save_incremental(show_status=False, update_project_json=False)
+        data = json.load(open(jf, encoding="utf-8"))
+        assert data.get("properties") == props, (
+            f"properties dropped by save_incremental: wrote {data.get('properties')!r}")
+    finally:
+        synthetic_project.all_polygons.pop(group, None)
+        if os.path.exists(jf):
+            os.remove(jf)
+
+
+def test_edit_properties_round_trips_through_a_disk_sync(synthetic_project):
+    """THE actual user-visible bug: a property edit must still be there after
+    the same save -> reload cycle a running app performs constantly (root
+    navigation, project reopen). Reproduces it end-to-end via the real
+    ProjectTab writer and the real disk-sync reader, not a shortcut."""
+    fp = _any_existing_fixture_filepath(synthetic_project)
+    group = "__prop_roundtrip_edit_cycle__"
+    props = {"CENSUS_STATUS": "Completed", "TAG": "193935"}
+    synthetic_project.all_polygons[group] = {fp: _poly_with_properties(group, fp, properties=props)}
+    jf = _sidecar_path(synthetic_project.project_folder, group, fp)
+    try:
+        synthetic_project._mark_polygon_dirty(group, fp)
+        synthetic_project.save_incremental(show_status=False, update_project_json=False)
+
+        synthetic_project._sync_all_polygons_from_disk()
+
+        reloaded = synthetic_project.all_polygons.get(group, {}).get(fp, {})
+        assert reloaded.get("properties") == props, (
+            "properties did not survive save -> _sync_all_polygons_from_disk -- "
+            f"got {reloaded.get('properties')!r}, expected {props!r}. This is the "
+            "bug: an edit made through the viewer's properties dialog looks fine "
+            "until the next disk sync, then silently reverts.")
+    finally:
+        synthetic_project.all_polygons.pop(group, None)
+        if os.path.exists(jf):
+            os.remove(jf)
+
+
+def test_hand_drawn_polygon_without_properties_key_saves_cleanly(synthetic_project):
+    """A hand-drawn polygon never gets a 'properties' key at all (confirmed:
+    project_tab.py's drawing path never sets one) -- the writer must not
+    crash on that, and must not invent a non-empty dict."""
+    fp = _any_existing_fixture_filepath(synthetic_project)
+    group = "__prop_roundtrip_hand_drawn__"
+    synthetic_project.all_polygons[group] = {fp: _poly_with_properties(group, fp, properties=None)}
+    jf = _sidecar_path(synthetic_project.project_folder, group, fp)
+    try:
+        synthetic_project._mark_polygon_dirty(group, fp)
+        synthetic_project.save_incremental(show_status=False, update_project_json=False)
+        data = json.load(open(jf, encoding="utf-8"))
+        assert data.get("properties") == {}, (
+            f"hand-drawn polygon (no properties key) wrote properties={data.get('properties')!r}, "
+            "expected an empty dict")
+    finally:
+        synthetic_project.all_polygons.pop(group, None)
+        if os.path.exists(jf):
+            os.remove(jf)
+
+
 def test_roots_and_mode_restored(synthetic_project):
     pt = synthetic_project
     assert pt.mode == "rgb_only", f"mode came back as {pt.mode!r}"

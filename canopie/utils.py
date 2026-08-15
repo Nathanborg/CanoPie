@@ -773,27 +773,133 @@ def build_nodata_mask(img, nd_vals, *, bgr_input=True, include_nonfinite=False):
                     tol = abs_fv * 0.001
                 else:
                     tol = 0.01
-                # With rtol=0, np.isclose is just |a - b| <= atol, but it costs
-                # ~10x more: it allocates several temporaries and runs its own
-                # finite/NaN handling. On a 15-band 1759x1930 scene that turned
-                # into 65 ms per channel, and CSV export spent 94 s of every
-                # 175 s inside isclose alone. NaN compares False either way, so
-                # the direct form is equivalent as well as much faster.
-                diff = np.empty(x.shape[:2], dtype=np.float32)
-                for c in range(C):
-                    np.subtract(x[..., c], fv, out=diff)
-                    np.abs(diff, out=diff)
-                    mask |= (diff <= tol)
+                # ONE call across every channel at once, instead of a Python
+                # loop calling subtract/abs/compare once per channel (C calls
+                # each). Equivalent output (NaN still compares False either
+                # way -- see the isclose comment this replaced), but far fewer
+                # ufunc dispatches: on real multi-band prediction stacks
+                # (15 bands, ~44% NaN) the per-channel loop measured highly
+                # inconsistent -- 70ms in a clean process but 5-6x that
+                # (400+ms) reached the SAME array through the app's actual
+                # call chain, for reasons that didn't trace to array layout,
+                # NaN bit pattern, or system load (all checked and ruled out
+                # -- see task notes). Cutting dispatch count from 2*C to 2
+                # measurably helped in BOTH cases and is the safer fix when
+                # the exact mechanism can't be pinned down.
+                mask |= (np.abs(x - fv) <= tol).any(axis=2)
             except Exception:
                 pass
 
-    # Also check for NaN/Inf (always masked). One isfinite pass per channel
-    # replaces separate isnan and isinf passes.
+    # Also check for NaN/Inf (always masked). One vectorized pass across all
+    # channels at once (see the numeric-literal comment above for why this
+    # replaced a per-channel loop).
     if np.issubdtype(x.dtype, np.floating):
-        for c in range(C):
-            mask |= ~np.isfinite(x[..., c])
-    
+        mask |= (~np.isfinite(x)).any(axis=2)
+
     return mask
+
+
+# ---------------------------------------------------------------------------
+# Per-polygon `properties` -> export columns
+# ---------------------------------------------------------------------------
+#: Every CSV column derived from a polygon's arbitrary `properties` dict is
+#: prefixed with this. `properties` keys come from an imported shapefile's DBF
+#: (truncated to 10 chars by the format) or from the viewer's "Edit
+#: properties" dialog -- i.e. entirely user-controlled, and different from one
+#: project to the next. Without a prefix a DBF field named `Mean`, `x` or
+#: `group_name` would silently overwrite a computed statistic column in one of
+#: the four export paths that read this. Prefixing is injective, so two
+#: distinct keys can never collide with each other either.
+#:
+#: NOTE the shapefile/DBF export path (shapefile_io.py's json_polygons_to_features)
+#: does NOT use this prefix, on purpose: DBF field names are capped at 10
+#: characters, so `prop_` would leave 5 usable, and that path already has its
+#: own collision guard (`if k in props: continue`) plus its own pinned test
+#: (canopie/qc/test_shapefile_batch_export.py). This asymmetry is deliberate.
+POLYGON_PROPERTY_COLUMN_PREFIX = 'prop_'
+
+
+def polygon_property_column(key):
+    """Column name for one raw property key. CR/LF/TAB are replaced with a
+    space so a pasted multi-line key cannot break a CSV row's framing."""
+    s = str(key)
+    for ch in ('\r', '\n', '\t'):
+        s = s.replace(ch, ' ')
+    return POLYGON_PROPERTY_COLUMN_PREFIX + s
+
+
+def polygon_property_value(v):
+    """Coerce one property value to something every writer here can emit.
+    Scalars pass through unchanged; None becomes '' so a missing/blank cell
+    reads the same as an absent key; numpy scalars are unwrapped; anything
+    else is stringified rather than raising mid-export."""
+    if v is None:
+        return ''
+    if isinstance(v, (bool, int, float, str)):
+        return v
+    try:
+        if isinstance(v, np.generic):
+            return v.item()
+    except Exception:
+        pass
+    return str(v)
+
+
+def collect_polygon_property_keys(polygons):
+    """SORTED union of raw property keys across `polygons`.
+
+    `polygons` is any iterable of polygon dicts. Sorted (not first-seen) so
+    the header is byte-identical between runs regardless of group-selection
+    order or dict insertion order -- the same reproducibility contract
+    order_csv_columns keeps for its own alphabetical tail.
+
+    A polygon with no `properties` key at all -- every hand-drawn one -- (or
+    a non-dict `properties`) contributes nothing and is never an error.
+    """
+    keys = set()
+    for p in polygons:
+        if not isinstance(p, dict):
+            continue
+        props = p.get('properties')
+        if isinstance(props, dict):
+            keys.update(str(k) for k in props.keys())
+    return sorted(keys)
+
+
+def iter_polygons_by_group(polygons_by_group):
+    """Flatten {group: {filepath: polygon_dict}} to an iterable of polygon
+    dicts -- the shape machine_learning_manager.py holds its snapshots in."""
+    for file_map in (polygons_by_group or {}).values():
+        if isinstance(file_map, dict):
+            for poly in file_map.values():
+                yield poly
+
+
+def polygon_property_cells(polygon_dict, keys=None):
+    """{'prop_<key>': value} for ONE polygon, for dict-shaped (DictWriter) rows.
+
+    keys=None  -> only the keys this polygon actually has.
+    keys=[...] -> every listed key is present; ones this polygon lacks get ''.
+    """
+    props = polygon_dict.get('properties') if isinstance(polygon_dict, dict) else None
+    if not isinstance(props, dict):
+        props = {}
+    if keys is None:
+        return {polygon_property_column(k): polygon_property_value(v)
+                for k, v in props.items()}
+    return {polygon_property_column(k): polygon_property_value(props.get(k, ''))
+            for k in keys}
+
+
+def polygon_property_values(polygon_dict, keys):
+    """FIXED-ORDER list of values aligned to `keys`, for list-shaped
+    (csv.writer) rows. Missing keys -> ''. Intended to be computed ONCE per
+    polygon and spliced onto every row/tile that polygon produces, so a
+    polygon yielding many rows (pixels) or many tiles never re-derives it."""
+    props = polygon_dict.get('properties') if isinstance(polygon_dict, dict) else None
+    if not isinstance(props, dict):
+        props = {}
+    return [polygon_property_value(props.get(k, '')) for k in keys]
 
 
 __all__ = [
@@ -822,4 +928,11 @@ __all__ = [
     'calculate_shd',
     'parse_nodata_text',
     'build_nodata_mask',
+    'POLYGON_PROPERTY_COLUMN_PREFIX',
+    'polygon_property_column',
+    'polygon_property_value',
+    'collect_polygon_property_keys',
+    'iter_polygons_by_group',
+    'polygon_property_cells',
+    'polygon_property_values',
 ]

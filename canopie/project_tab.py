@@ -72,6 +72,9 @@ from . import polygon_lod
 from .loaders import _LoaderSignals, _ImageLoadRunnable, ImageProcessor, ImageLoaderWorker
 from .utils import *
 from .utils import eval_band_expression
+from .utils import (
+    polygon_property_cells, collect_polygon_property_keys, polygon_property_column,
+)
 
 # High-performance computation module
 try:
@@ -8084,7 +8087,26 @@ class ProjectTab(QtWidgets.QWidget):
                                 viewer.set_polygons_visible(False)
                 except Exception:
                     pass
-                
+
+                # Reapply the last Filter & Color result, same idea as the
+                # label-visibility/lock-state sync above: EditablePolygonItem/
+                # EditablePointItem always construct with current_color=None,
+                # _filtered_hidden=False (see their __init__), and nothing
+                # durable stores filter RULES anywhere -- the filter's visual
+                # effect lives only on the live scene items PolygonManager's
+                # "Apply" button touched, so any refresh that recreates them
+                # (root switch, reopen, this very load) silently forgets it.
+                # Must run AFTER the polygon-add loop above, not in the early
+                # per-viewer sync near the top of this method, since there is
+                # nothing to style until the items just added here exist.
+                try:
+                    pm = getattr(self, "polygon_manager", None)
+                    style_map = getattr(pm, "_last_filter_style_map", None) if pm is not None else None
+                    if style_map and hasattr(viewer, "apply_polygon_style_map"):
+                        viewer.apply_polygon_style_map(style_map)
+                except Exception:
+                    logging.debug("[load_polygons] reapplying filter style failed", exc_info=True)
+
                 # Trigger one final repaint
                 if scene:
                     scene.update()
@@ -9628,7 +9650,7 @@ class ProjectTab(QtWidgets.QWidget):
                     self.copy_polygons_between_roots(
                         current_root, tgt,
                         rescale=do_rescale,
-                        defer_viewer_update=False,    # <<< speed (no per-target redraw)
+                        defer_viewer_update=True,    # <<< speed (no per-target redraw)
                         defer_save=True              # <<< speed (no per-target save)
                     )
                     successes += 1
@@ -10207,6 +10229,8 @@ class ProjectTab(QtWidgets.QWidget):
                         group_name = f"random_shape_{shape_counter}"
                         shape_counter += 1
                         shapes_generated += 1
+                        if shapes_generated % 50 == 0:
+                            QtWidgets.QApplication.processEvents()
 
                         scene_poly = QtGui.QPolygonF()
                         for k in range(poly.count()):
@@ -11038,12 +11062,41 @@ class ProjectTab(QtWidgets.QWidget):
 
         # ---- create editor ----
         try:
-            # Flush any pending polygon updates before opening dialog
-            if hasattr(self, "_flush_dirty_polygons"):
-                self._flush_dirty_polygons()
-            if hasattr(self, "update_all_polygons"):
-                self.update_all_polygons()
-            
+            # Flush any pending polygon updates before opening dialog.
+            #
+            # PERFORMANCE: this used to run UNCONDITIONALLY, and
+            # update_all_polygons() invalidates the polygon index -- so every
+            # editor open paid a full index rebuild proportional to the project's
+            # polygon count, for a dialog that does not draw polygons at all. On
+            # the BCI COG project (3598 crowns) opening the editor took a long
+            # time with polygons loaded and was instant after clearing them,
+            # which is exactly this cost.
+            #
+            # _jump_to_index already solved the identical problem for root
+            # navigation ("Calling update_all_polygons() on every navigation was
+            # causing 50,000-entry index rebuilds"); this mirrors that gate. When
+            # the current root has no pending polygon edits there is nothing to
+            # sync, so the whole step is skipped. _flush_dirty_polygons() is
+            # itself a no-op on an empty _dirty_polys, but it is kept inside the
+            # gate so the two stay consistent.
+            cur_root = None
+            try:
+                idx = getattr(self, "current_root_index", 0)
+                names = getattr(self, "multispectral_root_names", None) or []
+                if 0 <= idx < len(names):
+                    cur_root = names[idx]
+            except Exception:
+                cur_root = None
+            dirty_roots = getattr(self, "_dirty_polygon_roots", None)
+            # Unknown root, or no dirty-tracking at all -> keep the old
+            # always-sync behaviour rather than risk dropping a pending edit.
+            if cur_root is None or dirty_roots is None or cur_root in dirty_roots:
+                if hasattr(self, "_flush_dirty_polygons"):
+                    self._flush_dirty_polygons()
+                if hasattr(self, "update_all_polygons"):
+                    self.update_all_polygons()
+
+
             editor = ImageEditorDialog(self, image_data=original_image, image_filepath=filepath)
             # mirror viewer behavior into the editor
             editor.viewer = viewer
@@ -14545,6 +14598,17 @@ class ProjectTab(QtWidgets.QWidget):
 
                 if vec.size == 0:
                     logging.warning(f"No pixels under mask for '{filepath}'.")
+                    # This path can be reached after earlier loop iterations
+                    # already appended rows to data_rows (e.g. a label row at
+                    # the add_label_row branch above) -- the finalize/dedup
+                    # loop below never runs on this early-return path, so
+                    # attach properties here too or those rows would ship
+                    # without them.
+                    if data_rows:
+                        _prop_cells_early = polygon_property_cells(polygon_dict)
+                        if _prop_cells_early:
+                            for _r in data_rows:
+                                _r.update(_prop_cells_early)
                     return data_rows, modified_polygons
 
                 poly_stats = _calc_stats(vec)
@@ -14746,6 +14810,12 @@ class ProjectTab(QtWidgets.QWidget):
         except Exception as e:
             logging.debug("band name lookup failed for %s: %s", filepath, e)
 
+        # polygon_dict is already resident (its ['points'] was read far above
+        # to build this row set) -- one dict lookup, no extra I/O. Computed
+        # ONCE here rather than per row; every row gets the SAME polygon's
+        # properties, so there is nothing to recompute per row.
+        _prop_cells = polygon_property_cells(polygon_dict)
+
         unique_data_rows, seen = [], set()
         for row in data_rows:
             # Ensure centroid keys always exist (belt-and-suspenders)
@@ -14760,6 +14830,8 @@ class ProjectTab(QtWidgets.QWidget):
                          row.get("File Name"), row.get("Label Band Index"))
             if dedup_key not in seen:
                 seen.add(dedup_key)
+                if _prop_cells:
+                    row.update(_prop_cells)
                 unique_data_rows.append(row)
 
         # Memory note: all large locals (img, chans, nd_masks, img_float, etc.)
@@ -16222,8 +16294,10 @@ class ProjectTab(QtWidgets.QWidget):
             del file_items
             del file_poly_counts
         # Cleanup
-        progress_dialog.setValue(n_polygons)
-        progress_dialog.close()
+        if progress_dialog is not None:
+            progress_dialog.setLabelText("Formatting and writing CSV file...")
+            progress_dialog.setMaximum(0) # Indeterminate spinner during post-processing
+            QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents)
         
         if errors > 0:
             logging.warning(f"[CSV export] Completed with {errors} errors")
@@ -16277,6 +16351,24 @@ class ProjectTab(QtWidgets.QWidget):
                     if col not in fieldnames_raw:
                         fieldnames_raw.append(col)
 
+        # ---------------- Dynamic prop_* columns -------------------------
+        # Same shape as the Class_* augmentation directly above: this path's
+        # DictWriter uses extrasaction="ignore" (below), so a row key that is
+        # not in fieldnames_raw is DROPPED SILENTLY, not defaulted. process_polygon
+        # already merges prop_* keys into every row it emits, but nothing here
+        # widened the header for them -- the union is taken from the SOURCE
+        # polygons (polygons_to_process) rather than scanning every key of
+        # every row: scanning data_rows is O(rows * columns), which can be
+        # tens of thousands of rows for one export, whereas this is
+        # O(polygons), and the polygons are already resident (process_polygon
+        # just read ['points'] from every one of them, so nothing extra is
+        # materialised that would not have been anyway).
+        prop_keys = collect_polygon_property_keys(pd for (_g, _fp, pd) in polygons_to_process)
+        for _k in prop_keys:
+            _col = polygon_property_column(_k)
+            if _col not in fieldnames_raw:
+                fieldnames_raw.append(_col)
+
         # ---------------- Sanitize headers & build key map ----------------
         fieldnames_safe = [_sanitize_for_csv(h, csv_delimiter) for h in fieldnames_raw]
         key_map = dict(zip(fieldnames_raw, fieldnames_safe))
@@ -16301,7 +16393,9 @@ class ProjectTab(QtWidgets.QWidget):
                 writer.writeheader()  # DictWriter ignores provided dict for header, uses fieldnames
 
                 # rows
-                for row in data_rows:
+                for row_idx, row in enumerate(data_rows):
+                    if progress_dialog is not None and row_idx % 500 == 0:
+                        QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents)
                     # Base mapping for static fields
                     safe_row = {}
                     for raw_key, safe_key in key_map.items():
@@ -16408,6 +16502,11 @@ class ProjectTab(QtWidgets.QWidget):
             setattr(self, "_is_exporting", False)
         except Exception:
             pass
+
+        if progress_dialog is not None:
+            progress_dialog.setValue(progress_dialog.maximum() or 100)
+            progress_dialog.close()
+            QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents)
 
         return save_path  # <<< success indicator
 
@@ -24703,6 +24802,17 @@ class ProjectTab(QtWidgets.QWidget):
                         'type':   poly_type,
                         'coord_space': coord_space_out,  # usually 'image' after normalization
                         'image_ref_size': image_ref_size,
+                        # Arbitrary per-polygon attributes: DBF fields from a
+                        # shapefile import, or edits made in the viewer's
+                        # "Edit properties" dialog. This key was missing from
+                        # this literal, so every save through this writer
+                        # silently dropped it -- and LazyPolygonRecord
+                        # re-reads 'properties' from exactly this file
+                        # (polygon_lod.py's _EXACT_KEYS / _materialise), so
+                        # the loss only became visible after the next disk
+                        # sync. Absent on hand-drawn polygons: `or {}`.
+                        'properties': (polygon_data.get('properties') or {})
+                                      if isinstance(polygon_data, dict) else {},
                     }
 
                     base_filename     = os.path.splitext(os.path.basename(filepath))[0]
@@ -27488,6 +27598,12 @@ class ProjectTab(QtWidgets.QWidget):
                         'type': polygon_data.get('type', 'polygon'),
                         'coord_space': polygon_data.get('coord_space', 'image'),
                         'image_ref_size': ref_size,
+                        # See the matching comment in save_polygons_to_json:
+                        # this key was missing here too, so every autosave
+                        # (including the one triggered right after the
+                        # viewer's "Edit properties" dialog) silently
+                        # discarded the properties the user just entered.
+                        'properties': polygon_data.get('properties') or {},
                     }
                     # Store the pyramid alongside the full geometry so the
                     # overview can be rebuilt (and the viewer served) without
@@ -31595,6 +31711,14 @@ class ModifyPolygonCommand(QUndoCommand):
                                          item.setPos(0, 0) # Reset pos because points are scene coords
                                          item.update()
                                          break
+                             # Undo/redo rewrites the item's geometry directly,
+                             # without going through polygon_modified, so the
+                             # LOD tiles still hold the pre-undo outline and
+                             # would redraw it the moment the user zooms out.
+                             try:
+                                 viewer.invalidate_polygon_batch()
+                             except Exception:
+                                 pass
 
 
 

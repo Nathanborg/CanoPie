@@ -175,3 +175,93 @@ def test_degenerate_point_vs_1px_polygon_agree(synthetic_project):
     assert set(point_by_ch) == set(deg_by_ch)
     for ch, row in point_by_ch.items():
         assert_close(row["Mean"], deg_by_ch[ch]["Mean"], tol=1e-6, msg=f"point vs 1px-polygon {ch}")
+
+
+# --------------------------------------------------------------------------
+# `properties` -> prop_* row keys
+#
+# process_polygon never read polygon_dict['properties'] at all before this --
+# every row it emitted silently dropped whatever a shapefile import or the
+# viewer's "Edit properties" dialog had stored. These pin the fix directly
+# against the real function (not a reimplementation), using a real fixture's
+# polygon so the row-shape/dedup machinery around it is exercised for real.
+# --------------------------------------------------------------------------
+
+def _polygon_with_properties(synthetic_project, name, properties):
+    """A COPY of a real fixture's polygon dict with `properties` added --
+    never mutate the live dict living on the session-scoped fixture."""
+    spec = get_fixture(name)
+    fp = fixture_image_path(name)
+    group = polygon_group_name(name, spec["polygon"]["name"])
+    poly_dict = dict(synthetic_project.all_polygons[group][fp])
+    poly_dict["properties"] = properties
+    return group, fp, poly_dict
+
+
+def test_polygon_properties_become_prefixed_row_keys(synthetic_project):
+    props = {"DBH_CM": 31.5, "SPECIES": "Ceiba"}
+    group, fp, poly_dict = _polygon_with_properties(
+        synthetic_project, "rgb_8bit_untiled", props)
+    rows, _ = synthetic_project.process_polygon(
+        group, fp, poly_dict, {}, [], False, opts=STATS_OPTS,
+    )
+    assert rows, "precondition: this fixture must produce at least one row"
+    for row in rows:
+        assert row.get("prop_DBH_CM") == 31.5, row
+        assert row.get("prop_SPECIES") == "Ceiba", row
+
+
+def test_polygon_without_properties_adds_no_prop_columns(synthetic_project):
+    name = "rgb_8bit_untiled"
+    spec = get_fixture(name)
+    fp = fixture_image_path(name)
+    group = polygon_group_name(name, spec["polygon"]["name"])
+    poly_dict = synthetic_project.all_polygons[group][fp]  # unmodified, no 'properties' key
+    rows, _ = synthetic_project.process_polygon(
+        group, fp, poly_dict, {}, [], False, opts=STATS_OPTS,
+    )
+    assert rows
+    for row in rows:
+        assert not any(str(k).startswith("prop_") for k in row), row
+
+
+def test_property_key_colliding_with_a_stat_name_does_not_overwrite_it():
+    """THE collision-safety pin. A property literally named 'Mean' (or any
+    other reserved column) must land in 'prop_Mean', never overwrite the
+    real computed statistic in 'Mean'."""
+    from canopie.utils import polygon_property_cells
+    poly_dict = {"properties": {"Mean": "BOGUS", "Object ID": "BOGUS", "Channel": "BOGUS"}}
+    cells = polygon_property_cells(poly_dict)
+    assert cells == {"prop_Mean": "BOGUS", "prop_Object ID": "BOGUS", "prop_Channel": "BOGUS"}
+    # And a real row already carrying the true stat is untouched by update():
+    row = {"Mean": 42.0, "Object ID": "crown_1", "Channel": "R"}
+    row.update(cells)
+    assert row["Mean"] == 42.0, "prop_ cells overwrote the real Mean column"
+    assert row["Object ID"] == "crown_1"
+    assert row["Channel"] == "R"
+    assert row["prop_Mean"] == "BOGUS"
+
+
+def test_properties_do_not_change_row_count_or_dedup(synthetic_project):
+    """Adding properties must not change WHICH rows are emitted or how many
+    -- only add columns to rows that already exist."""
+    name = "rgb_8bit_untiled"
+    spec = get_fixture(name)
+    fp = fixture_image_path(name)
+    group = polygon_group_name(name, spec["polygon"]["name"])
+    base_dict = synthetic_project.all_polygons[group][fp]
+
+    rows_before, _ = synthetic_project.process_polygon(
+        group, fp, base_dict, {}, [], False, opts=STATS_OPTS,
+    )
+
+    with_props = dict(base_dict)
+    with_props["properties"] = {"DBH_CM": 31.5}
+    rows_after, _ = synthetic_project.process_polygon(
+        group, fp, with_props, {}, [], False, opts=STATS_OPTS,
+    )
+
+    key_cols = ("Object ID", "Channel", "File Name", "Label Band Index")
+    before_keys = [tuple(r.get(k) for k in key_cols) for r in rows_before]
+    after_keys = [tuple(r.get(k) for k in key_cols) for r in rows_after]
+    assert before_keys == after_keys, "row identity/order changed by adding properties"
