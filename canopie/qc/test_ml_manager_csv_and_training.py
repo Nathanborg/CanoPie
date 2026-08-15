@@ -188,3 +188,113 @@ def test_ax_declared_nodata_IS_honored_by_ml_export(synthetic_project, ml_manage
     band0 = gt["polygon"]["bands"]["0"]
     assert_close(float(rows[0]["mean_R"]), band0["ml_manager"]["mean"], tol=1e-1,
                  msg=f"{name} mean_R should match the .ax-masked (whole-pixel) mean")
+
+
+# ---------------------------------------------------------------------------
+# Polygon `properties` -> trailing prop_* columns (Step 3 of the properties-
+# export feature). header is a static list decided once, up front, in
+# export_csv_data -- see the pre-pass comment there -- then written verbatim
+# by _CsvExportWorker.run(); these tests exercise that real dialog-driven
+# entry point end to end, not the worker in isolation.
+# ---------------------------------------------------------------------------
+
+def _select_groups(mgr, *group_names):
+    wanted = set(group_names)
+    for i in range(mgr.list_widget.count()):
+        item = mgr.list_widget.item(i)
+        item.setSelected(item.text() in wanted)
+
+
+def test_prop_columns_appear_after_the_fixed_columns(synthetic_project, ml_manager_factory, monkeypatch, tmp_path):
+    name = "rgb_8bit_untiled"
+    spec = get_fixture(name)
+    fp = fixture_image_path(name)
+    group = polygon_group_name(name, spec["polygon"]["name"])
+
+    original = synthetic_project.all_polygons[group][fp]
+    synthetic_project.all_polygons[group][fp] = dict(original, properties={"DBH_CM": 31.5, "SPECIES": "Ceiba"})
+    try:
+        mgr = ml_manager_factory(synthetic_project)
+        _select_group(mgr, group)
+        out_csv = _run_export_csv(monkeypatch, mgr, tmp_path, "Average Pixel Value")
+        with open(out_csv, newline="", encoding="utf-8") as f:
+            fieldnames = csv.DictReader(f).fieldnames
+        assert fieldnames[-2:] == ["prop_DBH_CM", "prop_SPECIES"], fieldnames
+        assert not fieldnames[-2:][0].startswith("mean_")
+    finally:
+        synthetic_project.all_polygons[group][fp] = original
+
+
+def test_every_row_of_a_polygon_carries_its_properties(synthetic_project, ml_manager_factory, monkeypatch, tmp_path):
+    name = "rgb_8bit_untiled"
+    spec = get_fixture(name)
+    fp = fixture_image_path(name)
+    group = polygon_group_name(name, spec["polygon"]["name"])
+
+    original = synthetic_project.all_polygons[group][fp]
+    synthetic_project.all_polygons[group][fp] = dict(original, properties={"DBH_CM": 31.5})
+    try:
+        mgr = ml_manager_factory(synthetic_project)
+        _select_group(mgr, group)
+        out_csv = _run_export_csv(monkeypatch, mgr, tmp_path, "All Pixel Values")
+        rows = _read_csv(out_csv)
+        assert len(rows) > 1, "need multiple rows from one polygon to prove this isn't a fluke"
+        assert all(r["prop_DBH_CM"] == "31.5" for r in rows)
+    finally:
+        synthetic_project.all_polygons[group][fp] = original
+
+
+def test_missing_keys_fill_blank_across_polygons(synthetic_project, ml_manager_factory, monkeypatch, tmp_path):
+    """THE core 'adapt for missing/different properties' pin for this export
+    path: disjoint property key sets across polygons must fill gaps blank,
+    with an unchanged row count -- never dropped rows."""
+    name = "rgb_8bit_untiled"
+    spec = get_fixture(name)
+    fp = fixture_image_path(name)
+    group_a = polygon_group_name(name, spec["polygon"]["name"])
+    group_b = "__ml_csv_gap_fill_test__"
+
+    original_a = synthetic_project.all_polygons[group_a][fp]
+    synthetic_project.all_polygons[group_a][fp] = dict(original_a, properties={"DBH_CM": 31.5})
+    synthetic_project.all_polygons[group_b] = {fp: dict(original_a, name=group_b)}  # no 'properties' key at all
+    try:
+        mgr = ml_manager_factory(synthetic_project)
+        _select_groups(mgr, group_a, group_b)
+        out_csv = _run_export_csv(monkeypatch, mgr, tmp_path, "Average Pixel Value")
+        rows = _read_csv(out_csv)
+        by_group = {r["group_name"]: r for r in rows}
+        assert group_a in by_group and group_b in by_group, (
+            f"expected a row for both groups, got: {list(by_group)}")
+        assert by_group[group_a]["prop_DBH_CM"] == "31.5"
+        assert by_group[group_b]["prop_DBH_CM"] == "", "gap not blank for the property-less polygon"
+    finally:
+        synthetic_project.all_polygons[group_a][fp] = original_a
+        synthetic_project.all_polygons.pop(group_b, None)
+
+
+def test_property_key_named_x_does_not_shift_the_pixel_columns(synthetic_project, ml_manager_factory, monkeypatch, tmp_path):
+    """Collision pin: a property literally named 'x' becomes 'prop_x', a
+    DIFFERENT column from the real pixel-coordinate 'x' -- the real column
+    must keep holding pixel coordinates, not the property value."""
+    name = "rgb_8bit_untiled"
+    spec = get_fixture(name)
+    fp = fixture_image_path(name)
+    group = polygon_group_name(name, spec["polygon"]["name"])
+
+    original = synthetic_project.all_polygons[group][fp]
+    synthetic_project.all_polygons[group][fp] = dict(original, properties={"x": "not-a-pixel-coordinate"})
+    try:
+        mgr = ml_manager_factory(synthetic_project)
+        _select_group(mgr, group)
+        out_csv = _run_export_csv(monkeypatch, mgr, tmp_path, "All Pixel Values")
+        with open(out_csv, newline="", encoding="utf-8") as f:
+            fieldnames = csv.DictReader(f).fieldnames
+        assert "prop_x" in fieldnames
+        assert fieldnames.index("x") != fieldnames.index("prop_x")
+        rows = _read_csv(out_csv)
+        assert rows, "no rows written"
+        for row in rows[:5]:
+            int(row["x"])  # must still parse as a plain pixel coordinate
+            assert row["prop_x"] == "not-a-pixel-coordinate"
+    finally:
+        synthetic_project.all_polygons[group][fp] = original

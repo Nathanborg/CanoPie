@@ -57,6 +57,10 @@ def _no_file_basicConfig(*args, **kwargs):
 logging.basicConfig = _no_file_basicConfig
 
 from .utils import *
+from .utils import (
+    collect_polygon_property_keys, iter_polygons_by_group,
+    polygon_property_column, polygon_property_values,
+)
 from .loaders import ImageProcessor, ImageLoaderWorker
 from .image_data import ImageData
 
@@ -236,6 +240,35 @@ def _csvexp_dedupe_points_locally(yi_arr, xi_arr, W):
     key = yi_arr.astype(np.int64) * np.int64(W) + xi_arr.astype(np.int64)
     _, first_idx = np.unique(key, return_index=True)
     return np.sort(first_idx)
+
+
+def _thumbnail_sidecar_rows(prop_keys, records):
+    """One row per output IMAGE FILE (not per polygon) -- tiling can turn one
+    polygon into 0..N files; every file maps back to exactly one polygon, so
+    that polygon's property values repeat across its tiles.
+
+    Pure/testable on purpose: generate_thumbnails() itself is dialog-driven
+    and can't be exercised headlessly, so the row-shaping logic lives here,
+    separate from the QDialog-heavy method that calls it.
+    """
+    header = ['thumbnail_file', 'group_name', 'image_file', 'polygon_index'] \
+        + [polygon_property_column(k) for k in prop_keys]
+    rows = [[fname, group, fp, idx] + list(vals)
+            for (fname, group, fp, idx, vals) in records]
+    return header, rows
+
+
+def _write_thumbnail_sidecar_csv(path, prop_keys, records):
+    """Write the thumbnail properties sidecar. Always called unconditionally
+    from generate_thumbnails (matching segmentation's existing unconditional
+    sidecar), wrapped in try/except by the caller so a failed sidecar write
+    never makes an otherwise-successful thumbnail run look failed."""
+    import csv
+    header, rows = _thumbnail_sidecar_rows(prop_keys, records)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
 
 
 class _ThumbSource:
@@ -657,7 +690,7 @@ class _CsvExportWorker(QtCore.QThread):
 
     def __init__(self, mgr, output_path, all_entries, polygons_by_group,
                  extraction_mode, window_size, header, any_rgb, max_extras, max_small,
-                 parent=None):
+                 prop_keys=(), parent=None):
         super().__init__(parent)
         self.mgr = mgr
         self.output_path = output_path
@@ -669,6 +702,10 @@ class _CsvExportWorker(QtCore.QThread):
         self.any_rgb = any_rgb
         self.max_extras = max_extras
         self.max_small = max_small
+        # Ordered property-column keys (already reflected in `header`, see
+        # export_csv_data's pre-pass); () means no polygon in this export had
+        # any properties, and every per-row splice below becomes a no-op.
+        self.prop_keys = list(prop_keys or [])
         self._cancelled = False
 
     def cancel(self):
@@ -736,6 +773,12 @@ class _CsvExportWorker(QtCore.QThread):
         polydata = self.polygons_by_group.get(group_name, {}).get(filepath, {})
         raw_pts = polydata.get("points", [])
         poly_type = str(polydata.get("type", "")).lower()
+
+        # Fixed-order property values for THIS file's polygon, computed once
+        # here and reused for every row/sub-polygon it produces below --
+        # never re-derived per row, which is what keeps this off the
+        # per-pixel hot path (see _emit_points/_emit_polygon).
+        prop_vals = polygon_property_values(polydata, self.prop_keys) if self.prop_keys else []
 
         img, _C = mgr._get_export_image(filepath)
         if img is None:
@@ -816,7 +859,8 @@ class _CsvExportWorker(QtCore.QThread):
 
         if poly_type == "point":
             return self._emit_points(mgr, group_name, filepath, polydata, raw_pts,
-                                      img, chans, H, W, nd_mask, nodata_values, writer)
+                                      img, chans, H, W, nd_mask, nodata_values, writer,
+                                      prop_vals)
 
         polys = mgr._normalize_to_polygons(raw_pts)
         if not polys:
@@ -829,11 +873,12 @@ class _CsvExportWorker(QtCore.QThread):
             if not pts_img:
                 continue
             rows_here += self._emit_polygon(group_name, filepath, chans, H, W,
-                                             nd_mask, nodata_values, pts_img, writer)
+                                             nd_mask, nodata_values, pts_img, writer,
+                                             prop_vals)
         return rows_here
 
     def _emit_points(self, mgr, group_name, filepath, polydata, raw_pts, img, chans, H, W,
-                      nd_mask, nodata_values, writer):
+                      nd_mask, nodata_values, writer, prop_vals=()):
         """Point-SHAPE entries: a "point set" can hold anywhere from one to
         thousands of independently-drawn points (e.g. Random Shapes' "Point"
         mode), each becoming its own row -- so this is vectorized the same
@@ -898,7 +943,10 @@ class _CsvExportWorker(QtCore.QThread):
             # that pixel, just without x/y columns (see header construction).
             cols = _csvexp_gather_all_channels(any_rgb, max_extras, max_small, chans, yi_arr, xi_arr)
             value_rows = np.stack(cols, axis=1).tolist()
-            writer.writerows([group_name, filepath] + vals for vals in value_rows)
+            if prop_vals:
+                writer.writerows([group_name, filepath] + vals + prop_vals for vals in value_rows)
+            else:
+                writer.writerows([group_name, filepath] + vals for vals in value_rows)
             return len(value_rows)
 
         if mode == "All Pixel Values":
@@ -909,11 +957,16 @@ class _CsvExportWorker(QtCore.QThread):
 
         value_rows = np.stack(cols, axis=1).tolist()
         xs_list, ys_list = xi_arr.tolist(), yi_arr.tolist()
-        writer.writerows([group_name, filepath, x, y] + vals
-                          for x, y, vals in zip(xs_list, ys_list, value_rows))
+        if prop_vals:
+            writer.writerows([group_name, filepath, x, y] + vals + prop_vals
+                              for x, y, vals in zip(xs_list, ys_list, value_rows))
+        else:
+            writer.writerows([group_name, filepath, x, y] + vals
+                              for x, y, vals in zip(xs_list, ys_list, value_rows))
         return len(value_rows)
 
-    def _emit_polygon(self, group_name, filepath, chans, H, W, nd_mask, nodata_values, pts_img, writer):
+    def _emit_polygon(self, group_name, filepath, chans, H, W, nd_mask, nodata_values, pts_img, writer,
+                       prop_vals=()):
         import numpy as np
 
         any_rgb, max_extras, max_small = self.any_rgb, self.max_extras, self.max_small
@@ -928,20 +981,20 @@ class _CsvExportWorker(QtCore.QThread):
 
             if mode == "Average Pixel Value":
                 vals = self._scalar_channel_values(chans, xi, yi, any_rgb, max_extras, max_small)
-                writer.writerow([group_name, filepath] + vals)
+                writer.writerow([group_name, filepath] + vals + prop_vals)
                 return 1
             if mode == "All Pixel Values":
                 cols = _csvexp_gather_all_channels(any_rgb, max_extras, max_small, chans,
                                                     np.array([yi]), np.array([xi]))
                 vals = [c[0] for c in cols]
-                writer.writerow([group_name, filepath, int(xi), int(yi)] + vals)
+                writer.writerow([group_name, filepath, int(xi), int(yi)] + vals + prop_vals)
                 return 1
             # window
             cols = _csvexp_gather_window_all_channels(any_rgb, max_extras, max_small, chans,
                                                         np.array([yi]), np.array([xi]),
                                                         self.window_size, H, W)
             vals = [c[0] for c in cols]
-            writer.writerow([group_name, filepath, int(xi), int(yi)] + vals)
+            writer.writerow([group_name, filepath, int(xi), int(yi)] + vals + prop_vals)
             return 1
 
         # Real (multi-point) polygon.
@@ -966,7 +1019,7 @@ class _CsvExportWorker(QtCore.QThread):
                     means.append(float(np.nanmean(vals)) if vals.size else float('nan'))
                 else:
                     means.append(float('nan'))
-            writer.writerow([group_name, filepath] + means)
+            writer.writerow([group_name, filepath] + means + prop_vals)
             return 1
 
         ys, xs = np.where(valid_mask)
@@ -983,8 +1036,12 @@ class _CsvExportWorker(QtCore.QThread):
 
         value_rows = np.stack(cols, axis=1).tolist()
         xs_list, ys_list = xs.astype(np.int64).tolist(), ys.astype(np.int64).tolist()
-        writer.writerows([group_name, filepath, x, y] + vals
-                          for x, y, vals in zip(xs_list, ys_list, value_rows))
+        if prop_vals:
+            writer.writerows([group_name, filepath, x, y] + vals + prop_vals
+                              for x, y, vals in zip(xs_list, ys_list, value_rows))
+        else:
+            writer.writerows([group_name, filepath, x, y] + vals
+                              for x, y, vals in zip(xs_list, ys_list, value_rows))
         return len(xs_list)
 
     @staticmethod
@@ -2100,8 +2157,11 @@ class MachineLearningManager(QtWidgets.QDialog):
                         X_rows.append(row)
                         y_rows.append(group_name)
 
-        progress.setValue(len(entries))
+        progress.reset()
+        progress.hide()
         progress.close()
+        progress.deleteLater()
+        QtWidgets.QApplication.processEvents()
         
         # Free memory from image cache (no longer needed)
         _image_cache.clear()
@@ -2294,8 +2354,19 @@ class MachineLearningManager(QtWidgets.QDialog):
         tuned_models_for_stack = []   # list of (safe_name, tuned_estimator)
         tuned_meta_info = {}          # name -> dict(meta about tuning for txt/stack)
 
+        # Add dedicated Model Training Progress Dialog during fitting
+        train_progress = QtWidgets.QProgressDialog("Training models…", "Cancel", 0, max(1, len(model_names)), self)
+        train_progress.setWindowModality(QtCore.Qt.WindowModal)
+        train_progress.setAutoClose(False)
+        train_progress.setAutoReset(False)
+
         # ==== loop over selected models ====
-        for name in model_names:
+        for m_idx, name in enumerate(model_names):
+            if train_progress.wasCanceled():
+                break
+            train_progress.setValue(m_idx)
+            train_progress.setLabelText(f"Training {name} ({m_idx + 1}/{len(model_names)})...")
+            QtWidgets.QApplication.processEvents()
             try:
                 est, is_pipe = _build_estimator(name)
                 grid, dist = _spaces(name, is_pipe)
@@ -2488,6 +2559,12 @@ class MachineLearningManager(QtWidgets.QDialog):
                 QtWidgets.QMessageBox.critical(self, "Training Failed",
                                                f"{name} failed:\n{e}")
                 # keep going for other models
+
+        train_progress.reset()
+        train_progress.hide()
+        train_progress.close()
+        train_progress.deleteLater()
+        QtWidgets.QApplication.processEvents()
 
         # ==== Optional: Stacking ====
         stacked_saved = None
@@ -4485,6 +4562,20 @@ class MachineLearningManager(QtWidgets.QDialog):
             else:
                 header = list(prefix) + channel_names
 
+            # Per-polygon `properties` -> extra trailing columns. The header
+            # is a plain list decided BEFORE the worker starts and written
+            # verbatim as run()'s first line, so the union has to be taken up
+            # front rather than discovered as rows stream out; appended AFTER
+            # the existing fixed columns so no existing reader shifts.
+            #
+            # On a LazyPolygonRecord, .get('properties') triggers
+            # _materialise() -- but every one of these polygons is about to
+            # have .get("points") read by _process_one_file below, which
+            # materialises it anyway, so this front-loads existing I/O rather
+            # than adding any.
+            prop_keys = collect_polygon_property_keys(iter_polygons_by_group(polygons_by_group))
+            header = header + [polygon_property_column(k) for k in prop_keys]
+
             # ---- 5) Extract + write, on a background thread ------------------------
             progress = QtWidgets.QProgressDialog("Extracting pixels…", "Cancel", 0, len(all_entries), self)
             progress.setWindowModality(QtCore.Qt.WindowModal)
@@ -4493,6 +4584,7 @@ class MachineLearningManager(QtWidgets.QDialog):
             worker = _CsvExportWorker(
                 self, save_path, all_entries, polygons_by_group,
                 extraction_mode, window_size, header, any_rgb, max_extras, max_small,
+                prop_keys,
             )
 
             loop = QtCore.QEventLoop(self)
@@ -4820,6 +4912,13 @@ class MachineLearningManager(QtWidgets.QDialog):
         # Helper to get name builder
         build_name = getattr(self.parent_tab, "construct_thumbnail_name", None)
 
+        # Polygon `properties` -> thumbnail_properties.csv sidecar. Always
+        # written (see _write_thumbnail_sidecar_csv's docstring) -- keys are
+        # fixed up front, one value-list build per polygon (not per tile),
+        # so this never touches the per-tile render path below.
+        prop_keys = collect_polygon_property_keys(iter_polygons_by_group(polygons_by_group))
+        thumb_records = []
+
         for group_name in selected_groups:
             file_polygons = polygons_by_group.get(group_name, {})
             for filepath, pdata in file_polygons.items():
@@ -4913,12 +5012,24 @@ class MachineLearningManager(QtWidgets.QDialog):
                         suffix = f"_p{idx}" if len(polys) > 1 else ""
                         out_name = f"{group_name}_{stem}{suffix}.jpg"
 
+                    # Fetched once per polygon, not per tile -- never touches
+                    # the per-tile render loop just below.
+                    prop_vals = polygon_property_values(pdata, prop_keys) if prop_keys else []
+
                     for fname, image in self._render_thumbnail_outputs(
                             src, pts_img, x0, y0, new_w, new_h, W, H,
                             color, opts, out_name):
                         out_path = os.path.join(save_dir, fname)
                         if not cv2.imwrite(out_path, image):
                             logging.error(f"Failed to write thumbnail: {out_path}")
+                        else:
+                            thumb_records.append((fname, group_name, filepath, idx, prop_vals))
+
+        try:
+            sidecar_path = os.path.join(save_dir, "thumbnail_properties.csv")
+            _write_thumbnail_sidecar_csv(sidecar_path, prop_keys, thumb_records)
+        except Exception:
+            logging.exception("[thumbnails] failed to write thumbnail_properties.csv sidecar")
 
         QtWidgets.QMessageBox.information(self, "Thumbnails Generated", f"Saved in {save_dir}")
 
@@ -5029,11 +5140,20 @@ class MachineLearningManager(QtWidgets.QDialog):
                 else:
                     filepath_to_polygons[fp].append((g, pts))
 
+        # Header must be finalized before the first polygon is written below,
+        # so the property-key union across every polygon in this export has
+        # to be taken up front -- same constraint as export_csv_data's own
+        # header pre-pass. Polygons with no 'properties' key (every
+        # hand-drawn one) or a different key set than their neighbors are
+        # handled the same way there: gaps come back as ''.
+        prop_keys = collect_polygon_property_keys(iter_polygons_by_group(polygons_by_group))
+        prop_cols = [polygon_property_column(k) for k in prop_keys]
+
         csv_path = os.path.join(save_dir, "segmentation_labels.csv")
         try:
             with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
                 W = csv.writer(csvfile)
-                W.writerow(['object_id', 'group_name', 'image_file', 'polygon_index'])
+                W.writerow(['object_id', 'group_name', 'image_file', 'polygon_index'] + prop_cols)
 
                 for filepath, polys in filepath_to_polygons.items():
                     # Geometry-only dimensions, so the mask matches the frame
@@ -5077,7 +5197,8 @@ class MachineLearningManager(QtWidgets.QDialog):
                             pts_img = [(cx, cy)]
 
                         shapes.append((label, pts_img))
-                        W.writerow([label, group_name, filepath, poly_idx])
+                        W.writerow([label, group_name, filepath, poly_idx]
+                                   + polygon_property_values(pdata, prop_keys))
                         label += 1
                         poly_idx += 1
 

@@ -343,3 +343,78 @@ def test_build_nodata_mask_2d_still_handles_plain_arrays():
     mask = _CsvExportWorker._build_nodata_mask_2d(ch, [-9999])
     assert mask.shape == (12, 10)
     assert mask[4, 5] and mask.sum() == 1
+
+
+# ---------------------------------------------------------------------------
+# Polygon `properties` (Step 3) must not touch the per-pixel hot path -- the
+# whole point of computing prop_vals once per FILE in _process_one_file and
+# reusing it for every row/sub-polygon that file produces.
+# ---------------------------------------------------------------------------
+def test_csvexp_gather_helpers_never_reference_properties():
+    """Source-level pin, same style as test_no_per_pixel_loop_or_dict_allocation_remains
+    above: the numeric pixel-gather helpers stay a separate layer from
+    property handling -- if 'prop' ever leaks in here, it means someone
+    started threading property values through the O(pixels) gather path
+    instead of the O(polygons)/O(files) layer around it."""
+    import inspect
+    from canopie import machine_learning_manager as mlm
+
+    for fn_name in ("_csvexp_gather_paired", "_csvexp_gather_all_channels",
+                    "_csvexp_gather_window_all_channels", "_csvexp_dedupe_points_locally"):
+        src = inspect.getsource(getattr(mlm, fn_name))
+        assert "propert" not in src.lower() and "prop_" not in src, (
+            f"{fn_name} must not reference polygon properties")
+
+
+def test_polygon_property_values_runs_once_per_file_not_once_per_row(
+        synthetic_project, ml_manager_factory, monkeypatch, tmp_path):
+    """Direct analogue of test_extraction_runs_off_the_gui_thread's spying
+    pattern: prop_vals must be computed once per file in _process_one_file
+    and reused across every row/sub-polygon, never re-derived per row."""
+    from canopie import machine_learning_manager as mlm
+
+    name = "rgb_8bit_untiled"
+    spec = get_fixture(name)
+    fp = fixture_image_path(name)
+    group = polygon_group_name(name, spec["polygon"]["name"])
+
+    original = synthetic_project.all_polygons[group][fp]
+    synthetic_project.all_polygons[group][fp] = dict(original, properties={"DBH_CM": 31.5})
+    try:
+        calls = {"n": 0}
+        real_fn = mlm.polygon_property_values
+
+        def spying(*args, **kwargs):
+            calls["n"] += 1
+            return real_fn(*args, **kwargs)
+
+        monkeypatch.setattr(mlm, "polygon_property_values", spying)
+
+        mgr = ml_manager_factory(synthetic_project)
+        _select_group(mgr, group)
+        out_csv = _run_export_csv(monkeypatch, mgr, tmp_path, "All Pixel Values")
+        rows = _read_csv(out_csv)
+        assert len(rows) > 1, "need multiple rows from one file to make this test meaningful"
+        assert calls["n"] == 1, (
+            f"polygon_property_values ran {calls['n']} times for one file/one polygon "
+            f"producing {len(rows)} rows -- expected exactly 1 (once per file)")
+    finally:
+        synthetic_project.all_polygons[group][fp] = original
+
+
+def test_no_properties_export_has_no_prop_columns(synthetic_project, ml_manager_factory, monkeypatch, tmp_path):
+    """When nothing in the export has `properties`, the header/rows must stay
+    exactly as they were before this feature -- no prop_* columns, no shift
+    in the fixed columns' positions or values."""
+    name = "rgb_8bit_untiled"
+    spec = get_fixture(name)
+    group = polygon_group_name(name, spec["polygon"]["name"])
+
+    mgr = ml_manager_factory(synthetic_project)
+    _select_group(mgr, group)
+    out_csv = _run_export_csv(monkeypatch, mgr, tmp_path, "All Pixel Values")
+    import csv
+    with open(out_csv, newline="", encoding="utf-8") as f:
+        fieldnames = csv.DictReader(f).fieldnames
+    assert fieldnames == ["group_name", "image_file", "x", "y", "R", "G", "B"], fieldnames
+    assert not any(c.startswith("prop_") for c in fieldnames)

@@ -87,6 +87,22 @@ def test_unknown_columns_keep_a_stable_alphabetical_tail():
     assert tail == sorted(tail), tail
 
 
+def test_prop_columns_land_in_the_stable_alphabetical_tail():
+    """prop_* columns (polygon `properties`, arbitrary per-project keys) are
+    just another kind of unknown column to this function -- same contract as
+    Class_*/EXIF/formula names above, verified directly rather than assumed."""
+    extra = REPORTED + ["prop_ZZ", "prop_AA", "prop_Mean"]
+    a = order_csv_columns(extra)
+    b = order_csv_columns(list(reversed(extra)))
+    assert a == b, "column order is not deterministic w.r.t. input order"
+    prop_cols = [c for c in a if c.startswith("prop_")]
+    assert prop_cols == sorted(prop_cols), prop_cols
+    # And a property literally named "Mean" must not have moved the real
+    # "Mean" statistic column -- "prop_Mean" and "Mean" are different strings,
+    # order_csv_columns never needs to know they're related.
+    assert a.index("Mean") != a.index("prop_Mean")
+
+
 def test_both_export_paths_use_the_same_ordering_function():
     """The foreground and background CSVs must not diverge again."""
     import ast

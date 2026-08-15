@@ -512,7 +512,7 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
             return
         self.prepareGeometryChange()
         self._show_label = value
-        self._invalidate_geometry_cache()
+        self._update_bounding_rect()
 
     @property
     def _hover_showing_label(self):
@@ -525,7 +525,7 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
             return
         self.prepareGeometryChange()
         self._hover_label = value
-        self._invalidate_geometry_cache()
+        self._update_bounding_rect()
 
     # ---- polygon property: invalidate caches when geometry changes ----
     @property
@@ -651,31 +651,23 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
         except Exception:
             self._pts_np = None
 
-        # Tight rect (used during drag – no label area)
+        self._update_bounding_rect()
+
+        # Cached shape (QPainterPath)
+        path = QtGui.QPainterPath()
+        path.addPolygon(poly)
+        self._cached_shape = path
+
+        # Also invalidate pen cache (color depends on is_rgb/mask)
+        self._pen_base = None
+
+    def _update_bounding_rect(self):
+        """Recompute only the bounding rect (label visibility change)."""
+        raw = self._polygon.boundingRect()
         margin_tight = 10
         self._cached_brect_drag = raw.adjusted(-margin_tight, -margin_tight,
                                                margin_tight, margin_tight)
 
-        # Full rect (includes label area).
-        #
-        # This rect is the single biggest lever on pan/drag smoothness with many
-        # polygons, because Qt uses boundingRect BOTH to decide which items are
-        # exposed AND -- under MinimalViewportUpdate -- to size the dirty region
-        # it repaints when an item changes. An over-large rect therefore
-        # multiplies the number of pixels repainted per frame.
-        #
-        # Measured on 6000 items with a real name from the field
-        # ("guayacan_21294.0"): the label estimate below produced a 1150x350
-        # rect around a 40x40 polygon -- 251x its actual area -- and panning
-        # cost 67.3 ms/frame (15 FPS). With a tight rect the same pan cost
-        # 27.4 ms/frame: 2.5x faster.
-        #
-        # So only pay for the label area when a label can ACTUALLY be drawn.
-        # `paint()` draws it only when `self.show_label or self._hover_showing_label`,
-        # so when both are false nothing is ever painted outside the polygon and
-        # the tight rect is not merely faster but strictly correct. Turning
-        # labels off is the normal state for a project with thousands of
-        # polygons, which is exactly when this matters most.
         full = QtCore.QRectF(raw)
         if self.name and (self._show_label or self._hover_showing_label):
             label_width = len(self.name) * 50 + 100
@@ -687,14 +679,6 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
             full = full.united(label_rect)
         margin = 50
         self._cached_brect = full.adjusted(-margin, -margin, margin, margin)
-
-        # Cached shape (QPainterPath)
-        path = QtGui.QPainterPath()
-        path.addPolygon(poly)
-        self._cached_shape = path
-
-        # Also invalidate pen cache (color depends on is_rgb/mask)
-        self._pen_base = None
 
     def _get_image_size(self):
         """Get image dimensions, cached to avoid scene iteration on every paint."""
@@ -1386,7 +1370,7 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
             return
         self.prepareGeometryChange()
         self._show_label = value
-        self._invalidate_point_cache()
+        self._update_bounding_rect()
 
     @property
     def _hover_showing_label(self):
@@ -1399,16 +1383,30 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
             return
         self.prepareGeometryChange()
         self._hover_label = value
-        self._invalidate_point_cache()
+        self._update_bounding_rect()
 
     def _invalidate_point_cache(self):
         """Recompute cached boundingRect and shape from current points."""
+        self._update_bounding_rect()
+
+        pts = self.points
+        is_empty = pts.isEmpty() if hasattr(pts, 'isEmpty') else (len(pts) == 0)
+        if is_empty:
+            self._cached_shape = QtGui.QPainterPath()
+            return
+
+        path = QtGui.QPainterPath()
+        for p in self.points:
+            sx, sy = self._scene_xy(p)
+            path.addEllipse(sx, sy, 6, 6)
+        self._cached_shape = path
+
+    def _update_bounding_rect(self):
         pts = self.points
         is_empty = pts.isEmpty() if hasattr(pts, 'isEmpty') else (len(pts) == 0)
         if is_empty:
             self._cached_brect = QtCore.QRectF()
             self._cached_brect_drag = QtCore.QRectF()
-            self._cached_shape = QtGui.QPainterPath()
             return
 
         xs, ys = [], []
@@ -1420,14 +1418,8 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
         if rect.width() < 10 and rect.height() < 10:
             rect = rect.adjusted(-20, -20, 20, 20)
 
-        # Tight rect (drag mode)
         self._cached_brect_drag = rect.adjusted(-10, -10, 10, 10)
 
-        # Full rect (with label area).
-        # Same rule as EditablePolygonItem: only reserve the (large) label box
-        # when a label can actually be painted. See the detailed comment in
-        # EditablePolygonItem._invalidate_geometry_cache -- points sit in the
-        # same scenes and pay the same per-frame repaint cost.
         full = QtCore.QRectF(rect)
         if self.name and (self._show_label or self._hover_showing_label):
             label_width = len(self.name) * 50 + 100
@@ -1438,13 +1430,6 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
             )
             full = full.united(label_rect)
         self._cached_brect = full.adjusted(-50, -50, 50, 50)
-
-        # Cached shape
-        path = QtGui.QPainterPath()
-        for p in self.points:
-            sx, sy = self._scene_xy(p)
-            path.addEllipse(sx, sy, 6, 6)
-        self._cached_shape = path
 
     def _get_res_boost(self):
         """Get resolution boost factor, cached."""
@@ -1665,6 +1650,23 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
 
         elif chosen == a_delete_all and hasattr(v, "delete_all_polygons_in_group"):
             v.delete_all_polygons_in_group(self)
+
+
+def _norm_style_key_fp(fp):
+    """Canonical form of an `all_polygons[group][filepath]`-style path key.
+
+    Same formula as `ProjectTab._poly_index_lookup` (normpath THEN lower) --
+    the two must agree, since both exist to bridge the same split: one
+    project routinely holds two spellings of the same file's path
+    (project.json/viewer form vs. shapefile-import's `os.path.normpath`
+    form). Used by `ImageViewer.apply_polygon_style_map` so a filter/color
+    style map keyed in one spelling still matches a viewer whose
+    `image_data.filepath` is the other.
+    """
+    try:
+        return os.path.normpath(str(fp)).lower() if fp else ""
+    except Exception:
+        return str(fp).lower()
 
 
 # -------------------------------------------------------------------
@@ -4227,14 +4229,20 @@ class ImageViewer(QtWidgets.QGraphicsView):
                  for item, start_pos, end_pos in changes:
                      delta = end_pos - start_pos
                      new_points_scene = item.mapToScene(item.polygon)
-                     
+
                      old_points_scene = QtGui.QPolygonF()
                      for p in new_points_scene:
                          old_points_scene.append(p - delta)
-                     
+
                      owner.modify_polygon_command(item, old_points_scene, new_points_scene, viewer=self)
              finally:
                  owner.undo_stack.endMacro()
+             # Taking this branch SUPPRESSES polygon_modified (see
+             # EditablePolygonItem.mouseReleaseEvent's moved_via_undo), which is
+             # what would otherwise have dropped the LOD tiles. Without this the
+             # tiles keep the pre-drag geometry and the polygon appears to snap
+             # back to its original position as soon as the user zooms out.
+             self.invalidate_polygon_batch()
              return True
         return False
 
@@ -4247,9 +4255,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
         # exists. Editing only happens zoomed in (where the tiles are hidden),
         # so dropping them here is free and guarantees the user never zooms out
         # onto a stale outline.
-        if getattr(self, "_batch_tiles", None):
-            self.clear_polygon_batch()
-            self._batch_built_count = -1
+        self.invalidate_polygon_batch()
         self.polygon_changed.emit()
 
     def add_polygon(self, polygon, name=""):
@@ -4335,12 +4341,40 @@ class ImageViewer(QtWidgets.QGraphicsView):
         `key_for_item` lets a caller override key resolution; by default the
         key is `(item.name, this viewer's current image filepath)`, matching
         how `all_polygons[group][filepath]` is addressed elsewhere.
+
+        The default lookup is spelling-NORMALIZED, not exact. One project
+        routinely holds two spellings of the same file's path -- project.json
+        / this viewer's own `image_data.filepath` use forward slashes, while
+        a shapefile import stores `os.path.normpath` (backslashes on
+        Windows); see `ProjectTab._poly_index_lookup`'s docstring, which
+        documents this exact split with measured numbers on a real project.
+        `style_map`'s keys come from PolygonFilterWorker's snapshot of
+        `all_polygons`, i.e. the STORAGE spelling. An exact-tuple lookup
+        against the viewer's spelling therefore missed on every single
+        shapefile-imported polygon: `style_map.get(key)` returned None for
+        all of them, and the `style is None` branch below actively RESETS
+        each item to its default appearance -- so on exactly the projects
+        that motivated this feature, the filter looked like it did nothing
+        at all, regardless of whether any rule matched correctly.
         """
         fp = getattr(getattr(self, "image_data", None), "filepath", None)
         touched_batch = False
+        by_name = None
+        if key_for_item is None:
+            # Build once per call: normalize style_map's keys down to
+            # {name: style} for entries whose filepath matches THIS viewer's
+            # image, under the same normpath-then-lower formula
+            # _poly_index_lookup uses, so either spelling matches.
+            want = _norm_style_key_fp(fp)
+            by_name = {}
+            for (nm, k), style in style_map.items():
+                if _norm_style_key_fp(k) == want:
+                    by_name[nm] = style
         for item in self.get_all_polygons():
-            key = key_for_item(item) if key_for_item else (getattr(item, "name", None), fp)
-            style = style_map.get(key)
+            if key_for_item is not None:
+                style = style_map.get(key_for_item(item))
+            else:
+                style = by_name.get(getattr(item, "name", None))
             if style is None:
                 # No rule matched -- restore the default appearance rather
                 # than leaving a stale filter result in place.
@@ -4352,13 +4386,23 @@ class ImageViewer(QtWidgets.QGraphicsView):
             touched_batch = True
 
         if touched_batch and getattr(self, "_batch_tiles", None):
-            # Tiles bake filtered-out polygons out of their geometry (see
-            # rebuild_polygon_batch), so a changed filter must force a
-            # rebuild -- merely re-toggling visibility would leave a
-            # newly-hidden polygon drawn in the tile until the next
-            # unrelated rebuild.
-            self.rebuild_polygon_batch()
-            self._set_batch_active(True)
+            # Lazy invalidate, not an eager rebuild: rebuild_polygon_batch()
+            # is O(polygons x vertices) and was measured costing multiple
+            # seconds on real projects (3500+ polygons), running synchronously
+            # on the GUI thread on every single "Apply" click -- this was the
+            # other half of "filtering should be instant."
+            #
+            # This does not reintroduce the stale-tile problem the eager
+            # rebuild guarded against: invalidate_polygon_batch() drops the
+            # tiles via clear_polygon_batch(), whose `was_active` branch falls
+            # back to per-item visibility that already respects the NEW
+            # _filtered_hidden state each item was just given above (this
+            # loop runs set_filter_style on every item BEFORE this block).
+            # So between this click and the next zoom crossing the batch
+            # threshold, the user sees the correct per-item state, not a
+            # stale tile -- and paintEvent's own staleness check rebuilds
+            # correctly (and lazily) once batching is needed again.
+            self.invalidate_polygon_batch()
 
     def clear_polygon_style(self):
         """Undo every filter/color rule in this viewer -- restores default
@@ -4383,7 +4427,26 @@ class ImageViewer(QtWidgets.QGraphicsView):
                                            "This polygon is not yet associated with a saved image/group.")
             return
 
-        entry = (owner.all_polygons.get(group, {}) or {}).get(fp)
+        # all_polygons is keyed by filepath STRING, and one project routinely
+        # holds two spellings of the same file: the viewer/project.json form
+        # ('C:/Users/x/y.tif', forward slashes) and the shapefile-import form
+        # ('C:\\Users\\x\\y.tif', os.path.normpath). An exact .get(fp) matches
+        # only the former, so on a project whose polygons came from a shapefile
+        # import EVERY "Edit properties" failed with "Could not find this
+        # polygon's stored data" -- the polygon is plainly on screen, but it is
+        # filed under the other spelling. _poly_index_lookup returns the UNION
+        # of both indices for exactly this reason; see its docstring.
+        polys_for_group = owner.all_polygons.get(group, {}) or {}
+        entry = polys_for_group.get(fp)
+        storage_key = fp
+        if entry is None:
+            try:
+                for gn, key in owner._poly_index_lookup(fp):
+                    if gn == group and key in polys_for_group:
+                        entry, storage_key = polys_for_group[key], key
+                        break
+            except Exception:
+                logging.debug("[properties] index lookup failed", exc_info=True)
         if entry is None:
             QtWidgets.QMessageBox.warning(self, "Unavailable",
                                            "Could not find this polygon's stored data.")
@@ -4401,14 +4464,19 @@ class ImageViewer(QtWidgets.QGraphicsView):
 
         try:
             if hasattr(owner, "_mark_polygon_dirty"):
-                owner._mark_polygon_dirty(group, fp)
+                # The key the entry actually lives under -- not necessarily the
+                # viewer's spelling of it (see the lookup above).
+                owner._mark_polygon_dirty(group, storage_key)
         except Exception:
             logging.debug("[properties] _mark_polygon_dirty failed", exc_info=True)
 
         try:
-            if hasattr(owner, "request_save_polygons"):
-                owner.request_save_polygons()
-            elif hasattr(owner, "save_incremental"):
+            # ProjectTab has no request_save_polygons method (never has --
+            # confirmed via grep) and never will unless someone adds one by
+            # accident: this used to probe for it via hasattr() first, which
+            # always failed, so every save silently fell through to
+            # save_incremental() anyway. That fallback is now unconditional.
+            if hasattr(owner, "save_incremental"):
                 owner.save_incremental()
         except Exception:
             logging.exception("[properties] saving polygon properties failed")
@@ -4593,6 +4661,28 @@ class ImageViewer(QtWidgets.QGraphicsView):
             visible = self.are_polygons_visible()
             for it in self._batch_source_items():
                 it.setVisible(visible and not getattr(it, "_filtered_hidden", False))
+
+    def invalidate_polygon_batch(self):
+        """Drop the LOD tiles AND force paintEvent to rebuild them.
+
+        Clearing alone is not enough: paintEvent's staleness check compares
+        `_batch_built_count` against len(self.polygons), which is UNCHANGED by
+        a move (no polygon was added or removed), so the tiles would simply be
+        rebuilt from the same stale snapshot -- or not rebuilt at all. Stamping
+        -1 guarantees the next paint re-reads the live geometry.
+
+        Must be called by every path that changes a polygon's geometry or
+        position. `on_polygon_modified` is NOT such a path on its own: when a
+        drag is committed through the undo stack,
+        `EditablePolygonItem.mouseReleaseEvent` sets `moved_via_undo` and
+        deliberately does not emit `polygon_modified`, so nothing here ever
+        ran. Zoomed in the user saw the real (correct) item; zoomed out the
+        tiles took over and redrew the polygon at its PRE-DRAG position --
+        the "polygons jump back when I zoom out" report.
+        """
+        if getattr(self, "_batch_tiles", None):
+            self.clear_polygon_batch()
+        self._batch_built_count = -1
 
     def rebuild_polygon_batch(self):
         """(Re)build the tile items from the current polygon items."""

@@ -547,3 +547,181 @@ def test_untouched_polygons_are_unaffected_by_the_transform_step(qapp):
         if found:
             break
     assert found, "an untouched polygon's tile geometry no longer matches its own points"
+
+
+def _fake_project_owner(qapp):
+    """The real app ALWAYS has these two attributes on the ProjectTab, which is
+    what makes handle_undoable_move_batch succeed -- and therefore what makes
+    mouseReleaseEvent suppress polygon_modified. A bare viewer in a test has
+    no owner, so the undo branch never runs and the bug stays invisible."""
+    class _Owner:
+        def __init__(self):
+            self.undo_stack = QtWidgets.QUndoStack()
+            self.calls = []
+
+        def modify_polygon_command(self, item, old_pts, new_pts, viewer=None):
+            self.calls.append(item)
+    return _Owner()
+
+
+def _commit_drag_through_undo_stack(v, item, new_pos):
+    """Replay the exact branch EditablePolygonItem.mouseReleaseEvent takes when
+    a drag ends. QGraphicsSceneMouseEvent cannot be constructed from Python, so
+    the handler's body is driven directly rather than synthesising an event."""
+    item.setSelected(True)
+    item._undo_start_pos = item.pos()
+    item.setPos(*new_pos)
+
+    moved_via_undo = False
+    scene = item.scene()
+    view = scene.views()[0]
+    changes = [(it, it._undo_start_pos, it.pos())
+               for it in scene.selectedItems()
+               if isinstance(it, type(item)) and hasattr(it, "_undo_start_pos")
+               and it.pos() != it._undo_start_pos]
+    if changes and view.handle_undoable_move_batch(changes):
+        moved_via_undo = True
+    if not moved_via_undo:
+        item.polygon_modified.emit()
+    return moved_via_undo
+
+
+def _nearest_tile_centre(v, pt):
+    best = None
+    for t in v._batch_tiles or []:
+        for arr, _color in t._polygons:
+            d = abs(arr[:, 0].mean() - pt.x()) + abs(arr[:, 1].mean() - pt.y())
+            if best is None or d < best:
+                best = d
+    return best
+
+
+def test_drag_committed_through_undo_stack_invalidates_the_tiles(qapp):
+    """THE snap-back bug, via the path the real app actually takes.
+
+    test_tiles_follow_a_dragged_polygon above proves the tile BUILDER maps item
+    coordinates to scene coordinates correctly -- but it calls
+    rebuild_polygon_batch() by hand, so it never asks whether anything would
+    have triggered that rebuild. Nothing did: when a drag is committed through
+    the undo stack, mouseReleaseEvent sets moved_via_undo and deliberately does
+    NOT emit polygon_modified, which was the only thing that dropped the tiles.
+    Zoomed in the user saw the correct item; zoomed out the stale tile redrew
+    the polygon at its pre-drag position.
+
+    Note the count-based staleness check in paintEvent cannot save this: a move
+    changes no polygon COUNT, so _batch_built_count must be invalidated
+    explicitly.
+    """
+    v = _viewer_with(qapp, 900, img=20000)
+    v._find_project_owner = lambda: _fake_project_owner(qapp)
+
+    v.rebuild_polygon_batch()
+    assert v._batch_tiles, "precondition: tiles must be active at this density"
+
+    item = v.polygons[0]['item']
+    before = item.mapToScene(item.polygon).boundingRect().center()
+    assert _nearest_tile_centre(v, before) < 2.0
+
+    moved_via_undo = _commit_drag_through_undo_stack(v, item, (4000.0, 2500.0))
+    assert moved_via_undo, (
+        "precondition: the drag must go through the undo stack -- otherwise "
+        "this test is exercising the polygon_modified path that always worked")
+
+    assert not v._batch_tiles, (
+        "the LOD tiles survived a drag committed through the undo stack; "
+        "zooming out will redraw the polygon at its pre-drag position")
+    assert v._batch_built_count == -1, (
+        "_batch_built_count was not invalidated -- a move changes no polygon "
+        "count, so paintEvent's staleness check will not rebuild on its own")
+
+    # And the rebuild the next paint performs must land on the new position.
+    after = item.mapToScene(item.polygon).boundingRect().center()
+    v.rebuild_polygon_batch()
+    assert _nearest_tile_centre(v, after) < 2.0, (
+        "rebuilt tiles do not sit at the polygon's dragged position")
+    assert _nearest_tile_centre(v, before) > 100.0, (
+        "rebuilt tiles still carry geometry at the pre-drag position")
+
+
+def test_undo_of_a_move_also_invalidates_the_tiles(qapp):
+    """Undo/redo rewrites item.polygon and resets pos() directly (see
+    ModifyPolygonCommand._apply_state) without emitting polygon_modified, so it
+    needs the same invalidation as the drag itself."""
+    v = _viewer_with(qapp, 900, img=20000)
+    v.rebuild_polygon_batch()
+    assert v._batch_tiles
+
+    v.invalidate_polygon_batch()
+    assert not v._batch_tiles and v._batch_built_count == -1
+
+
+# ------------------------------------- Filter & Color: lazy invalidate, not eager rebuild
+
+def test_apply_polygon_style_map_does_not_call_rebuild_synchronously(qapp):
+    """THE other half of "filtering should be instant". apply_polygon_style_map
+    used to call rebuild_polygon_batch() -- an O(polygons x vertices) routine
+    this same file's own module docstring and rebuild_polygon_batch's inline
+    comment document costing multiple seconds on real projects (measured:
+    4.3s for 4.46M vertices) -- SYNCHRONOUSLY on the GUI thread, once per open
+    viewer, on every single "Apply Filter" click. It now invalidates (drops
+    tiles, stamps _batch_built_count=-1) and lets the next paint rebuild
+    lazily, matching every other geometry-changed path in this file
+    (on_polygon_modified, the drag/undo tests above)."""
+    v = _viewer_with(qapp, 900, img=20000)
+    v.rebuild_polygon_batch()
+    assert v._batch_tiles, "precondition: tiles must be active"
+
+    calls = {"n": 0}
+    real_rebuild = type(v).rebuild_polygon_batch
+    v.rebuild_polygon_batch = lambda: (calls.__setitem__("n", calls["n"] + 1), real_rebuild(v))[1]
+
+    target_name = v.polygons[0]["item"].name
+    style_map = {(target_name, None): {"visible": False, "color": None}}
+    v.apply_polygon_style_map(style_map, key_for_item=lambda item: (item.name, None))
+
+    assert calls["n"] == 0, (
+        "apply_polygon_style_map called rebuild_polygon_batch() synchronously "
+        "-- the eager multi-second rebuild is back")
+    assert not v._batch_tiles, "tiles must be dropped (invalidated), not left stale"
+    assert v._batch_built_count == -1
+
+
+def test_apply_polygon_style_map_source_has_no_rebuild_call(qapp):
+    """Source-level pin, independent of the runtime test above."""
+    import inspect
+    from canopie.image_viewer import ImageViewer as IV
+
+    src = inspect.getsource(IV.apply_polygon_style_map)
+    assert "self.rebuild_polygon_batch()" not in src, (
+        "apply_polygon_style_map calls rebuild_polygon_batch() again -- see "
+        "this file's module docstring for the measured cost (4.3s / 4.46M "
+        "vertices) that made 'Apply Filter' feel slow instead of instant")
+    assert "invalidate_polygon_batch" in src
+
+
+def test_a_filter_hidden_polygon_stays_hidden_through_the_lazy_invalidate(qapp):
+    """The correctness half that justifies the swap: dropping the tiles must
+    not let a filtered-out polygon reappear between the click and the next
+    paint. clear_polygon_batch()'s was_active branch falls back to per-item
+    visibility honoring _filtered_hidden -- which set_filter_style already
+    set on every item BEFORE apply_polygon_style_map touches the tiles."""
+    v = _viewer_with(qapp, 900, img=20000)
+    v.rebuild_polygon_batch()
+    target = v.polygons[0]["item"]
+
+    style_map = {(target.name, None): {"visible": False, "color": None}}
+    v.apply_polygon_style_map(style_map, key_for_item=lambda item: (item.name, None))
+
+    assert not v._batch_tiles, "precondition: tiles were dropped"
+    assert target.isVisible() is False, (
+        "the filtered-out polygon is visible again once its tile was dropped "
+        "-- the fallback to per-item visibility in clear_polygon_batch is "
+        "not respecting _filtered_hidden")
+
+    # And the next rebuild (the next paint, in the real app) must exclude it.
+    v.rebuild_polygon_batch()
+    after = target.mapToScene(target.polygon).boundingRect().center()
+    for t in v._batch_tiles:
+        for arr, _color in t._polygons:
+            d = abs(arr[:, 0].mean() - after.x()) + abs(arr[:, 1].mean() - after.y())
+            assert d > 1.0, "the hidden polygon's geometry is still baked into a rebuilt tile"

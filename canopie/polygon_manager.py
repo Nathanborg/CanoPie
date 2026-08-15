@@ -343,14 +343,69 @@ class ShapefileImportWorker(QtCore.QObject):
                 logging.info("[ShapefileImportWorker] skipped %d feature(s): %s",
                              total_skipped, "; ".join(parts))
 
-            if not self._is_cancelled:
+            # `finished` MUST fire whether this run completed or was
+            # cancelled: it is the ONLY thing that closes progress_dlg
+            # (ShapefileImportProgressDialog.on_cancel only disables its
+            # button and emits cancel_requested -- it never closes itself)
+            # and the only thing connected to thread.quit(), which is in turn
+            # the only thing that runs _cleanup(). Gating this emission on
+            # `not self._is_cancelled` meant clicking "Cancel Import" left the
+            # dialog on screen forever (stuck on "Canceling..."), the QThread
+            # running its default event loop with nothing left to quit it,
+            # and the worker/thread never deleteLater()'d. Whatever was
+            # matched before the cancel is real, already-reprojected data, so
+            # keep it rather than discard it -- Cancel means "stop importing
+            # the rest," not "undo what already succeeded."
+            if self._is_cancelled:
+                warnings_list.append("Import was cancelled; partial results were kept.")
+                self.progress.emit(100, processed_count, error_count, "Import cancelled.")
+            else:
                 self.progress.emit(100, processed_count, error_count, "Import complete.")
-                self.finished.emit(imported_all_polygons, warnings_list)
+            self.finished.emit(imported_all_polygons, warnings_list)
 
         except Exception as e:
             import traceback
             logging.error("[ShapefileImportWorker] Exception: %s\n%s", e, traceback.format_exc())
             self.error.emit(str(e))
+
+
+_NAN_INF_STRINGS = {"nan", "inf", "-inf", "+inf", "infinity", "-infinity", "+infinity"}
+
+
+def _coerce_numeric_strings(props):
+    """Return a copy of `props` where every value that is a STRING and
+    parses cleanly as a float is replaced by that float.
+
+    Shapefile-imported properties are typed by the SOURCE .dbf's own column
+    type byte, not by content -- a column declared Character stays a Python
+    str even when every value in it looks numeric (`dbh_mm: '353.0'`,
+    `hom_m: '1.3'`, `crown: '4'` were all observed as literal strings on a
+    real imported project). A filter rule like `dbh_mm > 300` then compares
+    str to int, raises TypeError, and the caller's blanket
+    `except Exception: continue` treats that as "rule doesn't match" -- so
+    the ENTIRE rule silently matched zero polygons project-wide, with
+    nothing telling the user why.
+
+    Deliberately does NOT touch non-string values (so a real int/float/bool
+    already in `properties` is untouched) and does not overwrite the dict
+    in place (so an unrelated caller reading the original `properties`
+    is unaffected). 'nan'/'inf'-shaped strings are excluded: float() parses
+    them "successfully" into a value that compares False against everything,
+    which would silently reintroduce exactly the failure mode this exists to
+    fix, for the rare column that legitimately contains that text (a species
+    code, a status string) rather than a numeric measurement.
+    """
+    out = dict(props)
+    for k, v in props.items():
+        if isinstance(v, str):
+            s = v.strip()
+            if s.lower() in _NAN_INF_STRINGS:
+                continue
+            try:
+                out[k] = float(s)
+            except ValueError:
+                pass
+    return out
 
 
 def _polygon_shoelace_area(points):
@@ -376,13 +431,25 @@ class PolygonFilterWorker(QtCore.QObject):
     architecture note in the class docstring below to know why that
     matters at CanoPie's polygon counts.
 
-    Emits `finished({(group, filepath): {'visible': bool, 'color': (r,g,b)}}, dict)`
-    -- the second dict is `{(group, filepath): area}` for any polygon whose
-    area was computed here (missing from stored properties), so the caller
-    can persist it back without recomputing.
+    Emits `finished({(group, filepath): {'visible': bool, 'color': (r,g,b)}},
+    dict, list)`:
+      - the 2nd dict is `{(group, filepath): area}` for any polygon whose
+        area was computed here (missing from stored properties), so the
+        caller can persist it back without recomputing.
+      - the 3rd item is the expression text of every VALID (compiled) rule
+        that matched zero polygons across the whole project -- the caller
+        surfaces this so "the filter did nothing" is diagnosable instead of
+        silent. A rule reaches zero matches either because the property name
+        it references doesn't exist on any polygon (routine: shapefile
+        imports truncate DBF field names to 10 characters and CanoPie passes
+        them through unrenamed) or because every comparison raised (routine
+        before this class's numeric-string coercion: a DBF Character column
+        holding '353.0' compared with `> 300` raised TypeError on every
+        polygon) -- both cases were previously absorbed by the per-rule
+        `except Exception: continue` below with nothing surfaced anywhere.
     """
     progress = QtCore.pyqtSignal(int, int)  # (done, total)
-    finished = QtCore.pyqtSignal(dict, dict)
+    finished = QtCore.pyqtSignal(dict, dict, list)
     error = QtCore.pyqtSignal(str)
 
     def __init__(self, all_polygons_snapshot, rules, hide_unmatched=False):
@@ -426,6 +493,13 @@ class PolygonFilterWorker(QtCore.QObject):
                     compiled.append((None, color, hide, expr))
                     logging.warning("[PolygonFilter] bad expression %r: %s", expr, e)
 
+            # How many polygons each valid rule actually matched -- so a rule
+            # that silently matched NOTHING (wrong/truncated DBF field name,
+            # or a comparison that raised and was swallowed) can be reported
+            # back instead of just producing a filter result that looks like
+            # it did nothing.
+            match_counts = {expr: 0 for code, _c, _h, expr in compiled if code is not None}
+
             for group, files in self._snapshot.items():
                 for fp, poly in files.items():
                     done += 1
@@ -444,7 +518,14 @@ class PolygonFilterWorker(QtCore.QObject):
                     # NO builtins -- this is user-authored text from a form
                     # field, evaluated per-polygon, so it must not be able to
                     # reach the filesystem/interpreter.
-                    local_ns = dict(props)
+                    #
+                    # Coerced so numeric-looking values that survived
+                    # shapefile import as strings (DBF column typing, not
+                    # content -- see _coerce_numeric_strings) support
+                    # </>/<=/>=; a rule like `dbh_mm > 300` would otherwise
+                    # TypeError on every single polygon and be silently
+                    # swallowed below as "no match".
+                    local_ns = _coerce_numeric_strings(props)
                     local_ns.setdefault('name', poly.get('name') or group)
                     local_ns.setdefault('group', group)
                     safe_globals = {'__builtins__': {}}
@@ -460,6 +541,7 @@ class PolygonFilterWorker(QtCore.QObject):
                         try:
                             if eval(code, safe_globals, local_ns):
                                 visible, color = (not rule_hide), (None if rule_hide else rule_color)
+                                match_counts[expr_text] += 1
                                 break
                         except Exception as e:
                             # A rule referencing a property this polygon
@@ -477,7 +559,14 @@ class PolygonFilterWorker(QtCore.QObject):
                         'color': QtGui.QColor(*color) if color else None,
                     }
 
-            self.finished.emit(style_map, computed_areas)
+            # Rules that matched NOTHING across the entire project -- the
+            # signature of a wrong/truncated property name or a comparison
+            # that raised on every polygon and was swallowed above. Reported
+            # so the caller can tell the user "this rule matched 0 polygons"
+            # instead of the filter just silently appearing to do nothing.
+            zero_match_rules = [expr for expr, n in match_counts.items() if n == 0]
+
+            self.finished.emit(style_map, computed_areas, zero_match_rules)
         except Exception as e:
             import traceback
             logging.error("[PolygonFilterWorker] Exception: %s\n%s", e, traceback.format_exc())
@@ -773,6 +862,13 @@ class PolygonManager(QtWidgets.QDialog):
 
         self._active_filter_threads = set()
 
+        # The last successfully-applied filter/color result, so it can be
+        # reapplied to a viewer that gets rebuilt after this dialog already
+        # applied it once -- see the sync block ProjectTab.load_polygons adds
+        # for this (mirrors how it already re-syncs show_labels_checkbox /
+        # lock_polys_checkbox there). None means "no filter currently applied".
+        self._last_filter_style_map = None
+
     def _on_filter_section_toggled(self):
         expanded = self.filter_toggle_button.isChecked()
         self.filter_content.setVisible(expanded)
@@ -845,10 +941,24 @@ class PolygonManager(QtWidgets.QDialog):
             QtWidgets.QMessageBox.information(self, "No Rules", "Add at least one rule first.")
             return
 
-        # Deep-copy snapshot: the worker thread must never touch the live
-        # dict the GUI thread (and autosave) can mutate concurrently -- same
-        # discipline as ProjectTab._snapshot_polygons_by_group for export.
-        snapshot = copy.deepcopy(parent.all_polygons)
+        # Scoped copy, not a full deepcopy: PolygonFilterWorker.run() only
+        # ever READS poly.get('properties')/poly.get('points')/poly.get('name')
+        # -- confirmed from its source, it never mutates a leaf polygon dict
+        # or point list. A deepcopy here was copying every point of every
+        # polygon (measured: real projects run to hundreds of thousands of
+        # vertices) synchronously on the GUI thread, before the background
+        # thread even started -- the actual "Apply" slowness was almost
+        # entirely this copy plus the tile rebuild in apply_polygon_style_map,
+        # not the worker's own evaluation (0.036s for 3504 real polygons).
+        #
+        # What DOES need protecting is the ITERATION STRUCTURE: the GUI
+        # thread (autosave, an edit) could add/remove a group or a file while
+        # the worker iterates, which would raise "dictionary changed size
+        # during iteration" on the worker thread. Copying the outer dict and
+        # each group's inner dict is enough for that -- the leaf polygon
+        # dicts/point lists are shared by reference and never touched by the
+        # worker, so sharing them is safe.
+        snapshot = {g: dict(files) for g, files in parent.all_polygons.items()}
         hide_unmatched = self.hide_unmatched_checkbox.isChecked()
 
         self.apply_filters_button.setEnabled(False)
@@ -877,7 +987,7 @@ class PolygonManager(QtWidgets.QDialog):
     def _on_filter_progress(self, done, total):
         self.filter_status_label.setText(f"Evaluating filters... {done}/{total}")
 
-    def _on_filter_finished(self, style_map, computed_areas):
+    def _on_filter_finished(self, style_map, computed_areas, zero_match_rules=None):
         """Apply the worker's {(group, filepath): {visible, color}} mapping
         to every open viewer, and persist any area it had to compute."""
         parent = self.parent()
@@ -898,13 +1008,29 @@ class PolygonManager(QtWidgets.QDialog):
 
         n_visible = sum(1 for s in style_map.values() if s.get('visible'))
         n_hidden = len(style_map) - n_visible
-        self.filter_status_label.setText(
-            f"Applied to {len(style_map)} polygon(s): {n_visible} visible, {n_hidden} hidden."
-        )
+        status = (f"Applied to {len(style_map)} polygon(s): "
+                  f"{n_visible} visible, {n_hidden} hidden.")
+        if zero_match_rules:
+            # Turns "the filter silently did nothing" into something the user
+            # can actually act on -- most often a property name that got
+            # truncated by the shapefile's DBF, or (before the coercion this
+            # worker now does) a numeric comparison against a value that
+            # imported as text.
+            names = ", ".join(repr(r) for r in zero_match_rules)
+            status += f"  ⚠ {len(zero_match_rules)} rule(s) matched nothing: {names}"
+        self.filter_status_label.setText(status)
 
         for _, viewer in self._iter_viewers():
             if hasattr(viewer, "apply_polygon_style_map"):
                 viewer.apply_polygon_style_map(style_map)
+
+        # Cache so a viewer rebuilt later (root switch, reload -- anything
+        # that recreates EditablePolygonItem/EditablePointItem from scratch,
+        # which always default to unfiltered) can have this reapplied. The
+        # filter's visual effect otherwise lives ONLY on the live scene items
+        # and is lost the instant they're recreated -- nothing durable stores
+        # the filter rules anywhere.
+        self._last_filter_style_map = style_map
 
         if parent is not None:
             try:
@@ -922,6 +1048,7 @@ class PolygonManager(QtWidgets.QDialog):
         for _, viewer in self._iter_viewers():
             if hasattr(viewer, "clear_polygon_style"):
                 viewer.clear_polygon_style()
+        self._last_filter_style_map = None
         self.filter_status_label.setText("Filters cleared.")
 
     def _select_group_in_viewers(self, group_name: str, additive: bool = False, center: bool = True):
@@ -1011,11 +1138,30 @@ class PolygonManager(QtWidgets.QDialog):
         if not fp:
             return None
         
-        # Get stored polygon data
+        # Get stored polygon data.
+        #
+        # An exact .get(fp) finds the entry only when all_polygons happens to
+        # be keyed with the viewer's spelling of the path. A shapefile import
+        # keys it with os.path.normpath (backslashes) while the viewer's
+        # image_data.filepath comes from project.json (forward slashes), so on
+        # an imported project this returned {} for every group -- points empty,
+        # rect None, and "Zoom to group" silently did nothing (visible in the
+        # log as `zoom_to_groups: group=<name>, rect=None`).
+        # _poly_index_lookup returns the union of both spellings; see its
+        # docstring in project_tab.py.
         parent = self.parent()
-        payload = (parent.all_polygons.get(group_name, {}) or {}).get(fp, {})
+        group_map = parent.all_polygons.get(group_name, {}) or {}
+        payload = group_map.get(fp) or {}
+        if not payload:
+            try:
+                for gn, key in parent._poly_index_lookup(fp):
+                    if gn == group_name and key in group_map:
+                        payload = group_map[key] or {}
+                        break
+            except Exception:
+                logging.debug("[zoom_to_group] index lookup failed", exc_info=True)
         pts = payload.get("points") or []
-        
+
         if not pts:
             return None
         
@@ -3277,8 +3423,26 @@ class PolygonManager(QtWidgets.QDialog):
 
     @QtCore.pyqtSlot(dict, list)
     def _on_shapefile_import_finished(self, imported_data, warnings, progress_dlg):
+        # Close the progress dialog FIRST, and never behind a call that can
+        # raise before it.
+        #
+        # This block used to open with a reset() call on the dialog. That is a
+        # QProgressDialog method; ShapefileImportProgressDialog is a plain
+        # QDialog (see shapefile_import_dialog.py) and has no such attribute,
+        # so the very first statement raised AttributeError, the bare
+        # `except Exception: pass` swallowed it, and hide()/close()/
+        # deleteLater() NEVER RAN -- leaving "Importing Shapefiles" on screen
+        # after every successful import. Each step is now guarded on its own
+        # so no single failure can strand the dialog again.
+        for _step in ("hide", "close", "deleteLater"):
+            try:
+                getattr(progress_dlg, _step)()
+            except Exception:
+                logging.debug("[ImportShapefile] progress dialog %s() failed",
+                              _step, exc_info=True)
+        # FORCE QT REPAINT IMMEDIATELY BEFORE SCENE CREATION
         try:
-            progress_dlg.close()
+            QtWidgets.QApplication.processEvents()
         except Exception:
             pass
 
@@ -3424,6 +3588,8 @@ class PolygonManager(QtWidgets.QDialog):
                         if new_item is not None:
                             existing_by_name[group_name] = [new_item]
                         added += 1
+                        if added % 100 == 0:
+                            QtWidgets.QApplication.processEvents() # Yield during scene insertion
                     except Exception as e:
                         skipped += 1
                         logging.debug(

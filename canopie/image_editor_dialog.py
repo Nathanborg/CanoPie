@@ -2207,15 +2207,21 @@ class ImageEditorDialog(QDialog):
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, total + 1)) as executor:
                 # Use _prepare_and_write helper
                 futures = {executor.submit(_prepare_and_write, fp, modifications): fp for fp in files}
-                for future in concurrent.futures.as_completed(futures):
-                    completed += 1
-                    # Update progress only periodically
-                    if completed == total or completed % update_stride == 0:
-                        _update_progress(f"Applying to all roots ({completed}/{total})...", completed, total)
-                    try:
-                        future.result() 
-                    except Exception as e:
-                         logging.error(f"Failed to write .ax for {futures[future]}: {e}")
+                working_futures = set(futures.keys())
+                while working_futures:
+                    done, not_done = concurrent.futures.wait(working_futures, timeout=0.1)
+                    if not done:
+                        QtWidgets.QApplication.processEvents()
+                    for future in done:
+                        working_futures.remove(future)
+                        completed += 1
+                        # Update progress only periodically
+                        if completed == total or completed % update_stride == 0:
+                            _update_progress(f"Applying to all roots ({completed}/{total})...", completed, total)
+                        try:
+                            future.result() 
+                        except Exception as e:
+                             logging.error(f"Failed to write .ax for {futures[future]}: {e}")
 
             # CRITICAL: Invalidate caches for all modified files
             try:
@@ -2245,14 +2251,20 @@ class ImageEditorDialog(QDialog):
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, total + 1)) as executor:
                 futures = {executor.submit(_prepare_and_write, fp, modifications): fp for fp in files}
-                for future in concurrent.futures.as_completed(futures):
-                    completed += 1
-                    if completed == total or completed % update_stride == 0:
-                        _update_progress(f"Applying to group ({completed}/{total})...", completed, total)
-                    try:
-                        future.result()
-                    except Exception as e:
-                        logging.error(f"Failed to write .ax for {futures[future]}: {e}")
+                working_futures = set(futures.keys())
+                while working_futures:
+                    done, not_done = concurrent.futures.wait(working_futures, timeout=0.1)
+                    if not done:
+                        QtWidgets.QApplication.processEvents()
+                    for future in done:
+                        working_futures.remove(future)
+                        completed += 1
+                        if completed == total or completed % update_stride == 0:
+                            _update_progress(f"Applying to group ({completed}/{total})...", completed, total)
+                        try:
+                            future.result()
+                        except Exception as e:
+                            logging.error(f"Failed to write .ax for {futures[future]}: {e}")
 
             # CRITICAL: Invalidate caches for all modified files
             try:
