@@ -155,3 +155,32 @@ def test_mixed_property_key_sets_fill_gaps_not_dropped_rows(project_tab):
     assert rows_by_group[g_b][0]["prop_DBH_CM"] == "", "gap not blank for group B"
     assert rows_by_group[g_c][0]["prop_DBH_CM"] == ""
     assert rows_by_group[g_c][0]["prop_SPECIES"] == ""
+
+
+def test_save_succeeds_and_every_polygon_produces_rows(project_tab):
+    """Regression: a since-reverted perf patch pre-allocated
+    save_polygons_to_csv's data_rows as [None] * N while the row-collection
+    code still only ever does data_rows.extend(...), leaving N leading
+    None entries ahead of the real rows. The writer loop then calls
+    row.get(...) on a None row, raising AttributeError -- caught by the
+    function's own try/except, so save_polygons_to_csv silently returns
+    None instead of writing a CSV. Pin the fix: the call must succeed, and
+    every polygon added must actually appear in the output (each polygon
+    may legitimately produce more than one row, e.g. one per raster band,
+    so this doesn't assert an exact row count -- just that nothing was
+    dropped or the whole export didn't silently fail)."""
+    fp = _any_existing_fixture_filepath(project_tab)
+    names = [f"__row_count_check_{i}__" for i in range(5)]
+    for name in names:
+        project_tab.all_polygons[name] = {fp: _poly(name)}
+
+    save_path = project_tab.save_polygons_to_csv(
+        options={"processing_params": ("sequential", 1, False)})
+    assert save_path and os.path.exists(save_path)
+
+    with open(save_path, encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+
+    for name in names:
+        matched = [r for r in rows if r.get("Object ID") == name]
+        assert matched, f"polygon {name} produced no rows at all"
