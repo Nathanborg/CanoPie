@@ -12680,19 +12680,23 @@ class ProjectTab(QtWidgets.QWidget):
         )
 
         def _calc_stats(array_1d):
-            """Calculate statistics with high-performance fallback."""
+            """Calculate statistics with high-performance fallback. Returns stats dict with '_valid_count' key."""
             qs = stats_cfg.get('quantiles', []) or []
 
             # Use fast_stats from performance module if available
             if _PERF_MODULE_AVAILABLE and array_1d is not None and getattr(array_1d, "size", 0) > 0:
                 try:
-                    return fast_stats(
+                    result = fast_stats(
                         array_1d,
                         compute_mean=stats_cfg.get('mean', True),
                         compute_median=stats_cfg.get('median', True),
                         compute_std=stats_cfg.get('std', True),
                         quantiles=qs if qs else None
                     )
+                    # Compute valid count to match semantics of fallback (using isnan, not isfinite)
+                    a_temp = np.asarray(array_1d, dtype=np.float64)
+                    result['_valid_count'] = int(np.count_nonzero(~np.isnan(a_temp)))
+                    return result
                 except Exception as e:
                     logging.debug(f"fast_stats failed, using fallback: {e}")
 
@@ -12705,10 +12709,15 @@ class ProjectTab(QtWidgets.QWidget):
                 for q in qs:
                     q_str = (str(q).rstrip('0').rstrip('.') if isinstance(q, float) else str(q))
                     out[f'Q{q_str}'] = None
+                out['_valid_count'] = 0
                 return out
 
             orig_is_int = np.issubdtype(np.asarray(array_1d).dtype, np.integer)
             a = np.asarray(array_1d, dtype=np.float64)
+
+            # Compute valid count once using isnan (matches fallback semantics for infinities)
+            nan_mask = np.isnan(a)
+            valid_count = int(np.count_nonzero(~nan_mask))
 
             def _cast_num(x, round_int=False):
                 if x is None or not np.isfinite(x):
@@ -12751,11 +12760,8 @@ class ProjectTab(QtWidgets.QWidget):
                 q_str = (str(q_orig).rstrip('0').rstrip('.') if isinstance(q_orig, float) else str(q_orig))
                 out[f'Q{q_str}'] = q_val_out
 
+            out['_valid_count'] = valid_count
             return out
-
-        def _valid_count(arr):
-            a = np.asarray(arr)
-            return int(np.count_nonzero(~np.isnan(a)))
 
         # ------------ Histogram-match config (once) ------------
         def _hm_enabled(hm_cfg):
@@ -13836,7 +13842,7 @@ class ProjectTab(QtWidgets.QWidget):
                     for channel_name, bi in zip(["R", "G", "B"], (0, 1, 2)):
                         v_arr = vals_rgb[bi]
                         channel_stats = _calc_stats(v_arr)
-                        pixel_count = _valid_count(v_arr)
+                        pixel_count = channel_stats.pop('_valid_count')
                         row = {
                             "Project": project_label,
                             "Root ID": root_id,
@@ -13884,7 +13890,7 @@ class ProjectTab(QtWidgets.QWidget):
                                 v_arr = np.array([np.nan], dtype=np.float32)
 
                             channel_stats = _calc_stats(v_arr)
-                            pixel_count = _valid_count(v_arr)
+                            pixel_count = channel_stats.pop('_valid_count')
                             if pixel_count == 0:
                                 continue
                             row = {
@@ -13934,7 +13940,7 @@ class ProjectTab(QtWidgets.QWidget):
                         pixs = np.array([np.nan], dtype=np.float32)
 
                     point_stats = _calc_stats(pixs)
-                    pixel_count = _valid_count(pixs)
+                    pixel_count = point_stats.pop('_valid_count')
                     channel_type = "Gray" if len(chans) == 1 else "Other"
                     row = {
                         "Project": project_label,
@@ -13984,7 +13990,7 @@ class ProjectTab(QtWidgets.QWidget):
                                 v_arr = np.array([np.nan], dtype=np.float32)
 
                             channel_stats = _calc_stats(v_arr)
-                            pixel_count2 = _valid_count(v_arr)
+                            pixel_count2 = channel_stats.pop('_valid_count')
                             row2 = {
                                 "Project": project_label,
                                 "Root ID": root_id,
@@ -14031,7 +14037,7 @@ class ProjectTab(QtWidgets.QWidget):
                                 val = _eval_band_expr(expr, xi=xi, yi=yi)
                             v_arr = np.array([val], dtype=np.float32)
                             channel_stats = _calc_stats(v_arr)
-                            pixel_count = _valid_count(v_arr)
+                            pixel_count = channel_stats.pop('_valid_count')
                             row = {
                                 "Project": project_label,
                                 "Root ID": root_id,
@@ -14391,7 +14397,7 @@ class ProjectTab(QtWidgets.QWidget):
                     if channel_pixels.size == 0:
                         continue
                     channel_stats = _calc_stats(channel_pixels)
-                    pixel_count = _valid_count(channel_pixels)
+                    pixel_count = channel_stats.pop('_valid_count')
                     if pixel_count == 0:
                         continue
                     row = {
@@ -14453,7 +14459,7 @@ class ProjectTab(QtWidgets.QWidget):
                         if vec.size == 0:
                             continue
                         channel_stats = _calc_stats(vec)
-                        pixel_count = _valid_count(vec)
+                        pixel_count = channel_stats.pop('_valid_count')
                         if pixel_count == 0:
                             continue
                         row = {
@@ -14575,7 +14581,7 @@ class ProjectTab(QtWidgets.QWidget):
                         "Centroid X": c_x,
                         "Centroid Y": c_y,
                         "Channel": "Label",
-                        "Pixel Count": _valid_count(lbl_vec),
+                        "Pixel Count": int(np.count_nonzero(~np.isnan(np.asarray(lbl_vec, dtype=np.float64)))),
                         "Lat": _root_lat,
                         "Long": _root_lon,
                         "Label Band Index": int(label_band_idx + 1),
@@ -14612,7 +14618,7 @@ class ProjectTab(QtWidgets.QWidget):
                     return data_rows, modified_polygons
 
                 poly_stats = _calc_stats(vec)
-                pixel_count = _valid_count(vec)
+                pixel_count = poly_stats.pop('_valid_count')
                 channel_type = "Gray" if len(chans) == 1 else "Other"
                 row = {
                     "Project": project_label,
@@ -14671,7 +14677,7 @@ class ProjectTab(QtWidgets.QWidget):
                             continue
 
                         channel_stats_extra = _calc_stats(vec_extra)
-                        pixel_count_extra = _valid_count(vec_extra)
+                        pixel_count_extra = channel_stats_extra.pop('_valid_count')
                         row_extra = {
                             "Project": project_label,
                             "Root ID": root_id,
@@ -14732,7 +14738,7 @@ class ProjectTab(QtWidgets.QWidget):
                             "Centroid X": c_x,
                             "Centroid Y": c_y,
                             "Channel": "Label",
-                            "Pixel Count": _valid_count(lbl_vec),
+                            "Pixel Count": int(np.count_nonzero(~np.isnan(np.asarray(lbl_vec, dtype=np.float64)))),
                             "Lat": _root_lat,
                             "Long": _root_lon,
                             "Label Band Index": int(label_band_idx + 1),
