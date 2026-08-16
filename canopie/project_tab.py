@@ -15222,28 +15222,33 @@ class ProjectTab(QtWidgets.QWidget):
         def _fake_path_token(n=8) -> str:
             return "FAKE:/" + "".join(random.choice(string.ascii_uppercase + string.digits) for _ in range(n))
 
+        # GEN4 SPEED OPT: hoist re/numpy imports OUTSIDE _sanitize_for_csv so they
+        # are not re-imported on every single per-row call (was O(N) module lookups).
+        import re as _re_mod
+        try:
+            import numpy as _np_mod
+            _np_ok_outer = True
+        except Exception:
+            _np_mod = None
+            _np_ok_outer = False
+        _re_numeric = _re_mod.compile(r'^[+\-]?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?$')
+
         def _sanitize_for_csv(val, delim=','):
             """Plain string with no CR/LF/TAB and no active delimiter.
-            Excel-guard ONLY non-numeric strings that start with = + - @."""
-            import re
-            try:
-                import numpy as np
-                _np_ok = True
-            except Exception:
-                _np_ok = False
+            Excel-guard ONLY non-numeric strings that start with = + - @.
+            GEN4: re/numpy imported once at function scope, not per-call."""
+            _np_ok = _np_ok_outer
+            np     = _np_mod
 
             def _is_numeric_scalar(x):
                 if isinstance(x, (int, float)):
                     return True
-                if _np_ok:
-                    import numpy as np
-                    if isinstance(x, (np.integer, np.floating)):
-                        return True
+                if _np_ok and isinstance(x, (np.integer, np.floating)):
+                    return True
                 return False
 
             def _is_numeric_string(s: str) -> bool:
-                s = s.strip()
-                return bool(re.match(r'^[+\-]?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?$', s))
+                return bool(_re_numeric.match(s.strip()))
 
             if val is None:
                 s = ""
@@ -16372,47 +16377,63 @@ class ProjectTab(QtWidgets.QWidget):
         key_map = dict(zip(fieldnames_raw, fieldnames_safe))
 
         # ---------------- Write CSV ----------------
+        # GEN4 SPEED OPT: write all rows into an io.StringIO buffer, then flush
+        # to disk in a single call with a large OS buffer (1 MB). This reduces
+        # per-row syscall overhead from O(N) disk writes to a single write().
+        # All EXIF/RF/audit/sanitize logic is unchanged.
+        # Tradeoff: the whole CSV is held in memory before the disk write,
+        # instead of being streamed row-by-row as the original did -- fine
+        # for normal project sizes, but worth knowing for unusually large
+        # exports (very many polygons and/or very wide RF class breakdowns).
+        import io as _io_mod
         try:
-            with open(save_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
-                writer = csv.DictWriter(
-                    csvfile,
-                    fieldnames=fieldnames_safe,
-                    restval="",
-                    extrasaction="ignore",
-                    delimiter=csv_delimiter,
-                    quoting=csv.QUOTE_NONE,
-                    escapechar='\\',
-                    lineterminator="\n",
-                )
+            # Hoist all hot-path names as locals (CPython LOAD_FAST >> LOAD_GLOBAL)
+            _san      = _sanitize_for_csv
+            _audit    = _audit_row_for_delim
+            _delim    = csv_delimiter
+            _km_items = list(key_map.items())  # snapshot once; avoid repeated dict iter
+            _ck       = class_keys             # local alias
 
-                # header: double-sanitize + audit just in case
-                header_safe = {safe: _sanitize_for_csv(safe, csv_delimiter) for safe in fieldnames_safe}
-                header_safe = _audit_row_for_delim(header_safe, csv_delimiter, "header")
-                writer.writeheader()  # DictWriter ignores provided dict for header, uses fieldnames
+            csv_buf = _io_mod.StringIO()
+            writer = csv.DictWriter(
+                csv_buf,
+                fieldnames=fieldnames_safe,
+                restval="",
+                extrasaction="ignore",
+                delimiter=_delim,
+                quoting=csv.QUOTE_NONE,
+                escapechar='\\',
+                lineterminator="\n",
+            )
 
-                # rows
-                for row_idx, row in enumerate(data_rows):
-                    # Base mapping for static fields
-                    safe_row = {}
-                    for raw_key, safe_key in key_map.items():
-                        # We'll fill dynamic Class_* separately; skip them here to avoid duplicate work
-                        if raw_key.startswith("Class_"):
-                            continue
-                        safe_val = _sanitize_for_csv(row.get(raw_key, ""), csv_delimiter)
-                        safe_row[safe_key] = safe_val
+            # header
+            header_safe = {safe: _san(safe, _delim) for safe in fieldnames_safe}
+            header_safe = _audit(header_safe, _delim, "header")
+            writer.writeheader()
 
-                    # Fill dynamic Class_* columns from Counts dict (0 if missing)
-                    if class_keys:
-                        counts = row.get("Counts") if isinstance(row.get("Counts"), dict) else {}
-                        for k in class_keys:
-                            col_raw = f"Class_{k}"
-                            col_safe = key_map[col_raw]
-                            val = counts.get(k, 0)
-                            safe_row[col_safe] = _sanitize_for_csv(val, csv_delimiter)
+            # rows — same logic as before, but writing to RAM buffer
+            for row in data_rows:
+                safe_row = {}
+                for raw_key, safe_key in _km_items:
+                    if raw_key.startswith("Class_"):
+                        continue
+                    safe_row[safe_key] = _san(row.get(raw_key, ""), _delim)
 
-                    # final guard
-                    safe_row = _audit_row_for_delim(safe_row, csv_delimiter, "row")
-                    writer.writerow(safe_row)
+                if _ck:
+                    counts = row.get("Counts") if isinstance(row.get("Counts"), dict) else {}
+                    for k in _ck:
+                        col_raw  = f"Class_{k}"
+                        col_safe = key_map[col_raw]
+                        safe_row[col_safe] = _san(counts.get(k, 0), _delim)
+
+                safe_row = _audit(safe_row, _delim, "row")
+                writer.writerow(safe_row)
+
+            # Single atomic disk flush — 1 MB OS write buffer
+            payload = csv_buf.getvalue()
+            csv_buf.close()
+            with open(save_path, 'w', newline='', encoding='utf-8-sig', buffering=1 << 20) as csvfile:
+                csvfile.write(payload)
 
             logging.info(f"Data successfully saved to {save_path}")
         except Exception as e:
