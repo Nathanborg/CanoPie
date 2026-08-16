@@ -1083,41 +1083,19 @@ class PolygonManager(QtWidgets.QDialog):
                         except Exception:
                             pass
         
-        # Second pass: "Zoom to Polygon" + 10% Zoom Out
+        # Second pass: pan to the group at whatever zoom the viewer already
+        # has. Delegates to ImageViewer.smart_zoom_to_scene_rect, shared
+        # with zoom_to_groups below -- see its docstring: this is pan-only
+        # by design, it never changes the current zoom level.
         if center:
             for vw_widget, viewer in self._iter_viewers():
                 r = self._get_polygon_scene_rect(vw_widget, viewer, group_name)
                 logging.debug(f"_select_group_in_viewers: group={group_name}, rect={r}")
-                if r and r.isValid():
-                    try:
-                        # 1. Enforce Minimum Size (same as zoom_to_groups)
-                        min_dim = 100.0
-                        if r.width() < min_dim:
-                            cx = r.center().x()
-                            r.setLeft(cx - min_dim/2)
-                            r.setRight(cx + min_dim/2)
-                        if r.height() < min_dim:
-                            cy = r.center().y()
-                            r.setTop(cy - min_dim/2)
-                            r.setBottom(cy + min_dim/2)
-
-                        # 2. Standard Padding (same as zoom_to_groups: 20%)
-                        pad_x = max(50.0, r.width() * 0.20)
-                        pad_y = max(50.0, r.height() * 0.20)
-                        
-                        view_rect = r.adjusted(-pad_x, -pad_y, pad_x, pad_y)
-                        
-                        # 3. Fit in View (The "Zoom to Polygon" step)
-                        viewer.fitInView(view_rect, QtCore.Qt.KeepAspectRatio)
-                        viewer.centerOn(view_rect.center())
-                        
-                        # 4. Zoom Out 10% ("redies the zoom 10%")
-                        # scale(0.9, 0.9) shrinks the view matrix, effectively zooming OUT
-                        viewer.scale(0.9, 0.9)
-                        
-                        viewer.setFocus()
-                    except Exception as e:
-                        logging.debug(f"_select_group_in_viewers: fit+scale failed: {e}")
+                # r may legitimately be zero-width/zero-height (a single
+                # point) -- not "invalid", centerOn handles it fine. Only
+                # "no rect at all" is skipped.
+                if r is not None:
+                    viewer.smart_zoom_to_scene_rect(r)
 
     def _get_polygon_scene_rect(self, viewer_widget, viewer, group_name):
         """
@@ -1174,12 +1152,51 @@ class PolygonManager(QtWidgets.QDialog):
         if not ref_w or not ref_h:
             if idata and hasattr(idata, 'raw_shape') and idata.raw_shape:
                 ref_h, ref_w = idata.raw_shape[:2]
-        
-        # Get current Scene dimensions (this is what we map TO)
+
+        # Points may already be in SCENE space (coord_space == "scene"),
+        # not raw image-pixel space -- the mapping below unconditionally
+        # assumed image space until this fix. Mirrors the same pattern
+        # used elsewhere in this file when reading polygon points (see
+        # import_polygons_from_files's "Convert to IMAGE coords if needed"
+        # block). Default is "image" (not "scene"), matching what this
+        # function already implicitly assumed for every live caller today.
+        coord_space = payload.get("coord_space", "image")
+        if coord_space == "scene" and hasattr(parent, "_map_points_scene_to_image"):
+            try:
+                size_hint = (ref_h or 0, ref_w or 0, 1)
+                pts = parent._map_points_scene_to_image(
+                    fp, pts, size_hint, polygon_data=payload, viewer=viewer)
+            except Exception:
+                logging.debug("[_get_polygon_scene_rect] scene->image mapping failed", exc_info=True)
+
+        # Get current Scene dimensions (this is what we map TO) -- the
+        # DISPLAYED PIXMAP's own width/height, NOT viewer.sceneRect().
+        #
+        # THE BUG THIS FIXES: sceneRect() is the QGraphicsView's scrollable
+        # extent, which is the image PLUS ImageViewer._SCENE_PAD_FRACTION
+        # (20%) padding on every side (image_viewer.py's set_image) -- e.g.
+        # a 4000x3000 image gets a 5600x4200 sceneRect. The pixmap item
+        # itself always sits at scene position (0,0) with an identity
+        # transform (set_image calls _image.setPos(0, 0)), so a point's
+        # fraction-of-image position must be re-scaled against the
+        # PIXMAP's own size to land back on the image -- multiplying by the
+        # padded sceneRect size instead (the previous code) scales every
+        # point ~1.4x too far AND never subtracts sceneRect's negative
+        # left/top offset, silently placing "zoom to polygon" well outside
+        # the actual image (reported: real projects landing the view fully
+        # below/beside the image, showing nothing but blank padding).
+        # _map_point_raw_to_scene's own docstring confirms the contract:
+        # it returns a fraction of "the current image", to be scaled by
+        # that image's own dimensions, not the view's padded scroll area.
         scene_w, scene_h = 100, 100
         try:
-            sr = viewer.sceneRect()
-            scene_w, scene_h = sr.width(), sr.height()
+            cached = getattr(viewer, "_cached_pixmap_size", None)
+            if cached and cached[0] and cached[1]:
+                scene_w, scene_h = cached
+            else:
+                pm = viewer._image.pixmap()
+                if pm and not pm.isNull():
+                    scene_w, scene_h = pm.width(), pm.height()
         except Exception:
             pass
             
@@ -1405,8 +1422,13 @@ class PolygonManager(QtWidgets.QDialog):
             all_image_filepaths.extend(fps or [])
         possible_exts = ['.tif', '.tiff', '.jpg', '.jpeg', '.png']
 
-        # Optional root mapping
-        root_mapping_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'root_mapping.json')
+        # Optional root mapping. root_mapping.json is written by ProjectTab
+        # into the PROJECT folder (save_root_mapping_json), not next to this
+        # module -- reading it from the package install directory almost
+        # never finds it, silently disabling this fallback layer.
+        project_folder = getattr(parent, "project_folder", None)
+        root_mapping_path = (os.path.join(project_folder, 'root_mapping.json') if project_folder
+                              else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'root_mapping.json'))
         try:
             with open(root_mapping_path, 'r', encoding='utf-8') as rm_file:
                 root_mapping = json.load(rm_file)
@@ -2269,10 +2291,18 @@ class PolygonManager(QtWidgets.QDialog):
         # Track files created in this run
         created_files = []
 
-        # ---- Load root_mapping.json (same convention as import_polygons) ----
+        # Hoisted above the root_mapping.json load below so that load can
+        # resolve the project folder the same way import_polygons_from_files
+        # does, instead of always falling back to the package directory.
+        parent = self.parent()
+
+        # ---- Load root_mapping.json (same convention as import_polygons).
+        # Written by ProjectTab into the PROJECT folder
+        # (save_root_mapping_json), not next to this module. ----
         try:
-            here = os.path.dirname(os.path.abspath(__file__))
-            rm_path = os.path.join(here, 'root_mapping.json')
+            project_folder = getattr(parent, "project_folder", None)
+            rm_path = (os.path.join(project_folder, 'root_mapping.json') if project_folder
+                       else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'root_mapping.json'))
             with open(rm_path, 'r', encoding='utf-8') as f:
                 root_mapping = json.load(f)
         except Exception as e:
@@ -2282,7 +2312,6 @@ class PolygonManager(QtWidgets.QDialog):
 
         # ---- Build base(lower) -> root_id(str) using ALL groups (multi-folder aware) ----
         base_to_rootid = {}
-        parent = self.parent()
         try:
             id_to_root = getattr(parent, "id_to_root", {}) or {}   # {int_id: root_name}
             rootname_to_id = {root_name: root_id for root_id, root_name in id_to_root.items()}
@@ -3090,46 +3119,67 @@ class PolygonManager(QtWidgets.QDialog):
 
     def zoom_to_groups(self, groups):
         """
-        Zoom every open viewer to frame the polygons/points belonging to the given groups.
-        Shows the polygon with surrounding image context for better orientation.
+        Frame the polygons/points belonging to the given groups in every
+        open viewer -- this one DOES actually change zoom, unlike a plain
+        list click (_select_group_in_viewers, always pan-only).
+
+        A real polygon (nonzero extent) is genuinely fit+zoomed via
+        ImageViewer.smart_fit_to_scene_rect. A POINT-LIKE combined rect
+        (near-zero area -- a single point, or several points with no real
+        polygon among them) has no natural "fit" scale, so it's routed to
+        the same pan-only ImageViewer.smart_zoom_to_scene_rect
+        _select_group_in_viewers uses instead -- forcing a fit for a
+        dimensionless target was the actual source of the "zoom is too
+        high" complaint this split exists to fix.
         """
         if not groups:
             return
+        parent = self.parent()
         for vw_widget, viewer in self._iter_viewers():
             combined = None
             for g in groups:
                 r = self._get_polygon_scene_rect(vw_widget, viewer, g)
                 logging.info(f"zoom_to_groups: group={g}, rect={r}")
-                if r and r.isValid():
-                    combined = r if combined is None else combined.united(r)
+                # r may legitimately be zero-width/zero-height (a single
+                # point) -- not "invalid", centerOn handles it fine. Only
+                # "no rect at all" is excluded.
+                #
+                # QRectF.united() silently DROPS a null/zero-size operand
+                # instead of expanding to include its position (confirmed:
+                # a point unioned with anything just returns the other rect
+                # unchanged, and two points union to a degenerate rect at
+                # the origin) -- so a multi-group selection mixing points
+                # and polygons would silently lose the points' positions.
+                # Union by min/max corners instead.
+                if r is not None:
+                    if combined is None:
+                        combined = QtCore.QRectF(r)
+                    else:
+                        x0 = min(combined.left(), r.left())
+                        y0 = min(combined.top(), r.top())
+                        x1 = max(combined.right(), r.right())
+                        y1 = max(combined.bottom(), r.bottom())
+                        combined = QtCore.QRectF(x0, y0, x1 - x0, y1 - y0)
 
-            if combined and combined.isValid():
+            if combined is not None:
                 logging.info(f"zoom_to_groups: combined rect center=({combined.center().x():.1f}, {combined.center().y():.1f})")
-                # Add extra context padding (show more of the surrounding image)
-                # Use 20% of the rect size as additional padding
-                pad_x = max(50.0, combined.width() * 0.20)
-                pad_y = max(50.0, combined.height() * 0.20)
-                view_rect = combined.adjusted(-pad_x, -pad_y, pad_x, pad_y)
-                
-                # Handle single-point or very small polygons - ensure minimum view size
-                min_size = 100.0
-                if view_rect.width() < min_size:
-                    expand_x = (min_size - view_rect.width()) / 2
-                    view_rect.adjust(-expand_x, 0, expand_x, 0)
-                if view_rect.height() < min_size:
-                    expand_y = (min_size - view_rect.height()) / 2
-                    view_rect.adjust(0, -expand_y, 0, expand_y)
-                
-                try:
-                    viewer.fitInView(view_rect, QtCore.Qt.KeepAspectRatio)
-                    viewer.setFocus()
-                except Exception:
-                    # Fallback: ensureVisible
+                # A near-zero-area combined rect (a single point, or several
+                # points with no real polygon among them) has no natural
+                # "fit" scale -- route it to the pan-only path instead of
+                # forcing an arbitrary zoom-in. A real polygon's extent is
+                # never this small at the scale these coordinates are in
+                # (image pixels mapped to scene space), so 1.0 scene unit
+                # is a safe, unambiguous point-like threshold.
+                if combined.width() < 1.0 and combined.height() < 1.0:
+                    viewer.smart_zoom_to_scene_rect(combined)
+                else:
+                    idata = vw_widget.get("image_data") if isinstance(vw_widget, dict) else None
+                    native_hw = None
                     try:
-                        viewer.ensureVisible(combined, 50, 50)
-                        viewer.centerOn(combined.center())
+                        native_hw = parent.polygon_basis_hw(viewer, image_data=idata)
                     except Exception:
-                        pass
+                        logging.debug("zoom_to_groups: polygon_basis_hw failed", exc_info=True)
+                    viewer.smart_fit_to_scene_rect(combined, native_hw)
 
 
     def _export_shapefile(self, groups):

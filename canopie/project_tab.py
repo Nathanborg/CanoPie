@@ -16296,8 +16296,6 @@ class ProjectTab(QtWidgets.QWidget):
         # Cleanup
         if progress_dialog is not None:
             progress_dialog.setLabelText("Formatting and writing CSV file...")
-            progress_dialog.setMaximum(0) # Indeterminate spinner during post-processing
-            QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents)
         
         if errors > 0:
             logging.warning(f"[CSV export] Completed with {errors} errors")
@@ -16394,8 +16392,6 @@ class ProjectTab(QtWidgets.QWidget):
 
                 # rows
                 for row_idx, row in enumerate(data_rows):
-                    if progress_dialog is not None and row_idx % 500 == 0:
-                        QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents)
                     # Base mapping for static fields
                     safe_row = {}
                     for raw_key, safe_key in key_map.items():
@@ -16506,7 +16502,6 @@ class ProjectTab(QtWidgets.QWidget):
         if progress_dialog is not None:
             progress_dialog.setValue(progress_dialog.maximum() or 100)
             progress_dialog.close()
-            QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents)
 
         return save_path  # <<< success indicator
 
@@ -24511,6 +24506,45 @@ class ProjectTab(QtWidgets.QWidget):
         print("Image loading has been canceled by the user.")            
 
 
+    def _resolve_root_coordinates(self, image_root: str, filepath: str):
+        """Coordinates: prefer cached root -> paired -> EXIF for this file.
+
+        Extracted from save_polygons_to_json's local _coords_for_root
+        closure so the fast autosave paths (_flush_dirty_polygons,
+        save_incremental) can reuse the same cache-first-then-EXIF logic
+        instead of only reading the (often not-yet-populated) cache -- see
+        the "GPS auto-assignment" fix. Cheap to call repeatedly: the EXIF
+        read only happens once per root, and a miss is negative-cached too.
+        """
+        coords = (getattr(self, "root_coordinates", {}) or {}).get(image_root)
+        if coords:
+            return coords
+        if getattr(self, "mode", None) == 'dual_folder':
+            paired = None
+            if hasattr(self, "_paired_ms_root"):
+                paired = self._paired_ms_root(image_root) or paired
+            if hasattr(self, "_paired_trgb_root"):
+                paired = self._paired_trgb_root(image_root) or paired
+            if paired:
+                coords = (getattr(self, "root_coordinates", {}) or {}).get(paired)
+                if coords:
+                    return coords
+        if hasattr(self, "_first_gps_from_files"):
+            one = self._first_gps_from_files([filepath])
+            # NEGATIVE CACHING: Store the result (even if None/empty) to prevent
+            # repeated expensive lookups (exiftool) for the same root on every file save.
+            # If one is found, store it. If not, store explicit None-markers.
+            val_to_cache = one if one else {'latitude': None, 'longitude': None}
+
+            # Ensure dict exists
+            if not getattr(self, "root_coordinates", None):
+                self.root_coordinates = {}
+
+            self.root_coordinates[image_root] = val_to_cache
+            return val_to_cache
+
+        return {'latitude': None, 'longitude': None}
+
     def save_polygons_to_json(self, root_name: str = None):
         """
         Write polygons to `<project>/polygons/{group}_{imageBase}_polygons.json`
@@ -24542,37 +24576,6 @@ class ProjectTab(QtWidgets.QWidget):
                 if fp in paths:
                     return rn
             return None
-
-        def _coords_for_root(image_root: str, filepath: str):
-            """Coordinates: prefer cached root -> paired -> EXIF for this file."""
-            coords = (getattr(self, "root_coordinates", {}) or {}).get(image_root)
-            if coords:
-                return coords
-            if getattr(self, "mode", None) == 'dual_folder':
-                paired = None
-                if hasattr(self, "_paired_ms_root"):
-                    paired = self._paired_ms_root(image_root) or paired
-                if hasattr(self, "_paired_trgb_root"):
-                    paired = self._paired_trgb_root(image_root) or paired
-                if paired:
-                    coords = (getattr(self, "root_coordinates", {}) or {}).get(paired)
-                    if coords:
-                        return coords
-            if hasattr(self, "_first_gps_from_files"):
-                one = self._first_gps_from_files([filepath])
-                # NEGATIVE CACHING: Store the result (even if None/empty) to prevent
-                # repeated expensive lookups (exiftool) for the same root on every file save.
-                # If one is found, store it. If not, store explicit None-markers.
-                val_to_cache = one if one else {'latitude': None, 'longitude': None}
-                
-                # Ensure dict exists
-                if not getattr(self, "root_coordinates", None):
-                    self.root_coordinates = {}
-                
-                self.root_coordinates[image_root] = val_to_cache
-                return val_to_cache
-
-            return {'latitude': None, 'longitude': None}
 
         def _viewer_effective_hw(fp: str):
             """
@@ -24784,7 +24787,7 @@ class ProjectTab(QtWidgets.QWidget):
                         c = polygon_data.get('coordinates')
                         if isinstance(c, dict) and 'latitude' in c and 'longitude' in c:
                             coords = c
-                    coords = coords or _coords_for_root(image_root, filepath)
+                    coords = coords or self._resolve_root_coordinates(image_root, filepath)
 
                     # Normalize points to the file's *current* basis
                     pts_out, ref_w, ref_h, coord_space_out = _normalize_points_for_save(filepath, polygon_data)
@@ -25547,6 +25550,25 @@ class ProjectTab(QtWidgets.QWidget):
             if not data:
                 logging.debug(f"[_flush_dirty_polygons] No data for {group_name} @ {os.path.basename(filepath)}")
                 continue
+
+            # GPS auto-assignment: this is the save that fires ~200ms after a
+            # polygon is drawn, so it's the one that needs to enrich
+            # 'coordinates' (cache-first, EXIF fallback for non-GeoTIFF
+            # images) -- see _resolve_root_coordinates. Only plain dicts are
+            # mutated; a lazy/pyramid record is left alone (dirty entries are
+            # always freshly-drawn/edited plain dicts in practice, but this
+            # guards against surprises rather than assuming it).
+            if isinstance(data, dict):
+                c = data.get('coordinates')
+                if not (isinstance(c, dict) and c.get('latitude') is not None and c.get('longitude') is not None):
+                    try:
+                        if hasattr(self, "get_root_by_filepath"):
+                            image_root = self.get_root_by_filepath(filepath)
+                            if image_root:
+                                data['coordinates'] = self._resolve_root_coordinates(image_root, filepath)
+                    except Exception as e:
+                        logging.debug(f"[_flush_dirty_polygons] Coordinate resolution failed for {group_name}: {e}")
+
             base = os.path.splitext(os.path.basename(filepath))[0]
             out_path = os.path.join(polygons_dir, f"{group_name}_{base}_polygons.json")
             try:
@@ -27552,6 +27574,18 @@ class ProjectTab(QtWidgets.QWidget):
                     root = self.get_root_by_filepath(filepath)
                     if root and hasattr(self, 'root_coordinates'):
                         coords = self.root_coordinates.get(root)
+                except Exception:
+                    pass
+            if not coords:
+                # GPS auto-assignment: this is Ctrl+Q / Quick Save, the other
+                # fast path that used to skip straight past EXIF -- fall back
+                # to the same cache-first-then-EXIF resolution the full save
+                # already uses, so coordinates land on the very next save
+                # instead of only on a full "Save Project".
+                try:
+                    root = self.get_root_by_filepath(filepath)
+                    if root:
+                        coords = self._resolve_root_coordinates(root, filepath)
                 except Exception:
                     pass
             return coords

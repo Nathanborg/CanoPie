@@ -2668,6 +2668,144 @@ class ImageViewer(QtWidgets.QGraphicsView):
             self.fitInView(self._scene.sceneRect(), QtCore.Qt.KeepAspectRatio)
         self._trigger_highres_update()
 
+    def smart_zoom_to_scene_rect(self, rect):
+        """"Bring this scene rect into view" -- PANS ONLY, never changes the
+        current zoom level. Used by:
+          - PolygonManager._select_group_in_viewers (click a group in the
+            list) -- ALWAYS, for both polygons and points. Clicking between
+            rows in a list should behave like scrolling, not re-fitting.
+          - PolygonManager.zoom_to_groups ("Zoom to Polygon" / double-click)
+            -- only when the target is POINT-LIKE (near-zero area). A
+            zero-area target has no natural "fit" scale (any zoom "fits" a
+            single point), so forcing one was the actual source of the
+            "zoom is too high on a COG" complaint this method exists to
+            fix. A real polygon with actual extent goes through
+            smart_fit_to_scene_rect below instead, which genuinely zooms.
+
+        rect: bounding rect of the polygon/point in SCENE coordinates. May
+        legitimately be zero-width/zero-height -- centerOn handles that
+        fine, no expansion needed since no fit is computed. Only
+        `rect is None` is treated as "nothing to pan to".
+        """
+        try:
+            if rect is None:
+                return
+            if self._image is None or sip.isdeleted(self._image):
+                return
+            self.centerOn(rect.center())
+            self.setFocus()
+        except Exception as e:
+            logging.debug(f"[smart_zoom_to_scene_rect] failed: {e}")
+
+    def smart_fit_to_scene_rect(
+        self, rect, native_hw=None, *,
+        max_native_scale=2.0, padding_fraction=0.20, settle_back=0.9,
+    ):
+        """Actually ZOOM to frame this scene rect -- used only by
+        PolygonManager.zoom_to_groups ("Zoom to Polygon" / double-click)
+        when the combined target has real extent (a genuine polygon, not a
+        point -- see smart_zoom_to_scene_rect above for the point case,
+        and _select_group_in_viewers, which never calls this method at
+        all: a plain list click is pan-only, always).
+
+        One fitInView, one native-resolution-aware scale clamp, one
+        settle-back, one final centerOn -- replaces the old hardcoded
+        absolute scene-unit constants (min_dim=100.0, pad=max(50.0, ...))
+        that broke down across image resolutions/COG pyramid levels, with
+        no cap on how far fitInView could zoom in.
+
+        rect: bounding rect of the polygon in SCENE coordinates. Expected
+        to have real (non-near-zero) extent -- callers route point-like
+        rects to smart_zoom_to_scene_rect instead. Only `rect is None` is
+        treated as "nothing to fit".
+
+        native_hw: (H, W) of the FULL NATIVE raster (from
+        ProjectTab.polygon_basis_hw), used to cap zoom at max_native_scale
+        (default 200%) of NATIVE resolution -- deliberately NOT scale
+        relative to whatever pixmap happens to be cached right now
+        (self.transform().m11() alone), since on a COG that cached pixmap
+        is often a decimated preview, not the native raster. Pass None
+        when native size can't be resolved (e.g. an unsaved/synthetic
+        image with no file to probe); the cap is then skipped and
+        padding/settle-back alone apply.
+        """
+        try:
+            if rect is None:
+                return
+            if self._image is None or sip.isdeleted(self._image):
+                return
+
+            cached = getattr(self, "_cached_pixmap_size", None)
+            cached_pw, cached_ph = cached if cached else (0, 0)
+
+            # 1) Relative padding (percentage of the rect's own size, not a
+            # fixed scene-unit constant), plus a SMALL, purely-defensive
+            # floor so a near-zero-area rect still gets a sane nonzero
+            # starting size for fitInView instead of the old fixed
+            # min_dim=100.0.
+            #
+            # This floor is NOT where the native-resolution cap is
+            # enforced -- that's step 3 below, an exact post-fitInView
+            # clamp. An earlier version of this floor tried to PRE-empt the
+            # cap here too, sized off the viewport (vp_w*cached_pw /
+            # (max_native_scale*native_w)) -- but whenever the current
+            # pixmap is already close to native resolution (any plain,
+            # non-COG image: no decimated-preview gap, cached_pw≈native_w),
+            # that formula collapses to roughly "half the viewport size in
+            # scene units", disconnected from the polygon's/image's own
+            # size. Verified this is a code-quality simplification, NOT an
+            # independent bug: floor-expansion is always symmetric around
+            # the rect's own center (never moves centerOn's target), and
+            # the exact clamp in step 3 corrects the final scale to
+            # max_native_scale regardless of what the floor produced --
+            # the real "zoom lands outside the image" bug was in
+            # PolygonManager._get_polygon_scene_rect's own coordinate
+            # mapping (see canopie/qc/test_polygon_zoom.py's module
+            # docstring), not here. This floor only needs to keep
+            # fitInView from choking on a literal 0x0 input.
+            pad_x = rect.width() * padding_fraction
+            pad_y = rect.height() * padding_fraction
+            view_rect = rect.adjusted(-pad_x, -pad_y, pad_x, pad_y)
+
+            floor_w = floor_h = 0.0
+            if cached_pw and cached_ph:
+                floor_w = floor_h = 0.02 * max(cached_pw, cached_ph)
+
+            if floor_w and view_rect.width() < floor_w:
+                cx = view_rect.center().x()
+                view_rect.setLeft(cx - floor_w / 2.0)
+                view_rect.setRight(cx + floor_w / 2.0)
+            if floor_h and view_rect.height() < floor_h:
+                cy = view_rect.center().y()
+                view_rect.setTop(cy - floor_h / 2.0)
+                view_rect.setBottom(cy + floor_h / 2.0)
+
+            # 2) The one and only fitInView call. Deliberately no centerOn
+            # here even though fitInView centers internally -- step 5 below
+            # is the single authoritative center call, once everything
+            # (including the clamp/settle-back scale adjustments) is final.
+            self.fitInView(view_rect, QtCore.Qt.KeepAspectRatio)
+
+            # 3) Clamp to the native-resolution cap if fitInView overshot it.
+            if native_hw and native_hw[0] and native_hw[1] and cached_pw:
+                native_h, native_w = native_hw
+                cur = self.transform().m11()
+                screen_px_per_native_px = cur * (cached_pw / float(native_w))
+                if screen_px_per_native_px > max_native_scale:
+                    clamp_factor = max_native_scale / screen_px_per_native_px
+                    self.scale(clamp_factor, clamp_factor)
+
+            # 4) Settle back 10%.
+            self.scale(settle_back, settle_back)
+
+            # 5) Center exactly once, as the final step -- fixes the
+            # jitter/offset from the old fitInView -> centerOn -> scale
+            # ordering, where centering happened BEFORE the trailing scale.
+            self.centerOn(view_rect.center())
+            self.setFocus()
+        except Exception as e:
+            logging.debug(f"[smart_fit_to_scene_rect] failed: {e}")
+
     def _get_image_rect(self):
         """Get the actual image bounding rect in scene coordinates."""
         if self._image is not None and not sip.isdeleted(self._image):
