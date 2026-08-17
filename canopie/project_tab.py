@@ -11359,19 +11359,29 @@ class ProjectTab(QtWidgets.QWidget):
                     logging.debug("edit_image_viewer: cleared _scene_stats_cache after Apply All")
             except Exception:
                 pass
-            # Also invalidate _raw_cache for this file to ensure fresh data on next load
-            try:
-                if filepath and hasattr(self, "_raw_cache") and self._raw_cache:
-                    fp_norm = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
-                    lock = getattr(self, "_raw_cache_lock", None)
-                    if lock:
-                        with lock:
-                            self._raw_cache.pop(fp_norm, None)
-                    else:
-                        self._raw_cache.pop(fp_norm, None)
-                    logging.debug(f"edit_image_viewer: cleared _raw_cache entry for {filepath}")
-            except Exception:
-                pass
+            # _raw_cache is DELIBERATELY NOT dropped here.
+            #
+            # It holds the RAW, unmodified pixels straight off disk. The editor
+            # is non-destructive -- it only ever writes the .ax sidecar, never
+            # the raster -- so those pixels cannot have changed, and re-reading
+            # them buys nothing. (Anything that genuinely rewrites the image on
+            # disk goes through invalidate_caches_for_file, which still clears
+            # this cache.)
+            #
+            # Dropping it made the SECOND editor open pay a full re-read. On a
+            # network-backed project -- this one's rasters live on a Google
+            # Drive File Stream mount, where a single file OPEN costs ~1-1.9s
+            # regardless of size -- _load_raw_image opens the file three times,
+            # so the open->Apply->open-again cycle cost ~3s of pure latency
+            # with nothing to show for it.
+            #
+            # The DERIVED caches above (_export_cache, _scene_stats_cache, and
+            # the .ax-dependent ones) are still cleared, because those DO
+            # depend on what the editor just changed.
+            if filepath:
+                logging.debug(
+                    "edit_image_viewer: keeping _raw_cache for %s (editor writes .ax only)",
+                    filepath)
 
             # ---- CRITICAL: Save editor's mask_polygon settings to .ax file BEFORE refresh ----
             # This ensures load_polygons reads the correct mask settings during polygon reload
