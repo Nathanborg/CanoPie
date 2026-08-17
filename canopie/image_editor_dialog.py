@@ -206,6 +206,24 @@ def shared_hist_edges(real, corrected=None, bins=80):
     return np.linspace(lo, hi, int(bins) + 1)
 
 
+#: `.ax` keys that describe ONE SPECIFIC image and must never be broadcast to
+#: other images by "apply to group" / "apply to all groups".
+#:
+#: `viewer_stretch` holds that image's display mapping (display_mode,
+#: display_band, r_band/g_band/b_band) and its measured intensity bounds
+#: (min_val/max_val, band_mins/band_maxs); `orig_size` is its pixel geometry;
+#: `classification` is a model result keyed to its pixels. Copying any of them
+#: onto a different raster makes that raster's `.ax` describe the wrong image --
+#: which is exactly how "the viewer changed channel order and stopped matching
+#: the .ax files" happened.
+_PER_IMAGE_AX_KEYS = frozenset({
+    "viewer_stretch",
+    "stretch",          # legacy spelling of viewer_stretch
+    "orig_size",
+    "classification",
+})
+
+
 class ImageEditorDialog(QDialog):
     # signal to let parent optionally react when group/all-group mods are saved
     modificationsAppliedToGroup = QtCore.pyqtSignal(str)
@@ -2186,6 +2204,32 @@ class ImageEditorDialog(QDialog):
                          final_mods = base_mods.copy()
                          final_mods["registration"] = {"enabled": False, "error": str(e)}
             
+            # PER-IMAGE STATE MUST NOT TRAVEL (the "channel orders changed"
+            # bug). self.modifications is seeded with the ENTIRE .ax of the
+            # image being edited (see __init__: self.modifications.update(
+            # loaded)), and save_modifications_to_file then persists
+            # dict(self.modifications) unfiltered. In "apply to group" / "apply
+            # to all groups" scope that same dict is written to EVERY target
+            # file -- so the edited image's viewer_stretch (display_mode,
+            # display_band, r_band/g_band/b_band, min_val/max_val, band_mins/
+            # band_maxs), its orig_size and its classification were stamped
+            # onto every other image, destroying each file's own band
+            # selection and making the .ax stop describing its own image.
+            #
+            # These keys describe ONE image and are never a user "edit" the
+            # apply-to-many action is meant to broadcast, so strip them for
+            # every file except the one actually open in the editor. The edited
+            # image itself still gets the full dict.
+            if final_mods:
+                try:
+                    _is_edited = (os.path.normcase(os.path.abspath(fp))
+                                  == os.path.normcase(os.path.abspath(self.image_filepath)))
+                except Exception:
+                    _is_edited = (fp == self.image_filepath)
+                if not _is_edited:
+                    final_mods = {k: v for k, v in final_mods.items()
+                                  if k not in _PER_IMAGE_AX_KEYS}
+
             # Write
             # If strict reference, maybe we force it? No, just write.
             self._write_ax(fp, final_mods, quiet=True)
@@ -3134,6 +3178,9 @@ class ImageEditorDialog(QDialog):
     
     def process_band_expression(self, image, expr, nodata_values=None):
         import logging, numpy as np, re
+        # Cleared per run so a stale failure from an earlier expression is never
+        # reported against a later, successful one.
+        self._last_band_expr_error = None
         try:
             # FIX: Remap band references for 3-channel BGR images
             # Image data is BGR but user sees RGB in display (due to BGR→RGB conversion)
@@ -3200,7 +3247,19 @@ class ImageEditorDialog(QDialog):
 
             return res
         except Exception as e:
-            logging.error(f"Error processing band expression '{expr}': {e}")
+            # DO NOT fail silently. Returning `image` unchanged is
+            # indistinguishable from "the expression ran and did nothing", so a
+            # typo, an out-of-range band, or a disallowed character produced no
+            # band, no error and no visible change -- the reported
+            # "band expression does not correctly append band".
+            #
+            # Record it so the UI layer can surface it, and keep returning the
+            # untouched image so a bad expression still cannot corrupt pixels.
+            logging.error(f"Error processing band expression '{expr}': {e}", exc_info=True)
+            try:
+                self._last_band_expr_error = f"{type(e).__name__}: {e}"
+            except Exception:
+                pass
             return image
 
 
@@ -3542,6 +3601,18 @@ class ImageEditorDialog(QDialog):
         self.band_input.setPlaceholderText("(b1>150) & (b2<200)")
         self.band_input.setMinimumWidth(140)
         
+        # Enter in the field does what the Apply button does. Without this the
+        # field had NO signal connected at all, so typing an expression and
+        # pressing Enter silently did nothing -- and because "+ Append Band"
+        # only enables once the expression has reached self.modifications
+        # (which happens on Apply), the button stayed greyed out too, leaving
+        # no obvious way to run the expression.
+        self.band_input.returnPressed.connect(self.apply_band_expression)
+        # Deliberately NOT wiring textChanged to the append button: appending
+        # takes the LAST APPLIED result, so enabling it on mere typing would
+        # let the user append a band that does not match the text on screen.
+        # Gating it on self.modifications (i.e. post-Apply) is correct.
+
         self.band_apply_button = QtWidgets.QPushButton("Apply")
         self.band_apply_button.setFixedHeight(22)
         self.band_apply_button.clicked.connect(self.apply_band_expression)
@@ -5328,19 +5399,32 @@ class ImageEditorDialog(QDialog):
             logging.warning("Band expression skipped (empty or no image).")
             return
 
-        bands = re.findall(r'b(\d+)', expression)
+        # Case-insensitive: eval_band_expression accepts `B4`, so a scan that
+        # only matched lowercase found NO bands for `B4`, skipped the load and
+        # the range check entirely, and then failed at eval time.
+        bands = re.findall(r'[bB](\d+)', expression)
         unique_bands = sorted(set(bands), key=lambda x: int(x))
 
-        # A preview holds only the display bands; b1..bN needs the full stack.
-        # Load it now, on the first expression that actually requires it.
+        # ALWAYS load the full stack before evaluating an expression.
+        #
+        # The previous `need > loaded` shortcut was wrong on any raster over
+        # _EDITOR_PREVIEW_BYTES (256 MB), where the editor holds only the 3
+        # DISPLAY bands: for `b1+b2`, need=2 and loaded=3, so the full load was
+        # skipped and the expression ran against the 3-band preview. Worse,
+        # because that preview has C == 3, process_band_expression's BGR->RGB
+        # remap fires and swaps b1<->b3 -- so `b1` silently addressed a
+        # different channel here than at export time, where the same expression
+        # runs on the full cube with no remap. Same .ax, two different answers.
+        #
+        # Correctness over speed (explicit product decision): pay the load.
         try:
-            need = max((int(b) for b in unique_bands), default=1)
-            loaded = (self.original_image.shape[2]
-                      if getattr(self.original_image, "ndim", 2) == 3 else 1)
-            if need > loaded and not self.ensure_all_bands_loaded():
+            if not self.ensure_all_bands_loaded():
                 QtWidgets.QMessageBox.warning(
                     self, "Band Expression",
-                    "Could not load all bands for this image.")
+                    "Could not load all bands for this image, so the expression "
+                    "cannot be evaluated against the full band stack.\n\n"
+                    "Evaluating it against the reduced preview would silently "
+                    "use the wrong bands.")
                 return
         except Exception as e:
             logging.debug("Band availability check failed: %s", e)
@@ -5643,7 +5727,13 @@ class ImageEditorDialog(QDialog):
                 ax = {}
 
             # Optional: pass band picks (display_mode, display_band, r/g/b) if renderer expects them
-            st = ax.get("stretch") or {}
+            # Everything that WRITES this state writes "viewer_stretch"
+            # (ProjectTab._render_with_viewer_stretch reads
+            # `ax.get("viewer_stretch") or ax.get("stretch")`). The editor read
+            # only the legacy "stretch" spelling, so on any real project it got
+            # {} and silently fell back to auto/percentile -- never showing the
+            # absolute min/max actually stored in the file.
+            st = ax.get("viewer_stretch") or ax.get("stretch") or {}
             viewer_like.display_mode = st.get("display_mode", "auto")
             viewer_like.display_band = st.get("display_band", None)
             viewer_like.r_band = st.get("r_band", None)
@@ -5668,7 +5758,13 @@ class ImageEditorDialog(QDialog):
             if os.path.exists(ax_path):
                 with open(ax_path, "r", encoding="utf-8") as f:
                     ax = json.load(f) or {}
-            st = ax.get("stretch") or {}
+            # Everything that WRITES this state writes "viewer_stretch"
+            # (ProjectTab._render_with_viewer_stretch reads
+            # `ax.get("viewer_stretch") or ax.get("stretch")`). The editor read
+            # only the legacy "stretch" spelling, so on any real project it got
+            # {} and silently fell back to auto/percentile -- never showing the
+            # absolute min/max actually stored in the file.
+            st = ax.get("viewer_stretch") or ax.get("stretch") or {}
         except Exception:
             st = {}
 
