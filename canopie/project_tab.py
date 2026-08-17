@@ -12107,6 +12107,7 @@ class ProjectTab(QtWidgets.QWidget):
         # Just iterate - process_polygon's caching handles the optimization:
         # - First polygon: loads image, computes scene stats, caches everything
         # - Subsequent polygons: cache hits for image and scene stats
+        _failed = 0
         for group_name, polygon_dict in polygon_list:
             try:
                 row, mod_polygon = self.process_polygon(
@@ -12116,8 +12117,19 @@ class ProjectTab(QtWidgets.QWidget):
                 all_data_rows.extend(row)
                 all_modified_polygons.extend(mod_polygon)
             except Exception as e:
+                _failed += 1
                 logging.error(f"[_process_file_batch] Error processing polygon '{group_name}': {e}")
-        
+
+        # A polygon that raises here contributes NO rows to the CSV, and this
+        # is the only place that knows it happened -- the per-polygon except
+        # above is inside the loop, so callers just see a shorter list and a
+        # successful return. Without this summary, "my export is missing rows"
+        # has no signal anywhere above DEBUG-level log noise.
+        if _failed:
+            logging.warning(
+                "[_process_file_batch] %s: %d of %d polygon(s) FAILED and produced no CSV rows",
+                os.path.basename(filepath), _failed, len(polygon_list))
+
         return all_data_rows, all_modified_polygons
     def invalidate_caches_for_file(self, filepath):
         """
@@ -15571,39 +15583,10 @@ class ProjectTab(QtWidgets.QWidget):
                 return None
             return None
 
-        try:
-            import tempfile
-            # Flush any pending polygon saves so disk snapshot reflects current UI state.
-            try:
-                if hasattr(self, "_flush_dirty_polygons"):
-                    self._flush_dirty_polygons()
-            except Exception:
-                pass
-
-            snapshot_dir = tempfile.mkdtemp(prefix="canopie_csv_export_")
-            snapshot_json_path = os.path.join(snapshot_dir, "polygons_snapshot.json")
-
-            snap_jobs = []
-            for (group_name, filepath, polygon_dict) in polygons_to_process:
-                pd_disk = _load_polygon_from_disk(group_name, filepath)
-                if pd_disk is None:
-                    # Fall back to a fully JSON-safe deep copy of in-memory dict
-                    pd_disk = _jsonify(polygon_dict if isinstance(polygon_dict, dict) else {})
-                    if isinstance(pd_disk, dict) and "name" not in pd_disk:
-                        pd_disk["name"] = group_name
-                snap_jobs.append([group_name, filepath, pd_disk])
-
-            import json  # FIX: Ensure json is available locally to avoid UnboundLocalError
-            with open(snapshot_json_path, "w", encoding="utf-8") as f:
-                json.dump(snap_jobs, f, ensure_ascii=False)
-
-            # Replace in-memory job list with the snapshotted (Qt-free) dicts for foreground mode.
-            polygons_to_process = [(g, fp, pd) for (g, fp, pd) in snap_jobs]
-
-        except Exception as e:
-            logging.warning(f"[CSV export] Failed to create disk snapshot (continuing with in-memory polygons): {e}")
-            snapshot_dir = None
-            snapshot_json_path = None
+        # NOTE: the snapshot itself is built further down, AFTER the processing
+        # mode dialog -- see "DISK-SNAPSHOT (built after the mode dialog)".
+        # It is O(number of polygons) synchronous disk reads, so running it
+        # here made the app look hung before any window appeared.
 
         data_rows = []
         modified_polygons = []
@@ -15691,7 +15674,95 @@ class ProjectTab(QtWidgets.QWidget):
                 # Background exports always run in safe file-batched sequential.
                 processing_mode, n_workers = ("multiprocessing", 1)
             logging.info(f"[CSV export] Selected: {processing_mode} with {n_workers} workers, background={run_background}")
-        
+
+        # -------------------------------------------------------------
+        # DISK-SNAPSHOT (built after the mode dialog)
+        # -------------------------------------------------------------
+        # Deliberately runs HERE, not before the dialog. This loop performs
+        # roughly ONE DISK READ PER POLYGON: _load_polygon_from_disk opens the
+        # sidecar when it exists, and otherwise _jsonify() walks the record --
+        # and for a LazyPolygonRecord, .items() materialises it, which opens
+        # that polygon's sidecar anyway (see polygon_lod.LazyPolygonRecord).
+        # On a ~5,000-polygon project that is thousands of synchronous reads on
+        # the GUI thread. Running it before the mode dialog meant the user
+        # clicked Export and got a frozen, windowless app for a long time with
+        # nothing to look at and no way out.
+        #
+        # Same work, same result -- but now it happens after the user has
+        # answered the dialog, and it reports progress and can be cancelled.
+        _snap_total = len(polygons_to_process)
+        snap_progress = QtWidgets.QProgressDialog(
+            "Preparing polygons for export…", "Cancel", 0, max(1, _snap_total), self)
+        snap_progress.setWindowTitle("Export")
+        snap_progress.setWindowModality(QtCore.Qt.WindowModal)
+        # Only materialises if the work actually takes a moment, so small
+        # projects never see a dialog flash.
+        snap_progress.setMinimumDuration(300)
+        snap_progress.setValue(0)
+        try:
+            import tempfile
+            # Flush any pending polygon saves so disk snapshot reflects current UI state.
+            try:
+                if hasattr(self, "_flush_dirty_polygons"):
+                    self._flush_dirty_polygons()
+            except Exception:
+                pass
+
+            snapshot_dir = tempfile.mkdtemp(prefix="canopie_csv_export_")
+            snapshot_json_path = os.path.join(snapshot_dir, "polygons_snapshot.json")
+
+            snap_jobs = []
+            _snap_cancelled = False
+            for _snap_i, (group_name, filepath, polygon_dict) in enumerate(polygons_to_process):
+                # Cheap cancel/repaint check -- every polygon would make the
+                # progress dialog itself the bottleneck.
+                if (_snap_i % 50) == 0:
+                    if snap_progress.wasCanceled():
+                        _snap_cancelled = True
+                        break
+                    snap_progress.setValue(_snap_i)
+                    QtWidgets.QApplication.processEvents()
+
+                pd_disk = _load_polygon_from_disk(group_name, filepath)
+                if pd_disk is None:
+                    # Fall back to a fully JSON-safe deep copy of in-memory dict
+                    pd_disk = _jsonify(polygon_dict if isinstance(polygon_dict, dict) else {})
+                    if isinstance(pd_disk, dict) and "name" not in pd_disk:
+                        pd_disk["name"] = group_name
+                snap_jobs.append([group_name, filepath, pd_disk])
+
+            if _snap_cancelled:
+                snap_progress.close()
+                try:
+                    import shutil
+                    if snapshot_dir:
+                        shutil.rmtree(snapshot_dir, ignore_errors=True)
+                except Exception:
+                    pass
+                logging.info("[CSV export] Cancelled by user during polygon snapshot")
+                return None
+
+            snap_progress.setLabelText("Writing export job list…")
+            snap_progress.setValue(_snap_total)
+            QtWidgets.QApplication.processEvents()
+
+            import json  # FIX: Ensure json is available locally to avoid UnboundLocalError
+            with open(snapshot_json_path, "w", encoding="utf-8") as f:
+                json.dump(snap_jobs, f, ensure_ascii=False)
+
+            # Replace in-memory job list with the snapshotted (Qt-free) dicts for foreground mode.
+            polygons_to_process = [(g, fp, pd) for (g, fp, pd) in snap_jobs]
+
+        except Exception as e:
+            logging.warning(f"[CSV export] Failed to create disk snapshot (continuing with in-memory polygons): {e}")
+            snapshot_dir = None
+            snapshot_json_path = None
+        finally:
+            try:
+                snap_progress.close()
+            except Exception:
+                pass
+
         # ============ BACKGROUND EXPORT ============
         if run_background:
             # Launch background worker
@@ -16061,10 +16132,23 @@ class ProjectTab(QtWidgets.QWidget):
                             worker_filepath, worker_poly_list,
                             exif_data_dict, exif_tags, model_loaded, opts
                         )
-                    except MemoryError as e:
-                        logging.error(f"[Thread worker] MemoryError for {os.path.basename(worker_filepath)}: {e}")
-                    except Exception as e:
-                        logging.error(f"[Thread worker] Error for {os.path.basename(worker_filepath)}: {e}")
+                    except MemoryError:
+                        # SILENT DATA LOSS GUARD. Swallowing this used to mean
+                        # the file contributed ZERO rows while the export still
+                        # reported success -- the threaded CSV came out smaller
+                        # than the file-batched one with nothing to explain it.
+                        # Re-raise so the consumer counts it in `errors` exactly
+                        # like every other mode does (multiprocessing and the
+                        # sequential fallback both do `errors += 1` on failure).
+                        logging.error(
+                            "[Thread worker] MemoryError for %s -- re-raising so it is counted",
+                            os.path.basename(worker_filepath), exc_info=True)
+                        raise
+                    except Exception:
+                        logging.error(
+                            "[Thread worker] Error for %s -- re-raising so it is counted",
+                            os.path.basename(worker_filepath), exc_info=True)
+                        raise
                     finally:
                         # Clear this file's cache entry immediately after processing
                         try:
