@@ -15,6 +15,7 @@ import threading
 import pickle
 import concurrent.futures
 import copy
+import itertools
 
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
@@ -318,16 +319,21 @@ class _ThumbSource:
 
 
 def _bgr_from_channels(chans, scale=None):
-    """List of 2D bands -> 8-bit image, EXACTLY as _as_8bit_bgr would.
+    """List of 2D bands -> 8-bit BGR image, for cv2 drawing/writing.
 
-    That function's branches are mirrored here rather than tidied, because a
-    crop taken this way has to equal the same crop taken out of its whole-frame
-    output. In particular it has an asymmetry worth stating plainly:
+    Only ever called from _ThumbSource.crop, whose `chans` come from
+    LazyChannels.read_window -- and a LazyChannels only ever wraps
+    raster_reader's own tiled reader, never cv2 (see
+    ProjectTab._try_lazy_export_channels: "this path only ever reads TIFFs
+    via raster_reader's own tiled reader, never cv2, so it is never BGR").
+    So `chans` here are ALWAYS in native (R,G,B,...) file order -- there is no
+    provenance to branch on, unlike _as_8bit_bgr's eager callers.
 
-      * uint8 input is returned UNCHANGED, keeping its native (R,G,B,...)
-        channel order and channel COUNT -- it never reorders to BGR;
-      * anything else is min/max normalised per channel and the first three
-        channels are then reversed into BGR.
+    Both dtype branches therefore reverse the first three channels to BGR.
+    The uint8 branch used to pass them through unreversed on the theory that
+    "uint8 == already BGR" (mirroring _as_8bit_bgr's old, same-flawed
+    assumption) -- but dtype says nothing about channel order, and doing that
+    swapped Red and Blue for every 8-bit lazily-read (large TIFF/COG) source.
 
     `scale` supplies per-channel (lo, hi) so a crop is stretched against the
     whole frame instead of against itself. The arithmetic reproduces
@@ -337,10 +343,13 @@ def _bgr_from_channels(chans, scale=None):
     if not chans:
         return None
 
-    # --- uint8 fast path: _as_8bit_bgr returns `v` untouched here ------------
+    # --- uint8 fast path -----------------------------------------------
     if all(getattr(c, "dtype", None) == np.uint8 for c in chans):
         if len(chans) == 1:
             return cv2.cvtColor(chans[0], cv2.COLOR_GRAY2BGR)
+        if len(chans) >= 3:
+            idx = [2, 1, 0] + list(range(3, len(chans)))
+            return np.dstack([chans[i] for i in idx])
         return np.dstack(chans)
 
     out = []
@@ -456,7 +465,36 @@ def _tiles_fully_inside(pts_img, gx, gy, gw, gh, tile):
     return block.all(axis=(1, 3))
 
 
-def _polygon_tile_yield(pts_img, tile, zoom, W, H, inside_only):
+def _tile_na_coverage(pts_img, gx, gy, gw, gh, tile):
+    """Per-tile 'any overlap' grid + the raster mask backing it (Allow NA).
+
+    Unlike _tiles_fully_inside (every pixel must be interior), a tile is kept
+    here as soon as ANY pixel of it is -- the point of Allow NA is to keep
+    partially-covered tiles instead of dropping them, masking the outside
+    part instead. Tiles with NO overlap at all are still dropped: an all-NA
+    tile carries no training signal.
+
+    Returns (keep, raster): `keep` is a (rows, cols) bool grid; `raster` is
+    the full (gh, gw) uint8 polygon fill (0/255) that _render_thumbnail_outputs
+    slices tile-by-tile into the companion mask files -- one fillPoly for the
+    whole grid, not one per tile, same idiom as _tiles_fully_inside. The fill
+    value is 255 so `raster` doubles as the mask pixel values directly.
+    """
+    import numpy as np, cv2
+    tile = max(1, int(tile))
+    rows, cols = int(gh) // tile, int(gw) // tile
+    raster = np.zeros((int(gh), int(gw)), dtype=np.uint8)
+    if pts_img and rows > 0 and cols > 0:
+        ring = np.array([[[int(round(px - gx)), int(round(py - gy))]
+                          for px, py in pts_img]], dtype=np.int32)
+        cv2.fillPoly(raster, ring, 255)
+    if rows <= 0 or cols <= 0:
+        return np.zeros((max(0, rows), max(0, cols)), dtype=bool), raster
+    block = (raster[:rows * tile, :cols * tile] > 0).reshape(rows, tile, cols, tile)
+    return block.any(axis=(1, 3)), raster
+
+
+def _polygon_tile_yield(pts_img, tile, zoom, W, H, inside_only, allow_na=False):
     """(kept, grid_total) tiles a single polygon would produce.
 
     Mirrors what _render_thumbnail_outputs actually does -- same bounding rect,
@@ -479,12 +517,15 @@ def _polygon_tile_yield(pts_img, tile, zoom, W, H, inside_only):
 
     gx, gy, gw, gh = _grow_to_tile_grid(x0, y0, new_w, new_h, tile, W, H)
     total = (gh // max(1, int(tile))) * (gw // max(1, int(tile)))
-    if not inside_only:
-        return total, total
-    return int(_tiles_fully_inside(pts_img, gx, gy, gw, gh, tile).sum()), total
+    if inside_only:
+        return int(_tiles_fully_inside(pts_img, gx, gy, gw, gh, tile).sum()), total
+    if allow_na:
+        keep, _ = _tile_na_coverage(pts_img, gx, gy, gw, gh, tile)
+        return int(keep.sum()), total
+    return total, total
 
 
-def estimate_tile_yield(polys, tile, zoom, inside_only, sample_cap=200):
+def estimate_tile_yield(polys, tile, zoom, inside_only, allow_na=False, sample_cap=200):
     """Estimate the tile count for a whole run, for the dialog's live readout.
 
     `polys` is [(points, W, H), ...]. Only the first `sample_cap` are measured
@@ -507,7 +548,8 @@ def estimate_tile_yield(polys, tile, zoom, inside_only, sample_cap=200):
     kept = grid = empty = 0
     for pts, W, H in sample:
         k, g = _polygon_tile_yield(pts, tile, zoom,
-                                   W or 10 ** 7, H or 10 ** 7, inside_only)
+                                   W or 10 ** 7, H or 10 ** 7, inside_only,
+                                   allow_na)
         kept += k
         grid += g
         if k == 0:
@@ -3012,7 +3054,22 @@ class MachineLearningManager(QtWidgets.QDialog):
             if fn is None:
                 logging.warning("Histogram matching not applied (canonical implementation unavailable).")
                 return img
+            # Histogram matching pairs reference bands POSITIONALLY, so the
+            # canonical routine needs to know which order THESE pixels are in.
+            # Without it, a reference measured on cv2-loaded BGR pixels applied
+            # to an RGB-ordered stack trains the model on Red/Blue-transposed
+            # features -- silently, and differently from what the CSV export and
+            # the viewer would show for the same .ax.
+            _src_order = str(getattr(getattr(self, "parent_tab", None),
+                                     "_last_export_channel_order", "") or "").lower()
             try:
+                return fn(img, mods,
+                          nodata_values=nodata_vals,
+                          mask_polygon_points=poly_points_list,
+                          mask_polygon_enabled=poly_enabled,
+                          src_channel_order=(_src_order or None))
+            except TypeError:
+                # Older signature without src_channel_order.
                 return fn(img, mods,
                           nodata_values=nodata_vals,
                           mask_polygon_points=poly_points_list,
@@ -4659,8 +4716,36 @@ class MachineLearningManager(QtWidgets.QDialog):
         `except` branch's np.asarray fallback asks for exactly the same thing,
         so it cannot rescue itself). Callers that only need crops must use
         _ThumbSource, which reads one polygon's window at a time.
+
+        CHANNEL ORDER: whether the first 3 channels need reversing to become
+        BGR depends on how `arr` was actually loaded -- the cv2.imread
+        fallback in ProjectTab._get_export_image's _read_raw_any is genuinely
+        BGR, but tifffile/raster_reader (the common case -- TIFFs are the
+        overwhelming majority of files this app handles) hand back native
+        (R,G,B,...) file order. That provenance is tracked on the owning
+        ProjectTab as `_last_export_channel_order`, exactly what
+        _channels_in_export_order already keys off for every other export
+        path. This function used to instead branch on dtype (uint8 -> pass
+        through untouched, else -> unconditionally reverse), which has no
+        relationship to channel order: it swapped Red and Blue for every
+        plain JPEG/PNG thumbnail source (cv2-loaded, genuinely BGR, then
+        wrongly left alone) while getting TIFFs right only by the accident of
+        them usually being read as float first (see _apply_ax_to_raw's
+        unconditional float32 upcast) and hitting the reversing branch.
+
+        Default when provenance is unavailable (no parent_tab, e.g. this
+        function called directly in isolation): assume NATIVE order, not BGR.
+        This matches _bgr_from_channels' lazy sibling, which is always native
+        by construction with no provenance to check -- keeping the two in
+        agreement is what test_lazy_thumbnail_crops_match_the_eager_whole_frame_crop
+        pins. In real usage this default never actually applies: the sole
+        caller (_ThumbSource, from generate_thumbnails) always runs right
+        after _get_export_image, which always sets the flag first.
         """
         import numpy as np, cv2
+        _order = str(getattr(getattr(self, "parent_tab", None),
+                             "_last_export_channel_order", "rgb") or "rgb").lower()
+        is_bgr = _order == "bgr"
         if arr is None:
             return None
         if hasattr(arr, "read_window"):
@@ -4699,8 +4784,15 @@ class MachineLearningManager(QtWidgets.QDialog):
             return None
 
         if v.dtype == np.uint8:
-            # If 2D, promote to BGR for drawing
-            return cv2.cvtColor(v, cv2.COLOR_GRAY2BGR) if v.ndim == 2 else v
+            if v.ndim == 2:
+                # 2D has no channel order to get wrong -- promote to BGR for drawing.
+                return cv2.cvtColor(v, cv2.COLOR_GRAY2BGR)
+            if is_bgr or v.shape[2] < 3:
+                return v
+            # Native R,G,B(,extras) -> B,G,R for OpenCV; extra bands beyond 3
+            # are carried through unchanged, same as _channels_in_export_order.
+            idx = [2, 1, 0] + list(range(3, v.shape[2]))
+            return np.ascontiguousarray(v[:, :, idx])
 
         if v.ndim == 2:
             v = cv2.normalize(v.astype(np.float32), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
@@ -4711,9 +4803,10 @@ class MachineLearningManager(QtWidgets.QDialog):
                 ch = v[:, :, c]
                 ch8 = cv2.normalize(ch.astype(np.float32), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
                 chans.append(ch8)
-            # Assume v is in “export order”: R,G,B,(extras...) -> convert to BGR for OpenCV drawing
             if len(chans) >= 3:
-                vis = cv2.merge([chans[2], chans[1], chans[0]])  # B,G,R
+                # Native R,G,B -> B,G,R for OpenCV; already-BGR input (is_bgr)
+                # needs no reorder -- just keep the first 3 as given.
+                vis = cv2.merge(chans[:3]) if is_bgr else cv2.merge([chans[2], chans[1], chans[0]])
             else:
                 vis = cv2.merge(chans)
             # If <3 channels, OpenCV still handles 1/2 channels poorly for color; ensure 3 ch
@@ -4827,6 +4920,12 @@ class MachineLearningManager(QtWidgets.QDialog):
         draw_outline = bool(opts.get("draw_outline", True))
         tile_enabled = bool(opts.get("tile_enabled", False))
         tile_size = int(opts.get("tile_size", 256) or 256)
+        tiles_inside_only = bool(opts.get("tiles_inside_only", False))
+        # A fully-inside tile has nothing to mask; if both flags are somehow
+        # set (the dialog itself keeps them mutually exclusive, but this is
+        # also called directly by tests/scripts), the stricter guarantee wins
+        # and no mask is written.
+        allow_na = bool(opts.get("allow_na", False)) and not tiles_inside_only
 
         def _draw(canvas, ox, oy):
             if not draw_outline:
@@ -4867,15 +4966,42 @@ class MachineLearningManager(QtWidgets.QDialog):
         # which is the point of the option -- the dialog's estimate says how
         # many polygons that silences before the run starts.
         keep = None
-        if opts.get("tiles_inside_only", False):
+        if tiles_inside_only:
             keep = _tiles_fully_inside(pts_img, gx, gy, gw, gh, tile_size)
 
+        # Allow NA is the opposite answer to the same question: keep a tile as
+        # soon as it touches the polygon at all (dropping only the tiles with
+        # ZERO overlap), and instead of dropping the rest, ship a same-named
+        # `_mask.png` next to it (255 = inside the polygon, 0 = NA) so a
+        # training loader can mask the loss / ignore those pixels. The tile
+        # IMAGE itself is left byte-for-byte as read -- there is no way to
+        # represent NA in an 8-bit BGR JPEG pixel, and baking a sentinel color
+        # in would get smeared by JPEG's own lossy compression right at the
+        # polygon boundary, which is exactly where it would need to be exact.
+        na_keep = na_raster = None
+        if allow_na:
+            na_keep, na_raster = _tile_na_coverage(pts_img, gx, gy, gw, gh, tile_size)
+
+        crop_tiles = _tile_grid(crop, tile_size)
+        # na_raster is built at exactly (gh, gw) -- the same source _tile_grid
+        # slices `crop` from -- so tiling it with the identical tile_size
+        # yields tiles in the same row-major (r, c) order and count; zip keeps
+        # the two in lockstep without re-deriving _tile_grid's own padding.
+        mask_tiles = (_tile_grid(na_raster, tile_size) if na_raster is not None
+                      else itertools.repeat((None, None, None)))
+
         out = []
-        for r, c, tile in _tile_grid(crop, tile_size):
+        for (r, c, tile), (mr, mc, mtile) in zip(crop_tiles, mask_tiles):
             if keep is not None:
                 if r >= keep.shape[0] or c >= keep.shape[1] or not keep[r, c]:
                     continue
-            out.append((f"{root}_r{r:02d}c{c:02d}{ext}", tile))
+            if na_keep is not None:
+                if r >= na_keep.shape[0] or c >= na_keep.shape[1] or not na_keep[r, c]:
+                    continue
+            tile_root = f"{root}_r{r:02d}c{c:02d}"
+            out.append((f"{tile_root}{ext}", tile))
+            if mtile is not None:
+                out.append((f"{tile_root}_mask.png", mtile))
         return out
 
     def generate_thumbnails(self):

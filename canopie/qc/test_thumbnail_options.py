@@ -64,6 +64,7 @@ DEFAULT_OPTS = {
     'tile_enabled': False,
     'tile_size': 256,
     'tiles_inside_only': False,
+    'allow_na': False,
 }
 
 
@@ -359,6 +360,132 @@ def test_inside_only_off_is_unchanged(qapp):
 
 
 # ---------------------------------------------------------------------------
+# "Allow NA"
+# ---------------------------------------------------------------------------
+# A diamond (not a square) inscribed in its own 400x400 bbox: unlike a square
+# filling its bbox corner to corner, this shape leaves the four bbox corners
+# genuinely uncovered regardless of how the grid growth margin falls, so one
+# fixture reliably has all three tile kinds Allow NA has to tell apart: fully
+# inside (near the centre), partially overlapping (along the diagonal edges),
+# and zero overlap (the bbox corners).
+_NA_PTS = [(500, 300), (700, 500), (500, 700), (300, 500)]
+_NA_ARGS = (300, 300, 400, 400)  # x0, y0, new_w, new_h
+
+
+def test_tile_na_coverage_any_vs_full(qapp):
+    """The core geometric contract: kept iff ANY pixel is interior, and the
+    raster handed back is exactly the mask _render_thumbnail_outputs writes."""
+    from ..machine_learning_manager import (_grow_to_tile_grid, _tile_na_coverage,
+                                             _tiles_fully_inside)
+    import cv2
+
+    gx, gy, gw, gh = _grow_to_tile_grid(*_NA_ARGS, 64, 1024, 1024)
+    keep, raster = _tile_na_coverage(_NA_PTS, gx, gy, gw, gh, 64)
+    full = _tiles_fully_inside(_NA_PTS, gx, gy, gw, gh, 64)
+
+    mask = np.zeros((gh, gw), np.uint8)
+    cv2.fillPoly(mask, np.array([[[px - gx, py - gy] for px, py in _NA_PTS]], np.int32), 255)
+    assert np.array_equal(raster, mask), "the returned raster is not the polygon fill"
+
+    for r in range(keep.shape[0]):
+        for c in range(keep.shape[1]):
+            block = mask[r * 64:(r + 1) * 64, c * 64:(c + 1) * 64]
+            assert keep[r, c] == bool((block > 0).any())
+    assert keep.any() and not keep.all(), "fixture must have both kept and dropped tiles"
+    assert full.any() and not full.all(), "fixture must have both full and partial tiles"
+    assert bool((keep & ~full).any()), (
+        "fixture has no tile that is partially-but-not-fully covered -- Allow NA "
+        "and inside-only would be indistinguishable on it")
+    assert np.array_equal(keep & full, full), "every fully-inside tile must also count as 'any'"
+
+
+def test_allow_na_keeps_partial_tiles_with_a_companion_mask(qapp):
+    img = _scene(1024, 1024)
+    m = _mlm()
+    args = (_FakeSrc(img), _NA_PTS, *_NA_ARGS, img.shape[1], img.shape[0], COLOR)
+
+    allt = m._render_thumbnail_outputs(*args, _opts(tile_enabled=True, tile_size=64), "a.jpg")
+    na = m._render_thumbnail_outputs(
+        *args, _opts(tile_enabled=True, tile_size=64, allow_na=True), "a.jpg")
+
+    by_name = dict(na)
+    tile_names = {n for n in by_name if not n.endswith("_mask.png")}
+    mask_names = {n for n in by_name if n.endswith("_mask.png")}
+    assert tile_names and mask_names, "expected both kept tiles and masks"
+    assert {n[:-len(".jpg")] for n in tile_names} == {
+        n[:-len("_mask.png")] for n in mask_names}, (
+        "every kept tile must have exactly one same-named mask, and vice versa")
+
+    names_all = {n for n, _ in allt}
+    assert tile_names < names_all, (
+        "Allow NA did not drop the zero-overlap tiles, or invented names outside the grid")
+
+    # Kept tile PIXELS are untouched -- identical to the unfiltered render of
+    # the same cell. Allow NA's whole point is that the image itself does not
+    # change; only the companion mask carries the NA information.
+    by_all = dict(allt)
+    for n in tile_names:
+        assert np.array_equal(by_name[n], by_all[n]), (
+            f"tile {n} pixels changed under Allow NA -- they must be left as read")
+
+    # Masks are single-channel uint8 with only 0/255 values, matching the
+    # documented convention.
+    for n in mask_names:
+        m_arr = by_name[n]
+        assert m_arr.ndim == 2 and m_arr.dtype == np.uint8
+        assert set(np.unique(m_arr).tolist()) <= {0, 255}
+
+
+def test_allow_na_drops_zero_overlap_tiles(qapp):
+    """A tile with no polygon pixels at all carries no signal and is dropped,
+    same spirit as inside-only dropping tiles that don't fully qualify."""
+    img = _scene(1024, 1024)
+    m = _mlm()
+    out = m._render_thumbnail_outputs(
+        _FakeSrc(img), _NA_PTS, *_NA_ARGS, img.shape[1], img.shape[0], COLOR,
+        _opts(tile_enabled=True, tile_size=64, allow_na=True), "a.jpg")
+    tile_names = {n for n, _ in out if not n.endswith("_mask.png")}
+
+    grid_all = m._render_thumbnail_outputs(
+        _FakeSrc(img), _NA_PTS, *_NA_ARGS, img.shape[1], img.shape[0], COLOR,
+        _opts(tile_enabled=True, tile_size=64), "a.jpg")
+    assert len(tile_names) < len(grid_all), (
+        "Allow NA kept every grid tile; the corner tiles with zero polygon "
+        "overlap should have been dropped")
+
+
+def test_allow_na_off_is_unchanged(qapp):
+    """The new flag must not disturb the existing (unfiltered) tiled path."""
+    img = _scene(1024, 1024)
+    m = _mlm()
+    args = (_FakeSrc(img), PTS, 100, 100, 300, 300, img.shape[1], img.shape[0], COLOR)
+    a = m._render_thumbnail_outputs(*args, _opts(tile_enabled=True, tile_size=128), "a.jpg")
+    b = m._render_thumbnail_outputs(
+        *args, _opts(tile_enabled=True, tile_size=128, allow_na=False), "a.jpg")
+    assert [n for n, _ in a] == [n for n, _ in b]
+    assert all(np.array_equal(x, y) for (_n, x), (_m2, y) in zip(a, b))
+
+
+def test_inside_only_takes_precedence_over_allow_na(qapp):
+    """If both flags are set (the dialog itself won't do this, but the
+    function is called directly elsewhere), the stricter guarantee wins and
+    no mask is written -- a fully-inside tile has nothing to mask anyway."""
+    img = _scene(1024, 1024)
+    m = _mlm()
+    both = m._render_thumbnail_outputs(
+        _FakeSrc(img), _NA_PTS, *_NA_ARGS, img.shape[1], img.shape[0], COLOR,
+        _opts(tile_enabled=True, tile_size=64, tiles_inside_only=True, allow_na=True),
+        "a.jpg")
+    inside_only = m._render_thumbnail_outputs(
+        _FakeSrc(img), _NA_PTS, *_NA_ARGS, img.shape[1], img.shape[0], COLOR,
+        _opts(tile_enabled=True, tile_size=64, tiles_inside_only=True), "a.jpg")
+
+    assert not any(n.endswith("_mask.png") for n, _ in both), (
+        "inside-only + allow_na must not emit mask files")
+    assert [n for n, _ in both] == [n for n, _ in inside_only]
+
+
+# ---------------------------------------------------------------------------
 # the live estimate
 # ---------------------------------------------------------------------------
 def _bbox_args(pts, zoom, W, H):
@@ -435,6 +562,23 @@ def test_estimate_scales_from_a_sample(qapp):
         "identical polygons must extrapolate exactly")
 
 
+def test_estimate_allow_na_between_inside_only_and_grid_total(qapp):
+    """'any overlap' must keep at least as much as 'full coverage' and at
+    most the whole grid, on a fixture that actually has all three tile kinds."""
+    from ..machine_learning_manager import estimate_tile_yield
+    polys = [(_NA_PTS, 1024, 1024)]
+
+    grid = estimate_tile_yield(polys, 64, 1.0, False, sample_cap=None)
+    inside = estimate_tile_yield(polys, 64, 1.0, True, sample_cap=None)
+    na = estimate_tile_yield(polys, 64, 1.0, False, allow_na=True, sample_cap=None)
+
+    assert inside['tiles'] <= na['tiles'] <= grid['tiles']
+    assert inside['tiles'] < na['tiles'], (
+        "fixture must have a tile that is partial but not fully inside")
+    assert na['tiles'] < grid['tiles'], (
+        "fixture must have a tile with zero overlap for allow_na to drop")
+
+
 def test_dialog_shows_a_live_estimate_that_moves_with_tile_size(qapp):
     from ..thumbnail_options_dialog import ThumbnailOptionsDialog
     pts = [(1000, 1000), (1400, 1000), (1400, 1400), (1000, 1400)]
@@ -465,6 +609,33 @@ def test_inside_only_defaults_off_and_needs_tiling(qapp):
         "the inside-only box is usable while tiling is off, where it does nothing")
     d.tile_cb.setChecked(True)
     assert d.inside_cb.isEnabled() is True
+
+
+def test_allow_na_defaults_off_and_needs_tiling(qapp):
+    from ..thumbnail_options_dialog import ThumbnailOptionsDialog
+    d = ThumbnailOptionsDialog()
+    assert d.get_options()['allow_na'] is False
+    assert d.allow_na_cb.isEnabled() is False
+    d.tile_cb.setChecked(True)
+    assert d.allow_na_cb.isEnabled() is True
+
+
+def test_dialog_inside_only_and_allow_na_are_mutually_exclusive(qapp):
+    from ..thumbnail_options_dialog import ThumbnailOptionsDialog
+    d = ThumbnailOptionsDialog()
+    d.tile_cb.setChecked(True)
+
+    d.inside_cb.setChecked(True)
+    opts = d.get_options()
+    assert opts['tiles_inside_only'] is True and opts['allow_na'] is False
+    d.allow_na_cb.setChecked(True)
+    assert d.inside_cb.isChecked() is False, "checking Allow NA must turn inside-only off"
+    assert d.get_options()['allow_na'] is True
+
+    d.inside_cb.setChecked(True)
+    assert d.allow_na_cb.isChecked() is False, "checking inside-only must turn Allow NA off"
+    d.update_estimate()
+    assert "companion mask" not in d.estimate_lbl.text()
 
 
 def test_dialog_works_without_polygons(qapp):

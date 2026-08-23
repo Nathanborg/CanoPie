@@ -279,6 +279,26 @@ class ExportWorker(QtCore.QThread):
         # IMPORTANT: mark export active so ALL mapping code stays offline-only.
         self._set_exporting_flag(True)
 
+        # Reset classification-error tracking for THIS run (see
+        # _record_rf_prediction_error) so a previous export's failures don't
+        # leak into this one's completion message.
+        try:
+            self.project_tab._rf_export_error_count = 0
+            self.project_tab._rf_export_error_samples = []
+        except Exception:
+            pass
+
+        # Same, for _apply_ax_to_raw's .ax-replay appended-band failures (see
+        # _record_appended_band_error) -- a classification/boolean/band-
+        # expression band appended in the editor silently missing from this
+        # export's feature columns, most often because no sklearn model is
+        # loaded in THIS session.
+        try:
+            self.project_tab._appended_band_error_count = 0
+            self.project_tab._appended_band_error_samples = []
+        except Exception:
+            pass
+
         def _load_snapshot_jobs():
             if not self.snapshot_json_path:
                 return None
@@ -513,8 +533,39 @@ class ExportWorker(QtCore.QThread):
                     shp_note = f"; shapefile FAILED: {e}"
                     logging.error("[ExportWorker] Shapefile export failed: %s", e, exc_info=True)
 
+            # Surface classification prediction failures that process_polygon
+            # swallows internally (see _record_rf_prediction_error) -- these
+            # never bump `errors` above, since process_polygon catches them
+            # and keeps writing the row (just without "Class X %" values), so
+            # without this the completion message says "(0 errors)" even when
+            # every single polygon's classification silently failed.
+            rf_note = ""
+            rf_err_count = getattr(self.project_tab, "_rf_export_error_count", 0)
+            if rf_err_count:
+                rf_samples = getattr(self.project_tab, "_rf_export_error_samples", []) or []
+                first = rf_samples[0] if rf_samples else "see log"
+                rf_note = (f"; WARNING: classification failed on {rf_err_count} polygon(s) "
+                           f"-- 'Class X %' columns are blank for those rows. First error: {first}")
+                logging.warning("[ExportWorker] %d polygon(s) had classification prediction "
+                                 "failures; samples: %s", rf_err_count, rf_samples)
+
+            # Same idea for _apply_ax_to_raw's .ax-replay appended-band
+            # failures (see _record_appended_band_error) -- a classification/
+            # boolean/band-expression band appended in the editor is a
+            # feature column here too, and silently missing it never bumps
+            # `errors` either.
+            ab_note = ""
+            ab_err_count = getattr(self.project_tab, "_appended_band_error_count", 0)
+            if ab_err_count:
+                ab_samples = getattr(self.project_tab, "_appended_band_error_samples", []) or []
+                ab_first = ab_samples[0] if ab_samples else "see log"
+                ab_note = (f"; WARNING: {ab_err_count} appended band(s) could not be regenerated "
+                           f"-- those feature columns are missing. First error: {ab_first}")
+                logging.warning("[ExportWorker] %d appended band(s) failed to regenerate; "
+                                 "samples: %s", ab_err_count, ab_samples)
+
             self.finished.emit(self.output_path, True,
-                               f"Exported {len(all_keys)} columns ({errors} errors){shp_note}")
+                               f"Exported {len(all_keys)} columns ({errors} errors){rf_note}{ab_note}{shp_note}")
 
         except Exception as e:
             self.finished.emit(self.output_path, False, str(e))
@@ -1027,72 +1078,139 @@ class ProjectImagesExportWorker(QtCore.QThread):
     """Background worker for exporting project images with .ax transformations."""
     progress = QtCore.pyqtSignal(int, int, str)  # current, total, message
     finished = QtCore.pyqtSignal(str, bool, str)  # output_path, success, error_message
-    
-    def __init__(self, project_tab, output_dir, filepaths, export_format, parent=None):
+
+    def __init__(self, project_tab, output_dir, filepaths, export_format, parent=None,
+                 copy_exif=False, band_order="keep"):
         super().__init__(parent)
         self.project_tab = project_tab
         self.output_dir = output_dir
         self.filepaths = filepaths
         self.export_format = export_format
+        self.copy_exif = bool(copy_exif)
+        # 'keep' (source order, the fixed default), 'rgb', or 'bgr' -- see
+        # _reorder_first3. Anything else is treated as 'keep'.
+        self.band_order = band_order if band_order in ("keep", "rgb", "bgr") else "keep"
         self._cancelled = False
         # Capture critical project state to avoid hitting 'self.project_tab' repeatedly
         self.project_folder = getattr(project_tab, 'project_folder', None)
-    
+
     def cancel(self):
         self._cancelled = True
-    
+
     def _load_image_simple(self, filepath):
-        """Thread-safe image loading avoiding all Qt/GUI dependencies."""
+        """Thread-safe image loading avoiding all Qt/GUI dependencies.
+
+        Returns (img, channel_order). channel_order is "rgb" when tifffile
+        supplied the native (already band-order-correct) array, "bgr" when
+        the cv2 fallback decoded it (cv2 always returns BGR). This mirrors
+        ProjectTab._get_export_image's _read_raw_any exactly, so this
+        worker's channel-order bookkeeping matches the canonical CSV/ML
+        export path instead of the previous untracked, format-blind "always
+        BGR" assumption.
+
+        That assumption was harmless in the plain cv2.imwrite save branch
+        below (cv2.imwrite itself re-applies the BGR convention on write, so
+        an unconditional flip of a genuinely-RGB tifffile array happened to
+        cancel out correctly there) -- but it was a real, confirmed R/B swap
+        in the OTHER save branch, tifffile.imwrite with photometric="rgb"
+        (used whenever the .ax has a band expression / appended bands /
+        classification enabled, or the source isn't uint8/uint16): unlike
+        cv2.imwrite, tifffile.imwrite does no BGR reinterpretation -- it
+        tags array indices as R/G/B literally, so flipping a genuinely-RGB
+        array before handing it there stored true-B where true-R belonged
+        and vice versa. Verified empirically (round-tripped a known
+        R=10/G=20/B=30 array through both the old and the fixed code and
+        read the raw stored bytes back) before writing this fix.
+        """
         import os, numpy as np, cv2
+        from .raster_reader import ensure_hwc as _ensure_hwc
+
         ext = os.path.splitext(filepath)[1].lower()
-        try:
-            if ext in ('.tif', '.tiff'):
+        if ext in ('.tif', '.tiff'):
+            try:
                 import tifffile
                 with tifffile.TiffFile(filepath) as tf:
-                    return np.ascontiguousarray(np.squeeze(tf.asarray()))
-            
-            # Using imdecode is safer for unicode paths on some systems
+                    axes = (tf.series[0].axes or "").upper()
+                    arr = _ensure_hwc(tf.asarray(), axes=axes)
+                return np.ascontiguousarray(np.squeeze(arr)), "rgb"
+            except Exception:
+                pass  # fall through to the cv2 fallback below, same as _read_raw_any
+
+        try:
+            # Using imdecode is safer for unicode paths on some systems.
             data = np.fromfile(filepath, dtype=np.uint8)
             img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
-            return img 
+            if img is None:
+                return None, "bgr"
+            return np.ascontiguousarray(_ensure_hwc(img)), "bgr"
         except Exception:
-            return None
+            return None, "bgr"
+
+    @staticmethod
+    def _reorder_first3(arr, swap):
+        """Swap only bands 0 and 2 (R<->B); band 1 and any 4th+ band are
+        left untouched -- a blanket [..., ::-1] flip (the old code) silently
+        reverses a whole BGRA/multiband stack instead of just R/B."""
+        import numpy as np
+        if not swap or arr.ndim != 3 or arr.shape[2] < 3:
+            return arr
+        out = np.array(arr, copy=True)
+        out[..., [0, 2]] = arr[..., [2, 0]]
+        return out
 
     def run(self):
         import os, logging, numpy as np
         try:
             import cv2
             total = len(self.filepaths)
-            saved, errors = 0, 0
+            saved, errors, exif_copied = 0, 0, 0
             os.makedirs(self.output_dir, exist_ok=True)
-            
+
             # Set flag on project_tab to prevent UI interference
             self.project_tab._is_exporting = True
+
+            # Reset appended-band-failure tracking for THIS run (see
+            # _record_appended_band_error) so a previous export's failures
+            # don't leak into this one's completion message.
+            try:
+                self.project_tab._appended_band_error_count = 0
+                self.project_tab._appended_band_error_samples = []
+            except Exception:
+                pass
 
             for i, filepath in enumerate(self.filepaths):
                 if self._cancelled:
                     break
-                
+
                 basename = os.path.basename(filepath)
                 self.progress.emit(i, total, f"Processing: {basename}")
-                
+
                 try:
-                    # 1. Load Raw
-                    img = self._load_image_simple(filepath)
+                    # 1. Load Raw (tracks true channel order -- see _load_image_simple)
+                    img, chan_order = self._load_image_simple(filepath)
                     if img is None: raise ValueError("Load failed")
-                    
+
                     # 2. Load AX Configuration (Offline)
                     ax = self.project_tab._load_ax_json(filepath)  # pure-logic (.ax sidecar), cached
-                    
+
                     # 3. Apply Transformations
                     # Note: Ensure _apply_ax_to_raw does NOT call _resolve_viewer
+                    # _apply_ax_to_raw's own hist-match realignment reads this
+                    # instance attribute (see ProjectTab._apply_ax_to_raw /
+                    # _apply_hist_match's src_channel_order plumbing) -- set it
+                    # before the call so this background path gets the same
+                    # provenance the foreground/CSV export path already does.
+                    self.project_tab._last_export_channel_order = chan_order
                     if ax:
                         img, _ = self.project_tab._apply_ax_to_raw(img, ax, filepath=filepath)
-                    
+                    # _apply_ax_to_raw's crop/rotate/hist_match/resize/band_expression
+                    # steps never reorder existing bands, only append/replace them --
+                    # chan_order still describes img's first-3-channel order here.
+
                     # 4. Save Logic (Standardized)
                     source_ext = os.path.splitext(filepath)[1].lower()
                     actual_format = 'jpg' if source_ext in ('.jpg', '.jpeg') else self.export_format
-                    
+
                     stem = os.path.splitext(basename)[0]
                     out_path = os.path.join(self.output_dir, f"{stem}.{actual_format}")
 
@@ -1108,9 +1226,26 @@ class ProjectImagesExportWorker(QtCore.QThread):
                     has_classification = (ax.get("classification") or {}).get("enabled", False)
                     needs_float = has_band_expr or has_appended_bands or has_classification
 
-                    # Convert RGB/BGR if needed and save
+                    is_rgb_order = (chan_order == "rgb")
+                    # self.band_order lets the user override the SOURCE's own
+                    # order (e.g. force everything to RGB regardless of what
+                    # each file happened to be); "keep" (the default) just
+                    # uses whatever chan_order actually is, which is the fix
+                    # for the reported bug on its own.
+                    if self.band_order == "rgb":
+                        is_rgb_order = True
+                    elif self.band_order == "bgr":
+                        is_rgb_order = False
+
+                    is_bigtiff = False
+
+                    # Convert to whichever order each writer actually expects,
+                    # using the TRACKED source order instead of a blanket
+                    # "always BGR" assumption.
                     if actual_format == 'jpg':
-                        cv2.imwrite(out_path, img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                        # cv2.imwrite requires BGR-ordered input.
+                        bgr = self._reorder_first3(img, swap=is_rgb_order)
+                        cv2.imwrite(out_path, bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
                     elif self.export_format in ('tif', 'tiff') and (needs_float or img.dtype not in (np.uint8, np.uint16)):
                         # Use tifffile for float data or multiband to preserve precision
                         import tifffile
@@ -1119,9 +1254,9 @@ class ProjectImagesExportWorker(QtCore.QThread):
                             photometric = "minisblack"
                             write_arr = a
                         elif a.ndim == 3 and a.shape[2] == 3:
-                            # BGR -> RGB for TIFF
+                            # tifffile photometric="rgb" expects genuine RGB order.
                             photometric = "rgb"
-                            write_arr = a[:, :, ::-1].copy()
+                            write_arr = self._reorder_first3(a, swap=not is_rgb_order)
                         elif a.ndim == 3 and a.shape[2] > 3:
                             # Multiband: write as CHW
                             photometric = "minisblack"
@@ -1129,22 +1264,84 @@ class ProjectImagesExportWorker(QtCore.QThread):
                         else:
                             photometric = "minisblack"
                             write_arr = a
-                        tifffile.imwrite(out_path, write_arr, compression="deflate", photometric=photometric)
+                        try:
+                            tifffile.imwrite(out_path, write_arr, compression="deflate", photometric=photometric)
+                        except Exception as e_size:
+                            msg = str(e_size)
+                            size_related = ("4 GB" in msg) or ("4GB" in msg) or ("too large" in msg) \
+                                           or ("bigtiff" in msg.lower()) \
+                                           or ("exceeds" in msg and "limit" in msg)
+                            if not size_related:
+                                raise
+                            with tifffile.TiffWriter(out_path, bigtiff=True) as tw:
+                                tw.write(write_arr, compression="deflate", photometric=photometric)
+                            is_bigtiff = True
+                            logging.info("Saved as BigTIFF due to size: %s", os.path.basename(out_path))
                     else:
-                        cv2.imwrite(out_path, img[..., ::-1] if img.ndim==3 else img)
-                    
+                        bgr = self._reorder_first3(img, swap=is_rgb_order)
+                        cv2.imwrite(out_path, bgr)
+
                     saved += 1
+
+                    # 5. Optional EXIF copy -- parity with the foreground export
+                    # path, which already offers this. ExifTool can't write
+                    # BigTIFF, matching the foreground path's skip rule.
+                    if self.copy_exif and not is_bigtiff:
+                        if self._copy_exif_one(filepath, out_path):
+                            exif_copied += 1
                 except Exception as e:
                     errors += 1
                     logging.error(f"Failed {basename}: {e}")
 
             status_msg = f"Exported {saved} images ({errors} errors)"
+            if self.copy_exif:
+                status_msg += f", EXIF copied for {exif_copied}"
+            # Surface appended-band failures that _apply_ax_to_raw swallows
+            # internally (see _record_appended_band_error) -- a classification
+            # band appended in the editor silently missing from the exported
+            # file (most often because no sklearn model is loaded in THIS
+            # session) never bumps `errors` above, since _apply_ax_to_raw
+            # still returns a valid (just narrower) image and the file still
+            # saves fine.
+            ab_err_count = getattr(self.project_tab, "_appended_band_error_count", 0)
+            if ab_err_count:
+                ab_samples = getattr(self.project_tab, "_appended_band_error_samples", []) or []
+                ab_first = ab_samples[0] if ab_samples else "see log"
+                status_msg += (f"; WARNING: {ab_err_count} appended band(s) could not be "
+                                f"regenerated -- exported file(s) are missing those bands. "
+                                f"First error: {ab_first}")
+                logging.warning("[ProjectImagesExportWorker] %d appended band(s) failed to "
+                                 "regenerate; samples: %s", ab_err_count, ab_samples)
             self.finished.emit(self.output_dir, not self._cancelled, status_msg)
-            
+
         except Exception as e:
             self.finished.emit(self.output_dir, False, f"Fatal error: {str(e)}")
         finally:
             self.project_tab._is_exporting = False
+
+    def _copy_exif_one(self, src, dst):
+        """Mirror export_project_images' own _copy_exif_per_file for the
+        foreground path -- same exiftool invocation, same failure handling,
+        just addressable from this worker (a QThread, no access to that
+        function's enclosing closure)."""
+        import os, shutil, subprocess, logging
+        exe = getattr(self.project_tab, "exiftool_path", None) or "exiftool"
+        if not (os.path.isfile(exe) or shutil.which(exe)):
+            logging.warning("ExifTool not found; skipping EXIF copy for %s", os.path.basename(dst))
+            return False
+        try:
+            cmd = [exe, "-m", "-overwrite_original", "-TagsFromFile", src, "-all:all", dst]
+            cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                                creationflags=_SUBPROCESS_FLAGS)
+            if cp.returncode != 0:
+                logging.warning("ExifTool copy failed (%s -> %s): %s",
+                                os.path.basename(src), os.path.basename(dst),
+                                cp.stderr.decode(errors="ignore"))
+            return cp.returncode == 0
+        except Exception as e:
+            logging.warning("ExifTool invocation failed (%s -> %s): %s",
+                            os.path.basename(src), os.path.basename(dst), e)
+            return False
 
 class ExportManagerDialog(QtWidgets.QDialog):
     """
@@ -2636,6 +2833,25 @@ _STRETCH_MAX_DISPLAY_DIM = 65000
 # lazily via ProjectTab._get_export_image.
 _PREVIEW_LOAD_THRESHOLD_BYTES = 512 * 1024 * 1024
 
+# Byte budgets for the per-file array caches below (_imgdata_cache, _raw_cache,
+# _raw_image_cache, _export_cache, _export_image_cache). These used to be
+# capped only by ENTRY COUNT (e.g. "100 images"), never by bytes -- so a
+# handful of large COGs, each individually under _PREVIEW_LOAD_THRESHOLD_BYTES
+# or loaded via a full-cube fallback, could collectively exceed available RAM
+# long before any count cap triggered eviction. Each cache gets its OWN
+# budget rather than one shared pool: they serve architecturally distinct
+# roles (navigation vs. editor-open vs. export-only), and a shared budget
+# would let a large export silently evict the navigation cache mid-session.
+# _raw_cache's budget is additionally scaled down while exporting (see its
+# ExportWorker._is_exporting wiring) the same way its old count-based limit
+# was (2 vs 20 entries).
+_IMGDATA_CACHE_BUDGET_BYTES = 1 * 1024 * 1024 * 1024        # 1 GB
+_RAW_CACHE_BUDGET_BYTES = 512 * 1024 * 1024                 # 512 MB (128 MB while exporting)
+_RAW_CACHE_EXPORTING_BUDGET_BYTES = 128 * 1024 * 1024
+_RAW_IMAGE_CACHE_BUDGET_BYTES = 512 * 1024 * 1024           # 512 MB
+_EXPORT_CACHE_BUDGET_BYTES = 768 * 1024 * 1024               # 768 MB
+_EXPORT_IMAGE_CACHE_BUDGET_BYTES = 768 * 1024 * 1024         # 768 MB -- see its own "biggest memory user" comment
+
 # Above this fully-decoded size, CSV/ML export reads polygon windows instead of
 # the whole cube. It is far lower than the viewer's threshold because export
 # touches only the pixels inside polygons: a 15-band 1759x1930 prediction stack
@@ -3518,7 +3734,12 @@ class ProjectTab(QtWidgets.QWidget):
         
         # RAW IMAGE CACHE: For faster Image Editor Dialog opening
         # Stores raw images (before .ax mods) so editor doesn't reload from disk
-        self._raw_cache = {}
+        # RAM FIX: byte-budgeted, not just count-capped (was a plain dict,
+        # FIFO-evicted by insertion order at a fixed 20/2-entry count -- see
+        # _RAW_CACHE_BUDGET_BYTES). Also now true LRU (re-access refreshes
+        # position), which the old plain-dict FIFO never did.
+        from .raster_reader import ByteBudgetedLRUDict
+        self._raw_cache = ByteBudgetedLRUDict(_RAW_CACHE_BUDGET_BYTES)
         self._raw_cache_lock = threading.Lock()
 
     def undo(self):
@@ -4183,7 +4404,8 @@ class ProjectTab(QtWidgets.QWidget):
   
     @staticmethod
     def _apply_hist_match(img, mods, *args, fast=True, max_samples=None, nodata_values=None,
-                          mask_polygon_points=None, mask_polygon_enabled=False):
+                          mask_polygon_points=None, mask_polygon_enabled=False,
+                          src_channel_order=None):
         """
         Histogram normalization used by ProjectTab viewers.
         - Mean/Std path: Uses LUT for uint8 only (fast). Full float precision for 16-bit/float.
@@ -4211,6 +4433,53 @@ class ProjectTab(QtWidgets.QWidget):
         hcfg = (mods or {}).get("hist_match")
         if not hcfg:
             return img
+
+        # ---- CHANNEL-ORDER REALIGNMENT (all consumers, one place) ----
+        # Matching pairs bands POSITIONALLY, so a reference measured in
+        # BGR (the editor's order for cv2-loaded <=4-band images) applied
+        # to RGB-ordered pixels pairs the Blue reference with Red. This
+        # lives HERE, in the one canonical routine, rather than in any
+        # single caller: the CSV export (_apply_ax_to_raw), the viewer
+        # (apply_aux_modifications) and ML training/prediction
+        # (MachineLearningManager._apply_hist_local) all funnel through
+        # this function, and fixing only one of them would make the three
+        # disagree about the pixels -- the precise thing
+        # test_contract_ax_consumers exists to forbid.
+        #
+        # RGB<->BGR is exactly a reversal of the first three entries;
+        # bands past the third are not part of the convention and are left
+        # alone. When either order is unknown (older .ax files carry no
+        # channel_order, or a caller cannot say) nothing is reordered --
+        # guessing could introduce the very swap this prevents.
+        try:
+            _ref_order = str(hcfg.get("channel_order") or "").lower()
+            _src_order = str(src_channel_order or "").lower()
+            if _ref_order and _src_order and _ref_order != _src_order:
+                def _realign(seq):
+                    if not isinstance(seq, list) or len(seq) < 2:
+                        return seq, False
+                    n = min(3, len(seq))
+                    return list(reversed(seq[:n])) + list(seq[n:]), True
+
+                _fixed = dict(hcfg)
+                _did = False
+                if isinstance(_fixed.get("ref_stats"), list):
+                    _fixed["ref_stats"], _ok = _realign(_fixed["ref_stats"])
+                    _did = _did or _ok
+                _rc = _fixed.get("ref_cdf")
+                if isinstance(_rc, dict) and isinstance(_rc.get("per_band"), list):
+                    _pb, _ok = _realign(_rc["per_band"])
+                    _fixed["ref_cdf"] = dict(_rc, per_band=_pb)
+                    _did = _did or _ok
+                if _did:
+                    hcfg = _fixed
+                    logging.warning(
+                        "[hist] reference measured in %s but pixels are %s -- "
+                        "realigned the first three reference bands so they pair "
+                        "correctly. Recompute the reference to remove this step.",
+                        _ref_order.upper(), _src_order.upper())
+        except Exception as _e:
+            logging.debug("[hist] channel-order realignment skipped: %s", _e)
 
         mode = (hcfg.get("mode") or "meanstd").lower()
         bands_cfg = int(hcfg.get("bands", 0)) if hcfg.get("bands", 0) else 0
@@ -4541,6 +4810,7 @@ class ProjectTab(QtWidgets.QWidget):
                                 project_folder=None,
                                 global_mode=False,
                                 *,
+                                src_channel_order=None,       # order `image`'s bands are in, for hist matching
                                 export_label_band=False,      # NEW: when True, append expr + labels as bands
                                 _float_dtype=np.float32,      # keep numeric stability consistent
                                 all_polygons=None):           # for mask_polygon name lookup
@@ -4817,7 +5087,8 @@ class ProjectTab(QtWidgets.QWidget):
                 result = ProjectTab._apply_hist_match(result, ax, fast=True, max_samples=HIST_MAX_SAMPLES,
                                                       nodata_values=_hist_nd,
                                                       mask_polygon_points=mask_polygon_points_list,
-                                                      mask_polygon_enabled=mask_polygon_enabled)
+                                                      mask_polygon_enabled=mask_polygon_enabled,
+                                                      src_channel_order=src_channel_order)
             except TypeError:
                 # Fallback if function doesn't support mask_polygon
                 try:
@@ -5479,41 +5750,57 @@ class ProjectTab(QtWidgets.QWidget):
                                 logging.warning(f"[apply_aux_modifications] Failed to evaluate appended band expression: {e}")
 
                     elif band_type == "classification":
-                        # Re-run classification and append as band
+                        # Re-run classification and append as band.
+                        #
+                        # Same fix as _apply_ax_to_raw's twin block: this used
+                        # to guess a feature matrix from just the first 3 raw
+                        # bands, which silently broke (feature-count mismatch,
+                        # swallowed by the except below) for any model not
+                        # literally trained on 3 raw bands -- i.e. the normal
+                        # case whenever the model uses band-math expressions,
+                        # a different band count, or a spatial window. That is
+                        # why an appended classification band reached every
+                        # target's .ax (appended_bands is not a per-image key)
+                        # but only ever rendered for the image open in the
+                        # editor. This method is a @staticmethod, so the
+                        # instance helper _make_feature_stack_for_model is
+                        # called unbound (it does not touch `self` internally).
                         try:
                             bundle = getattr(ProjectTab, "shared_random_forest_model", None) or getattr(ProjectTab, "random_forest_model", None)
                             if isinstance(bundle, dict) and "model" in bundle:
                                 model = bundle["model"]
-                                H, W = result.shape[:2]
-                                C = result.shape[2] if result.ndim == 3 else 1
+                                feat_names = list(bundle.get("feature_names") or [])
+                                expressions = bundle.get("expressions", [])
+                                window_size = bundle.get("window_size", 1)
+                                base_feature_names = bundle.get("base_feature_names", feat_names)
+                                label_names = list(bundle.get("label_names") or band_info.get("label_names") or [])
 
-                                # Build feature matrix
-                                base_ml = result.astype(np.float32, copy=False)
-                                if base_ml.ndim == 2:
-                                    base_ml = base_ml[..., np.newaxis]
+                                X, (H, W) = ProjectTab._make_feature_stack_for_model(
+                                    None, result, feat_names,
+                                    expressions=expressions,
+                                    window_size=window_size,
+                                    base_feature_names=base_feature_names,
+                                )
 
-                                # Simple feature extraction (first 3 bands as RGB)
-                                n_features = min(3, base_ml.shape[2])
-                                X = base_ml[:, :, :n_features].reshape(H * W, n_features)
-
-                                # Build label->index mapping (model may return string labels)
                                 classes = list(getattr(model, "classes_", []))
-                                label_to_idx = {lab: i for i, lab in enumerate(classes)}
+                                idx_map = ({lab: i for i, lab in enumerate(label_names)} if label_names
+                                           else {lab: i for i, lab in enumerate(classes)})
 
-                                # Predict
-                                valid = np.isfinite(X).all(axis=1)
-                                preds = np.zeros(H * W, dtype=np.float32)
-                                if valid.any():
-                                    raw_preds = model.predict(X[valid])
-                                    # Convert string labels to numeric indices
-                                    if len(classes) > 0 and isinstance(raw_preds[0], str):
-                                        preds[valid] = np.array([label_to_idx.get(p, 0) for p in raw_preds], dtype=np.float32)
-                                    else:
-                                        preds[valid] = np.asarray(raw_preds, dtype=np.float32)
+                                n = H * W
+                                chunk = max(50_000, min(500_000, n // 8 or 50_000))
+                                raw_preds = np.empty((n,), dtype=object)
+                                i = 0
+                                while i < n:
+                                    j = min(i + chunk, n)
+                                    raw_preds[i:j] = model.predict(X[i:j])
+                                    i = j
 
-                                cls_band = preds.reshape(H, W).astype(_float_dtype, copy=False)
+                                cls_band = np.vectorize(idx_map.get, otypes=[np.float32])(raw_preds).reshape(H, W)
+                                cls_band = np.nan_to_num(cls_band, nan=0).astype(_float_dtype, copy=False)
                                 result = np.concatenate([result, cls_band[..., np.newaxis]], axis=2)
                                 logging.info(f"[apply_aux_modifications] Appended classification band #{band_idx} (classes: {classes})")
+                            else:
+                                logging.warning(f"[apply_aux_modifications] No sklearn model available for appended classification band #{band_idx}")
                         except Exception as e:
                             logging.warning(f"[apply_aux_modifications] Failed to append classification band: {e}")
 
@@ -5693,12 +5980,37 @@ class ProjectTab(QtWidgets.QWidget):
                 logging.debug(f"TIFF preflight failed on '{path}': {e}")
                 return False
 
-        def _tifffile_read_as_HWC(path):
-            """Read with tifffile and coerce to HxWxC using the file's axis labels."""
+        def _tifffile_read_as_HWC(path, max_bytes=None):
+            """Read with tifffile and coerce to HxWxC using the file's axis labels.
+
+            `max_bytes`, when given, refuses the read (raises MemoryError)
+            instead of decoding a cube whose estimated size exceeds it. This
+            call used to be unconditional -- the exact "3.88 GB read" disaster
+            raster_reader.py's own module docstring says the whole windowed-
+            reading module exists to prevent (see its header comment), except
+            this fallback bypassed that protection entirely: any "stack" TIFF
+            that raster_reader.probe() doesn't classify into a known tiled/
+            strip/memmap strategy (profile.is_windowable == False) landed here
+            with no size check at all, no matter how large the file actually
+            was. Checked cheaply from series metadata, no pixels touched.
+            """
             import tifffile as tiff
             from .raster_reader import ensure_hwc
             with tiff.TiffFile(path) as tf:
-                axes = (tf.series[0].axes or "").upper()
+                series = tf.series[0] if tf.series else None
+                axes = (getattr(series, "axes", "") or "").upper()
+                shape = getattr(series, "shape", None) or ()
+                dtype = getattr(series, "dtype", None) or tf.pages[0].dtype
+                if max_bytes is not None and shape:
+                    est_bytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
+                    if est_bytes > max_bytes:
+                        raise MemoryError(
+                            f"{os.path.basename(path)}: stack is "
+                            f"{est_bytes / 1e9:.2f} GB with no windowed reader "
+                            f"available for this layout (probe failed or "
+                            f"unsupported strategy) -- refusing full in-memory "
+                            f"load to avoid exhausting RAM. Convert to a "
+                            f"tiled/COG TIFF to enable lazy loading.")
                 arr = np.squeeze(tf.asarray())
             return ensure_hwc(arr, axes=axes) if arr.ndim >= 3 else arr
 
@@ -5755,11 +6067,21 @@ class ProjectTab(QtWidgets.QWidget):
         # --- 1) TIFF preflight: if it's a real stack, go straight to tifffile ---
         if ext in (".tif", ".tiff") and _tifffile_is_stack(filepath):
             try:
-                arr = _tifffile_read_as_HWC(filepath)
+                arr = _tifffile_read_as_HWC(filepath, max_bytes=_PREVIEW_LOAD_THRESHOLD_BYTES)
                 if arr is not None and getattr(arr, "size", 0) > 0:
                     self._last_loader = "tifffile-preflight"
                     self._cache_raw_for_editor(filepath, arr)  # Cache for faster editor opening
                     return _Lite(filepath, arr, raw_shape=arr.shape, ax_config=ax_config, channel_order="rgb")
+            except MemoryError:
+                # Do NOT fall through to section 2's equally unbounded
+                # ImageData(filepath) -> cv2.imread(..., IMREAD_UNCHANGED) full
+                # read of the same oversized file -- that would spend the exact
+                # RAM this check exists to avoid. Let it propagate: the caller
+                # (_ImageLoadRunnable.run in loaders.py) already turns an
+                # uncaught exception here into a per-file load-error signal,
+                # the same graceful "this one file failed" path used for any
+                # other load failure -- not a crash.
+                raise
             except Exception as e:
                 logging.warning(f"tifffile stack load failed for '{filepath}', will try ImageData: {e}")
 
@@ -5774,8 +6096,13 @@ class ProjectTab(QtWidgets.QWidget):
                     try:
                         if img.ndim == 3 and img.shape[2] in (4, 5, 6, 7, 8):  # cv read with >3 channels
                             # Confirm with metadata; if it's truly a stack, reload via tifffile.
+                            # max_bytes here can only prevent an ADDITIONAL full
+                            # decode stacked on top of the cv2.imread a few lines
+                            # above (which already ran unconditionally) -- it
+                            # can't undo that cost, but it stops this from being
+                            # a second full read of the same oversized file.
                             if _tifffile_is_stack(filepath):
-                                arr = _tifffile_read_as_HWC(filepath)
+                                arr = _tifffile_read_as_HWC(filepath, max_bytes=_PREVIEW_LOAD_THRESHOLD_BYTES)
                                 if arr is not None and getattr(arr, "size", 0) > 0:
                                     self._last_loader = "tifffile-override-cv"
                                     self._cache_raw_for_editor(filepath, arr)  # Cache for faster editor opening
@@ -5811,7 +6138,13 @@ class ProjectTab(QtWidgets.QWidget):
         """
         Cache raw image for faster Image Editor Dialog opening.
         The editor checks _raw_cache before loading from disk.
-        This is a simple LRU-style cache limited to ~20 images.
+
+        RAM FIX: eviction is now byte-budgeted (ByteBudgetedLRUDict), not a
+        manual count check -- see _RAW_CACHE_BUDGET_BYTES /
+        _RAW_CACHE_EXPORTING_BUDGET_BYTES. The old count limit (20, or 2
+        while exporting) could still hold many hundred-MB+ arrays; the byte
+        budget scales down the same way while exporting, just by bytes
+        instead of entry count.
         """
         import os
         if image is None:
@@ -5820,27 +6153,17 @@ class ProjectTab(QtWidgets.QWidget):
             return
         try:
             key = os.path.normcase(os.path.abspath(filepath))
+            budget = (_RAW_CACHE_EXPORTING_BUDGET_BYTES if getattr(self, "_is_exporting", False)
+                      else _RAW_CACHE_BUDGET_BYTES)
             lock = getattr(self, "_raw_cache_lock", None)
             if lock:
                 with lock:
-                    # Limit cache size to avoid memory bloat
-                    limit = 2 if getattr(self, "_is_exporting", False) else 20
-                    if len(self._raw_cache) > limit:
-                        try:
-                            oldest = next(iter(self._raw_cache))
-                            del self._raw_cache[oldest]
-                        except Exception:
-                            pass
+                    if getattr(self._raw_cache, "budget", None) != budget:
+                        self._raw_cache.set_budget(budget)
                     self._raw_cache[key] = image
             else:
-                # Limit cache size to avoid memory bloat
-                limit = 2 if getattr(self, "_is_exporting", False) else 20
-                if len(self._raw_cache) > limit:
-                    try:
-                        oldest = next(iter(self._raw_cache))
-                        del self._raw_cache[oldest]
-                    except Exception:
-                        pass
+                if getattr(self._raw_cache, "budget", None) != budget:
+                    self._raw_cache.set_budget(budget)
                 self._raw_cache[key] = image
         except Exception:
             pass  # Never fail image loading due to cache issues
@@ -6092,16 +6415,19 @@ class ProjectTab(QtWidgets.QWidget):
         # Caches fully transformed ImageData (after apply_aux_modifications)
         # to skip disk I/O when navigating back to previously viewed roots
         # Cache key: (filepath, file_mtime, ax_mtime)
-        self._imgdata_cache = {}  # cache_key -> ImageData
+        # RAM FIX: byte-budgeted, not just count-capped -- see
+        # _IMGDATA_CACHE_BUDGET_BYTES for why (entries can be hundreds of MB
+        # each for real COGs; 100 count-capped entries could still be
+        # unboundedly large in aggregate).
+        from .raster_reader import ByteBudgetedLRUDict
+        self._imgdata_cache = ByteBudgetedLRUDict(_IMGDATA_CACHE_BUDGET_BYTES)  # cache_key -> ImageData
         self._imgdata_cache_lock = threading.Lock()
-        self._imgdata_cache_max = 100  # Cache up to 100 images (~100 roots * ~10 images)
 
         # PERFORMANCE: Raw image cache (for editor dialog)
         # Caches raw pixel arrays before transformations to speed up editor open
         # Cache key: (filepath_norm, file_mtime)
-        self._raw_image_cache = {}  # cache_key -> np.ndarray
+        self._raw_image_cache = ByteBudgetedLRUDict(_RAW_IMAGE_CACHE_BUDGET_BYTES)  # cache_key -> np.ndarray
         self._raw_image_cache_lock = threading.Lock()
-        self._raw_image_cache_max = 50  # Cache up to 50 raw images
 
     def _get_pixmap_cache_key(self, filepath, stretch_params):
         """
@@ -6195,12 +6521,13 @@ class ProjectTab(QtWidgets.QWidget):
         
         try:
             with self._imgdata_cache_lock:
-                # LRU eviction
-                if len(self._imgdata_cache) >= self._imgdata_cache_max:
-                    oldest = next(iter(self._imgdata_cache))
-                    del self._imgdata_cache[oldest]
+                # Eviction (by cumulative bytes, not entry count) now happens
+                # inside ByteBudgetedLRUDict.__setitem__ itself -- no manual
+                # count check needed here any more.
                 self._imgdata_cache[cache_key] = imgdata
-                logging.debug(f"[ImgData cache] STORE: {os.path.basename(filepath)} (cache size: {len(self._imgdata_cache)})")
+                logging.debug(f"[ImgData cache] STORE: {os.path.basename(filepath)} "
+                              f"(entries: {len(self._imgdata_cache)}, "
+                              f"~{self._imgdata_cache.nbytes / 1e6:.1f} MB)")
         except Exception as e:
             logging.debug(f"[ImgData cache] Store error: {e}")
 
@@ -7536,6 +7863,11 @@ class ProjectTab(QtWidgets.QWidget):
             elif has_expr and hasattr(image_data.image, "shape") and image_data.image.ndim == 3 and image_data.image.shape[2] > 3:
                 C = image_data.image.shape[2]
                 viewer.stretch_params = _StretchParams(display_mode="single", display_band=C - 1)
+                # Mark this as an AUTOMATIC pin so it can be undone when the
+                # expression/classification that justified it goes away (e.g.
+                # the band is appended). A user's own single-band choice from
+                # the stretch dialog carries no such mark and is never reset.
+                viewer._auto_pinned_last_band = True
 
             viewer.set_image(pixmap)
             self._wire_viewer_for_inspection(viewer)
@@ -11044,12 +11376,48 @@ class ProjectTab(QtWidgets.QWidget):
         return {}
 
     def _write_json_safely(self, path, data):
+        """Atomically replace `path` with `data` as JSON.
+
+        ATOMICITY IS THE WHOLE POINT OF THE NAME, and it used to be missing:
+        this did a plain `open(path, "w")`, which TRUNCATES the existing file
+        to zero bytes before a single byte of the new content is written. Any
+        interruption in that window (crash, power loss, or simply another
+        thread writing the same path) leaves a truncated or empty file on
+        disk. For `.ax` sidecars that is silent, permanent data loss: every
+        reader in this codebase swallows a parse failure and substitutes an
+        empty dict (`_read_json_silently` here, and the `except: existing =
+        {}` in ImageEditorDialog._write_ax), so a half-written `.ax` does not
+        raise -- it just makes every edit the user ever made to that image
+        disappear, and the next write then persists that empty state.
+
+        Serialise to a temp file in the SAME directory, then os.replace() --
+        which is atomic on both POSIX and Windows -- so a reader either sees
+        the complete old file or the complete new one, never a partial write.
+        This mirrors the pattern already used for polygon JSON elsewhere in
+        this file (see migrate_polygon_basis / the polygon save path).
+        """
+        tmp = None
         try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
+            d = os.path.dirname(path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            # Same directory as the target: os.replace is only atomic within a
+            # single filesystem, and a temp dir can be on another volume.
+            tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            tmp = None
         except Exception as e:
             logging.warning(f"Failed to write {path}: {e}")
+        finally:
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
 
     def edit_image_viewer(self, viewer):
         import logging, sip
@@ -11168,12 +11536,38 @@ class ProjectTab(QtWidgets.QWidget):
                 cblock = mods.get("classification") or {}
                 if isinstance(cblock, dict) and bool(cblock.get("enabled", False)):
                     logging.info("edit_image_viewer: CLASSIFICATION ENABLED - clearing all stretch")
-                    
+
+                    # Preserve the STRETCH METHOD (mode/percentiles/sigma/etc.) the
+                    # user had configured before wiping viewer.stretch_params below.
+                    # Only the ABSOLUTE numeric bounds (min_val/max_val/band_mins/
+                    # band_maxs) are stale here -- they were computed against the
+                    # old multi-band reflectance data and would make a classification
+                    # index band (0,1,2,3...) look black. The MODE itself (percentile/
+                    # stddev/absolute) is still exactly what the user wants applied,
+                    # just freshly recomputed against the new band. _render_with_
+                    # viewer_stretch's prefer_last_band fallback reads this to build
+                    # that "same method, fresh bounds" stretch instead of forcing an
+                    # unrelated hardcoded manual min-max.
+                    try:
+                        prior_sp = getattr(viewer, "stretch_params", None)
+                        if prior_sp is not None:
+                            viewer._prior_auto_stretch_mode = {
+                                "mode": getattr(prior_sp, "mode", "percentile"),
+                                "low_p": getattr(prior_sp, "low_p", 0.5),
+                                "high_p": getattr(prior_sp, "high_p", 99.5),
+                                "k_sigma": getattr(prior_sp, "k_sigma", 1.0),
+                                "per_channel": getattr(prior_sp, "per_channel", False),
+                                "clip": getattr(prior_sp, "clip", True),
+                            }
+                            logging.info(f"edit_image_viewer: captured prior stretch mode={viewer._prior_auto_stretch_mode.get('mode')} before clearing")
+                    except Exception as e:
+                        logging.debug(f"edit_image_viewer: could not capture prior stretch mode: {e}")
+
                     # Clear viewer stretch so it recalculates from new classified image
                     if hasattr(viewer, "stretch_params"):
                         viewer.stretch_params = None
                         logging.info("edit_image_viewer: cleared viewer.stretch_params")
-                    
+
                     # CRITICAL: Set flag to force auto-stretch (skip loading from .ax)
                     # This prevents _render_with_viewer_stretch from reloading old stretch
                     viewer._force_auto_stretch = True
@@ -11200,6 +11594,23 @@ class ProjectTab(QtWidgets.QWidget):
                                     ax_data = json.load(f)
                                 changed = False
                                 if "viewer_stretch" in ax_data:
+                                    # Fallback source for the prior mode: viewer.stretch_params
+                                    # may not be populated yet this session (e.g. first render
+                                    # after reopening the project), but a stretch persisted from
+                                    # an earlier session is sitting right here about to be deleted.
+                                    if not getattr(viewer, "_prior_auto_stretch_mode", None):
+                                        try:
+                                            st = ax_data["viewer_stretch"] or {}
+                                            viewer._prior_auto_stretch_mode = {
+                                                "mode": st.get("mode", "percentile"),
+                                                "low_p": st.get("low_p", 0.5),
+                                                "high_p": st.get("high_p", 99.5),
+                                                "k_sigma": st.get("k_sigma", 1.0),
+                                                "per_channel": st.get("per_channel", False),
+                                                "clip": st.get("clip", True),
+                                            }
+                                        except Exception:
+                                            pass
                                     del ax_data["viewer_stretch"]
                                     changed = True
                                     logging.info("edit_image_viewer: removed viewer_stretch from .ax")
@@ -11244,6 +11655,29 @@ class ProjectTab(QtWidgets.QWidget):
                         viewer.preview_prefers_index = False
                     if hasattr(viewer, "classification_indices"):
                         viewer.classification_indices = None
+
+                    # APPENDING an ML/classification result turns it into an
+                    # ordinary stacked band and switches classification and the
+                    # band expression OFF -- so the viewer must go back to
+                    # showing the ORIGINAL composite. It did not: the earlier
+                    # expression/classification had pinned the viewer to
+                    # display_mode='single', display_band=C-1, and because the
+                    # branch that sets that pin is guarded by `elif has_expr`,
+                    # it neither re-ran nor undid itself once the expression was
+                    # gone. The stale pin survived, the appended band count had
+                    # changed C underneath it, and auto-stretch kept rendering a
+                    # single band instead of the original image.
+                    #
+                    # Only an AUTOMATIC pin is dropped -- a single-band view the
+                    # user picked themselves in the stretch dialog has no marker
+                    # and is left exactly as they set it.
+                    if getattr(viewer, "_auto_pinned_last_band", False):
+                        viewer.stretch_params = None
+                        viewer._auto_pinned_last_band = False
+                        viewer._force_auto_stretch = True
+                        logging.info("edit_image_viewer: dropped stale auto single-band "
+                                     "pin; returning to the original composite")
+
                     logging.info("edit_image_viewer: cleared viewer flags (cls/expr disabled)")
             except Exception as e:
                 logging.debug(f"edit_image_viewer: viewer flag clearing failed: {e}")
@@ -11429,18 +11863,64 @@ class ProjectTab(QtWidgets.QWidget):
             scope = hint.get("scope")
             rn = hint.get("root_name")
             
-            # CRITICAL FIX: When applying to multiple files (all or group),
-            # we must clear the ENTIRE .ax cache, not just the current file.
-            # Otherwise the other files will use stale cached data (missing nodata_values, etc.)
+            # CRITICAL FIX: When applying to multiple files (all or group), we
+            # must clear every per-file performance cache, not just _ax_json_cache.
+            #
+            # invalidate_caches_for_file() (below) is the function that normally
+            # does this -- but it is only ever called for the ONE file the user
+            # had open in the editor. For "all"/"group" scope, _prepare_and_write()
+            # in the editor wrote fresh .ax data to every OTHER target file too,
+            # yet their _imgdata_cache / _raw_cache / _pixmap_cache / _export_cache
+            # / _scene_stats_cache / _nodata_mask_by_filepath / _raw_image_cache
+            # entries (7 caches beyond _ax_json_cache) were left untouched. Anyone
+            # who had already visited another root this session (thumbnails, prior
+            # navigation) keeps seeing that root's pre-classification ImageData
+            # object -- looking exactly like "other roots weren't classified" --
+            # until something forces a real reload (an explicit Refresh, which
+            # happens to route through a path that rebuilds ImageData from
+            # scratch). Clearing all of these wholesale here removes that gap;
+            # this is a rare, already-progress-dialog-gated bulk action, so the
+            # cost of a full clear (next load simply re-reads from disk) is
+            # negligible next to the batch write that just happened.
             if scope in ("all", "group"):
-                try:
-                    if hasattr(self, "_ax_json_cache"):
-                        self._ax_json_cache.clear()
-                        logging.info(f"edit_image_viewer: cleared entire _ax_json_cache for scope='{scope}'")
-                except Exception as e:
-                    logging.debug(f"edit_image_viewer: failed to clear _ax_json_cache: {e}")
-            
+                for cache_name in (
+                    "_ax_json_cache", "_imgdata_cache", "_raw_cache",
+                    "_pixmap_cache", "_export_cache", "_scene_stats_cache",
+                    "_nodata_mask_by_filepath", "_raw_image_cache",
+                    "_export_image_cache",  # biggest memory user -- same omission as invalidate_caches_for_file
+                ):
+                    try:
+                        cache = getattr(self, cache_name, None)
+                        if cache:
+                            cache.clear()
+                    except Exception as e:
+                        logging.debug(f"edit_image_viewer: failed to clear {cache_name}: {e}")
+                logging.info(f"edit_image_viewer: cleared per-file performance caches for scope='{scope}'")
+
             try:
+                if scope in ("all", "group"):
+                    # INSTANT FEEDBACK FIRST: "single" scope gets an immediate,
+                    # synchronous repaint via refresh_single_viewer(). "group"/
+                    # "all" used to skip straight to refresh_viewer(), which
+                    # reloads through load_image_group() -- an async, multi-
+                    # threaded QThreadPool loader that returns before the
+                    # reload finishes. That gap is why applying to a group/all
+                    # root visibly "did nothing" until the user separately
+                    # refreshed the viewer: the on-screen viewer never got the
+                    # cheap direct repaint that single-image scope gets, only
+                    # the slower background reload underneath. Do the same
+                    # direct repaint here for the image actually being looked
+                    # at, then still run the heavier reload below so every
+                    # other affected image/root stays consistent.
+                    if hasattr(self, "refresh_single_viewer"):
+                        try:
+                            if viewer is not None:
+                                self.refresh_single_viewer(viewer, reapply_mods=True, preserve_view=True)
+                            elif filepath:
+                                self.refresh_single_viewer(filepath, reapply_mods=True, preserve_view=True)
+                        except Exception as e:
+                            logging.debug(f"Immediate refresh_single_viewer before {scope}-scope reload failed: {e}")
+
                 if scope == "all":
                     if hasattr(self, "refresh_all_groups"):
                         self.refresh_all_groups()
@@ -12271,6 +12751,20 @@ class ProjectTab(QtWidgets.QWidget):
                         self._raw_image_cache.pop(k, None)
                 logging.debug(f"  Removed {len(keys_to_del)} entries from _raw_image_cache")
 
+        # 9. Export image cache -- BIGGEST MEMORY USER (see comment at its other
+        # clear sites, e.g. line ~16075). This function's whole purpose is "clear
+        # every per-file cache" but this one was missing; keys are
+        # ("export_unified_hist_once", filepath, img_mtime, axmt, poly_mt), so
+        # match on k[1] like the other _export_image_cache clear sites do.
+        if hasattr(self, "_export_image_cache") and self._export_image_cache:
+            keys_to_del = [k for k in self._export_image_cache
+                           if isinstance(k, tuple) and len(k) > 1
+                           and os.path.normcase(os.path.abspath(k[1])) == fp_norm]
+            for k in keys_to_del:
+                self._export_image_cache.pop(k, None)
+            if keys_to_del:
+                logging.debug(f"  Removed {len(keys_to_del)} entries from _export_image_cache")
+
     def _load_ax_config(self, filepath):
         """Load the .ax configuration for a file ONCE.
 
@@ -12294,6 +12788,66 @@ class ProjectTab(QtWidgets.QWidget):
             except Exception:
                 pass
         return None
+
+    def _record_rf_prediction_error(self, filepath, group_name, exc):
+        """Track a classification prediction failure so it reaches the user.
+
+        process_polygon's RF/classification try/except blocks catch every
+        prediction failure internally and only logging.error() it -- which
+        never propagates to ExportWorker's own `errors` counter (that counter
+        only increments when process_polygon raises all the way OUT, and
+        this is deliberately swallowed so one bad polygon doesn't abort the
+        whole CSV export). The result: a CSV with real "Class X %" column
+        headers (built once, upfront, straight from the model's classes_)
+        but every row's percentage cells blank, and the completion dialog
+        still proudly says "(0 errors)" because nothing was ever counted.
+        Surfacing the count + a sample message here is what turns that
+        silent, hard-to-diagnose failure into something the very next
+        export run reveals directly.
+        """
+        try:
+            self._rf_export_error_count = getattr(self, "_rf_export_error_count", 0) + 1
+            samples = getattr(self, "_rf_export_error_samples", None)
+            if samples is None:
+                samples = []
+                self._rf_export_error_samples = samples
+            if len(samples) < 5:
+                samples.append(f"{os.path.basename(filepath)} / {group_name}: {exc}")
+        except Exception:
+            pass
+
+    def _record_appended_band_error(self, filepath, band_type, band_idx, exc):
+        """Track a failure to regenerate an appended band (.ax `appended_bands`)
+        during .ax replay.
+
+        _apply_ax_to_raw's classification / boolean_expression / band_expression
+        append steps each catch their own failures internally -- a bad
+        expression or a missing in-memory sklearn model must not abort replay
+        for every other band or every other consumer of this same function
+        (CSV export, ML training, image export all share it). Without this,
+        the band is just silently absent from whatever consumed the replay: an
+        exported image with fewer bands than its own .ax says it should have,
+        a CSV missing a feature column, an ML run missing a feature -- with
+        only a buried logging.warning to explain why. The concrete, reproduced
+        case: a classification band appended in the editor replays fine while
+        the model that produced it is still loaded in memory (self.
+        random_forest_model / ProjectTab.shared_random_forest_model), but that
+        state is never persisted -- restart the app, or never (re)load the
+        .pkl this session, and _get_sklearn_bundle() returns None, so every
+        classification-type appended band across every consumer vanishes with
+        no error the user would ever see. Surfacing the count here is what
+        turns that into something the completion message actually reports.
+        """
+        try:
+            self._appended_band_error_count = getattr(self, "_appended_band_error_count", 0) + 1
+            samples = getattr(self, "_appended_band_error_samples", None)
+            if samples is None:
+                samples = []
+                self._appended_band_error_samples = samples
+            if len(samples) < 5:
+                samples.append(f"{os.path.basename(filepath or '')} / {band_type} #{band_idx}: {exc}")
+        except Exception:
+            pass
 
     def process_polygon(self, group_name, filepath, polygon_dict, exif_data_dict, exif_tags, model_loaded, opts=None):
         """
@@ -12808,6 +13362,27 @@ class ProjectTab(QtWidgets.QWidget):
             # Check for hist_enabled in opts
             hist_enabled_flag = (opts or {}).get('hist_enabled', True)
             if hist_enabled_flag and _hm_enabled(hm_candidate):
+                # TRAP -- READ BEFORE WIRING ANYTHING TO opts['hist_match'].
+                # hm_opts is consumed ONLY to build cache keys (export_key and
+                # sc_key below); it is never applied to any pixels. The actual
+                # histogram matching happens inside _get_export_image ->
+                # _apply_ax_to_raw, which is called with the FILEPATH ALONE and
+                # therefore only ever sees the .ax file's own hist_match block.
+                # Today nothing populates opts['hist_match'] (only the image
+                # editor writes hist_match, and it writes it to the .ax), so
+                # this branch is dormant and the key derived below correctly
+                # describes the .ax. The moment a caller does pass it, the
+                # cache key would claim "these pixels are histogram-matched
+                # with signature X" for pixels that were never matched at all,
+                # and every statistic -- polygon AND scene -- would silently be
+                # computed on unmatched data. If that plumbing is ever wanted,
+                # _get_export_image must be taught to accept the override too;
+                # changing only this block is worse than leaving it alone.
+                logging.warning(
+                    "[process_polygon] opts['hist_match'] was supplied for %s but "
+                    "is NOT applied to pixels -- only the .ax hist_match block is. "
+                    "Statistics will reflect the .ax, not this override.",
+                    os.path.basename(filepath))
                 hm_opts = dict(hm_candidate)
 
         if hm_opts is None:
@@ -13814,6 +14389,7 @@ class ProjectTab(QtWidgets.QWidget):
                              batch_predictions[real_idx] = (p_counts, p_perc, 1)
                      except Exception as e:
                          logging.error(f"Batch prediction failed: {e}")
+                         self._record_rf_prediction_error(filepath, group_name, e)
 
             # MAIN POINT LOOP (now using batched results)
             for idx, (xi, yi) in enumerate(pts_img):
@@ -14421,6 +14997,7 @@ class ProjectTab(QtWidgets.QWidget):
                                     class_percentages[f"Class {k} %"] = frac[k]
                     except Exception as e:
                         logging.error(f"RF prediction error for '{filepath}', polygon '{name}': {e}")
+                        self._record_rf_prediction_error(filepath, group_name, e)
                         class_percentages = {}
                 else:
                     class_percentages = {}
@@ -15190,8 +15767,11 @@ class ProjectTab(QtWidgets.QWidget):
 
         # process_polygon reads/writes these per-run caches and locks; make sure they
         # exist (mirrors the relevant subset of save_polygons_to_csv's own init).
+        # RAM FIX: byte-budgeted (was an uncapped plain dict) -- see
+        # _EXPORT_CACHE_BUDGET_BYTES.
         if not hasattr(self, "_export_cache"):
-            self._export_cache = {}
+            from .raster_reader import ByteBudgetedLRUDict
+            self._export_cache = ByteBudgetedLRUDict(_EXPORT_CACHE_BUDGET_BYTES)
         if not hasattr(self, "_export_cache_lock"):
             self._export_cache_lock = threading.RLock()
         if not hasattr(self, "_nodata_mask_by_filepath"):
@@ -15365,7 +15945,10 @@ class ProjectTab(QtWidgets.QWidget):
 
         # ====== SPEED TWEAKS INIT (per-run cache + I/O gate) ======
         try:
-            self._export_cache = {}
+            # RAM FIX: byte-budgeted (was an uncapped plain dict) -- see
+            # _EXPORT_CACHE_BUDGET_BYTES.
+            from .raster_reader import ByteBudgetedLRUDict
+            self._export_cache = ByteBudgetedLRUDict(_EXPORT_CACHE_BUDGET_BYTES)
             self._export_cache_lock = threading.Lock()
             # THREAD-SAFE: Initialize per-filepath nodata mask cache upfront
             # This avoids TOCTOU race condition in _apply_ax_to_raw and _get_export_image
@@ -15558,6 +16141,21 @@ class ProjectTab(QtWidgets.QWidget):
             logging.debug(f"[CSV export] Excluding mask polygon names: {mask_polygon_names_to_exclude}")
         
         polygons_to_process = []
+        # DEDUPE BY NORMALISED PATH: all_polygons[group_name] is keyed by the
+        # literal filepath STRING, and one project routinely holds two
+        # spellings of the same file under the same group -- e.g. the
+        # viewer's forward-slash form (drawn/moved polygons) alongside
+        # os.path.normpath's backslash form (shapefile import). See
+        # canopie/qc/test_polygon_path_key_shadowing.py for the incident this
+        # is documented against. Elsewhere in the app that's handled with a
+        # two-tier exact+normalised lookup so neither spelling shadows the
+        # other for RENDERING -- but this export builder just iterated the
+        # raw dict, so a polygon stored under both spellings was processed
+        # (and exported) twice: same "File Name" (basename hides the spelling
+        # difference), same Object ID, every channel/expression row doubled.
+        # Keep the first spelling encountered per (group_name, normalised
+        # path); later spellings of the same file are the same polygon.
+        _seen_group_fp = set()
         for group_name, polygons_data in self.all_polygons.items():
             # Skip if this group_name is a mask polygon
             if group_name in mask_polygon_names_to_exclude:
@@ -15569,6 +16167,12 @@ class ProjectTab(QtWidgets.QWidget):
                 if poly_name in mask_polygon_names_to_exclude:
                     logging.debug(f"[CSV export] Skipping mask polygon: {poly_name} for {filepath}")
                     continue
+                dedupe_key = (group_name, os.path.normpath(filepath).lower() if filepath else "")
+                if dedupe_key in _seen_group_fp:
+                    logging.debug(f"[CSV export] Skipping duplicate spelling of '{filepath}' "
+                                  f"for group '{group_name}' (already queued under another spelling)")
+                    continue
+                _seen_group_fp.add(dedupe_key)
                 polygons_to_process.append((group_name, filepath, polygon_dict))
         
         _t_preprocess_end = time.perf_counter()
@@ -17532,7 +18136,8 @@ class ProjectTab(QtWidgets.QWidget):
                     fast=True, max_samples=HIST_MAX_SAMPLES,
                     nodata_values=hist_nd_vals,
                     mask_polygon_points=poly_points,
-                    mask_polygon_enabled=mask_polygon_enabled
+                    mask_polygon_enabled=mask_polygon_enabled,
+                    src_channel_order=_hm_src_order
                 )
             except TypeError:
                 try:
@@ -17658,20 +18263,12 @@ class ProjectTab(QtWidgets.QWidget):
         # so the rest of this pipeline's masking behaviour is unchanged.
         hist_nd_vals = hist_nodata_values(ax, filepath) if hist_enabled else []
 
-        # Matching pairs bands positionally, so a reference measured in BGR
-        # (the editor's order for cv2-loaded <=4-band images) applied to an
-        # RGB-ordered multiband TIFF swaps the Red and Blue references. Warn
-        # rather than silently reorder: quietly permuting a stored reference
-        # would change numbers a previous export already used.
-        if hist_enabled and isinstance(hmatch, dict) and hmatch:
-            _ref_order = str(hmatch.get("channel_order") or "").lower()
-            _src_order = str(getattr(self, "_last_export_channel_order", "") or "").lower()
-            if _ref_order and _src_order and _ref_order != _src_order:
-                logging.warning(
-                    "[hist] %s: reference was measured in %s order but this image is "
-                    "%s -- matching is positional, so the first three bands are paired "
-                    "in reverse. Recompute the reference on an image of this type.",
-                    os.path.basename(filepath or "?"), _ref_order.upper(), _src_order.upper())
+        # Channel-order realignment now lives in ProjectTab._apply_hist_match
+        # itself, so the CSV export, the viewer and ML all get it from the one
+        # canonical routine instead of only whichever caller was patched. What
+        # this path still owns is knowing WHICH order its own pixels are in;
+        # that provenance is passed down via src_channel_order below.
+        _hm_src_order = str(getattr(self, "_last_export_channel_order", "") or "").lower()
 
         def _do_resize():
             nonlocal img, nodata_mask
@@ -18202,6 +18799,7 @@ class ProjectTab(QtWidgets.QWidget):
                                     logging.info(f"[_apply_ax_to_raw] Appended boolean expression band #{band_idx}: {expr}")
                             except Exception as e:
                                 logging.warning(f"[_apply_ax_to_raw] Failed to evaluate appended expression '{expr}': {e}")
+                                self._record_appended_band_error(filepath, "boolean_expression", band_idx, e)
 
                     elif band_type == "band_expression":
                         # Evaluate the stored numeric expression and append as a float band
@@ -18217,47 +18815,72 @@ class ProjectTab(QtWidgets.QWidget):
                                     logging.info(f"[_apply_ax_to_raw] Appended band expression band #{band_idx}: {expr}")
                             except Exception as e:
                                 logging.warning(f"[_apply_ax_to_raw] Failed to evaluate appended band expression '{expr}': {e}")
+                                self._record_appended_band_error(filepath, "band_expression", band_idx, e)
 
                     elif band_type == "classification":
-                        # Re-run classification using the stored model
+                        # Re-run classification using the stored model.
+                        #
+                        # This used to build its feature matrix from just the
+                        # first 3 raw bands ("Simple feature extraction (first
+                        # 3 bands as RGB features)"), which only matches a
+                        # model literally trained on 3 raw bands. Any model
+                        # trained with band-math expressions, a different band
+                        # count, or a spatial window (the normal case -- see
+                        # run_sklearn_classification()/_make_feature_stack_for_model()
+                        # in the editor) raised a feature-count mismatch here,
+                        # silently swallowed by the except below, so the band
+                        # just never got appended for any image other than the
+                        # one open in the editor -- reported as "append band
+                        # after classification is not being transmitted to
+                        # other roots". Reuse the same feature reconstruction
+                        # the live classification path already gets right,
+                        # driven by the shared model bundle's actual
+                        # feature_names/expressions/window_size instead of
+                        # guessing "first 3 bands".
                         try:
-                            bundle = getattr(ProjectTab, "shared_random_forest_model", None) or \
-                                     getattr(ProjectTab, "random_forest_model", None)
+                            bundle = self._get_sklearn_bundle()
                             if isinstance(bundle, dict) and "model" in bundle:
                                 model = bundle["model"]
-                                H, W = img.shape[:2]
+                                feat_names = list(bundle.get("feature_names") or [])
+                                expressions = bundle.get("expressions", [])
+                                window_size = bundle.get("window_size", 1)
+                                base_feature_names = bundle.get("base_feature_names", feat_names)
+                                label_names = list(bundle.get("label_names") or band_info.get("label_names") or [])
 
-                                # Build feature matrix - use same approach as apply_aux_modifications
-                                base_ml = img.astype(np.float32, copy=False)
-                                if base_ml.ndim == 2:
-                                    base_ml = base_ml[..., np.newaxis]
+                                X, (H, W) = self._make_feature_stack_for_model(
+                                    img, feat_names,
+                                    expressions=expressions,
+                                    window_size=window_size,
+                                    base_feature_names=base_feature_names,
+                                )
 
-                                # Simple feature extraction (first 3 bands as RGB features)
-                                n_features = min(3, base_ml.shape[2])
-                                X = base_ml[:, :, :n_features].reshape(H * W, n_features)
-
-                                # Build label->index mapping (model may return string labels)
                                 classes = list(getattr(model, "classes_", []))
-                                label_to_idx = {lab: i for i, lab in enumerate(classes)}
+                                idx_map = ({lab: i for i, lab in enumerate(label_names)} if label_names
+                                           else {lab: i for i, lab in enumerate(classes)})
 
-                                # Predict
-                                valid = np.isfinite(X).all(axis=1)
-                                preds = np.zeros(H * W, dtype=np.float32)
-                                if valid.any():
-                                    raw_preds = model.predict(X[valid])
-                                    # Convert string labels to numeric indices
-                                    if len(classes) > 0 and isinstance(raw_preds[0], str):
-                                        preds[valid] = np.array([label_to_idx.get(p, 0) for p in raw_preds], dtype=np.float32)
-                                    else:
-                                        preds[valid] = np.asarray(raw_preds, dtype=np.float32)
+                                n = H * W
+                                chunk = max(50_000, min(500_000, n // 8 or 50_000))
+                                raw_preds = np.empty((n,), dtype=object)
+                                i = 0
+                                while i < n:
+                                    j = min(i + chunk, n)
+                                    raw_preds[i:j] = model.predict(X[i:j])
+                                    i = j
 
-                                cls_band = preds.reshape(H, W).astype(_float_dtype, copy=False)
+                                cls_band = np.vectorize(idx_map.get, otypes=[np.float32])(raw_preds).reshape(H, W)
+                                cls_band = np.nan_to_num(cls_band, nan=0).astype(_float_dtype, copy=False)
                                 img = np.concatenate([img, cls_band[..., np.newaxis]], axis=2)
                                 logging.info(f"[_apply_ax_to_raw] Appended classification band #{band_idx} (classes: {classes})")
                             else:
                                 logging.warning(f"[_apply_ax_to_raw] No sklearn model available for appended classification band #{band_idx}")
+                                self._record_appended_band_error(
+                                    filepath, "classification", band_idx,
+                                    "no sklearn model loaded in this session "
+                                    "(_get_sklearn_bundle() returned None) -- "
+                                    "reload the .pkl model and export again")
                         except Exception as e:
                             logging.warning(f"[_apply_ax_to_raw] Failed to append classification band: {e}")
+                            self._record_appended_band_error(filepath, "classification", band_idx, e)
         except Exception as e:
             logging.debug(f"_apply_ax_to_raw: appended bands failed: {e}")
 
@@ -18466,9 +19089,16 @@ class ProjectTab(QtWidgets.QWidget):
     def export_project_images(self):
         """
         Export all project images after applying their .ax modifications.
+        Format, band order, EXIF, and background-run choices come from
+        ExportImagesOptionsDialog (see export_images_options_dialog.py).
         - Output: <project_folder>/Exported_images_<N> (auto-incremented per run)
         - Classic TIFF by default; fallback to BigTIFF if needed.
-        - JPEG/PNG via OpenCV converted BGR(A)->RGB(A) so colors match viewer.
+        - Band order defaults to "keep" (each source's own true channel
+          order, tracked from how it was loaded -- tifffile native vs cv2
+          BGR) rather than assuming every source is BGR; "Force RGB"/
+          "Force BGR" override that per-source order for every file.
+        - A .jpg/.jpeg SOURCE always exports as .jpg regardless of the
+          chosen format; everything else uses the chosen format.
         - Multiband stacks keep original band order (axes moved to HWC).
         - Optional EXIF copy (parallel when available).
         """
@@ -18510,15 +19140,25 @@ class ProjectTab(QtWidgets.QWidget):
             QtWidgets.QMessageBox.information(self, "Export", "No images to export.")
             return
 
-        # ---------- ask user: copy EXIF? (Yes = copy; No = skip) ----------
-        resp = QtWidgets.QMessageBox.question(
-            self,
-            "Export metadata",
-            "Copy EXIF metadata to exported images?",
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-            QtWidgets.QMessageBox.No,
-        )
-        copy_exif = (resp == QtWidgets.QMessageBox.Yes)
+        # ---------- ask user: format, band order, EXIF, background ----------
+        # One styled dialog replaces the old pair of QMessageBox prompts
+        # (copy EXIF? / run in background?) -- see export_images_options_dialog.py.
+        from .export_images_options_dialog import ExportImagesOptionsDialog
+        opts_dlg = ExportImagesOptionsDialog(n_images=len(filepaths), parent=self)
+        if opts_dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        opts = opts_dlg.get_options()
+        export_format = opts['format']
+        band_order = opts['band_order']
+        copy_exif = opts['copy_exif']
+        run_background = opts['background']
+
+        # Reset appended-band-failure tracking for THIS run (see
+        # _record_appended_band_error) so a previous export's failures don't
+        # leak into this one's completion message. The background path resets
+        # its own copy inside ProjectImagesExportWorker.run().
+        self._appended_band_error_count = 0
+        self._appended_band_error_samples = []
 
         # ---------- destination folder ----------
         def _next_export_dir(root):
@@ -18533,20 +19173,13 @@ class ProjectTab(QtWidgets.QWidget):
         os.makedirs(export_dir, exist_ok=True)
 
         # ============ BACKGROUND OPTION ============
-        reply = QtWidgets.QMessageBox.question(
-            self, "Run in Background?",
-            f"Export {len(filepaths)} images with .ax transformations.\n\n"
-            "Run in background to continue using the app?",
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No | QtWidgets.QMessageBox.Cancel,
-            QtWidgets.QMessageBox.Yes
-        )
-        
-        if reply == QtWidgets.QMessageBox.Cancel:
-            return
-        
-        if reply == QtWidgets.QMessageBox.Yes:
-            # Launch background worker
-            worker = ProjectImagesExportWorker(self, export_dir, filepaths, 'tif')
+        if run_background:
+            # copy_exif/export_format/band_order were all collected above --
+            # previously copy_exif was silently dropped for the background
+            # path (choosing "Yes" + the default "Run in background" copied
+            # no EXIF at all), and format/band order weren't offered at all.
+            worker = ProjectImagesExportWorker(self, export_dir, filepaths, export_format,
+                                                copy_exif=copy_exif, band_order=band_order)
             mgr = ExportManagerDialog.get_instance(self)
             mgr.add_export(worker, export_dir, export_type='images')
             mgr.show()
@@ -18566,16 +19199,28 @@ class ProjectTab(QtWidgets.QWidget):
             return cand
 
         def _norm_export_name(fp):
+            # A .jpg/.jpeg SOURCE always exports as .jpg regardless of the
+            # chosen format (unchanged from before this dialog existed) --
+            # everything else uses the user's chosen export_format.
             ext = os.path.splitext(fp)[1].lower()
             if ext in ('.jpg', '.jpeg'):
                 return os.path.splitext(os.path.basename(fp))[0] + ext
-            return os.path.splitext(os.path.basename(fp))[0] + ".tif"
+            out_ext = {'jpg': '.jpg', 'jpeg': '.jpg', 'png': '.png'}.get(export_format, '.tif')
+            return os.path.splitext(os.path.basename(fp))[0] + out_ext
 
         def _read_raw_any(fp):
             """
-            Read image and put channels last (HWC). 
-            Keep BGR order for JPEG/PNG (same as cv2.imread in viewer).
+            Read image and put channels last (HWC).
             Uses tifffile metadata to properly detect axis order.
+
+            Returns (arr, channel_order). channel_order is "rgb" for the
+            tifffile branch (tifffile returns the file's native band order,
+            which is never BGR) and "bgr" for the cv2 fallback (cv2 always
+            decodes to BGR). _save_tiff needs this to decide whether a
+            genuine BGR->RGB flip is required -- treating every source as
+            BGR here (the old behavior) silently swapped R/B for every TIFF
+            source, since tifffile succeeds for essentially any valid TIFF
+            and never returns BGR order.
             """
             ext = os.path.splitext(fp)[1].lower()
             try:
@@ -18584,7 +19229,7 @@ class ProjectTab(QtWidgets.QWidget):
                     with tiff.TiffFile(fp) as tf:
                         arr = tf.asarray()
                         arr = np.squeeze(arr)
-                        
+
                         if arr.ndim == 3:
                             # Check tifffile's axes interpretation
                             axes = ''
@@ -18593,7 +19238,7 @@ class ProjectTab(QtWidgets.QWidget):
                                     axes = tf.series[0].axes.upper()
                             except Exception:
                                 pass
-                            
+
                             # Determine if we need to transpose based on axes metadata
                             needs_transpose = False
                             if axes:
@@ -18607,21 +19252,21 @@ class ProjectTab(QtWidgets.QWidget):
                                 # First dim should be small AND much smaller than both spatial dims
                                 if d0 <= 32 and d1 >= 32 and d2 >= 32 and d0 < min(d1, d2) // 2:
                                     needs_transpose = True
-                            
+
                             if needs_transpose:
                                 arr = np.moveaxis(arr, 0, -1)
-                        
-                        return np.ascontiguousarray(arr)
+
+                        return np.ascontiguousarray(arr), "rgb"
                 else:
                     data = np.fromfile(fp, dtype=np.uint8)
                     img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
                     if img is None:
-                        return None
+                        return None, "bgr"
                     # Keep BGR order - same as cv2.imread used by viewer
-                    return np.ascontiguousarray(img)
+                    return np.ascontiguousarray(img), "bgr"
             except Exception as e:
                 logging.warning("Raw load failed for %s: %s", fp, e)
-                return None
+                return None, "bgr"
 
         def _load_ax(fp):
             import json
@@ -18642,11 +19287,13 @@ class ProjectTab(QtWidgets.QWidget):
 
         bigtiff_written = set()  # paths written as BigTIFF → skip EXIF copy
 
-        def _save_tiff(dst, arr):
+        def _save_tiff(dst, arr, src_order="bgr"):
             """
             Try classic TIFF first (ExifTool can write). On size error → BigTIFF.
             Photometric:
-              - 'rgb' only when exactly 3 channels (convert BGR→RGB first),
+              - 'rgb' only when exactly 3 channels (convert to genuine RGB
+                first, using src_order to know whether that's a no-op or a
+                swap -- see _read_raw_any),
               - otherwise 'minisblack' (multiband scientific).
             For multiband (>3 channels): write as (C, H, W) for proper viewer compatibility.
             Input MUST be in HWC format (height, width, channels) or 2D (height, width).
@@ -18655,6 +19302,7 @@ class ProjectTab(QtWidgets.QWidget):
                 if arr is None or arr.size == 0:
                     return False
                 a = np.ascontiguousarray(arr)
+                is_rgb_order = (src_order == "rgb")
                 
                 # Sanity check: ensure we have reasonable dimensions
                 # If 3D, the last dimension should be channels (typically <= 100)
@@ -18685,14 +19333,18 @@ class ProjectTab(QtWidgets.QWidget):
                     photometric = "minisblack"
                     write_arr = a
                 elif a.ndim == 3 and a.shape[2] == 3:
-                    # 3-channel image - convert BGR→RGB for proper TIFF color
-                    # (input is BGR from cv2/viewer, TIFF expects RGB for photometric='rgb')
+                    # 3-channel image - TIFF photometric='rgb' expects genuine
+                    # RGB order. Only flip when the source was actually BGR
+                    # (a jpg/png read via cv2) -- a TIFF source (src_order
+                    # "rgb", read via tifffile) is already correct and must
+                    # NOT be flipped, or R/B swap in the output.
                     photometric = "rgb"
-                    write_arr = a[:, :, ::-1].copy()  # BGR → RGB
+                    write_arr = a if is_rgb_order else a[:, :, ::-1].copy()  # BGR → RGB
                 elif a.ndim == 3 and a.shape[2] == 4:
-                    # BGRA - convert to RGBA
+                    # BGRA/RGBA - convert to RGBA if needed
                     photometric = "rgb"
-                    write_arr = np.concatenate([a[:, :, 2:3], a[:, :, 1:2], a[:, :, 0:1], a[:, :, 3:4]], axis=2)
+                    write_arr = a if is_rgb_order else np.concatenate(
+                        [a[:, :, 2:3], a[:, :, 1:2], a[:, :, 0:1], a[:, :, 3:4]], axis=2)
                 elif a.ndim == 3 and a.shape[2] > 4:
                     # Multiband scientific image (>4 channels)
                     # Write as (C, H, W) for proper viewer compatibility
@@ -18762,7 +19414,7 @@ class ProjectTab(QtWidgets.QWidget):
         with self._busy_dialog("Exporting images…"):
             for fp in filepaths:
                 QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents)
-                raw = _read_raw_any(fp)
+                raw, src_order = _read_raw_any(fp)
                 if raw is None:
                     fail += 1
                     continue
@@ -18816,11 +19468,36 @@ class ProjectTab(QtWidgets.QWidget):
 
                 out_name = _norm_export_name(fp)
                 out_path = _unique_path(export_dir, out_name)
-                
-                if out_name.lower().endswith(('.jpg', '.jpeg')):
-                    cv2.imwrite(out_path, img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+                # is_rgb_order: the tracked source order, overridden by the
+                # user's explicit Force RGB/BGR choice if they made one.
+                is_rgb_order_fg = (src_order == "rgb")
+                if band_order == "rgb":
+                    is_rgb_order_fg = True
+                elif band_order == "bgr":
+                    is_rgb_order_fg = False
+
+                if out_name.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    # cv2.imwrite requires BGR-ordered input for these
+                    # formats -- only reorder when the source wasn't
+                    # already BGR (a plain jpg source going to jpg output,
+                    # the only case before this dialog existed, needed none).
+                    if img.ndim == 3 and img.shape[2] >= 3 and is_rgb_order_fg:
+                        bgr = img.copy()
+                        bgr[..., [0, 2]] = img[..., [2, 0]]
+                    else:
+                        bgr = img
+                    if out_name.lower().endswith(('.jpg', '.jpeg')):
+                        cv2.imwrite(out_path, bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    else:
+                        cv2.imwrite(out_path, bgr)
                 else:
-                    if not _save_tiff(out_path, img):
+                    # Pass the already-resolved order (source order, folded
+                    # with any user Force RGB/BGR override) -- _save_tiff
+                    # just needs to know how to treat this array, not
+                    # separately re-derive the override.
+                    if not _save_tiff(out_path, img,
+                                       src_order=("rgb" if is_rgb_order_fg else "bgr")):
                         fail += 1
                         continue
 
@@ -18870,6 +19547,20 @@ class ProjectTab(QtWidgets.QWidget):
             msg += "\nEXIF copy skipped by user."
         if fail:
             msg += f"\nFailed: {fail}"
+        # Surface appended-band failures that _apply_ax_to_raw swallows
+        # internally (see _record_appended_band_error) -- a classification/
+        # boolean/band-expression band appended in the editor silently
+        # missing from an exported file never counts toward `fail` above,
+        # since _apply_ax_to_raw still returns a valid (just narrower) image
+        # and the file still saves fine.
+        ab_err_count = getattr(self, "_appended_band_error_count", 0)
+        if ab_err_count:
+            ab_samples = getattr(self, "_appended_band_error_samples", []) or []
+            ab_first = ab_samples[0] if ab_samples else "see log"
+            msg += (f"\nWARNING: {ab_err_count} appended band(s) could not be regenerated "
+                    f"-- exported file(s) are missing those bands. First error: {ab_first}")
+            logging.warning("[export_project_images] %d appended band(s) failed to "
+                             "regenerate; samples: %s", ab_err_count, ab_samples)
         logging.info(msg)
         QtWidgets.QMessageBox.information(self, "Export", msg)
         
@@ -18886,8 +19577,12 @@ class ProjectTab(QtWidgets.QWidget):
             filepath = os.fspath(filepath)
 
             # ---------- cache keyed by image & .ax mtimes ----------
+            # RAM FIX: byte-budgeted (was an uncapped plain dict, and its own
+            # comment elsewhere calls it the "biggest memory user") -- see
+            # _EXPORT_IMAGE_CACHE_BUDGET_BYTES.
             if not hasattr(self, "_export_image_cache"):
-                self._export_image_cache = {}
+                from .raster_reader import ByteBudgetedLRUDict
+                self._export_image_cache = ByteBudgetedLRUDict(_EXPORT_IMAGE_CACHE_BUDGET_BYTES)
 
             def _ax_candidates(fp):
                 base = os.path.splitext(os.path.basename(fp))[0] + ".ax"
@@ -20481,6 +21176,214 @@ class ProjectTab(QtWidgets.QWidget):
         logging.info("[migrate_polygon_basis] %s: %d rescaled, %d already correct",
                      "DRY RUN" if dry_run else "APPLIED", n_fixed, n_skip)
         return (n_fixed, n_skip, details)
+
+    def find_suspect_point_coordinates(self, dry_run=True, remove_flagged=False):
+        """Detect (and optionally remove) point coordinates saved by the
+        pre-fix on_polygon_drawn / on_polygon_modified ("points go stray on
+        reload" -- fixed this session).
+
+        UNLIKE migrate_polygon_basis, this CANNOT algebraically repair a
+        corrupted coordinate. That bug's `image_ref_size` was stamped
+        identically by the old and new code (never touched by the fix), so
+        there is no "wrong recorded basis" to diff against a true one and
+        invert -- the corrupting factor (which decimated preview level was
+        on screen, and/or transient drag state, at the exact moment of the
+        bad save) was a runtime-only value that was never persisted
+        anywhere. So this method only DETECTS implausible points and, if
+        asked, removes the unambiguous ones -- it never invents a
+        "corrected" coordinate.
+
+        Two independent checks per point, most confident first:
+          1. OUT OF BOUNDS: x/y outside [0, image_ref_size). This is the
+             documented symptom ("landed six times outside the image") and
+             is unambiguous -- a valid point can never be recorded outside
+             its own image's dimensions.
+          2. IMPLAUSIBLE RELATIVE TO SIBLINGS: in-bounds, but far outside the
+             combined extent of every OTHER in-bounds point recorded on the
+             same image -- from this same entry (a "Random Points" cluster
+             can hold many pairs, and one going stray inside its own cluster
+             is exactly the case this exists to catch) as well as every
+             other polygon/point file for that image. Leave-one-out per
+             POINT, not per file: the extent a point is judged against must
+             never include that point itself, or an isolated outlier could
+             never fail its own yardstick. This is a heuristic, not a
+             certainty (a deliberately isolated point is legitimate), so it
+             is only ever REPORTED, never auto-removed.
+
+        remove_flagged=True deletes only the out-of-bounds points (never the
+        sibling-heuristic ones) -- from their entry, or the whole entry if
+        it becomes empty -- via the same atomic .tmp + os.replace write
+        migrate_polygon_basis uses. dry_run=True (default) never writes.
+
+        Returns (n_checked, n_suspect, details), details being a list of
+        dicts: {file, group_name, filepath, point_index, x, y, reason,
+        removed}.
+        """
+        import os, json, glob
+
+        polygons_dir = os.path.join(self.project_folder or "", "polygons")
+        if not os.path.isdir(polygons_dir):
+            return (0, 0, ["no polygons dir"])
+
+        # A polygon/point entry's on-disk JSON body does NOT carry its own
+        # image filepath (confirmed by reading the writer -- on_polygon_drawn
+        # stores only points/coord_space/image_ref_size/name/root/type). The
+        # filepath is only ever the dict KEY in `all_polygons[group][filepath]`
+        # and the name is baked into the filename instead, exactly like
+        # migrate_polygon_basis resolves it -- by matching the longest known
+        # image base that the "<group>_<image base>_polygons.json" stem ends
+        # with (group names contain underscores too, so this cannot just
+        # split on "_").
+        known_bases = {}
+        for groups in ((getattr(self, "image_data_groups", {}) or {}),
+                       (getattr(self, "multispectral_image_data_groups", {}) or {}),
+                       (getattr(self, "thermal_rgb_image_data_groups", {}) or {})):
+            for paths in groups.values():
+                for pth in (paths or []):
+                    known_bases[os.path.splitext(os.path.basename(pth))[0]] = pth
+
+        def _resolve_fp(path):
+            stem = os.path.basename(path)[:-len("_polygons.json")]
+            for base, cand in sorted(known_bases.items(),
+                                     key=lambda kv: -len(kv[0])):
+                if stem.endswith(base):
+                    return cand
+            return None
+
+        poly_files = [p for p in glob.glob(os.path.join(polygons_dir, "*_polygons.json"))
+                      if not os.path.basename(p).startswith("_")]
+
+        # ---- Pass 1: every IN-BOUNDS point on each image, flattened ----
+        # Points that are already out of bounds are excluded here so a
+        # corrupted point can never inflate the yardstick used to judge
+        # others (see docstring point 2).
+        loaded = []               # (path, data, fp)
+        points_by_fp = {}         # fp -> list of (path, point_index, x, y)
+
+        for path in poly_files:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                continue
+            fp = _resolve_fp(path)
+            loaded.append((path, data, fp))
+            if not fp:
+                continue
+            pts = data.get("points") or []
+            ref = data.get("image_ref_size") or {}
+            rw, rh = ref.get("w"), ref.get("h")
+            bucket = points_by_fp.setdefault(fp, [])
+            for i, pt in enumerate(pts):
+                try:
+                    x, y = float(pt[0]), float(pt[1])
+                except Exception:
+                    continue
+                if rw and rh and (x < 0 or x >= rw or y < 0 or y >= rh):
+                    continue
+                bucket.append((path, i, x, y))
+
+        def _extent_excluding(fp, ex_path, ex_idx):
+            b = None
+            for path, i, x, y in points_by_fp.get(fp, ()):
+                if path == ex_path and i == ex_idx:
+                    continue
+                if b is None:
+                    b = [x, y, x, y]
+                else:
+                    if x < b[0]: b[0] = x
+                    if y < b[1]: b[1] = y
+                    if x > b[2]: b[2] = x
+                    if y > b[3]: b[3] = y
+            return b
+
+        # ---- Pass 2: check every point-type entry against both criteria ----
+        n_checked = 0
+        n_suspect = 0
+        details = []
+
+        # Margin for the sibling-extent heuristic: how far past the combined
+        # extent (as a multiple of its own diagonal) counts as implausible.
+        # Generous on purpose -- this check is advisory, not a deletion
+        # trigger, so it is tuned to avoid false positives over catching
+        # every possible case.
+        SIBLING_MARGIN_FACTOR = 2.0
+
+        for path, data, fp in loaded:
+            if str(data.get("type") or "").lower() != "point":
+                continue
+            pts = data.get("points") or []
+            if not pts:
+                continue
+            ref = data.get("image_ref_size") or {}
+            rw, rh = ref.get("w"), ref.get("h")
+            group_name = data.get("name") or os.path.basename(path)
+
+            keep_idx = set(range(len(pts)))
+            for i, pt in enumerate(pts):
+                n_checked += 1
+                try:
+                    x, y = float(pt[0]), float(pt[1])
+                except Exception:
+                    continue
+
+                reason = None
+                if rw and rh and (x < 0 or x >= rw or y < 0 or y >= rh):
+                    reason = "out of bounds (image is {}x{})".format(rw, rh)
+                else:
+                    sib = _extent_excluding(fp, path, i) if fp else None
+                    if sib:
+                        diag = ((sib[2] - sib[0]) ** 2 + (sib[3] - sib[1]) ** 2) ** 0.5
+                        sib_pad = diag * SIBLING_MARGIN_FACTOR
+                        if sib_pad > 0 and (
+                                x < sib[0] - sib_pad or x > sib[2] + sib_pad or
+                                y < sib[1] - sib_pad or y > sib[3] + sib_pad):
+                            reason = ("far outside every other point/polygon on "
+                                      "this image (extent ~{:.0f},{:.0f} - "
+                                      "{:.0f},{:.0f})").format(sib[0], sib[1], sib[2], sib[3])
+
+                if reason is None:
+                    continue
+
+                n_suspect += 1
+                removable = reason.startswith("out of bounds")
+                will_remove = bool(remove_flagged and not dry_run and removable)
+                details.append({
+                    "file": os.path.basename(path),
+                    "group_name": group_name,
+                    "filepath": fp,
+                    "point_index": i,
+                    "x": x, "y": y,
+                    "reason": reason,
+                    "removed": will_remove,
+                })
+                if will_remove:
+                    keep_idx.discard(i)
+
+            if remove_flagged and not dry_run and len(keep_idx) != len(pts):
+                new_pts = [pt for i, pt in enumerate(pts) if i in keep_idx]
+                if new_pts:
+                    data["points"] = new_pts
+                    tmp = path + ".tmp"
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(data, f)
+                    os.replace(tmp, path)
+                else:
+                    # Every point in this entry was flagged -- remove the
+                    # file itself rather than leave an empty "points": [].
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+
+        logging.info(
+            "[find_suspect_point_coordinates] %s: checked %d point(s), "
+            "%d suspect (%d out-of-bounds, %d sibling-heuristic)",
+            "DRY RUN" if dry_run else ("APPLIED" if remove_flagged else "REPORT ONLY"),
+            n_checked, n_suspect,
+            sum(1 for d in details if d["reason"].startswith("out of bounds")),
+            sum(1 for d in details if not d["reason"].startswith("out of bounds")))
+        return (n_checked, n_suspect, details)
 
     def polygon_basis_hw(self, viewer, image_data=None):
         """(H, W) that polygon coordinates are expressed in. ONE authority.
@@ -23140,34 +24043,43 @@ class ProjectTab(QtWidgets.QWidget):
             except Exception:
                 pass
 
-        # FIX: If we are preferring the last band (classification), and no stretch params exist,
-        # FORCE a simple min-max stretch (0-255) so the user sees *something* instead of black.
-        # This is critical for classification indices (e.g. 0, 1, 2) which look black with default percentile stretch.
+        # If we are preferring the last band (classification/boolean-expression
+        # append) and no stretch params exist, build a fresh auto-stretch for
+        # that one band so the user sees something instead of black (stale
+        # absolute bounds from the old multi-band image would clamp a 0-3
+        # classification index to near-nothing).
+        #
+        # This used to always hardcode mode="manual" with a literal 0-100%
+        # min-max, discarding whatever stretch METHOD (percentile/stddev/
+        # absolute) the user had configured -- so band selection correctly
+        # jumped to the new band, but the stretch always reset to the same
+        # raw min-max instead of "the user's configured auto method, applied
+        # fresh to the new band". Inherit the prior mode captured by
+        # edit_image_viewer (viewer._prior_auto_stretch_mode) when available;
+        # leave min_val/max_val unset so _apply_viewer_stretch_numpy computes
+        # them fresh for THIS band under that same method -- it already falls
+        # back to np.nanmin/nanmax of the current data when they are None, in
+        # every mode including "absolute", so no separate literal-min-max path
+        # is needed here.
         if prefer_last_band and sp is None:
-            # Create a temporary 'auto' stretch that covers the full range of the data
             if base is not None:
                 try:
-                    # If it's the classification result (last band), get the range
-                    if base.ndim == 3:
-                        target_band = base[..., -1]
-                    else:
-                        target_band = base
-                    
-                    mn, mx = float(np.min(target_band)), float(np.max(target_band))
-                    if mx <= mn: mx = mn + 1
-                    
-                    # Construct a manual min-max stretch param
+                    prior_mode = getattr(viewer, "_prior_auto_stretch_mode", None) or {}
+                    mode = prior_mode.get("mode", "percentile")
+
                     sp = _StretchParams(
-                        mode="manual", # or MinMax
-                        min_val=mn,
-                        max_val=mx,
-                        low_p=0.0, high_p=100.0,
-                        k_sigma=2.0,
-                        per_channel=False,
-                        clip=True,
-                        scope="viewer"
+                        mode=mode,
+                        low_p=prior_mode.get("low_p", 0.5),
+                        high_p=prior_mode.get("high_p", 99.5),
+                        k_sigma=prior_mode.get("k_sigma", 1.0),
+                        min_val=None,
+                        max_val=None,
+                        per_channel=prior_mode.get("per_channel", False),
+                        clip=prior_mode.get("clip", True),
+                        scope="viewer",
                     )
-                    logging.debug(f"_render_with_viewer_stretch: Auto-generated min-max stretch for classification: {mn} - {mx}")
+
+                    logging.debug(f"_render_with_viewer_stretch: last-band auto-stretch inheriting prior mode={mode}")
                 except Exception as e:
                     logging.warning(f"_render_with_viewer_stretch: Failed to generate auto-stretch: {e}")
 
@@ -24116,6 +25028,9 @@ class ProjectTab(QtWidgets.QWidget):
                     sp = self._project_default_stretch
                 if sp:
                     viewer.stretch_params = sp
+                    # A resolved/stored stretch is a deliberate choice, so it is
+                    # no longer an automatic pin and must not be auto-dropped.
+                    viewer._auto_pinned_last_band = False
 
             # --- Check fast paths (QImage from loader, pixmap cache) ---
             pixmap = None
@@ -25338,11 +26253,55 @@ class ProjectTab(QtWidgets.QWidget):
                 root_number = str(idx + 1) if idx is not None else "0"
 
         # Pick geometry and type
+        #
+        # BUG THIS FIXES ("points drawn in the past go stray on reload"):
+        # EditablePolygonItem.polygon stores genuine SCENE coordinates
+        # directly (see its __init__: self._polygon = polygon, no
+        # indirection). EditablePointItem.points does NOT -- it is
+        # pixmap-LOCAL, floor()-truncated integer pixel coordinates (see
+        # ImageViewer._scene_to_pix_local_int / add_point_to_scene), and the
+        # class provides `_scene_xy(p)` specifically to convert one of those
+        # back to a genuine scene position (add pixmap_item.pos(), or pass
+        # through unchanged when points_are_pixmap_local is False).
+        #
+        # This used to do `scene_poly = polygon_item.points` and feed those
+        # raw pixel-local values straight into scene_to_image_coords() below
+        # as if they were already scene coordinates -- discarding sub-pixel
+        # precision (the floor() truncation) and, whenever the pixmap the
+        # point is anchored to is not at scene position (0, 0) or the
+        # point's item-local transform is non-identity, applying the wrong
+        # basis entirely. The WRONG "image pixel" coordinate that produced
+        # was then the one written to all_polygons / polygons/*.json --
+        # so the corruption was baked into the saved file at DRAW time, and
+        # every reload faithfully (and correctly) re-displayed that already-
+        # wrong value. Converting through _scene_xy first is what
+        # EditablePointItem's own paint()/boundingRect()/hit-testing already
+        # do internally to turn `self.points` into real scene positions.
         if hasattr(polygon_item, "polygon"):
             scene_poly = polygon_item.polygon
             shape_type = "polygon"
         elif hasattr(polygon_item, "points"):
-            scene_poly = polygon_item.points
+            raw_pts = polygon_item.points
+            if hasattr(polygon_item, "_scene_xy"):
+                # _scene_xy(p) returns ITEM-LOCAL coordinates -- confirmed
+                # directly: EditablePointItem's own boundingRect()/shape()
+                # building code feeds its return value straight into
+                # path.addEllipse(sx, sy, ...) / QRectF(...), both item-local
+                # Qt APIs. Qt composes the item's OWN pos()/transform on top
+                # automatically at paint time -- and EditablePointItem has
+                # ItemIsMovable set with no itemChange/mouseMoveEvent override,
+                # so Qt's default drag DOES translate item.pos(). This item is
+                # freshly created here (add_point_to_scene never calls
+                # setPos()), so pos() is always (0, 0) at THIS call site and
+                # mapToScene is a no-op -- but wrapping it keeps this branch
+                # identical in shape to on_polygon_modified's (which does need
+                # it, see there), rather than two subtly different "fixes" for
+                # what is the same underlying reconstruction.
+                scene_poly = polygon_item.mapToScene(QtGui.QPolygonF([
+                    QtCore.QPointF(*polygon_item._scene_xy(p)) for p in raw_pts
+                ]))
+            else:
+                scene_poly = raw_pts
             shape_type = "point"
         else:
             scene_poly = QtGui.QPolygonF()
@@ -25403,6 +26362,14 @@ class ProjectTab(QtWidgets.QWidget):
 
         # UI updates (keep your existing persistence cadence)
         self.update_polygon_manager()
+
+        # Schedule immediate viewer refresh for newly drawn polygon
+        if hasattr(sender_viewer, 'image_data') and sender_viewer.image_data:
+            self._schedule_polygons_for_viewer(
+                sender_viewer,
+                sender_viewer.image_data,
+                delay_ms=0  # Immediate update - no batching delay
+            )
 
 
     def _save_specific_polygon_file(self, group_name, filepath):
@@ -25500,6 +26467,37 @@ class ProjectTab(QtWidgets.QWidget):
             return
 
         # --- collect SCENE points from the item (works for polygons and points) ---
+        #
+        # POINTS NEED A DIFFERENT RECONSTRUCTION THAN POLYGONS. item.polygon
+        # (EditablePolygonItem) already holds genuine scene coordinates by
+        # construction, so item.mapToScene(poly) is correct (composes the
+        # item's pos()/transform on top, which is what mapToScene is for).
+        #
+        # item.points (EditablePointItem) is the opposite: it is
+        # pixmap-LOCAL, floor()-truncated integer pixel coordinates (see
+        # ImageViewer._scene_to_pix_local_int). This USED to do
+        # `item.mapToScene(pts)` directly on those raw pixel-local values --
+        # mapToScene correctly composed item.pos()/transform, but on the
+        # WRONG base value (skipping the pixmap-offset conversion), so a
+        # moved point was saved with the wrong coordinate immediately, and
+        # every reload kept faithfully redrawing that already-wrong value
+        # ("points go stray on reload").
+        #
+        # The first fix (this same session) corrected the base value via
+        # _scene_xy() -- confirmed by direct inspection to return ITEM-LOCAL
+        # coordinates: EditablePointItem's own boundingRect()/shape()-building
+        # code feeds _scene_xy()'s return straight into path.addEllipse(sx,
+        # sy, ...) / QRectF(...), both item-local Qt APIs -- but DROPPED the
+        # mapToScene() call entirely, on the assumption the item's transform
+        # is always identity. It is NOT: EditablePointItem sets
+        # ItemIsMovable and never overrides itemChange/mouseMoveEvent (both
+        # mousePressEvent/mouseReleaseEvent call super()), so Qt's DEFAULT
+        # drag behaviour runs unmodified and item.pos() genuinely accumulates
+        # while dragging. Without mapToScene, on_polygon_modified -- which
+        # fires on drag RELEASE -- silently discarded the drag and re-saved
+        # the point's PRE-drag position. Compose both steps: _scene_xy()
+        # converts pixmap-local -> item-local, THEN mapToScene() converts
+        # item-local -> scene (adding whatever item.pos() the drag produced).
         try:
             if hasattr(item, "polygon") and item.polygon is not None:
                 poly = item.polygon
@@ -25511,7 +26509,13 @@ class ProjectTab(QtWidgets.QWidget):
                 pts = item.points
                 if isinstance(pts, QtGui.QPolygonF) and pts.count() == 0:
                     return
-                scene_poly = item.mapToScene(pts)
+                if hasattr(item, "_scene_xy"):
+                    item_local = QtGui.QPolygonF([
+                        QtCore.QPointF(*item._scene_xy(p)) for p in pts
+                    ])
+                    scene_poly = item.mapToScene(item_local)
+                else:
+                    scene_poly = item.mapToScene(pts)
             else:
                 scene_poly = None
         except RuntimeError as e:
@@ -25648,6 +26652,14 @@ class ProjectTab(QtWidgets.QWidget):
                 logging.debug(f"[on_polygon_modified] Forced immediate save for mask polygon '{group_name}'")
             except Exception as e:
                 logging.debug(f"[on_polygon_modified] Immediate save failed: {e}")
+
+        # Schedule immediate viewer refresh for modified polygon
+        if hasattr(viewer, 'image_data') and viewer.image_data:
+            self._schedule_polygons_for_viewer(
+                viewer,
+                viewer.image_data,
+                delay_ms=0  # Immediate update - no batching delay
+            )
 
 
     # ========== helpers for per-file save (tiny, local) ==========
@@ -28243,6 +29255,7 @@ class ProjectTab(QtWidgets.QWidget):
                                 or str(getattr(_sp, "display_mode", "")).lower() != "single"
                                 or getattr(_sp, "display_band", None) != C - 1):
                             viewer.stretch_params = _StretchParams(display_mode="single", display_band=C - 1)
+                            viewer._auto_pinned_last_band = True   # see the twin site in display_image_group
                 pm = self._render_with_viewer_stretch(imgd.image, viewer, prefer_last_band=prefer_last_band)
             except Exception as e:
                 # Do NOT swallow this silently. A bare `except: pass` here hid a

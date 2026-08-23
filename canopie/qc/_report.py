@@ -137,6 +137,24 @@ FEATURE_MAP = {
     "test_editor_refresh_preserves_view": (
         "Viewer state across Apply All Changes",
         "the post-editor refresh reaches the stretch-aware renderer instead of silently falling back"),
+    "test_export_and_ax_regressions": (
+        "Export path + .ax durability regressions",
+        "atomic .ax writes (no truncation, None deletes, concurrent merges), CSV path-spelling dedupe, classification failures surfaced, cache-clear completeness"),
+    "test_point_scene_coordinates": (
+        "Point item scene-coordinate reconstruction",
+        "drawn/moved points saved via _scene_xy, not raw pixmap-local storage -- fixes points going stray on project reload"),
+    "test_suspect_point_coordinates": (
+        "Migration: detect stray points saved before the scene-coordinate fix",
+        "filepath resolved by filename-stem match (no such key exists in the JSON body), out-of-bounds points removable, sibling-outlier points report-only via leave-one-out extent"),
+    "test_export_images_band_order": (
+        "Export Project Images band order (background + foreground)",
+        "channel order tracked from the loader (tifffile=native, cv2=BGR) instead of assumed; the real bug was in the tifffile.imwrite branch (band expr/classification/float sources), not the cv2.imwrite branch which already round-tripped correctly -- verified empirically both ways"),
+    "test_export_images_options_dialog": (
+        "Export Images options dialog (format / band order / EXIF / background)",
+        "replaces the old pair of QMessageBox prompts; defaults reproduce their old answers exactly; format and band order now thread through to both the background worker and the foreground path"),
+    "test_appended_band_failures": (
+        "Appended bands (classification/boolean/band-expression) silently missing from exports",
+        "_apply_ax_to_raw's per-band try/excepts only logged a warning on failure -- most commonly a classification band whose sklearn model isn't loaded in the current session -- so the band just vanished from CSV/image/ML output with nothing visible; now tracked and surfaced in every consumer's completion message, verified against a real project + a real trained model"),
     "test_csv_column_order": (
         "CSV column ordering",
         "canonical order shared by foreground and background exports; quantiles numeric not alphabetical"),

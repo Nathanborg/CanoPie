@@ -111,8 +111,14 @@ class _ImageLoadRunnable(QtCore.QRunnable):
 
             # 2) Apply aux mods (no UI here)
             #    FIX: pass the actual setting for global_mode
+            # `channel_order` is stamped by _imagedata_or_fallback: 'bgr' for the
+            # cv2/ImageData branch, 'rgb' for tifffile/raster_reader. Histogram
+            # matching pairs reference bands POSITIONALLY, so it needs to know
+            # which of the two this array is, or a BGR-measured reference applied
+            # to RGB pixels silently swaps Red and Blue.
             imgd.image = self._tab.__class__.apply_aux_modifications(
-                self._filepath, imgd.image, self._proj, global_mode=self._gmods
+                self._filepath, imgd.image, self._proj, global_mode=self._gmods,
+                src_channel_order=getattr(imgd, "channel_order", None)
             )
             # INVARIANT: `imgd.image` is now fully .ax-processed — crop/rotate,
             # HISTOGRAM MATCH, resize, band expression and classification have all been
