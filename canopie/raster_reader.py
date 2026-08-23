@@ -62,6 +62,8 @@ __all__ = [
     "ensure_hwc",
     "axes_for",
     "selftest_against_full",
+    "ByteBudgetedLRUDict",
+    "estimate_cache_entry_bytes",
 ]
 
 
@@ -521,6 +523,172 @@ class _TileCache:
 
 
 _TILE_CACHE = _TileCache()
+
+
+# --------------------------------------------------------------------------
+# Byte-budgeted LRU dict -- for callers OUTSIDE this module (ProjectTab's
+# per-file array caches) that need the same "evict by cumulative bytes, not
+# entry count" behavior as _TileCache above, but store heterogeneous value
+# shapes (ImageData/_Lite objects, bare ndarrays, tuples) rather than one
+# uniform tile shape, and are read/written through plain dict operations
+# (cache.pop(k, None), del cache[k], cache.clear(), k in cache, len(cache),
+# next(iter(cache))) scattered across many existing call sites.
+# --------------------------------------------------------------------------
+
+def estimate_cache_entry_bytes(value):
+    """Best-effort byte size of a cache value that may be an ndarray, an
+    object wrapping one or more ndarrays (e.g. ImageData/_Lite, via a
+    `.image` attribute), or a tuple/list containing any mix of the above
+    (e.g. ProjectTab._export_image_cache's ``(img, info, mask, ...)``
+    entries). Falls back to `sys.getsizeof` when no array is found, so an
+    entry is never silently counted as zero bytes.
+    """
+    import sys
+
+    def _nbytes(obj):
+        nb = getattr(obj, "nbytes", None)
+        if isinstance(nb, int):
+            return nb
+        return None
+
+    seen_bytes = 0
+    found_array = False
+
+    def _walk(obj, depth=0):
+        nonlocal seen_bytes, found_array
+        if depth > 4:
+            return
+        nb = _nbytes(obj)
+        if nb is not None:
+            seen_bytes += nb
+            found_array = True
+            return
+        img = getattr(obj, "image", None)
+        if img is not None:
+            nb = _nbytes(img)
+            if nb is not None:
+                seen_bytes += nb
+                found_array = True
+        if isinstance(obj, (tuple, list)):
+            for item in obj:
+                _walk(item, depth + 1)
+
+    _walk(value)
+    if found_array:
+        return seen_bytes
+    try:
+        return int(sys.getsizeof(value))
+    except Exception:
+        return 0
+
+
+class ByteBudgetedLRUDict(OrderedDict):
+    """dict-compatible LRU, evicted by cumulative bytes, not entry count.
+
+    Subclasses OrderedDict (not collections.UserDict) so that
+    `isinstance(cache, dict)` stays True -- OrderedDict IS a dict subclass,
+    UserDict is NOT. Existing call sites all over the codebase (including
+    QC test helpers, e.g. canopie/qc/test_lazy_eager_agreement.py's
+    `_clear_export_cache`) gate a `.clear()` call behind exactly that
+    isinstance check; a UserDict-based version silently made those calls
+    into no-ops, which surfaced as a genuine test regression (a stale
+    cached eager ndarray was returned where a freshly-computed LazyChannels
+    was expected) even though every *direct* dict operation the class
+    itself performs was correct.
+
+    Every mutating method is overridden explicitly at the Python level
+    (__setitem__, __delitem__, pop, popitem, clear, update, setdefault) --
+    contrary to the common caution that "dict's C-level methods bypass
+    Python overrides", that caution only applies to methods you do NOT
+    override; an EXPLICITLY defined method on a dict/OrderedDict subclass
+    is found first by normal attribute lookup and is always called for
+    ordinary `instance.method(...)` use (verified directly: overriding
+    __setitem__/pop/clear/__getitem__ on an OrderedDict subclass and calling
+    them normally invokes the overrides every time, with isinstance(x, dict)
+    still True). get_window()-style internal shortcuts that bypass Python
+    attribute lookup entirely (rare C-API-level PyDict_* calls) are the only
+    real exception, and none of this codebase's call sites do that -- they
+    all use plain `cache[k] = v`, `cache[k]`, `cache.pop(k, None)`,
+    `del cache[k]`, `cache.clear()`, `k in cache`, `next(iter(cache))`.
+
+    Mirrors _TileCache's proven pattern above (OrderedDict + running byte
+    total + evict-oldest-while-over-budget on every insert).
+    """
+
+    def __init__(self, budget_bytes, sizeof_fn=None):
+        super().__init__()
+        self._budget = int(budget_bytes)
+        self._bytes = 0
+        self._sizeof = sizeof_fn or estimate_cache_entry_bytes
+        self._cache_lock = threading.Lock()
+
+    def __setitem__(self, key, value):
+        with self._cache_lock:
+            if key in self:
+                self._bytes -= self._sizeof(super().__getitem__(key))
+            super().__setitem__(key, value)
+            self.move_to_end(key)
+            self._bytes += self._sizeof(value)
+            while self._bytes > self._budget and len(self):
+                oldest_key = next(iter(self))
+                self._bytes -= self._sizeof(super().pop(oldest_key))
+
+    def __delitem__(self, key):
+        with self._cache_lock:
+            self._bytes -= self._sizeof(super().__getitem__(key))
+            super().__delitem__(key)
+
+    def __getitem__(self, key):
+        with self._cache_lock:
+            val = super().__getitem__(key)
+            self.move_to_end(key)   # true LRU, matches _TileCache.get()
+            return val
+
+    def pop(self, key, *default):
+        with self._cache_lock:
+            if key in self:
+                self._bytes -= self._sizeof(super().__getitem__(key))
+            return super().pop(key, *default)
+
+    def popitem(self, last=True):
+        with self._cache_lock:
+            key, value = super().popitem(last=last)
+            self._bytes -= self._sizeof(value)
+            return key, value
+
+    def clear(self):
+        with self._cache_lock:
+            super().clear()
+            self._bytes = 0
+
+    def update(self, *args, **kwargs):
+        # Route through __setitem__ (not the bulk dict.update) so every
+        # inserted entry gets byte-tracked and LRU-touched individually.
+        other = dict(*args, **kwargs)
+        for k, v in other.items():
+            self[k] = v
+
+    def setdefault(self, key, default=None):
+        if key in self:
+            return self[key]
+        self[key] = default
+        return default
+
+    def set_budget(self, budget_bytes):
+        with self._cache_lock:
+            self._budget = int(budget_bytes)
+            while self._bytes > self._budget and len(self):
+                oldest_key = next(iter(self))
+                self._bytes -= self._sizeof(super().pop(oldest_key))
+
+    @property
+    def nbytes(self):
+        with self._cache_lock:
+            return self._bytes
+
+    @property
+    def budget(self):
+        return self._budget
 
 
 def set_cache_budget(budget_bytes):

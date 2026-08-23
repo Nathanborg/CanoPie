@@ -212,10 +212,22 @@ def shared_hist_edges(real, corrected=None, bins=80):
 #: `viewer_stretch` holds that image's display mapping (display_mode,
 #: display_band, r_band/g_band/b_band) and its measured intensity bounds
 #: (min_val/max_val, band_mins/band_maxs); `orig_size` is its pixel geometry;
-#: `classification` is a model result keyed to its pixels. Copying any of them
-#: onto a different raster makes that raster's `.ax` describe the wrong image --
-#: which is exactly how "the viewer changed channel order and stopped matching
-#: the .ax files" happened.
+#: `classification` is kept here too as a blanket guard (see the regression
+#: test `test_per_image_ax_keys_are_defined` for the real incident this
+#: protects against: a customer project where an earlier version broadcast
+#: `self.modifications` unfiltered and every sidecar stopped describing its
+#: own raster). Copying any of these verbatim onto a different raster makes
+#: that raster's `.ax` describe the wrong image.
+#:
+#: `_prepare_and_write` deliberately re-adds a *reconstructed* classification
+#: flag after this filter runs (see there) -- the persisted classification
+#: block only ever holds {"mode", "enabled", "label_names"}, a "run the
+#: shared model against THIS image's own bands" instruction, never a pixel
+#: array or geometry. Re-running it per target via the shared model is safe
+#: and is what makes "apply to group/all" actually classify every image
+#: instead of leaving classification enabled only on the one open in the
+#: editor. That re-add is explicit and separate from this filter so this
+#: frozenset stays the single source of truth for "never copy verbatim".
 _PER_IMAGE_AX_KEYS = frozenset({
     "viewer_stretch",
     "stretch",          # legacy spelling of viewer_stretch
@@ -1461,38 +1473,85 @@ class ImageEditorDialog(QDialog):
         return combined_mask if combined_mask.any() else None
 
 
+    #: Serialises the read-modify-write in _write_ax. Two targets can legitimately
+    #: map to the SAME .ax path -- _ax_path_for keys on project_folder + BASENAME,
+    #: so two images with the same filename in different folders (routine in a
+    #: dual-folder multispectral/thermal project) collide -- and
+    #: save_modifications_to_file fans _prepare_and_write out over a 32-worker
+    #: ThreadPoolExecutor. Without this, two workers can interleave
+    #: read/merge/write and silently drop one of the two merges (lost update).
+    _AX_WRITE_LOCK = threading.Lock()
+
     def _write_ax(self, image_path, modifications, quiet=False):
         mod_filename = self._ax_path_for(image_path)
         try:
-            existing = {}
-            if os.path.exists(mod_filename):
+            with ImageEditorDialog._AX_WRITE_LOCK:
+                existing = {}
+                if os.path.exists(mod_filename):
+                    try:
+                        with open(mod_filename, "r", encoding="utf-8") as f:
+                            existing = json.load(f) or {}
+                    except Exception:
+                        existing = {}
+
+                # ----- controlled deletions -----
+                deletes = []
+                if isinstance(modifications, dict):
+                    deletes = list(modifications.get("_delete", []))
+                    # also treat explicit None as "delete" for safety
+                    for k, v in list(modifications.items()):
+                        if v is None:
+                            deletes.append(k)
+                    # de-dupe and strip control key from what we write
+                    deletes = [k for k in dict.fromkeys(deletes)]
+                    # Strip BOTH the control key and every None-valued key from
+                    # what actually gets merged below. Dropping only "_delete"
+                    # was a real bug: the None-valued keys were popped from
+                    # `existing` a few lines down and then IMMEDIATELY PUT BACK
+                    # by `existing.update(modifications)`, so a "delete this
+                    # key" write (`_persist_classification_enabled(False)` ->
+                    # {"classification": None}, the hist_match disable path ->
+                    # {"hist_match": None}, ...) left `"classification": null`
+                    # sitting in the .ax instead of removing the key. Readers
+                    # that test truthiness (`ax.get(k) or {}`) tolerated that by
+                    # luck, but readers that test MEMBERSHIP (`if "hist_match"
+                    # in mods`) saw a key that should not exist, and the nulls
+                    # accumulated in the file forever because no later merge
+                    # ever touched them again.
+                    modifications = {k: v for k, v in modifications.items()
+                                     if k != "_delete" and v is not None}
+                for k in deletes:
+                    existing.pop(k, None)
+
+                # ----- normal merge -----
+                existing.update(modifications if isinstance(modifications, dict) else {})
+
+                # ----- ATOMIC WRITE -----
+                # This used to be a plain open(mod_filename, "w"), which
+                # truncates the .ax to zero bytes BEFORE writing the new
+                # content. Any interruption in that window (crash, power loss,
+                # or a second writer) leaves a truncated/empty file -- and the
+                # reader a few lines above swallows a parse failure and
+                # substitutes {}, so a half-written .ax does not raise, it
+                # silently discards every edit the user made to that image and
+                # the next save then persists that empty state as the truth.
+                # Write to a temp file in the same directory and os.replace()
+                # (atomic on POSIX and Windows) so a reader always sees either
+                # the complete old file or the complete new one.
+                tmp_filename = f"{mod_filename}.{os.getpid()}.{threading.get_ident()}.tmp"
                 try:
-                    with open(mod_filename, "r", encoding="utf-8") as f:
-                        existing = json.load(f) or {}
+                    with open(tmp_filename, "w", encoding="utf-8") as f:
+                        json.dump(existing, f, indent=4)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp_filename, mod_filename)
                 except Exception:
-                    existing = {}
+                    try:
+                        os.remove(tmp_filename)
+                    except Exception:
+                        pass
+                    raise
 
-            # ----- controlled deletions -----
-            deletes = []
-            if isinstance(modifications, dict):
-                deletes = list(modifications.get("_delete", []))
-                # also treat explicit None as "delete" for safety
-                for k, v in list(modifications.items()):
-                    if v is None:
-                        deletes.append(k)
-                # de-dupe and strip control key from what we write
-                deletes = [k for k in dict.fromkeys(deletes)]
-                if "_delete" in modifications:
-                    modifications = {k: v for k, v in modifications.items() if k != "_delete"}
-            for k in deletes:
-                existing.pop(k, None)
-
-            # ----- normal merge -----
-            existing.update(modifications if isinstance(modifications, dict) else {})
-
-            with open(mod_filename, "w", encoding="utf-8") as f:
-                json.dump(existing, f, indent=4)
-            
             if not quiet:
                 logging.info(f"Modifications saved to {mod_filename}")
         except Exception as e:
@@ -1551,6 +1610,13 @@ class ImageEditorDialog(QDialog):
             self._editor_bands = list(bands)
             self._editor_all_bands = bool(all_bands)
             self._editor_profile = profile
+            # raster_reader returns bands in the file's NATIVE order. Recorded
+            # here rather than only in _load_raw_image because
+            # ensure_all_bands_loaded() calls THIS function directly and
+            # assigns self.base_image from it -- so a reference measured after
+            # "load all bands for band math / classification" would otherwise
+            # carry whatever order the previous load happened to set.
+            self._editor_channel_order = "rgb"
             logging.info("[Editor] Preview %s: %s from %dx%dx%d (level %d, step %d, "
                          "%d of %d bands) in %.2fs",
                          os.path.basename(self.image_filepath), arr.shape,
@@ -1608,6 +1674,8 @@ class ImageEditorDialog(QDialog):
         # Large rasters: work on a decimated preview instead of the whole cube.
         preview = self._load_editor_preview()
         if preview is not None:
+            # raster_reader hands back bands in the file's NATIVE order.
+            self._editor_channel_order = "rgb"
             return preview
 
         ext = os.path.splitext(self.image_filepath)[1].lower()
@@ -1649,10 +1717,19 @@ class ImageEditorDialog(QDialog):
             return arr
 
         # Prefer tifffile for real stacks / multi-page TIFFs or TIFFs with >3 samples per pixel
+        # WHICH CHANNEL ORDER THIS RETURNS IS NOT COSMETIC. The histogram-match
+        # reference is computed from whatever array this hands back, and
+        # matching pairs bands POSITIONALLY -- so if the recorded order does not
+        # describe this array, reference band 0 (Blue, say) gets applied to
+        # image band 0 (Red) and every exported statistic is silently wrong.
+        # tifffile yields the file's native order (RGB for these rasters);
+        # cv2.imread yields BGR. Record which one actually produced the pixels
+        # instead of guessing later.
         if ext in (".tif", ".tiff") and _tifffile_is_stack(self.image_filepath):
             try:
                 arr = _tifffile_read_HWC(self.image_filepath)
                 if arr is not None and getattr(arr, "size", 0) > 0:
+                    self._editor_channel_order = "rgb"
                     return arr
             except Exception as e:
                 logging.warning(f"[Editor] tifffile load failed, falling back to cv2: {e}")
@@ -1661,6 +1738,7 @@ class ImageEditorDialog(QDialog):
         try:
             img = cv2.imread(self.image_filepath, cv2.IMREAD_UNCHANGED)
             if img is not None:
+                self._editor_channel_order = "bgr"
                 return img
         except Exception as e:
             logging.debug(f"_load_raw_image cv2 failed: {e}")
@@ -1671,6 +1749,7 @@ class ImageEditorDialog(QDialog):
                 logging.debug(f"[Editor] cv2 returned None for TIFF, trying tifffile as fallback")
                 arr = _tifffile_read_HWC(self.image_filepath)
                 if arr is not None and getattr(arr, "size", 0) > 0:
+                    self._editor_channel_order = "rgb"
                     return arr
             except Exception as e:
                 logging.warning(f"[Editor] tifffile fallback also failed: {e}")
@@ -2229,6 +2308,29 @@ class ImageEditorDialog(QDialog):
                 if not _is_edited:
                     final_mods = {k: v for k, v in final_mods.items()
                                   if k not in _PER_IMAGE_AX_KEYS}
+
+                    # Re-add JUST the classification flag. Unlike viewer_stretch/
+                    # orig_size, the persisted classification block never holds
+                    # pixel data or geometry -- run_sklearn_classification() only
+                    # ever writes {"mode", "enabled", "label_names"} (see
+                    # _PER_IMAGE_AX_KEYS docstring above). It is a "run the
+                    # shared model against THIS image's own bands" instruction,
+                    # so broadcasting it is safe and is what makes "apply to
+                    # group/all" actually classify every target image -- the
+                    # reader (ProjectTab._apply_sklearn_classification_with_indices,
+                    # used from apply_aux_modifications / _render_with_viewer_stretch
+                    # / _apply_ax_to_raw) recomputes the class map per file using
+                    # the shared model when it sees this flag.
+                    # Use a membership test, NOT truthiness. Disabling
+                    # classification is expressed as {"classification": None}
+                    # (see _persist_classification_enabled), and None is the
+                    # signal _write_ax turns into a key DELETE. A truthiness
+                    # check would broadcast the enable but silently swallow the
+                    # disable, so "apply to all roots" could turn classification
+                    # ON everywhere but never OFF again -- the same asymmetry,
+                    # in the opposite direction, as the bug this re-add fixes.
+                    if "classification" in base_mods:
+                        final_mods["classification"] = base_mods["classification"]
 
             # Write
             # If strict reference, maybe we force it? No, just write.
@@ -3772,17 +3874,48 @@ class ImageEditorDialog(QDialog):
         control_layout.addStretch()
 
         # Add Bottom Controls to Sidebar (Scope + Action Buttons)
-        # --- Scope Checkboxes ---
+        # --- Scope Indicator and Checkboxes ---
+        # Scope indicator label (shows current application scope)
+        scope_indicator_layout = QtWidgets.QHBoxLayout()
+        scope_label = QtWidgets.QLabel("Current Scope:")
+        scope_label.setStyleSheet("font-weight: bold;")
+        self.scope_value_label = QtWidgets.QLabel("Single image")
+        self.scope_value_label.setStyleSheet("color: #FF8C00; font-weight: bold;")  # Orange for visibility
+        scope_indicator_layout.addWidget(scope_label)
+        scope_indicator_layout.addWidget(self.scope_value_label)
+        scope_indicator_layout.addStretch()
+
         self.global_mods_checkbox = QtWidgets.QCheckBox("Apply modifications to all images at this root")
         self.apply_all_groups_checkbox = QtWidgets.QCheckBox("Apply modifications to all roots")
+
+        # Add helpful tooltips to explain scope behavior
+        self.global_mods_checkbox.setToolTip(
+            "When CHECKED: Apply changes to ALL images in the current root/group.\n"
+            "When UNCHECKED: Apply changes to ONLY the currently selected image.\n\n"
+            "Note: Classification results are always per-image (not copied between images)."
+        )
+        self.apply_all_groups_checkbox.setToolTip(
+            "When CHECKED: Apply changes to ALL images across ALL roots in this folder.\n"
+            "Overrides the 'Apply to all images at this root' checkbox.\n\n"
+            "Note: Classification results are always per-image (not copied between images)."
+        )
+
         self.global_mods_checkbox.toggled.connect(self._on_group_apply_toggled)
         self.apply_all_groups_checkbox.toggled.connect(self._on_all_groups_toggled)
-        
+        # Connect to scope update function
+        self.global_mods_checkbox.toggled.connect(self._update_scope_indicator)
+        self.apply_all_groups_checkbox.toggled.connect(self._update_scope_indicator)
+
+        # Initialize scope indicator with current state
+        self._update_scope_indicator()
+
         scope_layout = QtWidgets.QVBoxLayout()
+        scope_layout.addLayout(scope_indicator_layout)
+        scope_layout.addSpacing(8)
         scope_layout.addWidget(self.global_mods_checkbox)
         scope_layout.addWidget(self.apply_all_groups_checkbox)
         sidebar_layout.addLayout(scope_layout)
-        
+
         sidebar_layout.addSpacing(6)
 
         # --- Action Buttons ---
@@ -4490,14 +4623,34 @@ class ImageEditorDialog(QDialog):
             # tifffile in native RGB order -- so a reference taken on a JPEG and
             # applied to a multiband TIFF pairs the Blue reference with Red.
             # Storing the order is what makes that detectable at apply time.
+            # This label MUST describe the array these statistics were actually
+            # measured from (self.base_image), because matching is positional.
+            #
+            # It previously read `self.image_data_obj` -- an attribute that is
+            # never assigned anywhere in this class, so it was always None --
+            # and then fell back to the PARENT's `_last_export_channel_order`,
+            # a stale global left over from whatever unrelated export ran last.
+            # That is how a reference measured on cv2-loaded BGR pixels got
+            # stamped "rgb": the label described a different image entirely.
+            # A wrong label is worse than no label, because the export side's
+            # mismatch check (`_apply_ax_to_raw`, "[hist] ... reference was
+            # measured in %s order") compares against it and stays silent when
+            # it agrees -- so the R/B pairing silently reversed and every
+            # exported statistic was computed on swapped channels. Verified on
+            # a real project: matching an image to ITSELF (reference_path ==
+            # the source) returned band means 91.9/110.0/53.0 -> 52.8/110.0/91.9,
+            # i.e. R and B exchanged, when self-matching must be a no-op.
+            #
+            # _load_raw_image / _load_editor_preview now record which loader
+            # produced the pixels; that is the only trustworthy source here.
             try:
-                idata = getattr(self, "image_data_obj", None)
-                order = getattr(idata, "channel_order", None) if idata is not None else None
-                if not order:
-                    parent = self.parent()
-                    getter = getattr(parent, "_last_export_channel_order", None) if parent else None
-                    order = getter if isinstance(getter, str) else None
-                payload["channel_order"] = str(order or ("bgr" if C <= 4 else "rgb")).lower()
+                order = getattr(self, "_editor_channel_order", None)
+                if not isinstance(order, str) or not order:
+                    # Fall back to the loader heuristic, NOT to any parent
+                    # state: cv2 handles <=4-band images (BGR), tifffile
+                    # handles wider stacks (native/RGB).
+                    order = "bgr" if C <= 4 else "rgb"
+                payload["channel_order"] = str(order).lower()
             except Exception:
                 payload["channel_order"] = "bgr" if C <= 4 else "rgb"
         except Exception as e:
@@ -4528,6 +4681,21 @@ class ImageEditorDialog(QDialog):
             self.apply_all_groups_checkbox.blockSignals(True)
             self.apply_all_groups_checkbox.setChecked(False)
             self.apply_all_groups_checkbox.blockSignals(False)
+
+    def _update_scope_indicator(self):
+        """Update the visible scope indicator label based on current checkbox states."""
+        if not hasattr(self, 'scope_value_label'):
+            return
+
+        if self.apply_all_groups_checkbox.isChecked():
+            self.scope_value_label.setText("All roots")
+            self.scope_value_label.setStyleSheet("color: #FF0000; font-weight: bold;")  # Red for "all"
+        elif self.global_mods_checkbox.isChecked():
+            self.scope_value_label.setText("Current root")
+            self.scope_value_label.setStyleSheet("color: #FFA500; font-weight: bold;")  # Orange for "group"
+        else:
+            self.scope_value_label.setText("Single image")
+            self.scope_value_label.setStyleSheet("color: #0066CC; font-weight: bold;")  # Blue for "single"
 
     # ---------- lightweight delete helpers / resets ----------
     def _delete_ax_in_dir(self, base_dir: str, progress_dialog=None) -> int:
@@ -4607,6 +4775,28 @@ class ImageEditorDialog(QDialog):
                 except Exception as e:
                     logging.error(f"Failed to delete modifications file {mod_filename}: {e}")
 
+        # VERIFY the deletes actually happened. A failed os.remove() above only
+        # logs at error level -- nobody sees that -- so a locked/permission-denied
+        # .ax silently kept its _AX_BLOCKS_WINDOWING keys (registration,
+        # hist_match, resize, rotate, band_expression, classification,
+        # appended_bands, mask_polygon) alive, permanently disabling lazy/
+        # windowed loading for this file even though the UI showed "reset".
+        still_present = [c for c in candidates if os.path.exists(c)]
+        if still_present:
+            logging.error(
+                "[Reset] Failed to delete .ax candidate(s) %s -- file is locked "
+                "or permission-denied; stale edits may still block lazy/"
+                "windowed loading for this file.", still_present)
+            parent_for_status = self.parent()
+            if parent_for_status is not None and hasattr(parent_for_status, "statusBar"):
+                try:
+                    parent_for_status.statusBar().showMessage(
+                        f"Reset could not fully remove saved edits for "
+                        f"{os.path.basename(self.image_filepath)} -- file may be "
+                        f"locked. Windowed loading may stay disabled.", 8000)
+                except Exception:
+                    pass
+
         # FIX: Invalidate parent caches ONCE after deletion loop
         try:
             parent = self.parent()
@@ -4643,7 +4833,16 @@ class ImageEditorDialog(QDialog):
                 root_name = parent.get_current_root_name()
             except Exception:
                 root_name = None
-        #self._auto_refresh_after_reset(root_name=root_name)
+        # RAM/COG FIX: on_reset_group and on_reset_all_groups both call this
+        # refresh unconditionally; on_reset_image left it commented out. That
+        # meant the main ProjectTab viewer never learned to re-fetch the file
+        # after a single-image reset -- it kept showing/holding whatever
+        # ImageData it already had (potentially a full-resolution array),
+        # never re-entering the lazy/windowed load path even though the .ax
+        # and caches were just cleared above. Fires synchronously the instant
+        # Reset is clicked (inside the still-open dialog), independent of a
+        # later OK/Cancel on the dialog itself.
+        self._auto_refresh_after_reset(root_name=root_name)
         logging.info("Image modifications reset.")
 
     def on_reset_group(self):
@@ -6047,18 +6246,41 @@ class ImageEditorDialog(QDialog):
             )
 
         if cls_enabled:
-            # If we don't have a class map yet OR it's stale → invalidate & optionally re-run
+            # If we don't have a class map yet OR it's stale → invalidate & re-run
             if (not isinstance(cls, np.ndarray)) or (not cls.size) or (not _geom_matches(self._cls_snapshot, geom_now)):
                 # Invalidate stale cache
                 self.last_band_float_result = None
                 self._classification_result = None
                 self._cls_snapshot = None
-                # Show normal image while we (optionally) kick off a reclass
-                # (Avoid blocking UI here.)
                 cls_pending = True  # Mark that classification is pending
-                # Only schedule timer if NOT during initial render (showEvent handles that case)
+
+                # Re-run classification for the NEW geometry INLINE (synchronously)
+                # rather than via QTimer.singleShot(0, ...). The deferred version
+                # let THIS call fall through to the generic multi-band preview
+                # below (with prefer_last suppressed by cls_pending) -- showing
+                # raw band 0 -- and relied on run_sklearn_classification()'s own
+                # trailing reapply_modifications() call, on the NEXT event-loop
+                # tick, to correct the display. If self.modifications changed
+                # again before that later call ran (e.g. the crop/resize control
+                # fired more than one change in quick succession), that later
+                # snapshot didn't match the newest geometry either, and the
+                # preview stayed stuck on band 0 indefinitely -- reported as
+                # "crop/scale a classified image and the editor viewer shows the
+                # first channel" (the .ax written on Apply was always correct;
+                # only this in-dialog preview got stuck). Running it inline makes
+                # this one reapply_modifications() call responsible for its own
+                # correct final display, with no dependence on later ticks.
                 if not getattr(self, "_skip_cls_timer", False):
-                    QtCore.QTimer.singleShot(0, self.on_run_classification_clicked)
+                    try:
+                        self.on_run_classification_clicked()
+                    except Exception as e:
+                        logging.debug(f"reapply_modifications: inline reclassification failed: {e}")
+                    # on_run_classification_clicked() -> run_sklearn_classification()
+                    # already redrew the classified preview for the current
+                    # geometry (or, on failure, reported it via QMessageBox), so
+                    # stop here instead of falling through to the generic
+                    # band-preview code below.
+                    return
             else:
                 # Geometry matches → show the class map AS-IS (no resizing).
                 try:

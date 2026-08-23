@@ -195,6 +195,128 @@ def test_as_8bit_bgr_has_no_function_local_logging_import():
 
 
 # ---------------------------------------------------------------------------
+# channel order (the Red/Blue swap bug)
+# ---------------------------------------------------------------------------
+# THE BUG: _as_8bit_bgr/_bgr_from_channels used to decide whether to reverse
+# the first 3 channels by checking DTYPE (uint8 -> pass through, else ->
+# always reverse), which has no relationship to channel order. The real
+# question is PROVENANCE: did the array come from cv2.imread (genuinely BGR)
+# or from tifffile/raster_reader (native R,G,B file order)? ProjectTab tracks
+# that as `_last_export_channel_order` and _channels_in_export_order already
+# keys off it correctly for every other export path -- these pin the same
+# discipline here.
+#
+# Fixtures use three distinct constant-per-channel planes so a test can name
+# exactly which band ends up in which output position, independent of any
+# actual image content.
+def _rgb_planes(dtype):
+    import numpy as np
+    r = np.full((4, 4), 10, dtype=dtype)
+    g = np.full((4, 4), 20, dtype=dtype)
+    b = np.full((4, 4), 30, dtype=dtype)
+    return r, g, b
+
+
+class _Parent:
+    def __init__(self, order):
+        self._last_export_channel_order = order
+
+
+def test_as_8bit_bgr_reverses_native_rgb_uint8(qapp):
+    """provenance='rgb' (tifffile/raster_reader): the array really is R,G,B
+    and must be reversed to B,G,R for cv2 to draw/write it correctly."""
+    import numpy as np
+    r, g, b = _rgb_planes(np.uint8)
+    native = np.dstack([r, g, b])          # channel 0=R(10), 1=G(20), 2=B(30)
+
+    vis = _mlm(_Parent("rgb"))._as_8bit_bgr(native)
+    assert (vis[:, :, 0] == 30).all(), "channel 0 of the BGR output must be Blue"
+    assert (vis[:, :, 1] == 20).all(), "channel 1 of the BGR output must be Green"
+    assert (vis[:, :, 2] == 10).all(), "channel 2 of the BGR output must be Red"
+
+
+def test_as_8bit_bgr_leaves_native_bgr_uint8_unchanged(qapp):
+    """provenance='bgr' (cv2.imread fallback): the array is ALREADY B,G,R --
+    reversing it again is exactly the reported bug."""
+    import numpy as np
+    r, g, b = _rgb_planes(np.uint8)
+    already_bgr = np.dstack([b, g, r])     # channel 0=B(30), 1=G(20), 2=R(10)
+
+    vis = _mlm(_Parent("bgr"))._as_8bit_bgr(already_bgr)
+    assert np.array_equal(vis, already_bgr), (
+        "already-BGR uint8 input must be left alone, not re-reversed")
+
+
+def test_as_8bit_bgr_reverses_native_rgb_float(qapp):
+    """Same contract on the non-uint8 (normalise-then-merge) branch.
+
+    cv2.normalize(NORM_MINMAX) maps a constant plane to 0, so channel
+    IDENTITY has to be pinned with a single bright pixel per otherwise-zero
+    plane rather than by comparing to the pre-normalisation value.
+    """
+    import numpy as np
+    r = np.zeros((4, 4), np.float32); r[0, 0] = 10      # Red distinguishable
+    g = np.zeros((4, 4), np.float32); g[1, 1] = 20       # Green distinguishable
+    b = np.zeros((4, 4), np.float32); b[2, 2] = 30       # Blue distinguishable
+    native = np.dstack([r, g, b])
+
+    vis = _mlm(_Parent("rgb"))._as_8bit_bgr(native)
+    assert vis[2, 2, 0] > 0 and vis[0, 0, 0] == 0, "Blue plane must land in channel 0"
+    assert vis[1, 1, 1] > 0, "Green plane must land in channel 1"
+    assert vis[0, 0, 2] > 0 and vis[2, 2, 2] == 0, "Red plane must land in channel 2"
+
+
+def test_as_8bit_bgr_leaves_native_bgr_float_unchanged(qapp):
+    import numpy as np
+    b2 = np.zeros((4, 4), np.float32); b2[0, 0] = 30      # already channel 0
+    g2 = np.zeros((4, 4), np.float32); g2[1, 1] = 20
+    r2 = np.zeros((4, 4), np.float32); r2[2, 2] = 10      # already channel 2
+    already_bgr = np.dstack([b2, g2, r2])
+
+    vis = _mlm(_Parent("bgr"))._as_8bit_bgr(already_bgr)
+    assert vis[0, 0, 0] > 0 and vis[2, 2, 0] == 0, "channel 0 must stay Blue, not be reversed"
+    assert vis[2, 2, 2] > 0 and vis[0, 0, 2] == 0, "channel 2 must stay Red, not be reversed"
+
+
+def test_as_8bit_bgr_defaults_to_native_when_provenance_unknown(qapp):
+    """No parent_tab (this function called directly, as these tests do) must
+    assume NATIVE order, matching _bgr_from_channels' lazy sibling -- which is
+    always native by construction -- so the eager/lazy agreement test above
+    stays meaningful instead of the two paths silently disagreeing."""
+    import numpy as np
+    r, g, b = _rgb_planes(np.uint8)
+    native = np.dstack([r, g, b])
+    vis = _mlm()._as_8bit_bgr(native)          # no parent_tab at all
+    assert (vis[:, :, 0] == 30).all() and (vis[:, :, 2] == 10).all(), (
+        "unknown provenance must default to 'native' (reverse), not 'bgr' (pass through)")
+
+
+def test_bgr_from_channels_always_reverses_uint8(qapp):
+    """The lazy path has no provenance to check -- LazyChannels is always
+    native by construction -- so this must reverse unconditionally, unlike
+    _as_8bit_bgr which consults a flag."""
+    from ..machine_learning_manager import _bgr_from_channels
+    import numpy as np
+    r, g, b = _rgb_planes(np.uint8)
+
+    vis = _bgr_from_channels([r, g, b])
+    assert (vis[:, :, 0] == 30).all(), "channel 0 must be Blue"
+    assert (vis[:, :, 1] == 20).all(), "channel 1 must be Green"
+    assert (vis[:, :, 2] == 10).all(), "channel 2 must be Red"
+
+
+def test_bgr_from_channels_keeps_extra_bands_after_the_swap(qapp):
+    from ..machine_learning_manager import _bgr_from_channels
+    import numpy as np
+    r, g, b = _rgb_planes(np.uint8)
+    extra = np.full((4, 4), 99, np.uint8)
+
+    vis = _bgr_from_channels([r, g, b, extra])
+    assert vis.shape[2] == 4
+    assert (vis[:, :, 3] == 99).all(), "band 4+ must be carried through, only the first 3 swap"
+
+
+# ---------------------------------------------------------------------------
 # segmentation: shape without pixels
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("name", ["rgb_8bit_untiled", "ax_crop_nodata_source",

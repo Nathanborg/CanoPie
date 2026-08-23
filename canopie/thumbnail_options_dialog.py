@@ -120,8 +120,23 @@ class ThumbnailOptionsDialog(QDialog):
             "Keep a tile only when the whole square lies inside the outline.\n"
             "Tiles that straddle the edge, and any polygon narrower than one\n"
             "tile, produce nothing -- watch the estimate below.")
-        self.inside_cb.toggled.connect(self._schedule_estimate)
+        self.inside_cb.toggled.connect(self._on_inside_toggled)
         tile_box.content_layout.addWidget(self.inside_cb)
+
+        self.allow_na_cb = QCheckBox("Allow NA (keep partial tiles, mask what's outside)")
+        self.allow_na_cb.setChecked(False)
+        self.allow_na_cb.setEnabled(False)
+        self.allow_na_cb.setToolTip(
+            "Keep every tile that touches the polygon at all, instead of only\n"
+            "ones fully inside it. The tile image's pixels are left exactly as\n"
+            "read; a same-named '<tile>_mask.png' is written alongside it\n"
+            "(255 = inside the polygon, 0 = NA) so a training loader can mask\n"
+            "the loss or ignore those pixels. Tiles with NO overlap at all are\n"
+            "still dropped -- an all-NA tile carries no signal.\n"
+            "This is the other answer to what 'Only squares that fit inside'\n"
+            "answers, so only one of the two can be on at a time.")
+        self.allow_na_cb.toggled.connect(self._on_allow_na_toggled)
+        tile_box.content_layout.addWidget(self.allow_na_cb)
 
         self.estimate_lbl = QLabel("")
         self.estimate_lbl.setWordWrap(True)
@@ -196,10 +211,24 @@ class ThumbnailOptionsDialog(QDialog):
     def on_tiling_toggled(self, checked):
         self.tile_spin.setEnabled(checked)
         self.inside_cb.setEnabled(checked)
+        self.allow_na_cb.setEnabled(checked)
         # Tiles are tile_size square by construction, so an output width/height
         # would simply not be honoured -- disable rather than silently ignore.
         self.width_spin.setEnabled(not checked)
         self.height_spin.setEnabled(not checked)
+        self._schedule_estimate()
+
+    def _on_inside_toggled(self, checked):
+        """'Only squares inside' and 'Allow NA' are two different answers to
+        the same question (what to do with a tile that straddles the edge) --
+        they don't compose, so picking one turns the other off."""
+        if checked and self.allow_na_cb.isChecked():
+            self.allow_na_cb.setChecked(False)
+        self._schedule_estimate()
+
+    def _on_allow_na_toggled(self, checked):
+        if checked and self.inside_cb.isChecked():
+            self.inside_cb.setChecked(False)
         self._schedule_estimate()
 
     def _schedule_estimate(self, *_):
@@ -238,7 +267,8 @@ class ThumbnailOptionsDialog(QDialog):
             est = estimate_tile_yield(self._polygons,
                                       int(self.tile_spin.value()),
                                       float(self.zoom_spin.value()),
-                                      bool(self.inside_cb.isChecked()))
+                                      bool(self.inside_cb.isChecked()),
+                                      bool(self.allow_na_cb.isChecked()))
         except Exception as e:
             self.estimate_lbl.setText(f"(estimate unavailable: {e})")
             return
@@ -247,6 +277,9 @@ class ThumbnailOptionsDialog(QDialog):
         parts = [f"{approx}{est['tiles']:,} tile(s) from {est['total']:,} polygon(s)"]
         if self.inside_cb.isChecked():
             parts.append(f"{approx}{est['grid']:,} without the inside-only filter")
+        elif self.allow_na_cb.isChecked():
+            parts.append(f"{approx}{est['grid']:,} without the NA filter, "
+                         f"each kept tile gets a companion mask")
         if est['empty']:
             pct = 100.0 * est['empty'] / max(1, est['total'])
             parts.append(f"{approx}{est['empty']:,} polygon(s) ({pct:.0f}%) yield none")
@@ -264,4 +297,5 @@ class ThumbnailOptionsDialog(QDialog):
             'tile_enabled': bool(self.tile_cb.isChecked()),
             'tile_size': int(self.tile_spin.value()),
             'tiles_inside_only': bool(self.inside_cb.isChecked()),
+            'allow_na': bool(self.allow_na_cb.isChecked()),
         }
