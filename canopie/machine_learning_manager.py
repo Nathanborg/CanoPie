@@ -64,6 +64,7 @@ from .utils import (
 )
 from .loaders import ImageProcessor, ImageLoaderWorker
 from .image_data import ImageData
+from . import ml_augmentation
 
 #: Above this, an 8-bit whole-frame preview is refused rather than attempted.
 #: The BCI COG's frame is 4.48 GiB PER BAND on a 15.7 GiB machine.
@@ -1215,9 +1216,161 @@ class MachineLearningManager(QtWidgets.QDialog):
         self.main_layout.addWidget(self.list_widget)
 
         self.populate_polygon_groups()
-    
-    
-    
+
+    def _select_bands_and_expressions(self, img, chans, selected_band_indices, selected_expressions):
+        """Extract the selected bands (in order, None for a band index
+        beyond what `chans` has) and evaluate every custom band expression,
+        from ONE source image array.
+
+        Factored out of train_models' pixel-sampling loop so the PRISTINE
+        pass and each AUGMENTED image variant's pass (see
+        train_models -> ml_augmentation.augment_image_for_training) share
+        identical band-selection/expression-evaluation logic instead of two
+        independently-maintained copies that could silently drift apart.
+        `img`/`chans` must correspond to the SAME source array (chans =
+        self._channels_in_export_order(img)) -- expression evaluation reads
+        `img` directly (an expression can reference a band beyond the
+        selected set), never `chans`.
+
+        Returns (selected_chans: list[np.ndarray|None],
+        expr_images: list[np.ndarray|None]).
+        """
+        selected_chans = []
+        for band_idx in selected_band_indices:
+            if band_idx < len(chans):
+                selected_chans.append(chans[band_idx].astype(np.float32, copy=False))
+            else:
+                selected_chans.append(None)
+
+        expr_images = []
+        if selected_expressions:
+            try:
+                from .utils import eval_band_expression
+            except ImportError:
+                eval_band_expression = None
+
+            img_for_expr = img.astype(np.float32, copy=False)
+
+            for expr_name, expr_str in selected_expressions:
+                try:
+                    if eval_band_expression is not None:
+                        result = eval_band_expression(img_for_expr, expr_str)
+                    else:
+                        fn = getattr(self, "_eval_band_expression", None)
+                        result = fn(img_for_expr, expr_str) if fn else None
+
+                    if result is not None:
+                        if result.ndim == 3:
+                            result = result[:, :, -1]
+                        expr_images.append(result.astype(np.float32, copy=False))
+                    else:
+                        expr_images.append(None)
+                        logging.warning(f"[train] Expression '{expr_name}' returned None")
+                except Exception as e:
+                    logging.warning(f"[train] Failed to compute expression '{expr_name}': {e}")
+                    expr_images.append(None)
+
+        return selected_chans, expr_images
+
+    @staticmethod
+    def _build_training_row(chans, expr_images, yy, xx, window_size, nodata_values, num_features):
+        """Build ONE pixel's feature row from a window of band + expression
+        values around (yy, xx). This is the exact per-pixel logic
+        train_models used to run inline, extracted unchanged so it can be
+        unit-tested directly (see qc/test_ml_manager_build_training_row.py)
+        and so it can be reused, verbatim, against an AUGMENTED image
+        variant's chans/expr_images -- both the pristine pass and every
+        augmented-variant pass call this SAME method, never a separate copy.
+
+        Order: iterate window offsets row-major (dr outer, dc inner), then
+        bands then expressions at each offset -- this order defines
+        generate_window_feature_names' column order and must never change
+        independently of it.
+
+        chans: list of 2D band arrays (or None -- an unusable/out-of-range
+            band, counted as a missing-band drop).
+        expr_images: list of 2D expression-result arrays (or None, same
+            convention).
+        nodata_values: declared NoData literals for this image (numeric only
+            here -- expression-based NoData is a whole-pixel/polygon concept
+            handled by the caller's mask, not per band here).
+        num_features: unused by the row-building logic itself (callers check
+            `len(row) == num_features` themselves) -- kept as a parameter for
+            symmetry with the call site, not read internally.
+
+        Returns (row: list[float], ok: bool, n_dropped_nan: int,
+        n_dropped_missing_band: int) -- the two counts are each 0 or 1 (a row
+        stops at its first failure); the caller accumulates them into its own
+        running totals.
+        """
+        half = window_size // 2
+        row = []
+        ok_row = True
+        n_dropped_nan = 0
+        n_dropped_missing_band = 0
+
+        for dr in range(-half, half + 1):
+            for dc in range(-half, half + 1):
+                py, px = yy + dr, xx + dc
+
+                for ch in chans:
+                    if ch is None:
+                        ok_row = False
+                        n_dropped_missing_band += 1
+                        break
+                    val = float(ch[py, px])
+                    if not np.isfinite(val):
+                        ok_row = False
+                        n_dropped_nan += 1
+                        break
+                    if nodata_values:
+                        is_nodata = False
+                        for nd in nodata_values:
+                            try:
+                                nd_val = float(nd)
+                                abs_nd = abs(nd_val)
+                                if abs_nd > 1e+30:
+                                    tol = abs_nd * 0.01
+                                elif abs_nd > 1e+10:
+                                    tol = abs_nd * 0.001
+                                elif abs_nd > 100:
+                                    tol = abs_nd * 0.001
+                                else:
+                                    tol = 0.01
+                                if abs(val - nd_val) < tol:
+                                    is_nodata = True
+                                    break
+                            except Exception:
+                                pass
+                        if is_nodata:
+                            ok_row = False
+                            n_dropped_nan += 1
+                            break
+                    row.append(val)
+
+                if not ok_row:
+                    break
+
+                if expr_images:
+                    for expr_img in expr_images:
+                        if expr_img is None:
+                            ok_row = False
+                            n_dropped_missing_band += 1
+                            break
+                        val = float(expr_img[py, px])
+                        if not np.isfinite(val):
+                            ok_row = False
+                            n_dropped_nan += 1
+                            break
+                        row.append(val)
+
+                if not ok_row:
+                    break
+            if not ok_row:
+                break
+
+        return row, ok_row, n_dropped_nan, n_dropped_missing_band
+
     def train_models(self):
         """
         Train one or more sklearn classifiers from the currently selected groups.
@@ -1866,6 +2019,23 @@ class MachineLearningManager(QtWidgets.QDialog):
         cv_folds = 5
         rand_iter = 30
 
+        # ---- 3b) Augmentation + normalization options (with live preview) ----
+        # Every prior wizard step (bands/expressions/window_size, sampling
+        # cap, model choice, n_estimators, optimization) is already committed
+        # by this point, so this is the last configuration step before actual
+        # sampling begins. Sets self._pending_augmentation_cfg/
+        # self._pending_normalization_method, which the dataset-building
+        # section below reads (defaulting to "disabled"/"none" if this
+        # dialog is ever skipped/unavailable).
+        from .ml_augmentation_options_dialog import MLAugmentationOptionsDialog
+        aug_dlg = MLAugmentationOptionsDialog(
+            entries, self._get_export_image, self._channels_in_export_order, self)
+        if aug_dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        aug_options = aug_dlg.get_options()
+        self._pending_augmentation_cfg = aug_options["augmentation"]
+        self._pending_normalization_method = aug_options["normalization"]
+
         # ---- 4) Build feature names from selected bands ----
         # Map band indices to feature names
         def _band_idx_to_feature_name(idx):
@@ -1894,7 +2064,42 @@ class MachineLearningManager(QtWidgets.QDialog):
             logging.info(f"[train] First 10 feature names: {feature_names[:10]}...")
 
         # ---- 5) Build dataset (X,y) by sampling pixels using SELECTED bands ----
-        X_rows, y_rows = [], []
+        # TWO parallel row collections, not one array + an is_augmented mask:
+        # X_rows_report/y_rows_report are PRISTINE -- exactly what this method
+        # has always built -- and are the ONLY thing the holdout-metrics
+        # train_test_split calls below ever see, in both Add and Replace
+        # mode, unconditionally. X_rows_train/y_rows_train are what actually
+        # gets .fit()'d; when augmentation is disabled they are literally the
+        # SAME list objects as the report collection (aliased just below), so
+        # the common case has zero extra memory/CPU cost. A single boolean
+        # is_augmented column was considered and rejected: in Replace mode
+        # every sampled pixel can legitimately be overwritten, so excluding
+        # is_augmented==True rows from the holdout-eligible pool could shrink
+        # or exhaust it -- keeping the report collection entirely separate
+        # sidesteps that failure mode by construction. See
+        # qc/test_ml_augmentation_holdout_purity.py.
+        X_rows_report, y_rows_report = [], []
+        augmentation_cfg = getattr(self, "_pending_augmentation_cfg", None) or {
+            "enabled": False,
+            "brightness": {"mode": "none", "tile_size": 64, "mu_jitter": 0.15, "sd_jitter": 0.25},
+            "shadow": {"enabled": False, "smoothness": 75},
+            "row_policy": "add",
+            "n_variants": 1,
+        }
+        normalization_method = getattr(self, "_pending_normalization_method", None) or "none"
+        augmentation_enabled = bool(augmentation_cfg.get("enabled"))
+        # Replace mode always emits exactly one row per pixel (see
+        # ml_augmentation.assemble_pixel_rows) -- generating more than one
+        # candidate variant would just be wasted work, since only the first
+        # successful one is ever used.
+        n_variants = (max(1, int(augmentation_cfg.get("n_variants", 1)))
+                      if augmentation_cfg.get("row_policy") == "add" else 1)
+
+        if augmentation_enabled:
+            X_rows_train, y_rows_train = [], []
+        else:
+            X_rows_train, y_rows_train = X_rows_report, y_rows_report  # same list objects
+
         dropped_nan = 0
         dropped_missing_band = 0
 
@@ -1915,13 +2120,17 @@ class MachineLearningManager(QtWidgets.QDialog):
                 img, _ = _image_cache[filepath]
             else:
                 img, _ = self._get_export_image(filepath)
-            
+
             if img is None:
                 logging.warning(f"[train] Could not load {filepath}")
                 continue
             H, W = img.shape[:2]
-            chans = self._channels_in_export_order(img)
 
+            # NoData/mask-polygon loading is hoisted to run BEFORE chans is
+            # computed (it used to run after) -- it depends only on
+            # filepath/H/W/all_polygons, never on chans/img pixel data, and
+            # augmentation (below) needs these same exclusions to avoid
+            # perturbing NoData/masked pixels, so they must be known first.
             # Load NoData values from .ax file for this image
             nodata_values = []
             mask_polygon_enabled = False
@@ -2007,6 +2216,32 @@ class MachineLearningManager(QtWidgets.QDialog):
                 else:
                     poly_mask = None
 
+            # ---- Per-image augmentation (once per loaded image, BEFORE the
+            # per-polygon pixel-sampling loop below runs against it -- see
+            # ml_augmentation.py's module docstring for why patch-level
+            # brightness is deliberately computed once per whole image, not
+            # once per polygon: multiple polygons often sample the same
+            # physical image, and per-polygon-independent perturbation would
+            # give the same physical tile two different random brightnesses
+            # depending on which polygon happened to sample it) ----
+            variant_chans_expr = []  # list of (selected_chans, expr_images), one per augmented variant
+            if augmentation_enabled:
+                aug_nodata_mask = (build_nodata_mask(img, nodata_values, bgr_input=True)
+                                    if nodata_values else np.zeros((H, W), dtype=bool))
+                if poly_mask is not None:
+                    aug_nodata_mask = aug_nodata_mask | poly_mask
+                for _variant_idx in range(n_variants):
+                    img_aug = ml_augmentation.augment_image_for_training(
+                        img, augmentation_cfg, rng, nodata_mask=aug_nodata_mask)
+                    chans_aug = self._channels_in_export_order(img_aug)
+                    sel_chans_aug, expr_aug = self._select_bands_and_expressions(
+                        img_aug, chans_aug, selected_band_indices, selected_expressions)
+                    variant_chans_expr.append((sel_chans_aug, expr_aug))
+
+            # PRISTINE bands/expressions -- computed from the unmodified img,
+            # unconditionally, regardless of whether augmentation ran.
+            chans = self._channels_in_export_order(img)
+
             # Check if this image has all required bands
             max_required_band = max(selected_band_indices) if selected_band_indices else -1
             if max_required_band >= 0 and len(chans) <= max_required_band:
@@ -2014,50 +2249,8 @@ class MachineLearningManager(QtWidgets.QDialog):
                                f"but band index {max_required_band} is required. Skipping.")
                 continue
 
-            # Extract only the selected bands in the specified order
-            selected_chans = []
-            for band_idx in selected_band_indices:
-                if band_idx < len(chans):
-                    selected_chans.append(chans[band_idx].astype(np.float32, copy=False))
-                else:
-                    selected_chans.append(None)
-
-            # Pre-compute expression values for this image (more efficient than per-pixel)
-            expr_images = []  # List of 2D arrays, one per expression
-            if selected_expressions:
-                try:
-                    from .utils import eval_band_expression
-                except ImportError:
-                    eval_band_expression = None
-                
-                # Prepare image for expression evaluation (needs HxWxC float32)
-                img_for_expr = img.astype(np.float32, copy=False)
-                
-                for expr_name, expr_str in selected_expressions:
-                    try:
-                        if eval_band_expression is not None:
-                            result = eval_band_expression(img_for_expr, expr_str)
-                        else:
-                            # Fallback: use parent's eval method if available
-                            fn = getattr(self, "_eval_band_expression", None)
-                            if fn:
-                                result = fn(img_for_expr, expr_str)
-                            else:
-                                logging.warning(f"[train] No expression evaluator available for '{expr_name}'")
-                                result = None
-                        
-                        # Result should be 2D (HxW) - take last channel if 3D
-                        if result is not None:
-                            if result.ndim == 3:
-                                result = result[:, :, -1]  # Take last channel
-                            expr_images.append(result.astype(np.float32, copy=False))
-                            logging.debug(f"[train] Computed expression '{expr_name}' for {os.path.basename(filepath)}")
-                        else:
-                            expr_images.append(None)
-                            logging.warning(f"[train] Expression '{expr_name}' returned None for {filepath}")
-                    except Exception as e:
-                        logging.warning(f"[train] Failed to compute expression '{expr_name}' for {filepath}: {e}")
-                        expr_images.append(None)
+            selected_chans, expr_images = self._select_bands_and_expressions(
+                img, chans, selected_band_indices, selected_expressions)
 
             # iterate polygons/points inside this file
             file_polys = polygons_by_group.get(group_name, {}).get(filepath, {})
@@ -2117,104 +2310,75 @@ class MachineLearningManager(QtWidgets.QDialog):
                     if poly_mask is not None and poly_mask[yy, xx]:
                         dropped_nan += 1  # Count as dropped (masked)
                         continue
-                    
+
                     # For window-based extraction, skip edge pixels where window would go out of bounds
                     half = window_size // 2
                     if yy - half < 0 or yy + half >= H or xx - half < 0 or xx + half >= W:
                         if window_size > 1:
                             dropped_nan += 1  # Can't use edge pixels with windows
                             continue
-                    
-                    row = []
-                    ok_row = True
-                    
-                    # Window-based feature extraction
-                    # Order: iterate positions (row-major), then bands/expressions at each position
-                    for dr in range(-half, half + 1):
-                        for dc in range(-half, half + 1):
-                            py, px = yy + dr, xx + dc
-                            
-                            # First: collect band values at this window position
-                            for ch in selected_chans:
-                                if ch is None:
-                                    ok_row = False
-                                    dropped_missing_band += 1
-                                    break
-                                val = float(ch[py, px])
-                                if not np.isfinite(val):
-                                    ok_row = False
-                                    dropped_nan += 1
-                                    break
-                                # Skip NoData values
-                                if nodata_values:
-                                    is_nodata = False
-                                    for nd in nodata_values:
-                                        try:
-                                            nd_val = float(nd)
-                                            abs_nd = abs(nd_val)
-                                            # Use appropriate tolerance based on value magnitude
-                                            if abs_nd > 1e+30:
-                                                tol = abs_nd * 0.01  # 1% for extreme values
-                                            elif abs_nd > 1e+10:
-                                                tol = abs_nd * 0.001  # 0.1% for very large values
-                                            elif abs_nd > 100:
-                                                tol = abs_nd * 0.001  # 0.1% for large values
-                                            else:
-                                                tol = 0.01  # Absolute for small values
-                                            if abs(val - nd_val) < tol:
-                                                is_nodata = True
-                                                break
-                                        except Exception:
-                                            pass
-                                    if is_nodata:
-                                        ok_row = False
-                                        dropped_nan += 1  # Count as dropped
-                                        break
-                                row.append(val)
-                            
-                            if not ok_row:
-                                break
-                            
-                            # Second: collect expression values at this window position
-                            if expr_images:
-                                for expr_img in expr_images:
-                                    if expr_img is None:
-                                        ok_row = False
-                                        dropped_missing_band += 1
-                                        break
-                                    val = float(expr_img[py, px])
-                                    if not np.isfinite(val):
-                                        ok_row = False
-                                        dropped_nan += 1
-                                        break
-                                    row.append(val)
-                            
-                            if not ok_row:
-                                break
-                        
-                        if not ok_row:
-                            break
-                    
+
+                    row, ok_row, n_nan, n_missing = self._build_training_row(
+                        selected_chans, expr_images, yy, xx, window_size, nodata_values, num_features)
+                    dropped_nan += n_nan
+                    dropped_missing_band += n_missing
+
                     if ok_row and len(row) == num_features:
-                        X_rows.append(row)
-                        y_rows.append(group_name)
+                        # Report/holdout collection: pristine, always, unconditionally.
+                        X_rows_report.append(row)
+                        y_rows_report.append(group_name)
+
+                        if augmentation_enabled:
+                            # Run this SAME pixel through every augmented
+                            # image variant's own chans/expr_images (built
+                            # once per image, above) -- augmented-row
+                            # failures are not counted into dropped_nan/
+                            # dropped_missing_band, since they're not a
+                            # genuine data-quality signal about the source
+                            # imagery (assemble_pixel_rows falls back to the
+                            # pristine row rather than dropping the pixel).
+                            augmented_results = []
+                            for (chans_aug, expr_aug) in variant_chans_expr:
+                                r_aug, ok_aug, _n1, _n2 = self._build_training_row(
+                                    chans_aug, expr_aug, yy, xx, window_size, nodata_values, num_features)
+                                augmented_results.append(
+                                    (ok_aug and len(r_aug) == num_features, r_aug))
+                            for train_row in ml_augmentation.assemble_pixel_rows(
+                                    True, row, augmented_results, augmentation_cfg.get("row_policy", "add")):
+                                X_rows_train.append(train_row)
+                                y_rows_train.append(group_name)
+                        # else: X_rows_train IS X_rows_report (aliased above)
+                        # -- already updated by the append two lines up.
 
         progress.reset()
         progress.hide()
         progress.close()
         progress.deleteLater()
         QtWidgets.QApplication.processEvents()
-        
+
         # Free memory from image cache (no longer needed)
         _image_cache.clear()
 
-        if not X_rows:
+        if not X_rows_report:
             QtWidgets.QMessageBox.warning(self, "No Samples",
                                           "No valid training pixels could be collected.")
             return
 
-        X = np.asarray(X_rows, dtype=np.float32)
-        y = np.asarray(y_rows, dtype=object)
+        X_report = np.asarray(X_rows_report, dtype=np.float32)
+        y_report = np.asarray(y_rows_report, dtype=object)
+        X_train = np.asarray(X_rows_train, dtype=np.float32)
+        y_train = np.asarray(y_rows_train, dtype=object)
+
+        # ---- 6b) Feature normalization -- fit on X_train (what's actually
+        # .fit()'d, i.e. including Add-mode's augmented rows), apply to both
+        # X_train and X_report so holdout metrics reflect the same transform
+        # the model actually trains under. Recorded in the bundle so every
+        # later predict() call site applies the identical transform (see
+        # utils.apply_normalization and its ~6 call sites across
+        # project_tab.py/image_editor_dialog.py/this file). ----
+        normalization_cfg = fit_normalization(X_train, normalization_method)
+        X_train = apply_normalization(X_train, normalization_cfg)
+        X_report = apply_normalization(X_report, normalization_cfg)
 
         # ---- 7) Fit models (+ optional tuning) + write reports ----
         saved = []
@@ -2239,7 +2403,16 @@ class MachineLearningManager(QtWidgets.QDialog):
             return
 
         # builder for estimators (returns estimator object and a flag whether it's a pipeline)
-        def _build_estimator(name: str):
+        def _build_estimator(name: str, skip_internal_scaler: bool = False):
+            """skip_internal_scaler: when a bundle-level normalization is
+            selected (normalization_method != "none"), LogisticRegression/SVM
+            must NOT also apply their own private StandardScaler -- that
+            would silently double-standardize those two model types only,
+            while every other model type (RandomForest, ExtraTrees, etc.)
+            gets exactly the bundle-level transform and nothing else. Bare
+            estimator + is_pipeline=False makes _spaces() stop prefixing
+            hyperparameter keys with "clf__", which is the only other place
+            that flag is consumed."""
             if name == "RandomForest":
                 return RandomForestClassifier(n_estimators=n_estimators, n_jobs=-1, random_state=42), False
             if name == "ExtraTrees":
@@ -2247,10 +2420,14 @@ class MachineLearningManager(QtWidgets.QDialog):
             if name == "GradientBoosting":
                 return GradientBoostingClassifier(n_estimators=n_estimators, random_state=42), False
             if name == "LogisticRegression":
+                if skip_internal_scaler:
+                    return LogisticRegression(max_iter=1000, n_jobs=None, solver="lbfgs"), False
                 est = Pipeline([("scaler", StandardScaler()),
                                 ("clf", LogisticRegression(max_iter=1000, n_jobs=None, solver="lbfgs"))])
                 return est, True
             if name == "SVM":
+                if skip_internal_scaler:
+                    return SVC(probability=True), False
                 est = Pipeline([("scaler", StandardScaler()),
                                 ("clf", SVC(probability=True))])
                 return est, True
@@ -2381,12 +2558,17 @@ class MachineLearningManager(QtWidgets.QDialog):
             return None
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        labels_sorted = sorted(list(set(map(str, y))))
+        # Class identity/stratification feasibility is judged from the
+        # REPORT set (y_report), not y_train -- augmentation can inflate a
+        # class's row count without changing which classes exist or whether
+        # the ORIGINAL sampling gave each of them enough distinct pixels to
+        # stratify a holdout split from.
+        labels_sorted = sorted(list(set(map(str, y_report))))
 
         # can we stratify? (>=2 samples per class)
         can_holdout = True
         try:
-            _, counts = np.unique(y, return_counts=True)
+            _, counts = np.unique(y_report, return_counts=True)
             if np.any(counts < 2) or len(labels_sorted) < 2:
                 can_holdout = False
         except Exception:
@@ -2410,7 +2592,7 @@ class MachineLearningManager(QtWidgets.QDialog):
             train_progress.setLabelText(f"Training {name} ({m_idx + 1}/{len(model_names)})...")
             QtWidgets.QApplication.processEvents()
             try:
-                est, is_pipe = _build_estimator(name)
+                est, is_pipe = _build_estimator(name, skip_internal_scaler=(normalization_method != "none"))
                 grid, dist = _spaces(name, is_pipe)
 
                 optimization = "None"
@@ -2426,7 +2608,7 @@ class MachineLearningManager(QtWidgets.QDialog):
                             est, param_grid=grid, cv=cv_folds, n_jobs=-1,
                             scoring="balanced_accuracy", refit=True, verbose=0
                         )
-                        search.fit(X, y)
+                        search.fit(X_train, y_train)
                         estimator_for_eval = search.best_estimator_
                         best_params = dict(search.best_params_)
                         best_cv_score = float(search.best_score_)
@@ -2441,7 +2623,7 @@ class MachineLearningManager(QtWidgets.QDialog):
                             est, param_distributions=dist, n_iter=rand_iter, cv=cv_folds, n_jobs=-1,
                             scoring="balanced_accuracy", random_state=42, refit=True, verbose=0
                         )
-                        search.fit(X, y)
+                        search.fit(X_train, y_train)
                         estimator_for_eval = search.best_estimator_
                         best_params = dict(search.best_params_)
                         best_cv_score = float(search.best_score_)
@@ -2452,14 +2634,16 @@ class MachineLearningManager(QtWidgets.QDialog):
 
                 # If no tuning happened (or failed), just fit defaults for evaluation and saving
                 if optimization == "None":
-                    estimator_for_eval.fit(X, y)
+                    estimator_for_eval.fit(X_train, y_train)
 
-                # ---- holdout metrics for the report ----
+                # ---- holdout metrics for the report -- ALWAYS the pristine
+                # report split, never touched by augmentation, regardless of
+                # what final_model below is actually trained on ----
                 acc = None; bacc = None; report = "N/A"; cm = None
                 if can_holdout:
                     try:
                         X_tr, X_te, y_tr, y_te = train_test_split(
-                            X, y, test_size=0.20, random_state=42, stratify=y
+                            X_report, y_report, test_size=0.20, random_state=42, stratify=y_report
                         )
                         clf_eval = clone(estimator_for_eval)
                         clf_eval.fit(X_tr, y_tr)
@@ -2473,9 +2657,11 @@ class MachineLearningManager(QtWidgets.QDialog):
                     except Exception as e:
                         logging.warning(f"[train] Holdout metrics skipped for {name}: {e}")
 
-                # ---- final model on ALL data (already tuned if optimization ran) ----
+                # ---- final model on ALL (training-partition) data, already
+                # tuned if optimization ran -- includes Add-mode's augmented
+                # rows, since X_train/y_train is what's actually shipped ----
                 final_model = estimator_for_eval
-                final_model.fit(X, y)
+                final_model.fit(X_train, y_train)
 
                 bundle = {
                     "model": final_model,
@@ -2485,11 +2671,14 @@ class MachineLearningManager(QtWidgets.QDialog):
                     "expressions": [(name, expr) for name, expr in selected_expressions],  # Store custom expressions
                     "window_size": window_size,  # Spatial context window (1, 3, or 5)
                     "base_feature_names": list(base_feature_names),  # Feature names without window suffix
+                    "normalization": normalization_cfg,  # {"method": "none"|"l2"|"zscore", "mean", "scale"} --
+                                                          # see utils.fit_normalization/apply_normalization;
+                                                          # every predict() call site must apply this same transform.
                     "meta": {
                         "created": ts,
                         "notes": f"Trained in CanoPie ML Manager from groups: {', '.join(selected_groups)}",
                         "sklearn_version": getattr(sklearn, "__version__", "unknown"),
-                        "n_samples": int(X.shape[0]),
+                        "n_samples": int(X_train.shape[0]),
                         "n_features": int(len(feature_names)),
                         "optimization": optimization,
                         "best_cv_score": best_cv_score,
@@ -2499,6 +2688,15 @@ class MachineLearningManager(QtWidgets.QDialog):
                         "band_selection": list(selected_band_indices),  # Also in meta for reports
                         "n_expressions": len(selected_expressions),  # Number of custom expressions
                         "window_size": window_size,  # Also in meta for reports
+                        "augmentation": {
+                            "enabled": augmentation_enabled,
+                            "brightness": dict(augmentation_cfg.get("brightness") or {}),
+                            "shadow": dict(augmentation_cfg.get("shadow") or {}),
+                            "row_policy": augmentation_cfg.get("row_policy", "add"),
+                            "n_variants": n_variants,
+                            "n_original_rows": int(X_report.shape[0]),
+                            "n_augmented_rows": int(X_train.shape[0]) - int(X_report.shape[0]),
+                        },
                     }
                 }
 
@@ -2521,7 +2719,10 @@ class MachineLearningManager(QtWidgets.QDialog):
 
                 # ---- sidecar TXT ----
                 channel_names = _try_get_channel_names()
-                _, cls_counts = np.unique(y, return_counts=True)
+                # y_train (not y_report) so the reported distribution matches
+                # what the saved model was actually fit on, including any
+                # Add-mode augmented rows.
+                _, cls_counts = np.unique(y_train, return_counts=True)
                 dist_lines = [f"  {lab}: {cnt}" for lab, cnt in zip(labels_sorted, cls_counts)]
                 txt_path = os.path.splitext(fpath)[0] + ".txt"
                 with open(txt_path, "w", encoding="utf-8") as rf:
@@ -2636,7 +2837,7 @@ class MachineLearningManager(QtWidgets.QDialog):
                         try:
                             from sklearn.model_selection import train_test_split
                             X_tr, X_te, y_tr, y_te = train_test_split(
-                                X, y, test_size=0.20, random_state=42, stratify=y
+                                X_report, y_report, test_size=0.20, random_state=42, stratify=y_report
                             )
                             stack_eval = clone(stack)
                             stack_eval.fit(X_tr, y_tr)
@@ -2651,8 +2852,8 @@ class MachineLearningManager(QtWidgets.QDialog):
                         except Exception as e:
                             logging.warning(f"[train] Holdout metrics skipped for Stacked: {e}")
 
-                    # fit on ALL data
-                    stack.fit(X, y)
+                    # fit on the training partition (includes Add-mode's augmented rows)
+                    stack.fit(X_train, y_train)
 
                     # save stacked bundle
                     base_list = [{"name": name, **tuned_meta_info.get(name, {})} for name, _ in
@@ -2666,11 +2867,13 @@ class MachineLearningManager(QtWidgets.QDialog):
                         "expressions": [(name, expr) for name, expr in selected_expressions],  # Store custom expressions
                         "window_size": window_size,  # Spatial context window (1, 3, or 5)
                         "base_feature_names": list(base_feature_names),  # Feature names without window suffix
+                        "normalization": normalization_cfg,  # same fitted transform as the per-model bundles above --
+                                                              # reuses X_train/X_report, so it applies verbatim here too.
                         "meta": {
                             "created": ts,
                             "notes": f"STACKED model from: {', '.join([n for (n, _) in tuned_models_for_stack])}",
                             "sklearn_version": getattr(sklearn, "__version__", "unknown"),
-                            "n_samples": int(X.shape[0]),
+                            "n_samples": int(X_train.shape[0]),
                             "n_features": int(len(feature_names)),
                             "stacking": True,
                             "cv_folds": cv_folds,
@@ -2679,6 +2882,15 @@ class MachineLearningManager(QtWidgets.QDialog):
                             "band_selection": list(selected_band_indices),  # Also in meta for reports
                             "n_expressions": len(selected_expressions),  # Number of custom expressions
                             "window_size": window_size,  # Also in meta for reports
+                            "augmentation": {
+                                "enabled": augmentation_enabled,
+                                "brightness": dict(augmentation_cfg.get("brightness") or {}),
+                                "shadow": dict(augmentation_cfg.get("shadow") or {}),
+                                "row_policy": augmentation_cfg.get("row_policy", "add"),
+                                "n_variants": n_variants,
+                                "n_original_rows": int(X_report.shape[0]),
+                                "n_augmented_rows": int(X_train.shape[0]) - int(X_report.shape[0]),
+                            },
                         }
                     }
 
@@ -2695,7 +2907,7 @@ class MachineLearningManager(QtWidgets.QDialog):
 
                     # sidecar TXT for stacked
                     channel_names = _try_get_channel_names()
-                    _, cls_counts = np.unique(y, return_counts=True)
+                    _, cls_counts = np.unique(y_train, return_counts=True)
                     dist_lines = [f"  {lab}: {cnt}" for lab, cnt in zip(labels_sorted, cls_counts)]
                     txt_path = os.path.splitext(fpath)[0] + ".txt"
                     with open(txt_path, "w", encoding="utf-8") as rf:
@@ -4223,6 +4435,9 @@ class MachineLearningManager(QtWidgets.QDialog):
             combined_mask |= mask_polygon_mask
 
         X = np.stack([m.reshape(-1) for m in mats], axis=1)  # (H*W, F)
+        normalization_cfg = bundle.get("normalization")
+        if normalization_cfg is not None:
+            X = apply_normalization(X, normalization_cfg)
         valid = ~combined_mask.reshape(-1)  # Use combined mask
         
         if not np.any(valid):

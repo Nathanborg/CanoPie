@@ -482,6 +482,14 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
         self._cached_brect_drag = None     # tight bounding rect (no label)
         self._cached_shape = None          # QPainterPath from addPolygon
 
+        #: True while ImageViewer.start_vertex_editing has handles up for
+        #: THIS item. While active, _set_vertex_point (not the `polygon`
+        #: setter) is what per-drag-frame updates go through -- see there
+        #: for why: rebuilding _pts_np/_cached_shape from scratch on every
+        #: throttled frame is what made dragging a vertex on a large
+        #: (tens/hundreds of thousands of vertices) polygon freeze/crash.
+        self._vertex_editing_active = False
+
         # ---- Paint state cache (avoid per-frame allocation) ----
         self._pen_base = None
         self._pen_highlight = None
@@ -537,6 +545,73 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
         self.prepareGeometryChange()
         self._polygon = new_poly
         self._invalidate_geometry_cache()
+
+    def _set_vertex_point(self, index, new_point):
+        """Move ONE vertex, cheaply -- for a live drag, not a wholesale
+        polygon replacement.
+
+        THE BUG THIS FIXES ("edit vertices crashes with too many vertices"):
+        vertex dragging used to go through the `polygon` setter above --
+        rebuild a full new QPolygonF in a Python loop (the caller,
+        ImageViewer._apply_vertex_update), then _invalidate_geometry_cache()
+        rebuilds _pts_np with ANOTHER Python `for i in range(n): poly.at(i)`
+        loop AND rebuilds _cached_shape via `path.addPolygon(poly)` -- THREE
+        full O(n) passes for ONE point moving, repeated up to 60x/second
+        (on_vertex_moved's own throttle) for as long as the drag continues.
+        For a polygon with a real vertex count in the hundreds of thousands
+        (a detailed shapefile import easily reaches this -- the measured
+        real project here averaged 433 vertices/polygon with a max of 2312,
+        and that was already enough to matter for painting; an outlier
+        shapefile can be far denser), each of those passes can take from
+        noticeably slow to multiple seconds, ALL on the GUI thread, with new
+        drag events queuing up faster than they drain -- the "freeze that
+        looks like/becomes a crash" the report describes.
+
+        Vertex handles are already capped at 100 regardless of the real
+        point count (see start_vertex_editing's MAX_HANDLES) specifically so
+        dragging stays interactive -- but that cap only bounds how many
+        HANDLES exist, not the cost of updating the underlying polygon they
+        move, which is the actual bottleneck this method removes.
+
+        Only touches what a live drag frame needs:
+          - self._polygon[index] -- in-place (QPolygonF supports __setitem__
+            natively; no copy, no Python loop over every OTHER point).
+          - self._pts_np[index] -- in-place, if the cache exists (O(1)
+            numpy scalar write instead of rebuilding the whole array).
+          - self._simplified_cache -- invalidated (not rebuilt): the next
+            paint's _display_polygon() recomputes decimation from _pts_np
+            with vectorized numpy ops, which is fast even at very large n
+            (it is the Python-level PER-POINT loops that were slow, not
+            numpy operating on the whole array at once).
+
+        Deliberately does NOT touch _cached_shape / _cached_brect -- exactly
+        like the existing is_moving fast path for a whole-polygon drag
+        ("Keeping the bounding rect stable... the extra area is harmless"),
+        those stay at their pre-drag values until the edit session ends.
+        ImageViewer.stop_vertex_editing calls _invalidate_geometry_cache()
+        once, after dragging stops, to bring them back in sync -- a single
+        O(n) pass per EDIT SESSION instead of per FRAME.
+        """
+        self.prepareGeometryChange()
+        try:
+            self._polygon[index] = new_point
+        except Exception:
+            # Out-of-range index, or a QPolygonF that doesn't support
+            # __setitem__ in this Qt binding -- fall back to the full,
+            # correct (if expensive) path rather than silently doing nothing.
+            poly = QtGui.QPolygonF(self._polygon)
+            if 0 <= index < poly.count():
+                poly[index] = new_point
+            self.polygon = poly
+            return
+
+        pts_np = self._pts_np
+        if pts_np is not None and 0 <= index < len(pts_np):
+            pts_np[index, 0] = new_point.x()
+            pts_np[index, 1] = new_point.y()
+
+        self._simplified_cache = None
+        self.update()
 
     #: Below this vertex count, decimation cannot pay for itself.
     _SIMPLIFY_MIN_POINTS = 64
@@ -5100,7 +5175,13 @@ class ImageViewer(QtWidgets.QGraphicsView):
             
             # Make polygon non-movable while editing vertices
             polygon_item.setFlag(QtWidgets.QGraphicsItem.ItemIsMovable, False)
-            
+
+            # From here on, per-frame vertex moves go through the cheap
+            # _set_vertex_point path (see there) instead of the full
+            # `polygon` setter -- stop_vertex_editing flips this back off
+            # and does the one deferred full-cache rebuild.
+            polygon_item._vertex_editing_active = True
+
         except Exception as e:
             logging.error(f"[ImageViewer] Error creating vertex handles: {e}")
             # Clean up any handles that were created
@@ -5108,14 +5189,38 @@ class ImageViewer(QtWidgets.QGraphicsView):
         
     def stop_vertex_editing(self):
         """Remove all vertex handles and stop editing."""
-        # CRITICAL: Stop any pending throttled updates FIRST to prevent race conditions
+        # CRITICAL: Stop the throttle timer FIRST to prevent race conditions,
+        # but APPLY any update it was still holding before discarding it --
+        # otherwise the very last drag position (the one the throttle was
+        # deferring when the mouse was released) is silently lost and the
+        # vertex snaps back to its last-APPLIED, not last-DRAGGED-TO, spot.
         try:
             if getattr(self, '_vertex_update_timer', None):
                 self._vertex_update_timer.stop()
+            pending = getattr(self, '_pending_vertex_update', None)
             self._pending_vertex_update = None
+            if pending is not None:
+                self._apply_vertex_update(*pending)
         except Exception:
             pass
-        
+
+        # One full cache rebuild for the edited item, now that dragging has
+        # stopped -- _set_vertex_point (the per-frame path during the drag)
+        # deliberately left _cached_shape/_cached_brect stale to avoid
+        # paying that cost every frame (see its docstring). Pay it once here
+        # instead, so hit-testing/selection and the label position are
+        # correct again for whatever happens next.
+        edited = self._vertex_editing_item
+        if edited is not None:
+            try:
+                if edited.scene() is not None and hasattr(edited, "_invalidate_geometry_cache"):
+                    edited._invalidate_geometry_cache()
+                    edited._vertex_editing_active = False
+            except RuntimeError:
+                pass
+            except Exception as e:
+                logging.debug(f"[ImageViewer] Error resyncing geometry cache after vertex edit: {e}")
+
         # Remove all handles from scene
         for handle in self._vertex_handles:
             try:
@@ -5126,7 +5231,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 pass
             except Exception as e:
                 logging.debug(f"[ImageViewer] Error removing vertex handle: {e}")
-        
+
         # Restore movability on the polygon
         if self._vertex_editing_item is not None:
             try:
@@ -5138,7 +5243,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 pass
             except Exception as e:
                 logging.debug(f"[ImageViewer] Error restoring polygon movability: {e}")
-        
+
         # Clear all references
         self._vertex_handles = []
         self._vertex_editing_item = None
@@ -5217,20 +5322,24 @@ class ImageViewer(QtWidgets.QGraphicsView):
         else:
             poly_index = handle_index
         
-        # Update the polygon vertex
-        poly = poly_item.polygon
-        if 0 <= poly_index < poly.count():
-            # Create new polygon with updated point
-            new_poly = QtGui.QPolygonF()
-            for i in range(poly.count()):
-                if i == poly_index:
-                    new_poly.append(item_pos)
-                else:
-                    new_poly.append(poly.at(i))
-            
-            poly_item.prepareGeometryChange()
-            poly_item.polygon = new_poly
-            poly_item.update()
+        # Update the polygon vertex.
+        #
+        # PERFORMANCE: this used to rebuild an entire new QPolygonF via a
+        # Python `for i in range(poly.count())` loop, then assign it through
+        # the `polygon` SETTER -- which itself rebuilds the full _pts_np
+        # array and _cached_shape (see _invalidate_geometry_cache). That is
+        # three full O(n) passes for moving ONE point, repeated up to 60x/sec
+        # for as long as the drag continues -- the actual cause of "edit
+        # vertices crashes when I have too many vertices" (a freeze from
+        # queued-up drag events on a large polygon, not a true handle-count
+        # problem; MAX_HANDLES already caps draggable handles at 100
+        # regardless of the real point count). _set_vertex_point does the
+        # equivalent update in O(1): an in-place QPolygonF/_pts_np write,
+        # deferring the full cache rebuild to stop_vertex_editing (once per
+        # edit session, not once per frame). See its own docstring.
+        poly_count = poly_item.polygon.count()
+        if 0 <= poly_index < poly_count:
+            poly_item._set_vertex_point(poly_index, item_pos)
             
     def finish_vertex_editing(self):
         """Finish vertex editing and emit modification signal."""
@@ -5422,16 +5531,37 @@ class ImageViewer(QtWidgets.QGraphicsView):
         self._put_geom_on_clipboard(raw, txt)
 
     def _serialize_item(self, item):
-        """Return a JSON-serializable dict for a polygon/point item in *pixmap coords*."""
+        """Return a JSON-serializable dict for a polygon/point item in *pixmap coords*.
+
+        Used by copy/paste (`copy_selection`/`copy_specific_items`/
+        `paste_geometry`) and "Replicate to all viewers"
+        (`replicate_toviewer`). Both item types must be read through
+        `item.mapToScene(...)`, not their raw local geometry: both
+        EditablePolygonItem and EditablePointItem set ItemIsMovable with no
+        itemChange/mouseMoveEvent override, so Qt's default drag translates
+        `item.pos()` while leaving `.polygon`/`.points` at their pre-drag
+        values (see `_scene_xy`'s docstring and the matching fix in
+        `ProjectTab.on_polygon_modified`). `_image` is kept pinned at scene
+        (0, 0) (see `set_image`/`load_image`), so scene coords == pixmap
+        coords here once the drag offset is composed in.
+        """
         pm = self._image.pixmap() if self._image else None
         src_w = pm.width() if pm else 0
         src_h = pm.height() if pm else 0
 
         if isinstance(item, EditablePolygonItem):
-            pts = [(p.x(), p.y()) for p in item.polygon]  # scene==pixmap coords
+            poly_scene = item.mapToScene(item.polygon)
+            pts = [(p.x(), p.y()) for p in poly_scene]
             kind = "polygon"
         elif isinstance(item, EditablePointItem):
-            pts = [(p.x(), p.y()) for p in item.points]
+            if hasattr(item, "_scene_xy"):
+                item_local = QtGui.QPolygonF([
+                    QtCore.QPointF(*item._scene_xy(p)) for p in item.points
+                ])
+                poly_scene = item.mapToScene(item_local)
+                pts = [(p.x(), p.y()) for p in poly_scene]
+            else:
+                pts = [(p.x(), p.y()) for p in item.points]
             kind = "point"
         else:
             return None

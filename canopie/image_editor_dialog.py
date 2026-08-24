@@ -1560,6 +1560,18 @@ class ImageEditorDialog(QDialog):
     #: Byte ceiling for the editor's working image on large rasters.
     _EDITOR_PREVIEW_BYTES = 256 * 1024 * 1024
 
+    #: Byte ceiling for ONE sklearn-classification feature matrix
+    #: (H*W*F*4 for float32). Past this, run_sklearn_classification builds
+    #: and predicts the image in row-band tiles instead of one giant array
+    #: -- see utils.iter_tiled_feature_matrices. This is what stops a large
+    #: image + a spatial-window (window_size>1) model from an outright OOM
+    #: crash (e.g. a 10000x10000/3-band/window=3 image is ~10.8GB for the
+    #: feature matrix alone, unbounded). 512MB sits between the tighter
+    #: 64MB export-lazy threshold (project_tab.py) and the looser 1GB
+    #: preview-decode budget -- appropriate for one interactive operation,
+    #: matching _PREVIEW_LOAD_THRESHOLD_BYTES's precedent in project_tab.py.
+    _CLASSIFY_FEATURE_BUDGET_BYTES = 512 * 1024 * 1024
+
     def _load_editor_preview(self, all_bands=False):
         """Decimated working image for a large raster, or None if not applicable.
 
@@ -2117,6 +2129,46 @@ class ImageEditorDialog(QDialog):
         elif getattr(self, "global_mods_checkbox", None) and self.global_mods_checkbox.isChecked():
             scope = "group"
 
+        # ==================== HIST-MATCH MODE/DROPDOWN MISMATCH GUARD ====================
+        # Real incident this closes: only clicking "Calc" ever writes
+        # self.modifications["hist_match"]; switching hist_mode_combo alone
+        # does not recompute or clear it (see _update_hist_base_label's
+        # docstring). Without this check, a user who switched the dropdown
+        # after an earlier Calc -- without clicking Calc again -- would have
+        # THIS "Apply" broadcast the OLD, stale reference to every target
+        # file in scope="all"/"group" with zero warning: the dropdown reads
+        # "Mean/Std" but every other image's .ax silently gets a CDF block
+        # (or vice versa), and every one of them looks like "histogram
+        # matching had no effect" once checked against the mode the user
+        # actually meant to use. Single-file scope is exempt: the label
+        # already shows this in red, and there is no broadcast to protect
+        # other files from.
+        if scope in ("all", "group"):
+            try:
+                combo_mode = self._combo_hist_mode()
+                stored_mode = (modifications.get("hist_match") or {}).get("mode")
+                if combo_mode != "none" and stored_mode and combo_mode != stored_mode:
+                    combo_txt = self.hist_mode_combo.currentText()
+                    resp = QtWidgets.QMessageBox.warning(
+                        self, "Histogram reference is stale",
+                        f"The Hist Norm dropdown shows '{combo_txt}', but the histogram-match "
+                        f"reference actually stored (and about to be broadcast to every image "
+                        f"in this {scope}) is still '{stored_mode}' -- computed before you "
+                        f"changed the dropdown. Click Calc first to recompute the '{combo_txt}' "
+                        f"reference, or every target image will be matched against the OLD "
+                        f"'{stored_mode}' reference instead.\n\n"
+                        f"Apply anyway with the OLD '{stored_mode}' reference?",
+                        QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+                        QtWidgets.QMessageBox.Cancel)
+                    if resp != QtWidgets.QMessageBox.Yes:
+                        logging.info(
+                            "save_modifications_to_file: cancelled -- hist_mode_combo "
+                            "('%s') did not match the stored reference ('%s').",
+                            combo_txt, stored_mode)
+                        return None
+            except Exception as e:
+                logging.debug(f"hist-match mismatch guard skipped: {e}")
+
         # ==================== REGISTRATION SETUP ====================
         sr = None
         ref_img_gray = None
@@ -2479,7 +2531,19 @@ class ImageEditorDialog(QDialog):
                 progress.close()
         else:
             self._last_apply_hint = self.save_modifications_to_file()
-        
+
+        # A None hint means save_modifications_to_file bailed out before
+        # writing anything -- e.g. the user chose "Cancel" on the hist-match
+        # dropdown/stored-reference mismatch guard, or there was no
+        # image_filepath at all. Either way nothing was saved, so closing
+        # the dialog here would silently discard the user's chance to fix
+        # it (re-click Calc) and re-apply -- they would have to reopen the
+        # editor and reconfigure everything from scratch.
+        if self._last_apply_hint is None:
+            logging.info("apply_all_changes: save_modifications_to_file returned None; "
+                         "keeping the editor open instead of accepting.")
+            return
+
         self.accept()
         logging.info("All changes applied, modifications saved, and dialog accepted.")
 
@@ -3768,6 +3832,11 @@ class ImageEditorDialog(QDialog):
         self.hist_base_label.setStyleSheet("color: #888; font-size: 10px;")
         img_ops_layout.addWidget(self.hist_base_label)
         self._update_hist_base_label()
+        # Re-render the moment the dropdown selection changes (not just after
+        # Calc) so a dropdown/stored-reference mismatch is caught immediately
+        # -- see _update_hist_base_label's docstring for the incident this
+        # closes.
+        self.hist_mode_combo.currentIndexChanged.connect(self._update_hist_base_label)
 
         # The histogram plot lives in a separate pop-up window (see
         # show_hist_plot_window), one tab per band; nothing is embedded in this panel.
@@ -4001,27 +4070,66 @@ class ImageEditorDialog(QDialog):
         
     def _update_hist_base_label(self):
         """
-        Show which image the current histogram-match reference statistics came from.
+        Show which image the current histogram-match reference statistics came from
+        -- and, critically, whether that STORED reference still matches what the
+        mode dropdown currently displays.
 
-        Reads the provenance keys written by on_hist_match_clicked. Older .ax files
-        predate them, so an unknown base is reported honestly rather than guessed.
+        THE BUG THIS GUARDS: only clicking "Calc" (on_hist_match_clicked) ever
+        writes self.modifications["hist_match"]; changing hist_mode_combo's
+        selection alone does not recompute or clear anything. "Apply All
+        Changes" then persists (and, with 'apply to group'/'apply to all
+        roots', BROADCASTS to every other image) whatever Calc last stored --
+        with no prior signal wired to this label, a user could switch the
+        dropdown from CDF to Mean/Std, never re-click Calc, and Apply: every
+        target image silently gets the OLD CDF reference while the dropdown
+        (and the user) believe Mean/Std was just applied project-wide. Reads
+        the provenance keys written by on_hist_match_clicked; older .ax files
+        predate them, so an unknown base is reported honestly rather than
+        guessed.
         """
         lbl = getattr(self, "hist_base_label", None)
         if lbl is None:
             return
         try:
             hm = (getattr(self, "modifications", {}) or {}).get("hist_match") or {}
-            if not hm:
+            combo_mode = self._combo_hist_mode()
+            combo_txt = self.hist_mode_combo.currentText() if hasattr(self, "hist_mode_combo") else "?"
+
+            if combo_mode == "none":
+                # Dropdown says "None": save_modifications_to_file independently
+                # re-checks the live combo text for this case (see hist_disable
+                # there), so an old stored block, if any, is not silently
+                # broadcast -- nothing to warn about here.
                 lbl.setText("")
+                lbl.setStyleSheet("color: #888; font-size: 10px;")
                 return
+
+            if not hm:
+                lbl.setText(f"No reference calculated yet for '{combo_txt}' — click Calc.")
+                lbl.setStyleSheet("color: #a86b00; font-size: 10px;")
+                return
+
+            stored_mode = hm.get("mode", "?")
+            if combo_mode != stored_mode:
+                lbl.setText(
+                    f"⚠ Dropdown shows '{combo_txt}' but the stored reference is still "
+                    f"'{stored_mode}' (from {hm.get('reference_name', '?')}"
+                    f"{', ' + hm.get('computed_at', '').replace('T', ' ') if hm.get('computed_at') else ''}). "
+                    f"Click Calc to recompute — otherwise Apply All Changes will save/broadcast "
+                    f"the OLD reference, not '{combo_txt}'.")
+                lbl.setStyleSheet("color: #b00000; font-size: 10px; font-weight: bold;")
+                lbl.setToolTip(hm.get("reference_path") or "")
+                return
+
             name = hm.get("reference_name")
             when = hm.get("computed_at") or ""
-            mode = hm.get("mode", "?")
+            mode = stored_mode
             if name:
                 txt = f"Base image: {name}  ({mode}{', ' + when.replace('T', ' ') if when else ''})"
             else:
                 txt = f"Base image: not recorded — stats predate provenance tracking ({mode})"
             lbl.setText(txt)
+            lbl.setStyleSheet("color: #888; font-size: 10px;")
             lbl.setToolTip(hm.get("reference_path") or "")
         except Exception:
             try:
@@ -4319,6 +4427,25 @@ class ImageEditorDialog(QDialog):
             logging.exception("[_update_hist_plot] failed")
             _message_tab(f"Could not draw histogram:\n{e}")
 
+    def _combo_hist_mode(self):
+        """Canonical mode string ('none'|'meanstd'|'cdf') for whatever
+        hist_mode_combo currently DISPLAYS. The single source of truth for
+        that text->mode mapping -- on_hist_match_clicked uses it to decide
+        what to compute, and _update_hist_base_label uses it to detect when
+        the dropdown no longer agrees with the STORED reference (see that
+        method for why the gap between the two is a real, silent bug)."""
+        mode_txt = ""
+        if hasattr(self, "hist_mode_combo") and self.hist_mode_combo is not None:
+            try:
+                mode_txt = (self.hist_mode_combo.currentText() or "").strip().lower()
+            except Exception:
+                mode_txt = ""
+        if "mean/std" in mode_txt:
+            return "meanstd"
+        if "cdf" in mode_txt:
+            return "cdf"
+        return "none"
+
     def on_hist_match_clicked(self):
         """
         Build/clear histogram-match parameters for the *current edit session only*.
@@ -4330,19 +4457,7 @@ class ImageEditorDialog(QDialog):
         import cv2
 
         # 1) Which method?
-        mode_txt = None
-        if hasattr(self, "hist_mode_combo") and self.hist_mode_combo is not None:
-            try:
-                mode_txt = (self.hist_mode_combo.currentText() or "").strip().lower()
-            except Exception:
-                mode_txt = ""
-        mode = "none"
-        if "mean/std" in mode_txt:
-            mode = "meanstd"
-        elif "cdf" in mode_txt:
-            mode = "cdf"
-        else:
-            mode = "none"
+        mode = self._combo_hist_mode()
 
         # 2) If None: clear pending hist_match and preview
         if mode == "none":
@@ -6701,6 +6816,7 @@ class ImageEditorDialog(QDialog):
         expressions = bundle.get("expressions", [])  # Get custom expressions from bundle
         window_size = bundle.get("window_size", 1)  # Get spatial window size (default 1)
         base_feature_names = bundle.get("base_feature_names", feat_names)  # Base names without window suffix
+        normalization_cfg = bundle.get("normalization")
         if not feat_names:
             raise RuntimeError("Model bundle missing 'feature_names'.")
 
@@ -6710,26 +6826,27 @@ class ImageEditorDialog(QDialog):
         if expressions:
             logging.info(f"[image_editor] Model has {len(expressions)} custom expressions: {[n for n,_ in expressions]}")
 
-        # Build features (H*W, F) - pass expressions and window info for custom band math
-        X, (H, W) = self._make_feature_stack_for_model(
-            img, feat_names, 
-            expressions=expressions,
-            window_size=window_size,
-            base_feature_names=base_feature_names
-        )
-        if X is None:
-            raise RuntimeError("Could not build feature stack for the model. "
-                             "Check that image has required bands and all expressions are valid.")
+        # H/W come straight from the image, not from the builder's return --
+        # needed BEFORE feature construction so the progress dialog (and
+        # pred_flat) can be created up front and cover the whole operation,
+        # including a possibly-tiled build (see below), not just predict.
+        a_img = np.asarray(img)
+        H, W = int(a_img.shape[0]), int(a_img.shape[1])
         total = H * W
         if total == 0:
             QtWidgets.QMessageBox.warning(self, "Empty Image", "Image has zero pixels after processing.")
             return
-        X = np.ascontiguousarray(X, dtype=np.float32)
 
         # Chunk size tuned for throughput while keeping progress smooth
         cores = max(1, (os.cpu_count() or 1))
         chunk = max(400_000, min(2_000_000, total // max(cores, 4) or 400_000))
 
+        # Progress now covers FEATURE CONSTRUCTION too, not just prediction:
+        # this used to be created AFTER _make_feature_stack_for_model
+        # returned, so the (previously very slow, unbounded-memory) feature
+        # build ran with zero UI feedback -- a silent freeze, not just a
+        # slow progress bar. Created here, before either step, so a large
+        # image shows continuous progress and stays cancellable throughout.
         progress = QtWidgets.QProgressDialog("Classifying image...", "Cancel", 0, total, self)
         progress.setWindowModality(QtCore.Qt.WindowModal)
         progress.setMinimumDuration(0)
@@ -6756,7 +6873,9 @@ class ImageEditorDialog(QDialog):
 
         pred_flat = np.empty(total, dtype=np.int32)
 
-        # Throttle progress updates (avoid UI churn)
+        # Throttle progress updates (avoid UI churn). Callers pass the
+        # GLOBAL cumulative pixel count (offset-adjusted per tile below), so
+        # this advances smoothly across tiles, not just within one.
         last_tick = 0.0
         def tick(v):
             nonlocal last_tick
@@ -6766,7 +6885,8 @@ class ImageEditorDialog(QDialog):
                 QtWidgets.QApplication.processEvents()
                 last_tick = now
 
-        # Prefer model's internal parallelism if it supports n_jobs
+        # Prefer model's internal parallelism if it supports n_jobs -- a
+        # one-time model config change, done once regardless of tiling.
         use_internal = False
         try:
             params = getattr(model, "get_params", lambda **k: {})()
@@ -6779,30 +6899,38 @@ class ImageEditorDialog(QDialog):
         except Exception:
             pass
 
-        if use_internal:
-            i = 0
-            while i < total:
-                if progress.wasCanceled():
-                    progress.close(); return
-                j = min(i + chunk, total)
-                y = model.predict(X[i:j])
-                pred_flat[i:j] = map_to_idx(y)
-                i = j
-                tick(i)
-        else:
-            # our own threading; prevent nested BLAS threads if possible
-            if threadpool_limits:
-                def predict_fn(xslice):
-                    with threadpool_limits(limits=1):
-                        return model.predict(xslice)
-            else:
-                def predict_fn(xslice):
+        # our own threading; prevent nested BLAS threads if possible
+        if threadpool_limits:
+            def predict_fn(xslice):
+                with threadpool_limits(limits=1):
                     return model.predict(xslice)
+        else:
+            def predict_fn(xslice):
+                return model.predict(xslice)
+
+        def _classify_chunk(X_local, out_offset, tile_total):
+            """Predict one tile's feature matrix, writing results into
+            pred_flat[out_offset:out_offset+tile_total] -- the SAME chunk/
+            thread logic as before this fix, just scoped to one tile
+            (out_offset/tile_total are (0, total) for the common,
+            fits-in-budget case, so this is a no-op restructuring there).
+            Returns False on cancel/error (caller aborts)."""
+            if use_internal:
+                i = 0
+                while i < tile_total:
+                    if progress.wasCanceled():
+                        return False
+                    j = min(i + chunk, tile_total)
+                    y = model.predict(X_local[i:j])
+                    pred_flat[out_offset + i: out_offset + j] = map_to_idx(y)
+                    i = j
+                    tick(out_offset + i)
+                return True
 
             ranges = []
             i = 0
-            while i < total:
-                j = min(i + chunk, total)
+            while i < tile_total:
+                j = min(i + chunk, tile_total)
                 ranges.append((i, j))
                 i = j
 
@@ -6816,9 +6944,8 @@ class ImageEditorDialog(QDialog):
                 for _ in range(min(max_workers * 2, len(ranges))):
                     a, b = next(it, (None, None))
                     if a is None: break
-                    futures[ex.submit(predict_fn, X[a:b])] = (a, b)
+                    futures[ex.submit(predict_fn, X_local[a:b])] = (a, b)
 
-                from concurrent.futures import as_completed
                 while futures:
                     if progress.wasCanceled():
                         ok = False; break
@@ -6830,19 +6957,54 @@ class ImageEditorDialog(QDialog):
                         QtWidgets.QMessageBox.critical(self, "Classification Error", str(e))
                         ok = False
                         break
-                    pred_flat[a:b] = map_to_idx(y)
-                    tick(b)
+                    pred_flat[out_offset + a: out_offset + b] = map_to_idx(y)
+                    tick(out_offset + b)
 
                     # keep queue full
                     a2, b2 = next(it, (None, None))
                     if a2 is not None:
-                        futures[ex.submit(predict_fn, X[a2:b2])] = (a2, b2)
+                        futures[ex.submit(predict_fn, X_local[a2:b2])] = (a2, b2)
+            return ok
 
-            progress.close()
-            if not ok:
-                return
+        # ---- build + predict, tiled if the feature matrix would be too
+        # big (see _CLASSIFY_FEATURE_BUDGET_BYTES) ----
+        #
+        # THE FIX for "classify... too slow" / "a very big file will take
+        # forever and crash": _make_feature_stack_for_model's window_size>1
+        # branch is now vectorized (see there), and iter_tiled_feature_matrices
+        # bounds peak memory by building/predicting the image in row-band
+        # tiles instead of one whole-image array when it would exceed the
+        # budget -- mirroring how process_polygon stays memory-bounded via
+        # LazyChannels.read_window's own budgeted lazy decode. For the
+        # common case (feature matrix fits the budget) this yields exactly
+        # one tile covering the whole image, identical to the single call
+        # this loop replaces.
+        from .utils import iter_tiled_feature_matrices
+        import functools
+        _builder = functools.partial(self._make_feature_stack_for_model,
+                                      normalization_cfg=normalization_cfg)
+        aborted = False
+        for row0, row1, X_tile, w in iter_tiled_feature_matrices(
+                img, feat_names, expressions, window_size, base_feature_names,
+                self._CLASSIFY_FEATURE_BUDGET_BYTES, _builder):
+            if X_tile is None:
+                progress.close()
+                raise RuntimeError("Could not build feature stack for the model. "
+                                 "Check that image has required bands and all expressions are valid.")
+            if progress.wasCanceled():
+                aborted = True
+                break
+            X_tile = np.ascontiguousarray(X_tile, dtype=np.float32)
+            tile_total = (row1 - row0) * w
+            out_offset = row0 * w
+            if not _classify_chunk(X_tile, out_offset, tile_total):
+                aborted = True
+                break
 
-        progress.setValue(total); progress.close()
+        progress.setValue(total)
+        progress.close()
+        if aborted:
+            return
 
         # reshape to HxW float32 for grayscale last-band preview
         pred_idx = pred_flat.reshape(H, W).astype(np.float32, copy=False)
@@ -6958,7 +7120,7 @@ class ImageEditorDialog(QDialog):
         return hasattr(m, "predict")
 
         # ---------- sklearn classification: features ----------
-    def _make_feature_stack_for_model(self, img, feature_names, expressions=None, window_size=1, base_feature_names=None):
+    def _make_feature_stack_for_model(self, img, feature_names, expressions=None, window_size=1, base_feature_names=None, normalization_cfg=None):
         """
         Build features in the SAME order used at training time and return:
             X_flat: (H*W, F) float32
@@ -6969,13 +7131,21 @@ class ImageEditorDialog(QDialog):
           • Extras map to band_4, band_5, …
           • If expressions are provided, compute them and add to features.
           • If window_size > 1, extract spatial neighborhoods around each pixel.
-        
+
         Args:
             img: Input image (HxW or HxWxC)
             feature_names: List of feature names the model expects (may include window suffixes)
             expressions: Optional list of (name, expr_str) tuples for custom band expressions
             window_size: Spatial context window (1, 3, or 5). Default 1 = center pixel only.
             base_feature_names: Base feature names without window suffixes (needed for window > 1)
+            normalization_cfg: Optional bundle["normalization"] dict (see
+                utils.fit_normalization/apply_normalization) -- applied to
+                X_flat right before it's returned, mirroring
+                ProjectTab._make_feature_stack_for_model's twin parameter.
+                Kept independent of that copy's extra NaN/Inf median-
+                imputation pass (which this copy does not have) -- adding
+                normalization here must not couple to that pre-existing
+                asymmetry between the two copies.
         """
         import numpy as np
         import re
@@ -7044,32 +7214,28 @@ class ImageEditorDialog(QDialog):
                 except Exception as e:
                     logging.warning(f"[image_editor] Failed to compute expression '{expr_name}': {e}")
 
-        # Helper to get base feature value at a position
-        def _get_base_feature_value(name, y, x):
-            """Get a single feature value at position (y, x)."""
+        # Resolve a base feature name to its whole 2D (H, W) array -- shared
+        # by both branches below, ONCE per name, instead of the old
+        # per-pixel `_get_base_feature_value(name, y, x)` this replaces
+        # (that function is what the window_size>1 branch used to call
+        # H*W*window_size^2 times with scalar (y,x) indices; resolving each
+        # name's array once and slicing it is the actual "too slow" fix --
+        # see build_windowed_feature_cube in utils.py).
+        def _resolve_base_array(name):
             if name == "red_channel":
-                if len(chans) < 3:
-                    return None
-                return chans[0][y, x]
-            elif name == "green_channel":
-                if len(chans) < 3:
-                    return None
-                return chans[1][y, x]
-            elif name == "blue_channel":
-                if len(chans) < 3:
-                    return None
-                return chans[2][y, x]
-            elif name.startswith("band_"):
+                return chans[0] if len(chans) >= 3 else None
+            if name == "green_channel":
+                return chans[1] if len(chans) >= 3 else None
+            if name == "blue_channel":
+                return chans[2] if len(chans) >= 3 else None
+            if name.startswith("band_"):
                 try:
-                    k = int(name.split("_", 1)[1])
-                    idx = k - 1
+                    idx = int(name.split("_", 1)[1]) - 1
                 except Exception:
                     return None
-                if 0 <= idx < len(chans):
-                    return chans[idx][y, x]
-                return None
-            elif name in expr_images:
-                return expr_images[name][y, x]
+                return chans[idx] if 0 <= idx < len(chans) else None
+            if name in expr_images:
+                return expr_images[name]
             return None
 
         # Determine base feature names for window extraction
@@ -7093,90 +7259,47 @@ class ImageEditorDialog(QDialog):
         if window_size == 1:
             cube = np.zeros((H, W, F), dtype=np.float32)
             for i, name in enumerate(base_names):
-                if name == "red_channel":
-                    if len(chans) < 3:
-                        return None, (0, 0)
-                    cube[:, :, i] = chans[0]
-                elif name == "green_channel":
-                    if len(chans) < 3:
-                        return None, (0, 0)
-                    cube[:, :, i] = chans[1]
-                elif name == "blue_channel":
-                    if len(chans) < 3:
-                        return None, (0, 0)
-                    cube[:, :, i] = chans[2]
-                elif name.startswith("band_"):
-                    try:
-                        k = int(name.split("_", 1)[1])
-                        idx = k - 1
-                    except Exception:
-                        return None, (0, 0)
-                    if 0 <= idx < len(chans):
-                        cube[:, :, i] = chans[idx]
-                    else:
-                        return None, (0, 0)
-                elif name in expr_images:
-                    cube[:, :, i] = expr_images[name]
-                else:
+                arr = _resolve_base_array(name)
+                if arr is None:
                     logging.warning(f"[image_editor] Unknown feature name: {name}")
                     return None, (0, 0)
-            
+                cube[:, :, i] = arr
+
             X_flat = cube.reshape(H * W, F)
+            if normalization_cfg is not None:
+                from .utils import apply_normalization
+                X_flat = apply_normalization(X_flat, normalization_cfg)
             return X_flat, (H, W)
-        
-        # For window_size > 1, pad image and extract neighborhoods
-        # Pad channels and expression images
-        padded_chans = [np.pad(ch, half, mode='edge') for ch in chans]
-        padded_exprs = {name: np.pad(img, half, mode='edge') 
-                       for name, img in expr_images.items()}
-        
-        # Build feature array: iterate over each pixel, then window positions, then base features
-        X_flat = np.zeros((H * W, F), dtype=np.float32)
-        
-        for y in range(H):
-            for x in range(W):
-                flat_idx = y * W + x
-                feat_idx = 0
-                
-                # Window positions in row-major order
-                for dr in range(-half, half + 1):
-                    for dc in range(-half, half + 1):
-                        py = y + half + dr  # Offset by padding
-                        px = x + half + dc
-                        
-                        # Extract each base feature at this window position
-                        for base_name in base_names:
-                            if base_name == "red_channel":
-                                if len(padded_chans) < 3:
-                                    return None, (0, 0)
-                                val = padded_chans[0][py, px]
-                            elif base_name == "green_channel":
-                                if len(padded_chans) < 3:
-                                    return None, (0, 0)
-                                val = padded_chans[1][py, px]
-                            elif base_name == "blue_channel":
-                                if len(padded_chans) < 3:
-                                    return None, (0, 0)
-                                val = padded_chans[2][py, px]
-                            elif base_name.startswith("band_"):
-                                try:
-                                    k = int(base_name.split("_", 1)[1])
-                                    idx = k - 1
-                                except Exception:
-                                    return None, (0, 0)
-                                if 0 <= idx < len(padded_chans):
-                                    val = padded_chans[idx][py, px]
-                                else:
-                                    return None, (0, 0)
-                            elif base_name in padded_exprs:
-                                val = padded_exprs[base_name][py, px]
-                            else:
-                                logging.warning(f"[image_editor] Unknown base feature: {base_name}")
-                                return None, (0, 0)
-                            
-                            X_flat[flat_idx, feat_idx] = val
-                            feat_idx += 1
-        
+
+        # For window_size > 1: vectorized neighborhood extraction.
+        #
+        # PERFORMANCE: this used to be a `for y: for x: for dr: for dc: for
+        # base_name:` scalar loop touching every pixel individually --
+        # O(H*W*window_size^2*n_features) Python-level operations (minutes
+        # on a modest image, effectively hung on a large one -- reported as
+        # "classify... too slow" / "a very big file will take forever and
+        # crash"). Resolving each base_name's array ONCE (not per pixel,
+        # matching the window_size==1 branch above) and building the whole
+        # window-offset stack with build_windowed_feature_cube's vectorized
+        # slice-copies turns that into window_size^2 * n_features numpy
+        # array copies -- same total element count, but each is one C-level
+        # operation instead of H*W Python bytecode steps.
+        resolved = {}
+        for name in base_names:
+            arr = _resolve_base_array(name)
+            if arr is None:
+                logging.warning(f"[image_editor] Unknown base feature: {name}")
+                return None, (0, 0)
+            resolved[name] = arr
+
+        padded = {name: np.pad(arr, half, mode='edge') for name, arr in resolved.items()}
+
+        from .utils import build_windowed_feature_cube
+        cube = build_windowed_feature_cube(padded, base_names, window_size, H, W)
+        X_flat = cube.reshape(H * W, F)
+        if normalization_cfg is not None:
+            from .utils import apply_normalization
+            X_flat = apply_normalization(X_flat, normalization_cfg)
         return X_flat, (H, W)
 
 

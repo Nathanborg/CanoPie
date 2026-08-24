@@ -152,6 +152,12 @@ FEATURE_MAP = {
     "test_export_images_options_dialog": (
         "Export Images options dialog (format / band order / EXIF / background)",
         "replaces the old pair of QMessageBox prompts; defaults reproduce their old answers exactly; format and band order now thread through to both the background worker and the foreground path"),
+    "test_vertex_edit_perf": (
+        "Edit Vertices crash on high-vertex-count polygons",
+        "dragging a handle rebuilt the ENTIRE polygon (3 full O(n) passes) on every throttled frame regardless of the 100-handle cap; _set_vertex_point does an O(1) in-place update instead, deferring the one full resync to drag-end -- verified with a real 20,000-vertex polygon through the actual start/apply/stop methods, and confirmed the old code blows the timing bound on revert"),
+    "test_polygon_disappear_on_refresh_race": (
+        "Polygons vanishing after Image Editor apply (classification and others)",
+        "the debounced polygon-load pipeline bailed on a global _nav_seq counter bumped by ANY navigation/refresh anywhere, silently dropping loads for grids it never touched; both bail-outs now ask the precise question (grid identity / per-viewer filepath) instead"),
     "test_appended_band_failures": (
         "Appended bands (classification/boolean/band-expression) silently missing from exports",
         "_apply_ax_to_raw's per-band try/excepts only logged a warning on failure -- most commonly a classification band whose sklearn model isn't loaded in the current session -- so the band just vanished from CSV/image/ML output with nothing visible; now tracked and surfaced in every consumer's completion message, verified against a real project + a real trained model"),

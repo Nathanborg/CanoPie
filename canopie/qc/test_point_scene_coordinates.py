@@ -241,3 +241,141 @@ def test_on_polygon_drawn_also_maps_through_the_items_transform():
         "harmless today (a freshly created item's pos() is always the "
         "origin) but leaves two different reconstructions for the same "
         "EditablePointItem coordinate model")
+
+
+# ---------------------------------------------------------------------------
+# 4. Other consumers of a point/polygon item's position must ALSO compose
+#    _scene_xy() (or `.polygon`) with mapToScene() -- on_polygon_modified is
+#    not the only reader. Found during a re-review of this fix: two more
+#    call sites had their OWN independent pixmap/item-local -> scene
+#    reconstruction, and both had the identical bug (computed the item-local
+#    position correctly, then used it directly as "the scene position"
+#    without ever composing item.mapToScene() on top -- so a completed drag
+#    was silently discarded there too, even though the AST-level checks
+#    above only ever looked at on_polygon_drawn/on_polygon_modified).
+#
+# These drive the REAL ImageViewer + real ProjectTab methods end-to-end
+# (not a reimplementation), and simulate a completed drag the same way Qt's
+# own default ItemIsMovable handling does: item.setPos(...), leaving the
+# item's stored geometry (`.points` / `.polygon`) untouched -- see
+# EditablePointItem.mouseReleaseEvent / EditablePolygonItem's itemChange,
+# neither of which bakes the drag back into stored geometry.
+# ---------------------------------------------------------------------------
+
+class _FakeImageDataInMemory:
+    """image_data with a non-existent filepath: polygon_basis_hw's file-probe
+    (shapefile_io._raw_image_dims) fails to open it and falls back to
+    `.image.shape`, so the basis is exactly the synthetic array below --
+    keeping the expected scene<->image scale factor at a clean 1:1."""
+
+    def __init__(self, arr):
+        self.filepath = "C:/nonexistent/does_not_exist_qc_fixture.png"
+        self.image = arr
+
+
+def test_update_all_polygons_reflects_a_completed_point_drag(qapp):
+    """THE regression this re-review found: update_all_polygons has its OWN,
+    independent pixmap-local -> scene reconstruction for point items
+    (separate from on_polygon_modified's), reached from root navigation and
+    project save -- not the point_modified signal. It computed the
+    item-local position (pixmap-item offset + stored pixel, i.e. exactly
+    what _scene_xy does) but used that directly as the scene position,
+    never composing item.mapToScene() on top. So dragging a point and then
+    switching roots (which flushes dirty polygons through
+    update_all_polygons before saving) silently reverted the point to its
+    PRE-drag position on disk -- even though on_polygon_modified had just
+    saved the correct post-drag position moments earlier.
+    """
+    import numpy as np
+    from PyQt5 import QtGui, QtCore
+    from ..image_viewer import ImageViewer
+
+    v = ImageViewer()
+    pm = QtGui.QPixmap(400, 300)
+    pm.fill(QtCore.Qt.black)
+    v.set_image(pm)
+    v.image_data = _FakeImageDataInMemory(np.zeros((300, 400, 3), np.uint8))
+
+    point_item = v.add_point_to_scene(
+        QtGui.QPolygonF([QtCore.QPointF(50, 60)]), name="pt_group")
+
+    # Simulate a completed drag: Qt's default ItemIsMovable behaviour
+    # translates item.pos() and never touches `.points` (confirmed by
+    # EditablePointItem having no itemChange/mouseMoveEvent override that
+    # would bake it back in).
+    point_item.setPos(QtCore.QPointF(20, 5))
+
+    pt = ProjectTab.__new__(ProjectTab)
+    pt.all_polygons = {}
+    pt.viewer_widgets = [{"viewer": v, "image_data": v.image_data}]
+    # __new__ never runs QWidget.__init__, so any INSTANCE attribute that is
+    # not pre-set here and gets touched (even via hasattr/getattr-with-
+    # default) raises RuntimeError instead of the AttributeError plain
+    # Python would give -- PyQt's own attribute-resolution fallback needs
+    # the C++-side object, which does not exist. Pre-seed exactly what
+    # _ensure_polygon_index/_poly_index_lookup/_add_to_polygon_index read,
+    # so the index machinery takes its already-valid early-return path
+    # instead of touching anything unset.
+    pt._poly_exact_index = {}
+    pt._poly_norm_index = {}
+    pt._poly_norm_index_invalid = False
+
+    pt.update_all_polygons()
+
+    saved = pt.all_polygons.get("pt_group", {}).get(v.image_data.filepath)
+    assert saved is not None, (
+        "update_all_polygons did not write the dragged point at all -- "
+        "check for a newly-introduced exception in the point branch")
+    assert saved["points"] == [(70.0, 65.0)], (
+        f"expected the drawn position (50, 60) plus the drag delta (20, 5) "
+        f"= (70, 65); got {saved['points']} -- the drag was discarded, "
+        f"which is the bug this test pins")
+
+
+def test_serialize_item_reflects_a_completed_point_drag(qapp):
+    """The same missing-mapToScene bug in ImageViewer._serialize_item, used
+    by 'Copy points' / Ctrl+C (`copy_selection`/`copy_specific_items`) and
+    'Replicate to all viewers' (`replicate_toviewer`): copying or
+    replicating a point that had already been dragged silently used its
+    PRE-drag position."""
+    from PyQt5 import QtGui, QtCore
+    from ..image_viewer import ImageViewer
+
+    v = ImageViewer()
+    pm = QtGui.QPixmap(400, 300)
+    pm.fill(QtCore.Qt.black)
+    v.set_image(pm)
+
+    point_item = v.add_point_to_scene(
+        QtGui.QPolygonF([QtCore.QPointF(50, 60)]), name="pt")
+    point_item.setPos(QtCore.QPointF(20, 5))
+
+    payload = v._serialize_item(point_item)
+    assert payload["points"] == [(70.0, 65.0)], (
+        f"_serialize_item ignored the completed drag (item.pos() == "
+        f"(20, 5)) and serialized the pre-drag position instead; got "
+        f"{payload['points']}")
+
+
+def test_serialize_item_reflects_a_completed_polygon_drag(qapp):
+    """Same bug, polygon branch: `.polygon` holds genuine scene coordinates
+    ONLY at construction time; after a drag it is item-local and still
+    needs mapToScene()."""
+    from PyQt5 import QtGui, QtCore
+    from ..image_viewer import ImageViewer
+
+    v = ImageViewer()
+    pm = QtGui.QPixmap(400, 300)
+    pm.fill(QtCore.Qt.black)
+    v.set_image(pm)
+
+    poly_item = v.add_polygon_to_scene(
+        QtGui.QPolygonF([QtCore.QPointF(10, 10), QtCore.QPointF(20, 10),
+                          QtCore.QPointF(20, 20)]),
+        name="poly")
+    poly_item.setPos(QtCore.QPointF(5, 8))
+
+    payload = v._serialize_item(poly_item)
+    assert payload["points"] == [(15.0, 18.0), (25.0, 18.0), (25.0, 28.0)], (
+        f"_serialize_item ignored the completed drag (item.pos() == "
+        f"(5, 8)) on the polygon branch; got {payload['points']}")

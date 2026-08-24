@@ -86,9 +86,22 @@ Every image edit (crop, rotate, brightness/contrast via histogram matching, resi
 **band-math expression**, false color, registration matrix, per-pixel classification) is
 stored as JSON in a sidecar `<image>.ax` (or in the project folder). Nothing is written
 back to the raw image. The canonical application order is
-**crop → rotate → histogram/CLAHE → resize → band_expression** (see
+**crop → rotate → histogram/CLAHE → resize → band_expression → appended_bands** (see
 `ProjectTab.apply_aux_modifications` for the display path and `ProjectTab._apply_ax_to_raw`
-for the export path). `.ax` edits can be applied to one image, a group, or all images.
+for the export path — both are replayed by `MachineLearningManager` too via `_apply_hist_local`).
+`.ax` edits can be applied to one image, a group, or all images.
+
+**`appended_bands`**: the Image Editor's Append (+) button turns a live classification result
+or boolean/numeric band expression into a *permanent extra band*, stored as
+`{"type": "classification"|"boolean_expression"|"band_expression", "index", "expression"?,
+"model_name"?, "label_names"?}`. Only the reference/expression is persisted — the pixel data is
+regenerated on every replay. A classification entry therefore needs the ORIGINAL sklearn model
+back in memory (`ProjectTab._get_sklearn_bundle()` → `self.random_forest_model` or the
+class-shared `ProjectTab.shared_random_forest_model`) to re-run prediction; that state is
+runtime-only and never persisted, so restarting the app (or never re-loading the `.pkl` this
+session) makes every classification-type appended band silently vanish from every consumer
+(CSV, ML training, image export) unless the caller checks `_record_appended_band_error`'s
+counter — see the channel-order/silent-failure gotchas above.
 
 **Histogram matching is applied EXACTLY ONCE per image**, inside those two functions.
 Renderers must never re-apply it: `_render_with_viewer_stretch` receives arrays that have
@@ -130,10 +143,18 @@ Saved at `<project_folder>/project.json`. Key fields:
   on a `QThreadPool`; results delivered via Qt signals (`image_loaded`/`finished`/`error`).
   OpenCV thread count is pinned to 0 inside runnables to avoid oversubscription.
 - **Export**: CSV/EXIF/thumbnail/image exports each run in dedicated worker threads defined
-  inside `project_tab.py` (ExportWorker, ExifExportWorker, ThumbnailExportWorker). They emit
-  progress/finished signals; ProjectTab methods often **return `None` when work went to the
-  background** and a path when it completed in the foreground — respect this contract when
-  wiring new callers (MainWindow relies on it to decide whether to show a popup).
+  inside `project_tab.py` (`ExportWorker` for CSV, `ExifExportWorker`, `ThumbnailExportWorker`,
+  `ProjectImagesExportWorker` for "Export Project Images"). They emit progress/finished signals
+  surfaced by `ExportManagerDialog` (a singleton, non-modal, multi-export status panel);
+  ProjectTab methods often **return `None` when work went to the background** and a path when it
+  completed in the foreground — respect this contract when wiring new callers (MainWindow relies
+  on it to decide whether to show a popup). "Export Project Images" prompts via
+  `export_images_options_dialog.ExportImagesOptionsDialog` (format/band-order/EXIF/background) —
+  the same options dict must reach BOTH `ProjectImagesExportWorker.__init__` (background) and the
+  inline `export_project_images` foreground loop, since they don't share code.
+  A QThread worker returning `finished(path, ok, message)` should append any
+  `_appended_band_error_count`/EXIF-copy/BigTIFF-fallback notes to `message` — that string is
+  literally what `ExportManagerDialog` displays, so it's the only place those notes reach the user.
 - **Cross-thread safety**: polygons are deep-copied (`_snapshot_polygons_by_group`) before
   export; all Qt widget updates are marshaled to the main thread via signals (see the
   status-bar logging handler in `main_window.py`).
@@ -159,6 +180,50 @@ applied per-pixel during export via `ProjectTab._classify_array` / `_apply_sklea
 `AnalysisOptionsDialog` collects export stats + index definitions; `RootOffsetDialog` tunes
 the dual-folder offset.
 
+### Training augmentation + feature normalization
+
+`MachineLearningManager.train_models` optionally augments training pixels and/or
+normalizes features before fitting, via `MLAugmentationOptionsDialog`
+(`ml_augmentation_options_dialog.py`), shown as one more wizard step right before
+feature names are built. Two things to know before touching any of this:
+
+- **Two parallel row collections, not one `is_augmented` mask.**
+  `X_rows_report`/`y_rows_report` are pristine and are the *only* thing the
+  holdout-metrics `train_test_split` calls ever see; `X_rows_train`/`y_rows_train`
+  (aliased to the same list objects when augmentation is off — zero extra cost in
+  the common case) are what actually gets `.fit()`ed. `ml_augmentation.assemble_pixel_rows`
+  is the policy function deciding what goes into the train collection per pixel
+  ("add" appends every successful augmented variant; "replace" always emits exactly
+  one row, falling back to the pristine row if every variant failed). Never merge
+  these into one array + a boolean column — Replace mode can legitimately touch
+  every sampled pixel, which would shrink or exhaust an `is_augmented`-filtered
+  holdout pool.
+- **Augment the raw image, before bands/expressions are derived from it.**
+  `_channels_in_export_order` returns copies and band-expression evaluation reads
+  the raw image directly — patching only the extracted channels would leave
+  expressions (e.g. NDVI) computed from unaugmented pixels while raw bands look
+  augmented. `MachineLearningManager._select_bands_and_expressions` is the shared
+  helper both the pristine pass and every augmented variant call, so this can't
+  drift.
+
+A trained bundle can carry a `"normalization"` key —
+`{"method": "none"|"l2"|"zscore", "mean": [...]|None, "scale": [...]|None}`, built by
+`utils.fit_normalization` and applied by `utils.apply_normalization` — recording how
+features were transformed before `.fit()`. **Every place that later loads a bundle and
+calls `model.predict()` on a freshly-built feature matrix must apply this same
+transform**, since `_make_feature_stack_for_model` is *not* a universal choke point
+(several sites hand-build their own `X`). As of this writing there are six such sites,
+each taking a `normalization_cfg` parameter or reading `bundle.get("normalization")`
+directly: `project_tab.py`'s and `image_editor_dialog.py`'s own
+`_make_feature_stack_for_model` (covers `_apply_sklearn_classification[_with_indices]`
+and both `.ax` "appended classification band" replay blocks), the hand-built main
+classification block inside both `_apply_ax_to_raw` and `apply_aux_modifications`,
+`ProjectTab._safe_predict` (the choke point for `process_polygon`'s three independent
+feature builders), and `MachineLearningManager._predict_class_map_from_bundle`. Adding
+a 7th classification call site anywhere means adding it to this list too —
+`canopie/qc/test_ml_normalization_end_to_end.py` only covers three of the six
+end-to-end; check the others by inspection when you add a new one.
+
 ## Conventions & gotchas
 
 - **ProjectTab is huge (~26k lines) and central.** Most features are methods on it. Use grep
@@ -173,9 +238,26 @@ the dual-folder offset.
   is disabled for frozen builds.
 - **Frozen/Nuitka builds**: `main.py` resolves the logo relative to `__file__` for Nuitka
   onefile; keep asset paths robust to bundling.
-- **Not a git repo** as shipped — there's no history to consult; rely on this doc + the code.
+- **This IS a git repo** (`origin` → `github.com/Nathanborg/CanoPie`, branch `main`) — `git log`/
+  `git blame` are real history here, use them. (Stale note from before the repo was fixed onto
+  the right root — see the skill's "Repo setup" section for the incident.)
 - **`from .utils import *`** is used widely; new shared helpers must be added to `utils.__all__`
   to be visible.
+- **Channel order is provenance, not a format constant.** cv2 (`imread`/`imdecode`) always
+  decodes to BGR; tifffile always returns the file's native order (never BGR). Code that treats
+  "3-channel array" as unconditionally one or the other has repeatedly caused real R/B swaps —
+  in histogram-match reference application, in `_channels_in_export_order`, in Export Project
+  Images' save step, in thumbnail/segmentation-mask rendering. The fix pattern every time is the
+  same: track the true order at the point of loading (`channel_order` on `ImageData`,
+  `_last_export_channel_order` on `ProjectTab`, the `(img, channel_order)` tuple
+  `ProjectImagesExportWorker._load_image_simple` returns) and branch on it, never assume.
+- **A `try/except` that only `logging.warning()`s hides real, silent failures.** Multiple bugs
+  this project has shipped were a feature working perfectly *when its precondition held* (a model
+  loaded, an expression naming existing bands) and silently doing nothing otherwise, with only a
+  log line nobody reads. The established fix pattern (`_record_rf_prediction_error`,
+  `_record_appended_band_error`): track a count + a few sample messages on `self`, reset it at
+  the start of each export run, and append a `WARNING: ...` note to that run's completion
+  message. Apply this pattern to any new swallowed-exception path that affects export output.
 
 ## Where to start for common tasks
 
@@ -187,6 +269,9 @@ the dual-folder offset.
 | Add/adjust an image edit | `image_editor_dialog.py` + `ProjectTab.apply_aux_modifications` / `_apply_ax_to_raw` + `.ax` schema |
 | Add a vegetation index / band function | `utils.py` (add helper + expose in `__all__`) and/or `performance.FastBandMathEngine` |
 | Change CSV/EXIF/thumbnail export | export worker classes + `save_polygons_to_csv` / `extract_exif_to_csv` / `save_all_thumbnails` in `project_tab.py` |
+| Change "Export Project Images" (image files, not CSV) | `ProjectImagesExportWorker` + `export_project_images` (both in `project_tab.py`) + `export_images_options_dialog.py` |
 | ML training/prediction | `machine_learning_manager.py`, `performance.FastSklearnPredictor` |
 | Project save/load format | `ProjectTab.save_project`/`load_project`, `MainWindow.load_project`, project.json keys |
 | Speed up a hot pixel loop | `performance.py`; guard new deps behind availability checks |
+| A drawn point/polygon looks wrong after reload, or you need to clean up already-corrupted saved coordinates | `image_viewer.py` (`EditablePointItem._scene_xy`, `on_polygon_drawn`/`on_polygon_modified` composing it with `item.mapToScene`) for the live bug; `ProjectTab.find_suspect_point_coordinates` (detect-only migration, next to `migrate_polygon_basis`) for already-saved files |
+| Verify a change touching pixel values/export | `canopie/qc/` — the one permanent regression suite here, see the skill's "QC test suite" section and `python -m canopie.qc.which_tests <files>` |
