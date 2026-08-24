@@ -603,6 +603,273 @@ def eval_band_expression(image: np.ndarray, expr: str) -> np.ndarray:
 
 
 # =============================================================================
+# Classification feature-stack primitives
+#
+# Shared by ImageEditorDialog._make_feature_stack_for_model (the live
+# "Classify" button) and ProjectTab._make_feature_stack_for_model (render/
+# preview + the .ax "appended classification band" replay in
+# _apply_ax_to_raw/apply_aux_modifications). Both callers keep their own
+# wrapper body -- base-feature-name resolution (case-sensitivity differs
+# between them), error convention (one returns (None,(0,0)), the other
+# raises), and project_tab.py's copy's extra NaN/Inf sanitization pass that
+# the editor's copy currently lacks -- deliberately NOT unified here, since
+# those are real behavioral differences relied on by each caller. Only the
+# part that has to be fast and memory-safe is shared.
+#
+# THE BUG THIS FIXES ("classify using the pkl files is too slow" / "a very
+# big file will take forever and crash the program"): both callers used to
+# build a spatial-window (window_size > 1) feature matrix with a pure Python
+# `for y: for x: for dr: for dc: for base_name: ... arr[py,px] ...` loop --
+# O(H*W*window_size^2*n_features) Python-level scalar operations touching
+# every pixel individually (minutes on a modest image, unusable on a large
+# one), AND unconditionally allocated the WHOLE feature array up front with
+# no memory budget (H*W*F*4 bytes -- ~10.8 GB for a 10000x10000/3-band/
+# window=3 image), a straightforward OOM crash. process_polygon never has
+# this problem because it's always bounded to one polygon's ROI via
+# LazyChannels.read_window's own memory-budgeted lazy decode
+# (raster_reader.py's max_materialize / _DEFAULT_CACHE_BYTES) -- there is no
+# small ROI to exploit here (the user wants the WHOLE image classified), so
+# the fix instead (a) vectorizes the window construction and (b) tiles by a
+# row-band memory budget, mirroring that same "bound peak memory, decode in
+# pieces past a threshold" principle.
+# =============================================================================
+
+def build_windowed_feature_cube(padded_arrays, base_names, window_size, out_h, out_w):
+    """Vectorized replacement for the old per-pixel window-feature loop.
+
+    `padded_arrays` maps each name in `base_names` to its 2D array, already
+    padded by `window_size // 2` on every side with `mode='edge'` (same
+    padding both callers already applied before the old loop). `out_h`/
+    `out_w` are the UNPADDED image dimensions.
+
+    Returns an (out_h, out_w, F) float32 array, F = window_size**2 *
+    len(base_names), with columns in the EXACT order the old loop produced:
+    (dr, dc) outer (row-major over [-half, half]), `base_names` inner. This
+    is what makes it a drop-in replacement -- a model trained against the
+    old column order still gets the same feature at the same index.
+
+    Equivalence: the old loop read `padded[name][y+half+dr, x+half+dc]` for
+    every pixel (y, x). For one fixed (dr, dc), that is exactly the slice
+    `padded[name][half+dr : half+dr+out_h, half+dc : half+dc+out_w]` --
+    every (y, x) at once. So this replaces H*W Python-level reads per
+    (dr, dc, name) with one C-level array copy, without changing a single
+    output value.
+    """
+    half = window_size // 2
+    F = (window_size * window_size) * len(base_names)
+    cube = np.empty((out_h, out_w, F), dtype=np.float32)
+    feat_idx = 0
+    for dr in range(-half, half + 1):
+        for dc in range(-half, half + 1):
+            r0 = half + dr
+            c0 = half + dc
+            for name in base_names:
+                cube[:, :, feat_idx] = padded_arrays[name][r0:r0 + out_h, c0:c0 + out_w]
+                feat_idx += 1
+    return cube
+
+
+#: Row-band tiling stays correct for any window_size this codebase offers
+#: (1, 3, or 5 per the Image Editor's own UI) -- the halo is always small.
+CLASSIFY_MAX_WINDOW_SIZE = 5
+
+
+def iter_classification_row_tiles(h, w, n_features, budget_bytes, half, dtype_bytes=4):
+    """Yield (row0, row1, halo_row0, halo_row1) row-band tiles whose feature
+    matrix (tile_rows * w * n_features * dtype_bytes) fits `budget_bytes`.
+
+    `half = window_size // 2`. `halo_row0`/`halo_row1` extend the tile by up
+    to `half` REAL rows on each side (clamped at the true image edges) so a
+    windowed feature builder given `arr[halo_row0:halo_row1]` sees genuine
+    neighbor rows at every interior tile seam -- not the tile's own edge-pad,
+    which would incorrectly replicate an interior row as if it were the
+    image boundary. The caller discards the halo rows after building/
+    predicting on the padded tile, keeping only `[row0-halo_row0 :
+    row0-halo_row0+(row1-row0)]` of the result.
+
+    If the whole image already fits the budget, yields exactly one tile
+    covering everything (`(0, h, 0, h)`) -- the common case is a plain,
+    single-shot pass, identical in behavior (and byte-for-byte output) to
+    processing it unbounded.
+    """
+    if h <= 0 or w <= 0:
+        return
+    total_bytes = h * w * n_features * dtype_bytes
+    if total_bytes <= budget_bytes or n_features <= 0:
+        yield (0, h, 0, h)
+        return
+
+    per_row_bytes = max(1, w * n_features * dtype_bytes)
+    tile_rows = max(1, budget_bytes // per_row_bytes)
+    row0 = 0
+    while row0 < h:
+        row1 = min(h, row0 + tile_rows)
+        halo_row0 = max(0, row0 - half)
+        halo_row1 = min(h, row1 + half)
+        yield (row0, row1, halo_row0, halo_row1)
+        row0 = row1
+
+
+def iter_tiled_feature_matrices(img, feat_names, expressions, window_size,
+                                 base_feature_names, budget_bytes, builder_fn):
+    """Bound peak memory for `builder_fn` (either class's
+    `_make_feature_stack_for_model`) regardless of image size.
+
+    Estimates the full feature matrix's byte size up front; if it fits
+    `budget_bytes`, calls `builder_fn` ONCE on the whole image (identical,
+    single-shot behavior to before this fix existed). If it doesn't, slices
+    `img` into row-band tiles via `iter_classification_row_tiles` (each with
+    a `half`-row halo of REAL neighbor rows) and calls `builder_fn`
+    separately on each tile slice, discarding the halo rows from each
+    result before yielding just the tile's own core rows.
+
+    This never needs `builder_fn` itself to know about tiling: calling it on
+    `img[halo_row0:halo_row1]` and keeping only rows
+    `[row0-halo_row0 : row0-halo_row0+(row1-row0)]` of its output is
+    mathematically identical to what it would have computed for those same
+    rows given the WHOLE image -- the halo rows supply genuine neighbor
+    context at interior tile seams, so `builder_fn`'s own edge-padding is
+    only ever exercised at the image's true boundary, exactly as it would be
+    without tiling.
+
+    Yields `(row0, row1, X_tile, w)` per tile, `X_tile` shaped
+    `((row1-row0)*w, F)` -- or `(row0, row1, None, w)` if `builder_fn`
+    signaled failure for that tile (its own `(None, (0, 0))` convention),
+    which callers should treat exactly like today's single-call failure.
+    """
+    h, w = img.shape[0], img.shape[1]
+    n_features = len(feat_names)
+    half = (window_size or 1) // 2
+    total_bytes = h * w * n_features * 4  # float32
+
+    if total_bytes <= budget_bytes:
+        X, (out_h, out_w) = builder_fn(img, feat_names, expressions, window_size,
+                                       base_feature_names)
+        yield (0, h, X, w)
+        return
+
+    for row0, row1, halo_row0, halo_row1 in iter_classification_row_tiles(
+            h, w, n_features, budget_bytes, half):
+        tile_img = img[halo_row0:halo_row1]
+        X_tile, (tile_h, tile_w) = builder_fn(tile_img, feat_names, expressions,
+                                              window_size, base_feature_names)
+        if X_tile is None:
+            yield (row0, row1, None, w)
+            continue
+        core_lo = row0 - halo_row0
+        core_hi = core_lo + (row1 - row0)
+        X_core = X_tile.reshape(halo_row1 - halo_row0, w, -1)[core_lo:core_hi]
+        yield (row0, row1, X_core.reshape(-1, X_core.shape[-1]), w)
+
+
+# =============================================================================
+# Feature normalization -- bundle-recorded, applied identically at train time
+# and at every classification/predict call site that later loads the bundle.
+#
+# THE PROBLEM THIS SOLVES: `.pkl` model bundles never carried any normalization
+# state. The only scaling anywhere in the app was an sklearn `Pipeline`-internal
+# `StandardScaler` private to the LogisticRegression/SVM model types (invisible
+# to every other consumer, and to every OTHER of the 8 selectable model types).
+# A user wanting L2 or z-score normalization for e.g. RandomForest had no way to
+# apply it consistently between training and the ~6 independent places the app
+# later re-predicts from a saved bundle (process_polygon's CSV export,
+# ProjectTab's classification replay/appended-band paths, the Image Editor's
+# live "Classify" button, MachineLearningManager's thumbnail/segmentation
+# export). These two functions are the single shared implementation every one
+# of those sites calls, keyed off a `bundle["normalization"]` dict of the shape
+# {"method": "none"|"l2"|"zscore", "mean": [...]|None, "scale": [...]|None}.
+# =============================================================================
+
+def fit_normalization(X, method):
+    """Compute the normalization_cfg to store in a model bundle.
+
+    X: (N, F) float32/float64 training feature matrix (the array that will
+    actually be fit on -- see machine_learning_manager.py's train_models,
+    which calls this on X_train, i.e. AFTER any augmented rows have been
+    added, so the fitted stats reflect what the model actually trains under).
+    method: 'none' | 'l2' | 'zscore'.
+
+    'l2' needs no fitted parameters (Normalizer(norm='l2') semantics are
+    entirely per-row, recomputed fresh from whatever X apply_normalization is
+    later given). 'zscore' fits per-feature mean/std here, once, and both must
+    be stored in the bundle so every later predict call applies the SAME
+    fitted transform rather than re-fitting on its own (usually much smaller,
+    single-image) feature matrix -- refitting per call would make predictions
+    drift from what the model was actually trained on.
+
+    Returns a dict matching the bundle's "normalization" key shape exactly;
+    always all three keys present so callers never need `"mean" in cfg`-style
+    membership checks, only `cfg["method"]`.
+    """
+    method = (method or "none").lower()
+    if method not in ("none", "l2", "zscore"):
+        raise ValueError(f"Unknown normalization method: {method!r}")
+
+    if method != "zscore":
+        return {"method": method, "mean": None, "scale": None}
+
+    Xf = np.asarray(X, dtype=np.float64)
+    mean = Xf.mean(axis=0)
+    scale = Xf.std(axis=0)
+    # A constant feature column has std==0; dividing by it would produce
+    # inf/nan for every sample. Floor it to 1.0 (mirrors sklearn's
+    # StandardScaler _handle_zeros_in_scale) so a constant column normalizes
+    # to a constant 0.0 instead of blowing up.
+    scale = np.where(scale < 1e-12, 1.0, scale)
+    return {"method": "zscore", "mean": mean.tolist(), "scale": scale.tolist()}
+
+
+def apply_normalization(X, normalization_cfg):
+    """Transform a feature matrix per a bundle's "normalization" config.
+
+    X: (N, F) or (F,) array (a single row is accepted too -- several of the
+    predict call sites this feeds slice a single sample out of a batch before
+    calling this). Returns a NEW float32 array; never mutates X in place, since
+    several callers keep using the pre-normalization X afterward (e.g. for
+    label mapping keyed by row index).
+
+    normalization_cfg: the dict fit_normalization returns (or a plain-dict
+    equivalent read back from a pickled bundle, or None/{} for "no bundle
+    entry at all" -- treated identically to {"method": "none"}, so every call
+    site can pass `bundle.get("normalization")` directly without a None-guard).
+    """
+    Xin = np.asarray(X, dtype=np.float32)
+    cfg = normalization_cfg or {"method": "none"}
+    method = (cfg.get("method") or "none").lower()
+
+    if method == "none":
+        return Xin.copy() if Xin is X else Xin
+
+    single_row = (Xin.ndim == 1)
+    X2 = Xin[None, :] if single_row else Xin
+
+    if method == "l2":
+        norms = np.linalg.norm(X2, axis=1, keepdims=True)
+        norms = np.where(norms < 1e-12, 1.0, norms)
+        out = (X2 / norms).astype(np.float32, copy=False)
+    elif method == "zscore":
+        mean = cfg.get("mean")
+        scale = cfg.get("scale")
+        if mean is None or scale is None:
+            raise ValueError(
+                "normalization_cfg method='zscore' but 'mean'/'scale' are "
+                "missing -- the bundle is malformed or predates this feature.")
+        mean = np.asarray(mean, dtype=np.float32)
+        scale = np.asarray(scale, dtype=np.float32)
+        if X2.shape[-1] != mean.shape[0]:
+            raise ValueError(
+                f"Feature count mismatch for zscore normalization: X has "
+                f"{X2.shape[-1]} columns but the bundle's fitted mean/scale "
+                f"have {mean.shape[0]} -- this model was trained on a "
+                f"different feature set than the one being predicted with.")
+        out = ((X2 - mean) / scale).astype(np.float32, copy=False)
+    else:
+        raise ValueError(f"Unknown normalization method: {method!r}")
+
+    return out[0] if single_row else out
+
+
+# =============================================================================
 # NoData Utilities - Support both numeric literals and boolean expressions
 # =============================================================================
 
@@ -928,6 +1195,12 @@ __all__ = [
     'calculate_shd',
     'parse_nodata_text',
     'build_nodata_mask',
+    'build_windowed_feature_cube',
+    'iter_classification_row_tiles',
+    'iter_tiled_feature_matrices',
+    'CLASSIFY_MAX_WINDOW_SIZE',
+    'fit_normalization',
+    'apply_normalization',
     'POLYGON_PROPERTY_COLUMN_PREFIX',
     'polygon_property_column',
     'polygon_property_value',

@@ -2865,6 +2865,19 @@ _EXPORT_LAZY_THRESHOLD_BYTES = 64 * 1024 * 1024
 # reader drop to a pyramid level instead. ~1 GB is roughly 3 s of zlib/zstd.
 _PREVIEW_DECODE_BUDGET_BYTES = 1024 * 1024 * 1024
 
+# Byte ceiling for ONE sklearn-classification feature matrix (H*W*F*4 for
+# float32), shared with ImageEditorDialog._CLASSIFY_FEATURE_BUDGET_BYTES.
+# Past this, classification (render/preview path, and the .ax "appended
+# classification band" replay in _apply_ax_to_raw/apply_aux_modifications)
+# builds and predicts in row-band tiles instead of one whole-image array --
+# see utils.iter_tiled_feature_matrices. Without this, a spatial-window
+# (window_size>1) model on a large raster allocates unboundedly (a
+# 10000x10000/3-band/window=3 image is ~10.8GB for the feature matrix
+# alone) -- a straightforward OOM crash. 512MB sits between the tighter
+# _EXPORT_LAZY_THRESHOLD_BYTES (64MB) and the looser _PREVIEW_DECODE_BUDGET_BYTES
+# (1GB), matching _PREVIEW_LOAD_THRESHOLD_BYTES's precedent above.
+_CLASSIFY_FEATURE_BUDGET_BYTES = 512 * 1024 * 1024
+
 # Budgets for band-math SCENE statistics on the lazy export path (Scene
 # Mean/Median/Std for a "compute these indices" formula, not the polygon's own
 # exact row). These are deliberately much smaller than the preview budgets
@@ -5461,6 +5474,7 @@ class ProjectTab(QtWidgets.QWidget):
                     expressions = bundle.get("expressions", [])  # Get custom expressions
                     window_size = bundle.get("window_size", 1)  # Get spatial window size
                     base_feature_names = bundle.get("base_feature_names", [])  # Base names without window suffix
+                    normalization_cfg = bundle.get("normalization")
                     logging.info(f"[apply_aux_modifications] feat_names={feat_names}, base_feature_names={base_feature_names}, window_size={window_size}")
                     
                     # IMPORTANT: Use pre-band-expression image for classification if available
@@ -5654,6 +5668,9 @@ class ProjectTab(QtWidgets.QWidget):
                             # Only predict for valid pixels
                             if valid_mask.any():
                                 X_valid = X[valid_mask]
+                                if normalization_cfg is not None:
+                                    from .utils import apply_normalization
+                                    X_valid = apply_normalization(X_valid, normalization_cfg)
                                 # predict in chunks - use class-level lock for thread safety (no self in @staticmethod)
                                 n_valid = X_valid.shape[0]
                                 chunk = max(50_000, min(500_000, n_valid // 8 or 50_000))
@@ -5773,28 +5790,60 @@ class ProjectTab(QtWidgets.QWidget):
                                 expressions = bundle.get("expressions", [])
                                 window_size = bundle.get("window_size", 1)
                                 base_feature_names = bundle.get("base_feature_names", feat_names)
+                                normalization_cfg = bundle.get("normalization")
                                 label_names = list(bundle.get("label_names") or band_info.get("label_names") or [])
 
-                                X, (H, W) = ProjectTab._make_feature_stack_for_model(
-                                    None, result, feat_names,
-                                    expressions=expressions,
-                                    window_size=window_size,
-                                    base_feature_names=base_feature_names,
-                                )
+                                # H/W straight from the image (not the
+                                # builder's return) so a possibly-tiled
+                                # build/predict (see below) can be sized up
+                                # front -- same fix as _apply_ax_to_raw's
+                                # twin block, for the same reason (this
+                                # replay can run at full resolution too).
+                                _cls_H, _cls_W = int(result.shape[0]), int(result.shape[1])
 
                                 classes = list(getattr(model, "classes_", []))
                                 idx_map = ({lab: i for i, lab in enumerate(label_names)} if label_names
                                            else {lab: i for i, lab in enumerate(classes)})
 
-                                n = H * W
+                                n = _cls_H * _cls_W
                                 chunk = max(50_000, min(500_000, n // 8 or 50_000))
                                 raw_preds = np.empty((n,), dtype=object)
-                                i = 0
-                                while i < n:
-                                    j = min(i + chunk, n)
-                                    raw_preds[i:j] = model.predict(X[i:j])
-                                    i = j
 
+                                # PERFORMANCE/MEMORY: builds and predicts in
+                                # row-band tiles when the feature matrix
+                                # would exceed _CLASSIFY_FEATURE_BUDGET_BYTES
+                                # -- see _apply_ax_to_raw's twin block and
+                                # _make_feature_stack_for_model's own fix for
+                                # the underlying "classify... too slow"/
+                                # "crash on a big file" bug. This is a
+                                # @staticmethod, so the builder is called
+                                # unbound (self=None), same as the plain call
+                                # just above used to be.
+                                from .utils import iter_tiled_feature_matrices
+                                def _unbound_builder(img_slice, fn, ex, ws, bn):
+                                    return ProjectTab._make_feature_stack_for_model(
+                                        None, img_slice, fn, expressions=ex,
+                                        window_size=ws, base_feature_names=bn,
+                                        normalization_cfg=normalization_cfg)
+                                _tile_build_failed = False
+                                for _r0, _r1, _X_tile, _w in iter_tiled_feature_matrices(
+                                        result, feat_names, expressions, window_size,
+                                        base_feature_names, _CLASSIFY_FEATURE_BUDGET_BYTES,
+                                        _unbound_builder):
+                                    if _X_tile is None:
+                                        _tile_build_failed = True
+                                        break
+                                    _tile_n = (_r1 - _r0) * _w
+                                    _out_offset = _r0 * _w
+                                    i = 0
+                                    while i < _tile_n:
+                                        j = min(i + chunk, _tile_n)
+                                        raw_preds[_out_offset + i: _out_offset + j] = model.predict(_X_tile[i:j])
+                                        i = j
+                                if _tile_build_failed:
+                                    raise RuntimeError("Could not build feature stack for the model")
+
+                                H, W = _cls_H, _cls_W
                                 cls_band = np.vectorize(idx_map.get, otypes=[np.float32])(raw_preds).reshape(H, W)
                                 cls_band = np.nan_to_num(cls_band, nan=0).astype(_float_dtype, copy=False)
                                 result = np.concatenate([result, cls_band[..., np.newaxis]], axis=2)
@@ -12880,15 +12929,24 @@ class ProjectTab(QtWidgets.QWidget):
 
         # High-performance sklearn prediction using optimized predictor
         # Uses FastSklearnPredictor with parallel processing and optimal batching
-        def _safe_predict(model, X, batch_size=None):
+        def _safe_predict(model, X, batch_size=None, normalization_cfg=None):
             """
             Thread-safe sklearn model prediction with optimal performance.
             Uses performance module if available for 2-5x speedup.
+
+            normalization_cfg: optional bundle["normalization"] dict (see
+            utils.fit_normalization/apply_normalization) -- applied to X
+            before predicting, so the model sees exactly the same transform
+            it was trained under. Default None preserves every existing
+            call site's behavior unchanged; callers that HAVE a bundle in
+            scope should pass bundle.get("normalization").
             """
             if X is None or len(X) == 0:
                 return np.array([], dtype=np.int64)
 
             X = np.asarray(X, dtype=np.float32)
+            if normalization_cfg is not None:
+                X = apply_normalization(X, normalization_cfg)
 
             # Use high-performance predictor if available
             if _PERF_MODULE_AVAILABLE:
@@ -14283,10 +14341,11 @@ class ProjectTab(QtWidgets.QWidget):
                  model = self.random_forest_model["model"]
                  model_classes = list(model.classes_)
                  class_keys = [str(c) for c in model_classes]
-                 
+
                  model_window_size = self.random_forest_model.get("window_size", 1)
                  model_feature_names = self.random_forest_model.get("feature_names", ["red_channel", "green_channel", "blue_channel"])
                  model_base_feature_names = self.random_forest_model.get("base_feature_names", [])
+                 model_normalization_cfg = self.random_forest_model.get("normalization")
                  
                  effective_feature_names = model_base_feature_names if model_base_feature_names else model_feature_names
                  half = model_window_size // 2
@@ -14373,7 +14432,7 @@ class ProjectTab(QtWidgets.QWidget):
                 if X_batch.size > 0:
                      try:
                          # Predict all at once
-                         all_preds = _safe_predict(model, X_batch)
+                         all_preds = _safe_predict(model, X_batch, normalization_cfg=model_normalization_cfg)
                          # Process results per point
                          # Note: for points, we usually have 1 sample per point (unless windowed?)
                          # Wait, _safe_predict returns array of labels.
@@ -14882,6 +14941,7 @@ class ProjectTab(QtWidgets.QWidget):
                         model_feature_names = self.random_forest_model.get(
                             "feature_names", ["red_channel", "green_channel", "blue_channel"]
                         )
+                        model_normalization_cfg = self.random_forest_model.get("normalization")
 
                         half = model_window_size // 2
 
@@ -14938,7 +14998,7 @@ class ProjectTab(QtWidgets.QWidget):
 
                             if X_rows:
                                 X = np.array(X_rows, dtype=np.float32)
-                                predictions = _safe_predict(model, X)
+                                predictions = _safe_predict(model, X, normalization_cfg=model_normalization_cfg)
                                 u, cts = np.unique(predictions, return_counts=True)
                                 total = cts.sum()
                                 frac = {str(k): 0.0 for k in model_classes}
@@ -14987,7 +15047,7 @@ class ProjectTab(QtWidgets.QWidget):
                                 for k in class_keys:
                                     class_percentages[f"Class {k} %"] = 0.0
                             else:
-                                predictions = _safe_predict(model, X)
+                                predictions = _safe_predict(model, X, normalization_cfg=model_normalization_cfg)
                                 u, cts = np.unique(predictions, return_counts=True)
                                 total = cts.sum()
                                 frac = {str(k): 0.0 for k in model_classes}
@@ -18539,6 +18599,7 @@ class ProjectTab(QtWidgets.QWidget):
                     expressions = bundle.get("expressions", [])  # Get custom expressions
                     window_size = bundle.get("window_size", 1)  # Get spatial window size
                     base_feature_names = bundle.get("base_feature_names", [])  # Base names without window suffix
+                    normalization_cfg = bundle.get("normalization")
 
                     # IMPORTANT: Use pre-band-expression image for classification if available
                     # This ensures classification has access to original RGB channels even when
@@ -18716,6 +18777,9 @@ class ProjectTab(QtWidgets.QWidget):
                             # Only predict for valid pixels
                             if valid_mask.any():
                                 X_valid = X[valid_mask]
+                                if normalization_cfg is not None:
+                                    from .utils import apply_normalization
+                                    X_valid = apply_normalization(X_valid, normalization_cfg)
                                 # predict in chunks - use lock for thread safety
                                 n_valid = X_valid.shape[0]
                                 chunk = max(50_000, min(500_000, n_valid // 8 or 50_000))
@@ -18845,28 +18909,59 @@ class ProjectTab(QtWidgets.QWidget):
                                 expressions = bundle.get("expressions", [])
                                 window_size = bundle.get("window_size", 1)
                                 base_feature_names = bundle.get("base_feature_names", feat_names)
+                                normalization_cfg = bundle.get("normalization")
                                 label_names = list(bundle.get("label_names") or band_info.get("label_names") or [])
 
-                                X, (H, W) = self._make_feature_stack_for_model(
-                                    img, feat_names,
-                                    expressions=expressions,
-                                    window_size=window_size,
-                                    base_feature_names=base_feature_names,
-                                )
+                                # H/W straight from the image being replayed
+                                # (not the builder's return) so a possibly-
+                                # tiled build/predict (see below) can be
+                                # sized up front -- this replay runs at FULL
+                                # export resolution, unlike the render/
+                                # preview path, so it is exactly the case
+                                # _CLASSIFY_FEATURE_BUDGET_BYTES exists for.
+                                _cls_H, _cls_W = int(img.shape[0]), int(img.shape[1])
 
                                 classes = list(getattr(model, "classes_", []))
                                 idx_map = ({lab: i for i, lab in enumerate(label_names)} if label_names
                                            else {lab: i for i, lab in enumerate(classes)})
 
-                                n = H * W
+                                n = _cls_H * _cls_W
                                 chunk = max(50_000, min(500_000, n // 8 or 50_000))
                                 raw_preds = np.empty((n,), dtype=object)
-                                i = 0
-                                while i < n:
-                                    j = min(i + chunk, n)
-                                    raw_preds[i:j] = model.predict(X[i:j])
-                                    i = j
 
+                                # PERFORMANCE/MEMORY: builds and predicts in
+                                # row-band tiles when the feature matrix
+                                # would exceed _CLASSIFY_FEATURE_BUDGET_BYTES
+                                # -- see utils.iter_tiled_feature_matrices
+                                # and the fix in _make_feature_stack_for_model
+                                # for the underlying "classify... too slow"/
+                                # "crash on a big file" bug this replay was
+                                # equally exposed to (it runs on the raw,
+                                # full-resolution export image).
+                                from .utils import iter_tiled_feature_matrices
+                                import functools as _functools
+                                _builder = _functools.partial(
+                                    self._make_feature_stack_for_model,
+                                    normalization_cfg=normalization_cfg)
+                                _tile_build_failed = False
+                                for _r0, _r1, _X_tile, _w in iter_tiled_feature_matrices(
+                                        img, feat_names, expressions, window_size,
+                                        base_feature_names, _CLASSIFY_FEATURE_BUDGET_BYTES,
+                                        _builder):
+                                    if _X_tile is None:
+                                        _tile_build_failed = True
+                                        break
+                                    _tile_n = (_r1 - _r0) * _w
+                                    _out_offset = _r0 * _w
+                                    i = 0
+                                    while i < _tile_n:
+                                        j = min(i + chunk, _tile_n)
+                                        raw_preds[_out_offset + i: _out_offset + j] = model.predict(_X_tile[i:j])
+                                        i = j
+                                if _tile_build_failed:
+                                    raise RuntimeError("Could not build feature stack for the model")
+
+                                H, W = _cls_H, _cls_W
                                 cls_band = np.vectorize(idx_map.get, otypes=[np.float32])(raw_preds).reshape(H, W)
                                 cls_band = np.nan_to_num(cls_band, nan=0).astype(_float_dtype, copy=False)
                                 img = np.concatenate([img, cls_band[..., np.newaxis]], axis=2)
@@ -21901,32 +21996,52 @@ class ProjectTab(QtWidgets.QWidget):
                             shape_type = "polygon"
 
                     elif hasattr(it, "points"):
-                        # Point item: stored points may be pixmap-local
+                        # Point item: stored points may be pixmap-local.
+                        #
+                        # BUG THIS FIXES: EditablePointItem has ItemIsMovable
+                        # and never overrides itemChange/mouseMoveEvent to bake
+                        # a drag back into `points` -- Qt's default drag just
+                        # translates item.pos() (same as EditablePolygonItem,
+                        # see the polygon branch above using mapToScene). The
+                        # old code here converted pixmap-local -> item-local
+                        # (ox/oy from the pixmap item's own position) and then
+                        # used THAT directly as the scene position, never
+                        # composing it.mapToScene() on top. So any point that
+                        # had been dragged got silently reverted to its
+                        # PRE-drag position the next time this function ran
+                        # (root navigation, project save, etc.) -- even though
+                        # on_polygon_modified had already saved the correct
+                        # post-drag position moments earlier. Use the item's
+                        # own _scene_xy() (the same pixmap-local -> item-local
+                        # conversion EditablePointItem's paint()/boundingRect()
+                        # use internally) THEN mapToScene(), mirroring the fix
+                        # in on_polygon_drawn/on_polygon_modified.
                         shape_type = "point"
                         try:
                             pts = list(getattr(it, "points") or [])
                         except Exception:
                             pts = []
 
-                        if getattr(it, "points_are_pixmap_local", False):
-                            # Convert pixmap-local -> scene using pixmap item's position
-                            try:
+                        try:
+                            if hasattr(it, "_scene_xy"):
+                                item_local = QtGui.QPolygonF([
+                                    QtCore.QPointF(*it._scene_xy(p)) for p in pts
+                                ])
+                            elif getattr(it, "points_are_pixmap_local", False):
                                 pm = getattr(viewer, "_image", None)
                                 off = pm.pos() if pm is not None else QtCore.QPointF(0, 0)
                                 ox, oy = float(off.x()), float(off.y())
-                            except Exception:
-                                ox, oy = 0.0, 0.0
-                            pts_scene = [(ox + float(p.x()), oy + float(p.y())) for p in pts]
-                        else:
-                            # Already in item coords; map to scene if possible
-                            try:
-                                qpoly = QtGui.QPolygonF()
-                                for p in pts:
-                                    qpoly.append(QtCore.QPointF(float(p.x()), float(p.y())))
-                                poly_scene = it.mapToScene(qpoly)
-                                pts_scene = [(float(p.x()), float(p.y())) for p in poly_scene]
-                            except Exception:
-                                pts_scene = [(float(p.x()), float(p.y())) for p in pts]
+                                item_local = QtGui.QPolygonF([
+                                    QtCore.QPointF(ox + float(p.x()), oy + float(p.y())) for p in pts
+                                ])
+                            else:
+                                item_local = QtGui.QPolygonF([
+                                    QtCore.QPointF(float(p.x()), float(p.y())) for p in pts
+                                ])
+                            poly_scene = it.mapToScene(item_local)
+                            pts_scene = [(float(p.x()), float(p.y())) for p in poly_scene]
+                        except Exception:
+                            pts_scene = [(float(p.x()), float(p.y())) for p in pts]
                     else:
                         continue
 
@@ -25199,15 +25314,29 @@ class ProjectTab(QtWidgets.QWidget):
         except Exception:
             pass
 
-        def _fire_when_idle(seq=self._nav_seq):
-            if seq != getattr(self, "_nav_seq", 0):
-                # THE bail-out that leaves a refreshed viewer with no polygons:
-                # set_image() has already cleared the scene, and nothing else
-                # ever calls load_polygons for it.
-                logging.warning("[poly_load] NOT SCHEDULED: nav_seq moved %s -> %s "
-                                "between the refresh and the idle timer. The scene "
-                                "was cleared and no polygon load will follow.",
-                                seq, getattr(self, "_nav_seq", 0))
+        def _fire_when_idle(seq=self._nav_seq, expected_widgets=local_viewers):
+            # FORMERLY gated on `seq != self._nav_seq` alone -- "THE bail-out
+            # that leaves a refreshed viewer with no polygons" (its own prior
+            # comment). _nav_seq is a single GLOBAL counter bumped by ANY
+            # navigation/refresh anywhere in the app (a different root, a
+            # single-image edit elsewhere, a polygon-edit-finished full-grid
+            # reload via reload_current_root) -- not just ones that touch
+            # THIS grid. set_image() has already cleared every one of THESE
+            # viewers' scenes by the time this timer fires, so bailing here
+            # left them with no polygons and nothing left to redraw them,
+            # even when nothing about this specific grid was stale at all.
+            #
+            # The precise question is "has a NEWER display_image_group call
+            # already replaced the grid this closure was built for" -- answer
+            # that by identity against `self.viewer_widgets`, which only
+            # display_image_group itself ever reassigns (line ~24968) and
+            # does so synchronously, so this check is exact: if it's still
+            # the same list, these are still the on-screen viewers and must
+            # get their polygons loaded regardless of what else navigated.
+            if self.viewer_widgets is not expected_widgets:
+                logging.info("[poly_load] grid superseded before the idle timer "
+                             "fired -- the newer refresh's own idle timer will "
+                             "load polygons for what's actually on screen now.")
                 return
             n = 0
             for rec in list(self.viewer_widgets):
@@ -31375,18 +31504,26 @@ class ProjectTab(QtWidgets.QWidget):
             pass
         return None
 
-    def _make_feature_stack_for_model(self, img, feature_names, expressions=None, window_size=1, base_feature_names=None):
+    def _make_feature_stack_for_model(self, img, feature_names, expressions=None, window_size=1, base_feature_names=None, normalization_cfg=None):
         """Return (X, (H,W)) with X shape [H*W, F], float32.
-        
+
         For 3-channel BGR images (OpenCV default), converts to RGB order
         to match the training data from Image Editor.
-        
+
         Args:
             img: Input image (HxW or HxWxC)
             feature_names: List of feature names the model expects (may include window suffixes)
             expressions: Optional list of (name, expr_str) tuples for custom band expressions
             window_size: Spatial context window (1, 3, or 5). Default 1 = center pixel only.
             base_feature_names: Base feature names without window suffixes (needed for window > 1)
+            normalization_cfg: Optional bundle["normalization"] dict (see
+                utils.fit_normalization/apply_normalization) -- applied to X
+                right before it's returned, so every caller that later feeds
+                this straight into model.predict() gets the SAME transform
+                the model was trained under, with no extra work at the call
+                site. None (the default) means "no bundle context available
+                here / caller doesn't know" -- X is returned unnormalized,
+                same as before this parameter existed.
         """
         import numpy as np
         import re
@@ -31480,24 +31617,19 @@ class ProjectTab(QtWidgets.QWidget):
                 if arr is None:
                     raise RuntimeError(f"Unknown base feature name: {nm}")
                 band_arrays[nm] = np.pad(arr, half, mode='edge')
-            
-            # Build feature array
-            X = np.zeros((H * W, F), dtype=np.float32)
-            
-            for y in range(H):
-                for x in range(W):
-                    flat_idx = y * W + x
-                    feat_idx = 0
-                    
-                    # Window positions in row-major order
-                    for dr in range(-half, half + 1):
-                        for dc in range(-half, half + 1):
-                            py = y + half + dr
-                            px = x + half + dc
-                            
-                            for nm in base_names:
-                                X[flat_idx, feat_idx] = band_arrays[nm][py, px]
-                                feat_idx += 1
+
+            # PERFORMANCE: this used to be a `for y: for x: for dr: for dc:
+            # for nm:` scalar loop -- O(H*W*window_size^2*n_features)
+            # Python-level operations, the actual cause of "classify... too
+            # slow" / "a very big file will take forever and crash".
+            # band_arrays above already resolves each name's array ONCE (this
+            # copy always did that part right); build_windowed_feature_cube
+            # replaces only the fill loop with window_size^2*n_features
+            # vectorized slice-copies -- same element count, C-level instead
+            # of per-pixel Python.
+            from .utils import build_windowed_feature_cube
+            cube = build_windowed_feature_cube(band_arrays, base_names, window_size, H, W)
+            X = cube.reshape(H * W, F)
 
         # sanitize NaN/Inf
         bad = ~np.isfinite(X)
@@ -31508,6 +31640,10 @@ class ProjectTab(QtWidgets.QWidget):
                 med = np.median(col[good]) if good.any() else 0.0
                 col[~good] = med
                 X[:, j] = col
+
+        if normalization_cfg is not None:
+            from .utils import apply_normalization
+            X = apply_normalization(X, normalization_cfg)
 
         return X, (H, W)
 
@@ -31533,22 +31669,41 @@ class ProjectTab(QtWidgets.QWidget):
         expressions = b.get("expressions", [])
         window_size = b.get("window_size", 1)
         base_feature_names = b.get("base_feature_names", feat_names)
+        normalization_cfg = b.get("normalization")
 
-        X, (H, W) = self._make_feature_stack_for_model(
-            img, feat_names, 
-            expressions=expressions,
-            window_size=window_size,
-            base_feature_names=base_feature_names
-        )
-
+        # H/W straight from the image (not the builder's return) so a
+        # possibly-tiled build/predict (see below) can be sized up front.
+        a_img = np.asarray(img)
+        H, W = int(a_img.shape[0]), int(a_img.shape[1])
         n = H * W
+        if n == 0:
+            return None
         chunk = max(50_000, min(500_000, n // 8 or 50_000))
         out = np.empty((n,), dtype=object)
-        i = 0
-        while i < n:
-            j = min(i + chunk, n)
-            out[i:j] = model.predict(X[i:j])
-            i = j
+
+        # PERFORMANCE/MEMORY: builds and predicts in row-band tiles when the
+        # feature matrix would exceed _CLASSIFY_FEATURE_BUDGET_BYTES, instead
+        # of materializing one whole-image array -- see
+        # utils.iter_tiled_feature_matrices and _make_feature_stack_for_model's
+        # own fix for the underlying "classify... too slow"/"crash on a big
+        # file" bug. For the common (fits-in-budget) case this is exactly one
+        # tile covering the whole image, unchanged from before.
+        from .utils import iter_tiled_feature_matrices
+        import functools
+        builder = functools.partial(self._make_feature_stack_for_model,
+                                     normalization_cfg=normalization_cfg)
+        for row0, row1, X_tile, w in iter_tiled_feature_matrices(
+                img, feat_names, expressions, window_size, base_feature_names,
+                _CLASSIFY_FEATURE_BUDGET_BYTES, builder):
+            if X_tile is None:
+                return None
+            tile_n = (row1 - row0) * w
+            out_offset = row0 * w
+            i = 0
+            while i < tile_n:
+                j = min(i + chunk, tile_n)
+                out[out_offset + i: out_offset + j] = model.predict(X_tile[i:j])
+                i = j
 
         if labels:
             idx_map = {lab: k for k, lab in enumerate(labels)}
@@ -31558,7 +31713,7 @@ class ProjectTab(QtWidgets.QWidget):
 
         idx = np.vectorize(idx_map.get, otypes=[np.int32])(out).reshape(H, W)
         idx = np.nan_to_num(idx, nan=0).astype(np.int32, copy=False)
-        
+
         # Return both colorized image AND raw indices
         colorized = self._colorize_class_map(idx, n_classes=len(labels) if labels else None)
         return colorized, idx.copy()
@@ -31578,23 +31733,40 @@ class ProjectTab(QtWidgets.QWidget):
         expressions = b.get("expressions", [])  # Get custom expressions from bundle
         window_size = b.get("window_size", 1)  # Get spatial window size
         base_feature_names = b.get("base_feature_names", feat_names)  # Base names
+        normalization_cfg = b.get("normalization")
 
-        X, (H, W) = self._make_feature_stack_for_model(
-            img, feat_names, 
-            expressions=expressions,
-            window_size=window_size,
-            base_feature_names=base_feature_names
-        )
-
-        # chunked prediction to limit memory
+        # H/W straight from the image (not the builder's return) so a
+        # possibly-tiled build/predict (see below) can be sized up front.
+        a_img = np.asarray(img)
+        H, W = int(a_img.shape[0]), int(a_img.shape[1])
         n = H * W
+        if n == 0:
+            return None
+        # chunked prediction to limit memory
         chunk = max(50_000, min(500_000, n // 8 or 50_000))
         out = np.empty((n,), dtype=object)
-        i = 0
-        while i < n:
-            j = min(i + chunk, n)
-            out[i:j] = model.predict(X[i:j])
-            i = j
+
+        # PERFORMANCE/MEMORY: builds and predicts in row-band tiles when the
+        # feature matrix would exceed _CLASSIFY_FEATURE_BUDGET_BYTES -- see
+        # the twin comment in _apply_sklearn_classification_with_indices and
+        # _make_feature_stack_for_model's own fix for the underlying
+        # "classify... too slow"/"crash on a big file" bug.
+        from .utils import iter_tiled_feature_matrices
+        import functools
+        builder = functools.partial(self._make_feature_stack_for_model,
+                                     normalization_cfg=normalization_cfg)
+        for row0, row1, X_tile, w in iter_tiled_feature_matrices(
+                img, feat_names, expressions, window_size, base_feature_names,
+                _CLASSIFY_FEATURE_BUDGET_BYTES, builder):
+            if X_tile is None:
+                return None
+            tile_n = (row1 - row0) * w
+            out_offset = row0 * w
+            i = 0
+            while i < tile_n:
+                j = min(i + chunk, tile_n)
+                out[out_offset + i: out_offset + j] = model.predict(X_tile[i:j])
+                i = j
 
         # map labels -> indices (stable ordering)
         if labels:
@@ -31934,18 +32106,24 @@ class ProjectTab(QtWidgets.QWidget):
         timer.setSingleShot(True)
         timer.setTimerType(QtCore.Qt.CoarseTimer)
 
-        def go(v=viewer, idata=image_data, expected_seq=nav_seq):
-            # If navigation happened after this was scheduled → bail
-            if expected_seq is not None and expected_seq != getattr(self, "_nav_seq", 0):
-                # DIAGNOSTIC: this silently skips loading a viewer's polygons.
-                # If polygons are missing after a refresh, this is one of only
-                # two places the load can be dropped without a trace.
-                logging.info("[poly_load] SKIPPED %s: nav_seq changed (%s -> %s)",
-                             os.path.basename(getattr(idata, "filepath", "?") or "?"),
-                             expected_seq, getattr(self, "_nav_seq", 0))
-                return
+        def go(v=viewer, idata=image_data):
+            # FORMERLY also bailed on `expected_seq != self._nav_seq` here --
+            # one of "only two places the load can be dropped without a
+            # trace" (its own prior comment; the other was
+            # display_image_group's _fire_when_idle, fixed the same way).
+            # `_nav_seq` is a single GLOBAL counter bumped by ANY navigation/
+            # refresh anywhere in the app, not just ones that affect THIS
+            # viewer -- an unrelated root change, a different single-image
+            # edit, a polygon-edit-finished full-grid reload via
+            # reload_current_root, all silently cancelled a load for a
+            # viewer none of them actually touched. `nav_seq` is still
+            # accepted as a parameter (existing callers keep working
+            # unchanged) but is no longer load-bearing: the check below is
+            # already precise on its own -- if THIS viewer still shows the
+            # SAME file it was scheduled to load polygons for, the load is
+            # valid regardless of what happened elsewhere.
 
-            # If the viewer has already switched files → bail (your existing guard)
+            # If the viewer has already switched files → bail (precise, per-viewer)
             try:
                 fp_now = getattr(getattr(v, "image_data", None), "filepath", None)
             except Exception:
