@@ -763,6 +763,151 @@ def iter_tiled_feature_matrices(img, feat_names, expressions, window_size,
 
 
 # =============================================================================
+# Classification pixel eligibility -- INFERENCE MUST MATCH TRAINING
+# =============================================================================
+#
+# `MachineLearningManager.train_models` never trains on every pixel inside a
+# labelled polygon. It DROPS a sampled pixel when:
+#
+#   * any value in its window is non-finite      (_build_training_row)
+#   * any value in its window equals a declared numeric NoData literal
+#     (within the tolerance ladder reproduced in `nodata_match_tolerance`)
+#   * `window_size > 1` and its window would extend past the image edge
+#     (train_models' explicit `continue`)
+#
+# So the model has never seen an imputed, an edge-padded, or a NoData-
+# contaminated feature row, and a prediction made from one is not a
+# prediction the model is qualified to make. `ProjectTab.process_polygon`
+# (the CSV class-percentage columns) already applies exactly these three
+# rules; several inference paths did not, which is precisely why the class
+# percentages a user read off the screen differed from the ones in the CSV
+# for the same polygon.
+#
+# These helpers are the ONE definition of that rule. Every inference path
+# uses them, so the pixel population can no longer drift between training,
+# the viewer, the editor preview and the CSV.
+
+#: Class index written for a pixel that was deliberately NOT classified,
+#: because training would have dropped it. Distinct from every real class
+#: index (which are 0..K-1) so "unclassified" can never be mistaken for
+#: "class 0" by a consumer counting class percentages.
+UNCLASSIFIED_CLASS_INDEX = -1
+
+
+def nodata_match_tolerance(value):
+    """Absolute tolerance for "this feature value IS the NoData literal".
+
+    Reproduces `MachineLearningManager._build_training_row`'s ladder exactly
+    -- that function is what TRAINING uses, so every inference-side check has
+    to agree with it or the two disagree about which pixels exist.
+    """
+    abs_nd = abs(float(value))
+    if abs_nd > 1e+30:
+        return abs_nd * 0.01
+    if abs_nd > 1e+10:
+        return abs_nd * 0.001
+    if abs_nd > 100:
+        return abs_nd * 0.001
+    return 0.01
+
+
+def numeric_nodata_values(nodata_values):
+    """The numeric literals in `nodata_values`, ignoring expression entries.
+
+    Expression rules ("b1>100") are a whole-pixel/spatial concept resolved by
+    `build_nodata_mask` against the IMAGE, not by scanning a feature matrix --
+    `_build_training_row` makes the same split.
+    """
+    out = []
+    for nv in (nodata_values or []):
+        if isinstance(nv, str) and any(op in nv for op in ("<", ">", "=", "!")):
+            continue
+        try:
+            out.append(float(nv))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def window_edge_rows(H, W, window_size):
+    """(H*W,) bool -- True where a `window_size` window leaves the image.
+
+    These are the pixels `train_models` skips outright, and the ones
+    `process_polygon` skips with its `if yg - half < 0 or ...: continue`.
+    Feature builders that `np.pad(..., mode='edge')` instead invent neighbour
+    values the model was never trained on, so the rows have to be excluded
+    here even though the padding makes them numerically well-formed.
+    """
+    n = int(H) * int(W)
+    half = int(window_size or 1) // 2
+    if half <= 0:
+        return np.zeros((n,), dtype=bool)
+    edge = np.zeros((int(H), int(W)), dtype=bool)
+    if 2 * half >= int(H) or 2 * half >= int(W):
+        edge[:, :] = True
+        return edge.reshape(-1)
+    edge[:half, :] = True
+    edge[H - half:, :] = True
+    edge[:, :half] = True
+    edge[:, W - half:] = True
+    return edge.reshape(-1)
+
+
+def classification_invalid_rows(X, H=None, W=None, window_size=1,
+                                nodata_values=None):
+    """(N,) bool -- feature rows TRAINING would have DROPPED.
+
+    `X` is the (H*W, F) feature matrix. `H`/`W` are only needed for the
+    window-edge rule; pass them whenever `window_size > 1`.
+
+    A True entry means "do not predict this pixel": mark it unclassified
+    instead of handing the model a row it was never trained to see.
+    """
+    X = np.asarray(X)
+    if X.ndim != 2 or X.shape[0] == 0:
+        return np.zeros((0 if X.ndim != 2 else X.shape[0],), dtype=bool)
+
+    bad = ~np.all(np.isfinite(X), axis=1)
+
+    for nd in numeric_nodata_values(nodata_values):
+        tol = nodata_match_tolerance(nd)
+        # `< tol`, not np.isclose's `<= atol`: _build_training_row uses a
+        # strict comparison, and this must agree with it exactly.
+        with np.errstate(invalid="ignore"):
+            bad |= np.any(np.abs(X - nd) < tol, axis=1)
+
+    if (window_size or 1) > 1 and H is not None and W is not None:
+        edge = window_edge_rows(H, W, window_size)
+        if edge.shape[0] == X.shape[0]:
+            bad |= edge
+
+    return bad
+
+
+def mark_ineligible_rows(X, H=None, W=None, window_size=1, nodata_values=None):
+    """Return `X` with every training-ineligible row set to NaN.
+
+    NaN is the marker every classification caller then tests with
+    `np.all(np.isfinite(row))`. It is chosen because it survives row slicing
+    (so `iter_tiled_feature_matrices` needs no extra channel) and survives
+    `apply_normalization`, and because feeding NaN to `model.predict` raises
+    loudly instead of silently returning a class -- a caller that forgets to
+    filter cannot quietly reintroduce the bug this exists to fix.
+
+    Returns `X` itself when nothing is ineligible (no copy on the hot path).
+    """
+    X = np.asarray(X)
+    if X.ndim != 2 or X.shape[0] == 0:
+        return X
+    bad = classification_invalid_rows(X, H, W, window_size, nodata_values)
+    if not bad.any():
+        return X
+    out = np.array(X, dtype=np.float32, copy=True)
+    out[bad] = np.nan
+    return out
+
+
+# =============================================================================
 # Feature normalization -- bundle-recorded, applied identically at train time
 # and at every classification/predict call site that later loads the bundle.
 #
@@ -867,6 +1012,178 @@ def apply_normalization(X, normalization_cfg):
         raise ValueError(f"Unknown normalization method: {method!r}")
 
     return out[0] if single_row else out
+
+
+# =============================================================================
+# CANONICAL BAND ORDER -- the one place that decides what `b1` means
+# =============================================================================
+#
+# THE RULE (single, program-wide, no exceptions):
+#
+#     For imagery with 3 or more channels, `b1` = RED, `b2` = GREEN, `b3` = BLUE.
+#     `b4`..`bN` are the source raster's own bands 4..N, in NATIVE order.
+#
+# This holds in band-math expressions, boolean expressions, NoData expressions,
+# ML feature stacks (training AND inference), CSV export, appended bands, the
+# Image Editor, the viewer and the Pixel Inspector alike.
+#
+# WHY A HELPER AND NOT AN `if C == 3:` AT EACH SITE:
+#   Whether channel 0 of an in-memory array is Red or Blue is a fact about WHO
+#   LOADED IT, not about its shape:
+#       * cv2.imread / cv2.imdecode  -> ALWAYS BGR   ("bgr")
+#       * tifffile / raster_reader   -> ALWAYS the file's native order ("rgb")
+#   The same 3-band TIF is loaded by cv2 for the viewer but by tifffile for
+#   export, so a shape-based `if C == 3: swap` produced OPPOSITE answers on the
+#   two paths -- measured on real data as `b1>189` counting 783,943 px in one
+#   consumer and 380,830 px in the other for the same file. Always consult the
+#   provenance the app already tracks:
+#       ImageData/_Lite.channel_order        (display/viewer path)
+#       ProjectTab._last_export_channel_order (CSV / export path)
+#       ProjectTab._last_raw_channel_order    (_load_raw_image path)
+#       ImageEditorDialog._editor_channel_order (editor path)
+#   and pass it to `to_rgb_band_order` / `build_nodata_mask(bgr_input=...)`.
+#
+# A blanket `arr[..., ::-1]` is WRONG for C > 3: it reverses the WHOLE stack,
+# so band 4 of a 5-band cube becomes band 2. Only channels 0 and 2 may ever be
+# exchanged. `ProjectTab._reorder_first3` (used by the image-file export writer)
+# implements the same first-3-only rule for the opposite direction.
+
+# Marker stamped into a migrated `.ax` file / model bundle. Its PRESENCE means
+# "the expressions in here are already written under b1=Red"; its absence means
+# "authored under the old, inverted convention". See ProjectTab.migrate_band_convention.
+BAND_CONVENTION_KEY = "band_convention"
+BAND_CONVENTION_RGB = "rgb"
+
+
+def channel_order_attr(obj, name, default=""):
+    """Read a channel-order provenance attribute off `obj`, safely.
+
+    Every holder of one of these flags -- ProjectTab (`_last_export_channel_order`,
+    `_last_raw_channel_order`), ImageEditorDialog (`_editor_channel_order`),
+    MachineLearningManager (`_last_ml_raw_channel_order`) -- is a Qt widget
+    subclass. Reading a MISSING attribute on an instance created with
+    `Cls.__new__(Cls)` (which QC tests and headless helpers do all the time,
+    since the real __init__ builds a whole UI) raises
+    ``RuntimeError: super-class __init__() of type X was never called`` from
+    sip. That is NOT an AttributeError, so a plain ``getattr(obj, name, default)``
+    does not absorb it and the caller dies instead of falling back.
+
+    "Attribute unavailable" and "attribute absent" mean exactly the same thing
+    here -- provenance unknown -- so both return `default`.
+
+    Returns the raw value (not lowercased); pass it to `is_bgr_channel_order`
+    or `to_rgb_band_order`, which normalise.
+    """
+    if obj is None:
+        return default
+    try:
+        val = getattr(obj, name, None)
+    except Exception:
+        return default
+    return default if val is None else val
+
+
+def is_bgr_channel_order(channel_order) -> bool:
+    """True only when `channel_order` explicitly says the array is BGR.
+
+    Deliberately strict: anything else (None, "", "rgb", "native", a garbage
+    string) is treated as NOT-BGR, i.e. native order. Call sites that have a
+    historical default of "assume BGR when unknown" must spell that default out
+    themselves -- e.g. ``channel_order_attr(self, "_last_export_channel_order") or "bgr"``
+    -- so the assumption stays visible at the place that actually knows.
+    """
+    return str(channel_order or "").strip().lower() == "bgr"
+
+
+def to_rgb_band_order(arr, channel_order):
+    """Return `arr` with its first three channels in canonical R, G, B order.
+
+    Channels 4..N (and channel 1/green) are NEVER moved. Bands beyond the third
+    are ancillary/multispectral planes whose index IS their identity.
+
+    Parameters
+    ----------
+    arr : ndarray
+        2-D (H, W) or 3-D (H, W, C). Any dtype. Never modified in place.
+    channel_order : str | None
+        "bgr" -> swap channels 0 and 2. Anything else -> no-op (see
+        `is_bgr_channel_order`).
+
+    Returns
+    -------
+    ndarray
+        A NEW array when a swap was needed; otherwise `arr` itself (no copy).
+        Callers that intend to mutate the result must copy it themselves --
+        the no-swap case aliases the input on purpose, because this runs on
+        every band-expression evaluation on full-size rasters.
+
+    Shapes handled without raising: 2-D, C == 1, C == 2, C == 3, C > 3, and
+    non-array inputs (returned unchanged).
+    """
+    if arr is None:
+        return arr
+    if not is_bgr_channel_order(channel_order):
+        return arr
+    a = np.asarray(arr)
+    # 2-D, C == 1 and C == 2 have no third channel to exchange with.
+    if a.ndim != 3 or a.shape[2] < 3:
+        return arr
+    out = np.array(a, copy=True)
+    out[..., [0, 2]] = a[..., [2, 0]]
+    return out
+
+
+# --- expression-token rewriting (migration ONLY, never a live pixel path) ----
+#
+# There used to be a SECOND remap idiom scattered through the live code: rewrite
+# the expression STRING (`re.sub(r'\bb1\b', ...)` swapping b1<->b3) instead of
+# reordering the array. It has been removed from every live path because it
+# silently handles only b1/b3 -- a 5-band expression like `(b4-b3)/(b4+b3)` came
+# out addressing the wrong planes. The token rewriter survives here for exactly
+# one purpose: the one-shot migration of expressions AUTHORED under the old
+# convention (see ProjectTab.migrate_band_convention).
+
+_BAND_TOKEN_RE = re.compile(r'(?<![A-Za-z0-9_])([bB])([0-9]+)(?![A-Za-z0-9_])')
+
+
+def swap_b1_b3_tokens(expr):
+    """Exchange whole `b1` <-> `b3` band tokens in an expression string.
+
+    Token-accurate and case-preserving: `b10`, `b13`, `B31`, `ab1`, `b1_x` are
+    left alone -- only a complete band token whose number is exactly 1 or 3 is
+    rewritten, and `B1` comes back as `B3` (not `b3`).
+
+    Returns the (possibly unchanged) string; non-str input is returned as-is.
+    """
+    if not isinstance(expr, str) or not expr:
+        return expr
+
+    def _sub(m):
+        prefix, num = m.group(1), m.group(2)
+        if num == "1":
+            return prefix + "3"
+        if num == "3":
+            return prefix + "1"
+        return m.group(0)
+
+    return _BAND_TOKEN_RE.sub(_sub, expr)
+
+
+def expression_mentions_band_above_3(expr):
+    """True when `expr` references any band token b4..bN.
+
+    Used by the migration to refuse to touch expressions that clearly belong to
+    a wider-than-RGB stack, where a b1<->b3 swap is meaningless and harmful.
+    """
+    if not isinstance(expr, str) or not expr:
+        return False
+    for m in _BAND_TOKEN_RE.finditer(expr):
+        try:
+            if int(m.group(2)) > 3:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 # =============================================================================
@@ -1193,11 +1510,24 @@ __all__ = [
     'calculate_gbd',
     'calculate_wdx',
     'calculate_shd',
+    'channel_order_attr',
+    'is_bgr_channel_order',
+    'to_rgb_band_order',
+    'swap_b1_b3_tokens',
+    'expression_mentions_band_above_3',
+    'BAND_CONVENTION_KEY',
+    'BAND_CONVENTION_RGB',
     'parse_nodata_text',
     'build_nodata_mask',
     'build_windowed_feature_cube',
     'iter_classification_row_tiles',
     'iter_tiled_feature_matrices',
+    'UNCLASSIFIED_CLASS_INDEX',
+    'nodata_match_tolerance',
+    'numeric_nodata_values',
+    'window_edge_rows',
+    'classification_invalid_rows',
+    'mark_ineligible_rows',
     'CLASSIFY_MAX_WINDOW_SIZE',
     'fit_normalization',
     'apply_normalization',

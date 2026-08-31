@@ -1980,6 +1980,23 @@ class ImageViewer(QtWidgets.QGraphicsView):
 
     @image_data.setter
     def image_data(self, value):
+        # A different file replacing what this viewer shows invalidates any
+        # composite stretch/bands stashed by ProjectTab._on_band_bar_clicked
+        # while a single band of the OLD file was being viewed -- those belong
+        # to that file, not this one. Left in place, clicking the band bar's
+        # "Auto"/composite button on the new file could restore the previous
+        # file's stretch mode and band selection instead of this file's own
+        # (or falling back to it correctly only by luck of matching indices).
+        old = getattr(self, "_image_data", None)
+        old_fp = getattr(old, "filepath", None) if old is not None else None
+        new_fp = getattr(value, "filepath", None) if value is not None else None
+        if new_fp != old_fp:
+            for _attr in ("_composite_stretch_params", "_composite_preview_bands"):
+                if _attr in self.__dict__:
+                    try:
+                        delattr(self, _attr)
+                    except Exception:
+                        pass
         self._image_data = value
         try:
             self._refresh_band_bar()
@@ -2322,11 +2339,11 @@ class ImageViewer(QtWidgets.QGraphicsView):
             pass
         self._zoom = 0
 
-        if self.drawing and self.temp_drawing_item:
-            scale = self.get_current_scale_factor()
-            pen = self.temp_drawing_item.pen()
-            pen.setWidthF(2.0 / max(1e-6, scale))
-            self.temp_drawing_item.setPen(pen)
+        # temp_drawing_item's pen is cosmetic (constant 2 DEVICE pixels at any
+        # zoom -- see mousePressEvent/start_drawing_with_group_name); it must
+        # NOT be re-divided by the current scale here. See update_temp_drawing
+        # for the full explanation of the zoom-dependent-disappearing bug this
+        # used to cause.
         self.viewport().update()
         self._trigger_highres_update()
 
@@ -3447,12 +3464,12 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 _ZoomBar._fixed_zoom = new_zoom
                 _ZoomBar._store_scroll_position(self)
 
-            # Update temp drawing pen width if drawing
-            if self.drawing and self.temp_drawing_item:
-                pen = self.temp_drawing_item.pen()
-                pen.setWidthF(2.0 / new_zoom)
-                self.temp_drawing_item.setPen(pen)
-            
+            # NOTE: temp_drawing_item's pen is cosmetic (constant 2 DEVICE
+            # pixels regardless of zoom), so it must NOT be re-divided by
+            # new_zoom here -- doing so used to shrink the in-progress
+            # polygon/line preview towards zero width as the user zoomed in,
+            # making it disappear at high zoom. See update_temp_drawing.
+
             # Refresh the zoom bar HERE. attach_zoom_bar's wheel wrapper reads
             # the zoom immediately after the event returns, which was correct
             # when zooming happened inline -- but the coalescing timer applies
@@ -4297,8 +4314,16 @@ class ImageViewer(QtWidgets.QGraphicsView):
         self.temp_drawing_item.setPos(0, 0)
         self.temp_drawing_item.setTransform(QtGui.QTransform())
 
-        scale = self.get_current_scale_factor()
-        
+        # temp_drawing_item's pen is created COSMETIC -- a constant 2 DEVICE
+        # pixels at any zoom (see mousePressEvent / start_drawing_with_group_name).
+        # This function must NEVER touch its width. An earlier version divided
+        # the width by the current view scale on every call here (correct only
+        # for a non-cosmetic, scene-space pen); applied to this cosmetic pen it
+        # shrinks the on-screen width towards zero as the user zooms IN, and at
+        # high zoom (this app allows up to 50x) it rounds down to an invisible
+        # line -- the root cause of the in-progress polygon/line preview
+        # "disappearing at high zoom" while drawing.
+
         # Rectangle mode preview
         if self.drawing_mode == "rectangle":
             if self._shape_start_point and self._shape_end_point:
@@ -4313,11 +4338,8 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 ])
                 if isinstance(self.temp_drawing_item, QtWidgets.QGraphicsPolygonItem):
                     self.temp_drawing_item.setPolygon(rect_poly)
-            pen = self.temp_drawing_item.pen()
-            pen.setWidthF(2 / max(1e-6, scale))
-            self.temp_drawing_item.setPen(pen)
             return
-        
+
         # Circle mode preview
         if self.drawing_mode == "circle":
             if self._shape_start_point and self._shape_end_point:
@@ -4334,16 +4356,11 @@ class ImageViewer(QtWidgets.QGraphicsView):
                     circle_poly.append(QtCore.QPointF(x, y))
                 if isinstance(self.temp_drawing_item, QtWidgets.QGraphicsPolygonItem):
                     self.temp_drawing_item.setPolygon(circle_poly)
-            pen = self.temp_drawing_item.pen()
-            pen.setWidthF(2 / max(1e-6, scale))
-            self.temp_drawing_item.setPen(pen)
             return
-        
+
         # Polygon mode
         if self.drawing_mode == "polygon":
             self.temp_drawing_item.setPolygon(self.currentPolygon)
-            pen = self.temp_drawing_item.pen(); pen.setWidthF(2 / max(1e-6, scale))
-            self.temp_drawing_item.setPen(pen)
             return
 
         # Point mode
@@ -4356,9 +4373,6 @@ class ImageViewer(QtWidgets.QGraphicsView):
             ry = int(math.floor(lp.y()))
             path.addRect(off.x() + rx, off.y() + ry, 1, 1)
         self.temp_drawing_item.setPath(path)
-
-        pen = self.temp_drawing_item.pen(); pen.setWidthF(2 / max(1e-6, scale))
-        self.temp_drawing_item.setPen(pen)
 
     def _generate_random_points(self):
         """
@@ -5455,9 +5469,13 @@ class ImageViewer(QtWidgets.QGraphicsView):
             self.temp_drawing_item = QtWidgets.QGraphicsPathItem()
 
         pen = QtGui.QPen(QtCore.Qt.red, 2, QtCore.Qt.DashLine)
-        scale = getattr(self, "get_current_scale_factor", lambda: 1.0)()
-        desired_screen_width = 2.0
-        pen.setWidthF(max(0.5, desired_screen_width / (scale or 1.0)))
+        # Cosmetic: 2 DEVICE pixels at any zoom, matching mousePressEvent's
+        # freehand-drawing pen -- see update_temp_drawing's note on why this
+        # width must never be recomputed from the view scale (a stale
+        # scale-divided width here used to make the in-progress preview
+        # shrink to invisible at high zoom).
+        pen.setCosmetic(True)
+        pen.setWidthF(2.0)
         pen.setColor(QtCore.Qt.red)
         self.temp_drawing_item.setPen(pen)
         self.temp_drawing_item.setBrush(QtGui.QBrush(QtCore.Qt.transparent))

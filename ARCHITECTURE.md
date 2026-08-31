@@ -118,6 +118,22 @@ evaluated in float32. Two engines:
 Bands are referenced `b1..bN` (also uppercase). Prebuilt veg-index helpers live in `utils`
 (`calculate_exg/gcc/bcc/gbd/wdx/shd`).
 
+**`b1` IS RED, everywhere, for every loader.** `eval_band_expression` itself is purely
+positional (`b1` = array channel 0), so every caller must hand it an array whose first three
+channels are already R,G,B. The one way to do that is
+`utils.to_rgb_band_order(arr, channel_order)` driven by the loader's real provenance
+(`ImageData.channel_order` / `_Lite.channel_order` / `ProjectTab._last_export_channel_order` /
+`ImageEditorDialog._editor_channel_order` / `MachineLearningManager._current_channel_order()`).
+Two idioms that used to do this and must never come back: an `if C == 3: swap` shape guess
+(right for cv2, silently backwards for tifffile), and rewriting the expression STRING via a
+`__B1_TEMP__` placeholder (only ever handled b1/b3, so `b4`+ on a wider stack addressed the
+wrong plane). Bands 4..N are NEVER reordered — their index is their identity.
+`utils.swap_b1_b3_tokens` survives for a hypothetical one-shot migration of stored expressions
+only and must not appear on any live pixel path. Pinned by
+`canopie/qc/test_band_convention_contract.py`, which drives the viewer replay, the export
+replay, `process_polygon`, the Image Editor and the ML manager on the SAME image delivered
+under BOTH provenances and requires one number.
+
 ### Polygons
 Stored hierarchically: `all_polygons[group_name][image_filepath] = [ {points, image_ref_size, root, class, ...}, ... ]`.
 - `points` are raw-image pixel coordinates.
@@ -179,6 +195,41 @@ present), tunes with Grid/RandomizedSearchCV, and writes `.pkl` bundles under
 applied per-pixel during export via `ProjectTab._classify_array` / `_apply_sklearn_classification`.
 `AnalysisOptionsDialog` collects export stats + index definitions; `RootOffsetDialog` tunes
 the dual-folder offset.
+
+### Which pixels are eligible for classification (inference must match training)
+
+`train_models` never fits on every pixel inside a labelled polygon. It DROPS a sampled pixel
+when any value in its window is non-finite, when any value in its window equals a declared
+numeric NoData literal, or (for `window_size > 1`) when its window would leave the image.
+`process_polygon`'s CSV `Class N %` columns exclude exactly those pixels too.
+
+Every inference path must therefore exclude them as well — a median-imputed feature, an
+edge-padded neighbour and a NoData sentinel are all rows the model was never trained on, and
+predicting from one makes the screen and the CSV describe different pixel populations for the
+same polygon. The single definition lives in `utils`:
+`classification_invalid_rows` / `mark_ineligible_rows` / `window_edge_rows` /
+`nodata_match_tolerance` (the tolerance ladder is copied from
+`MachineLearningManager._build_training_row`, which is what training actually uses).
+
+Mechanics: both `_make_feature_stack_for_model` copies (ProjectTab's and
+ImageEditorDialog's) set ineligible rows to **NaN** instead of imputing them — NaN survives
+`iter_tiled_feature_matrices`' row slicing and `apply_normalization`, and makes a caller that
+forgets to filter fail loudly in `model.predict` rather than silently classify. Callers filter
+with `np.all(np.isfinite(X), axis=1)` and write `utils.UNCLASSIFIED_CLASS_INDEX` (-1) for the
+rest; `_colorize_class_map` renders a negative index as 0. The hand-built classification blocks
+in `_apply_ax_to_raw` / `apply_aux_modifications` keep their own `nodata_fill` convention for
+the exported label band but apply the same three rules. Computing the window-edge mask INSIDE
+the builder is correct under tiling: `iter_tiled_feature_matrices` supplies halo rows and
+discards exactly them, so only the image's true boundary is ever marked.
+
+**Known remaining gap** (not fixed, measured): at `window_size > 1` with a *numeric* NoData
+literal, `process_polygon` excludes a pixel only when its OWN centre is NoData (plus
+non-finite anywhere in the window), while training and the feature builders exclude a pixel
+whose window merely TOUCHES NoData. `_apply_ax_to_raw` zeroes NoData pixels before
+`process_polygon` sees them, so process_polygon cannot detect them by value; matching training
+there needs its NoData mask dilated by `half`. Covered by
+`canopie/qc/test_classification_pixel_eligibility.py`, which deliberately tests NoData at
+`window_size == 1` and the edge/non-finite rules at `window_size == 3`.
 
 ### Training augmentation + feature normalization
 

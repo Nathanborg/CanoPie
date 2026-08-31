@@ -44,7 +44,14 @@ from PyQt5.QtWidgets import (
 
 import sip
 from .utils import process_band_expression_float, normalize_band_expr
-from .utils import eval_band_expression 
+from .utils import eval_band_expression
+# The single canonical answer to "which array index is b1?" -- see the
+# "CANONICAL BAND ORDER" block in utils.py.
+from .utils import (
+    to_rgb_band_order as _to_rgb_band_order,
+    is_bgr_channel_order as _is_bgr_channel_order,
+    channel_order_attr as _chan_attr,
+)
 
 # Prevent logging from writing to files by removing filename and file handlers
 _original_basicConfig = logging.basicConfig
@@ -3342,56 +3349,80 @@ class ImageEditorDialog(QDialog):
    
     
     
-    def process_band_expression(self, image, expr, nodata_values=None):
-        import logging, numpy as np, re
+    def process_band_expression(self, image, expr, nodata_values=None, src_channel_order=None):
+        """Evaluate `expr` on `image` and append the result as a new trailing band.
+
+        `src_channel_order` ("bgr"/"rgb") is the order `image`'s first three
+        channels are actually in. It defaults to `self._editor_channel_order`,
+        which _load_raw_image / _load_editor_preview record from the loader that
+        actually produced the pixels (cv2 -> "bgr", tifffile/raster_reader ->
+        "rgb"). It is the SINGLE authority for what `b1` means here.
+        """
+        import logging, numpy as np
         # Cleared per run so a stale failure from an earlier expression is never
         # reported against a later, successful one.
         self._last_band_expr_error = None
         try:
-            # FIX: Remap band references for 3-channel BGR images
-            # Image data is BGR but user sees RGB in display (due to BGR→RGB conversion)
-            # So when user types b1, they expect Red (what they see), but data has Blue at index 0
-            # Remap b1↔b3 so expression matches what user visually sees
-            effective_expr = expr
-            if isinstance(image, np.ndarray) and image.ndim == 3 and image.shape[2] == 3:
-                # BGR→RGB remapping: b1↔b3 (b2 stays the same)
-                effective_expr = re.sub(r'\bb1\b', '__B1_TEMP__', effective_expr)
-                effective_expr = re.sub(r'\bb3\b', 'b1', effective_expr)
-                effective_expr = re.sub(r'__B1_TEMP__', 'b3', effective_expr)
-                if effective_expr != expr:
-                    logging.info(f"[process_band_expression] Remapped BGR→RGB: '{expr}' → '{effective_expr}'")
-            
+            # CANONICAL BAND ORDER: b1 = Red, decided by the loader's real
+            # channel order -- never by the channel count.
+            #
+            # Was: rewrite the EXPRESSION STRING (b1<->b3) whenever the image
+            # happened to have exactly 3 channels. Two separate failures:
+            #   * A shape guess. On a raster over _EDITOR_PREVIEW_BYTES the
+            #     editor holds a 3-band DECIMATED PREVIEW from raster_reader,
+            #     whose order is native ("rgb") -- and this swapped it anyway,
+            #     so `b1` meant Blue in the editor and Red at export time for
+            #     the same .ax (see apply_band_expression's note).
+            #   * String rewriting only ever handled b1/b3, so on a wider stack
+            #     `b4`+ was silently left addressing the wrong plane.
+            # Reordering the ARRAY (first three channels only) fixes both.
+            _src_order = str(src_channel_order
+                             or _chan_attr(self, "_editor_channel_order") or None
+                             or "bgr").lower()
+            base_expr = (_to_rgb_band_order(image, _src_order)
+                         if isinstance(image, np.ndarray) else image)
+
             # CRITICAL FIX: Build nodata mask using shared utility that supports expressions
             # This ensures expressions like "b1 > 143" create a SPATIAL mask from the
             # ORIGINAL multi-channel image, applied to ALL bands at those (x,y) locations
             nodata_mask = None
             if nodata_values and isinstance(image, np.ndarray):
                 from .utils import build_nodata_mask as _shared_build_nodata_mask
-                # Build mask from ORIGINAL image (before any band expression transform)
-                # bgr_input=True because image_editor works with BGR data
-                nodata_mask = _shared_build_nodata_mask(image, nodata_values, bgr_input=True)
-            
-            res = eval_band_expression(image, effective_expr)
+                # Build mask from ORIGINAL image (before any band expression
+                # transform). bgr_input is PROVENANCE, not a constant: a NoData
+                # expression "b1 > 143" shares the b1=Red namespace with the
+                # band expression evaluated just below.
+                nodata_mask = _shared_build_nodata_mask(
+                    image, nodata_values, bgr_input=_is_bgr_channel_order(_src_order))
+
+            res = eval_band_expression(base_expr, expr)
 
             # Restore nodata values in result (preserve original pixel values where nodata).
             # Boolean-indexed in-place assignment instead of np.where(...): the
             # latter allocates a whole new channel-sized array just to
             # recombine two arrays already sitting in memory, per channel.
-            if nodata_mask is not None and isinstance(res, np.ndarray):
+            #
+            # The restore source is `base_expr`, NOT `image`: a channel-wise
+            # restore only makes sense against the array the expression was
+            # actually evaluated on. When no reorder was needed `to_rgb_band_order`
+            # returns `image` itself, so this is byte-for-byte the previous
+            # behaviour in every non-BGR case.
+            if nodata_mask is not None and isinstance(res, np.ndarray) \
+                    and isinstance(base_expr, np.ndarray):
                 if res.shape[:2] == nodata_mask.shape:
                     # Preserve original values where nodata
-                    if res.ndim == image.ndim:
+                    if res.ndim == base_expr.ndim:
                         if res.ndim == 2:
-                            res[nodata_mask] = image.astype(res.dtype)[nodata_mask]
+                            res[nodata_mask] = base_expr.astype(res.dtype)[nodata_mask]
                         else:
-                            n_ch = min(res.shape[2], image.shape[2] if image.ndim == 3 else 1)
-                            if image.ndim == 3 and n_ch == image.shape[2] == res.shape[2]:
+                            n_ch = min(res.shape[2], base_expr.shape[2] if base_expr.ndim == 3 else 1)
+                            if base_expr.ndim == 3 and n_ch == base_expr.shape[2] == res.shape[2]:
                                 # Common case: identical channel counts -- one
                                 # broadcast assignment covers every band.
-                                res[nodata_mask] = image.astype(res.dtype)[nodata_mask]
+                                res[nodata_mask] = base_expr.astype(res.dtype)[nodata_mask]
                             else:
                                 for c in range(n_ch):
-                                    img_ch = image[..., c] if image.ndim == 3 else image
+                                    img_ch = base_expr[..., c] if base_expr.ndim == 3 else base_expr
                                     res[..., c][nodata_mask] = img_ch.astype(res.dtype)[nodata_mask]
 
             self.last_band_float_result = res.copy()
@@ -4304,11 +4335,16 @@ class ImageEditorDialog(QDialog):
                     logging.warning(f"[_update_hist_plot] correction preview failed: {e}")
                     corrected = None
 
-            # Native cv2/app channel order is BGR (see "image_editor works with BGR
-            # data" elsewhere in this file), so label 3-channel imagery accordingly
-            # rather than assuming RGB.
+            # These label the histogram tabs by the PHYSICAL identity of each
+            # array plane, so they must follow the loader's real channel order
+            # (cv2 -> B,G,R; tifffile/raster_reader -> R,G,B), not the channel
+            # count. Hardcoding ["Blue","Green","Red"] for every 3-band image
+            # mislabelled every tifffile-loaded raster's tabs.
             if C == 3:
-                band_names = ["Blue", "Green", "Red"]
+                band_names = (["Blue", "Green", "Red"]
+                              if _is_bgr_channel_order(
+                                  _chan_attr(self, "_editor_channel_order", "bgr") or "bgr")
+                              else ["Red", "Green", "Blue"])
             elif C == 1:
                 band_names = ["Gray"]
             else:
@@ -4759,7 +4795,7 @@ class ImageEditorDialog(QDialog):
             # _load_raw_image / _load_editor_preview now record which loader
             # produced the pixels; that is the only trustworthy source here.
             try:
-                order = getattr(self, "_editor_channel_order", None)
+                order = _chan_attr(self, "_editor_channel_order") or None
                 if not isinstance(order, str) or not order:
                     # Fall back to the loader heuristic, NOT to any parent
                     # state: cv2 handles <=4-band images (BGR), tifffile
@@ -5724,11 +5760,13 @@ class ImageEditorDialog(QDialog):
         # The previous `need > loaded` shortcut was wrong on any raster over
         # _EDITOR_PREVIEW_BYTES (256 MB), where the editor holds only the 3
         # DISPLAY bands: for `b1+b2`, need=2 and loaded=3, so the full load was
-        # skipped and the expression ran against the 3-band preview. Worse,
-        # because that preview has C == 3, process_band_expression's BGR->RGB
-        # remap fires and swaps b1<->b3 -- so `b1` silently addressed a
-        # different channel here than at export time, where the same expression
-        # runs on the full cube with no remap. Same .ax, two different answers.
+        # skipped and the expression ran against the 3-band preview -- i.e.
+        # against `b1`/`b2` of the DISPLAY SUBSET rather than of the file.
+        # (Historically it was worse still: process_band_expression's remap was
+        # a `C == 3` shape guess, so it also swapped b1<->b3 on that
+        # native-order preview. That part is fixed -- the remap now keys off
+        # _editor_channel_order -- but the band-SUBSET problem is inherent and
+        # is what this full load exists to prevent.)
         #
         # Correctness over speed (explicit product decision): pay the load.
         try:
@@ -6981,8 +7019,15 @@ class ImageEditorDialog(QDialog):
         # this loop replaces.
         from .utils import iter_tiled_feature_matrices
         import functools
+        # The .ax's declared NoData reaches the feature builder so the SAME
+        # pixels training dropped are excluded here -- see
+        # utils.classification_invalid_rows.
+        _mods = self.modifications or {}
+        _cls_nodata = (list(_mods.get("nodata_values", []) or [])
+                       if _mods.get("nodata_enabled", True) else [])
         _builder = functools.partial(self._make_feature_stack_for_model,
-                                      normalization_cfg=normalization_cfg)
+                                      normalization_cfg=normalization_cfg,
+                                      nodata_values=_cls_nodata)
         aborted = False
         for row0, row1, X_tile, w in iter_tiled_feature_matrices(
                 img, feat_names, expressions, window_size, base_feature_names,
@@ -6997,9 +7042,22 @@ class ImageEditorDialog(QDialog):
             X_tile = np.ascontiguousarray(X_tile, dtype=np.float32)
             tile_total = (row1 - row0) * w
             out_offset = row0 * w
+            # Rows the builder marked NaN are the ones training would have
+            # dropped (NoData / non-finite / window off the image edge). They
+            # must not receive a class -- process_polygon's CSV percentages
+            # exclude exactly these pixels. They are still SENT to predict
+            # (zero-filled) rather than compacted out, purely to leave the
+            # tuned chunk/thread scheduling below untouched; their predictions
+            # are overwritten with UNCLASSIFIED_CLASS_INDEX immediately after.
+            _ineligible = ~np.all(np.isfinite(X_tile), axis=1)
+            if _ineligible.any():
+                X_tile[_ineligible] = 0.0
             if not _classify_chunk(X_tile, out_offset, tile_total):
                 aborted = True
                 break
+            if _ineligible.any():
+                pred_flat[out_offset:out_offset + tile_total][_ineligible] = \
+                    UNCLASSIFIED_CLASS_INDEX
 
         progress.setValue(total)
         progress.close()
@@ -7120,14 +7178,24 @@ class ImageEditorDialog(QDialog):
         return hasattr(m, "predict")
 
         # ---------- sklearn classification: features ----------
-    def _make_feature_stack_for_model(self, img, feature_names, expressions=None, window_size=1, base_feature_names=None, normalization_cfg=None):
+    def _make_feature_stack_for_model(self, img, feature_names, expressions=None, window_size=1, base_feature_names=None, normalization_cfg=None, src_channel_order=None, nodata_values=None):
         """
         Build features in the SAME order used at training time and return:
             X_flat: (H*W, F) float32
             (H, W): original image height/width
+
+        ROWS TRAINING WOULD HAVE DROPPED COME BACK ALL-NaN (non-finite,
+        NoData, or a window running off the image edge) -- see
+        `utils.classification_invalid_rows` and the twin note on
+        ProjectTab._make_feature_stack_for_model. This copy previously had no
+        NaN handling and no NoData handling at all, so the editor's Classify
+        preview covered a strictly larger pixel set than the CSV's class
+        percentages for the same image.
         Order rules:
-          • If img has exactly 3 channels (OpenCV BGR), remap to RGB → [R,G,B].
-          • If img has >3 channels, keep natural order as b1..bC, where b1=R, b2=G, b3=B.
+          • b1/red_channel = Red, b2 = Green, b3 = Blue -- channels 0 and 2 are
+            exchanged when, and only when, `src_channel_order` says the array is
+            BGR (see utils.to_rgb_band_order).
+          • Bands 4..N keep their own index: their index IS their identity.
           • Extras map to band_4, band_5, …
           • If expressions are provided, compute them and add to features.
           • If window_size > 1, extract spatial neighborhoods around each pixel.
@@ -7142,29 +7210,37 @@ class ImageEditorDialog(QDialog):
                 utils.fit_normalization/apply_normalization) -- applied to
                 X_flat right before it's returned, mirroring
                 ProjectTab._make_feature_stack_for_model's twin parameter.
-                Kept independent of that copy's extra NaN/Inf median-
-                imputation pass (which this copy does not have) -- adding
-                normalization here must not couple to that pre-existing
-                asymmetry between the two copies.
+            nodata_values: declared NoData literals for this image; rows whose
+                window contains one are marked NaN, exactly as training drops
+                them (utils.classification_invalid_rows).
+            src_channel_order: "bgr"/"rgb" -- the order img's first three
+                channels are actually in. Defaults to
+                `self._editor_channel_order` (recorded by _load_raw_image /
+                _load_editor_preview from the loader that produced the pixels),
+                then to "bgr". The old code instead swapped whenever `C == 3`
+                and never for C > 3, so a tifffile-loaded 3-band raster had its
+                features transposed relative to training, and a genuinely-BGR
+                4-band image was never corrected at all.
         """
         import numpy as np
         import re
         import logging
+        from .utils import mark_ineligible_rows as _mark_ineligible_rows
 
         if img is None:
             return None, (0, 0)
+
+        _src_order = str(src_channel_order
+                         or _chan_attr(self, "_editor_channel_order") or None
+                         or "bgr").lower()
 
         a = np.asarray(img)
         if a.ndim == 2:
             chans = [a.astype(np.float32, copy=False)]
         elif a.ndim == 3:
-            C = a.shape[2]
-            if C == 3:
-                # OpenCV is BGR → flip to RGB to match training
-                chans = [a[:, :, 2], a[:, :, 1], a[:, :, 0]]  # R, G, B
-            else:
-                # Multispectral stack: keep natural order b1..bC
-                chans = [a[:, :, i] for i in range(C)]
+            # CANONICAL BAND ORDER: provenance, not the channel count.
+            a_rgb = _to_rgb_band_order(a, _src_order)
+            chans = [a_rgb[:, :, i] for i in range(a_rgb.shape[2])]
             chans = [np.ascontiguousarray(c.astype(np.float32, copy=False)) for c in chans]
         else:
             return None, (0, 0)
@@ -7266,6 +7342,7 @@ class ImageEditorDialog(QDialog):
                 cube[:, :, i] = arr
 
             X_flat = cube.reshape(H * W, F)
+            X_flat = _mark_ineligible_rows(X_flat, H, W, window_size, nodata_values)
             if normalization_cfg is not None:
                 from .utils import apply_normalization
                 X_flat = apply_normalization(X_flat, normalization_cfg)
@@ -7297,6 +7374,7 @@ class ImageEditorDialog(QDialog):
         from .utils import build_windowed_feature_cube
         cube = build_windowed_feature_cube(padded, base_names, window_size, H, W)
         X_flat = cube.reshape(H * W, F)
+        X_flat = _mark_ineligible_rows(X_flat, H, W, window_size, nodata_values)
         if normalization_cfg is not None:
             from .utils import apply_normalization
             X_flat = apply_normalization(X_flat, normalization_cfg)

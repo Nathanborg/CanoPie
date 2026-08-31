@@ -170,6 +170,15 @@ def test_boolean_expression_band_failure_is_recorded(tmp_path):
 
 
 def test_boolean_expression_band_appends_correctly(tmp_path):
+    """`b1` in an appended expression is RED, like everywhere else.
+
+    `src_channel_order="rgb"` states the truth about `img`: it came from
+    `tifffile.imread`, which always returns the file's native band order (this
+    fixture is written with photometric="rgb", so plane 0 IS Red). The replay
+    now resolves b1 from that PROVENANCE instead of guessing from the channel
+    count -- without it the call falls back to the historical "assume BGR"
+    default and b1 would land on plane 2.
+    """
     src = str(tmp_path / "a.tif")
     _write_rgb_tiff(src, r=150, g=20, b=30)
     tab = _stub_tab(tmp_path)
@@ -177,11 +186,37 @@ def test_boolean_expression_band_appends_correctly(tmp_path):
     ax = {"appended_bands": [{"type": "boolean_expression", "index": 1,
                               "expression": "b1 > 100"}]}
     img = tifffile.imread(src)
-    out, C = tab._apply_ax_to_raw(img, ax, filepath=src)
+    out, C = tab._apply_ax_to_raw(img, ax, filepath=src, src_channel_order="rgb")
 
     assert C == 4
     assert getattr(tab, "_appended_band_error_count", 0) == 0
     assert out[0, 0, 3] == 1.0  # r=150 > 100 -> True
+
+
+def test_appended_expression_band_agrees_with_the_ax_band_expression(tmp_path):
+    """An APPENDED expression and the .ax's OWN band_expression must resolve
+    `b1` to the same physical band -- they run in the same function, on the same
+    array, so any disagreement is self-contradiction.
+
+    They used to disagree: the primary band_expression remapped (via a
+    b1<->b3 rewrite of the expression STRING whenever C == 3) while the
+    appended-band branches applied no remap at all.
+    """
+    src = str(tmp_path / "a.tif")
+    _write_rgb_tiff(src, r=150, g=20, b=30)
+    img = tifffile.imread(src)
+
+    for order, arr in (("rgb", img), ("bgr", img[..., ::-1].copy())):
+        tab = _stub_tab(tmp_path)
+        ax = {"band_expression": "b1", "band_enabled": True,
+              "appended_bands": [{"type": "band_expression", "index": 1,
+                                  "expression": "b1"}]}
+        out, C = tab._apply_ax_to_raw(arr.copy(), ax, filepath=src,
+                                      src_channel_order=order)
+        assert C == 5, f"{order}: expected 3 source + band_expression + appended"
+        assert getattr(tab, "_appended_band_error_count", 0) == 0
+        assert out[0, 0, 3] == 150.0, f"{order}: .ax band_expression b1 was not Red"
+        assert out[0, 0, 4] == 150.0, f"{order}: appended-band b1 was not Red"
 
 
 def test_band_expression_failure_is_recorded(tmp_path):
