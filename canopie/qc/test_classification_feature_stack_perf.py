@@ -182,11 +182,14 @@ def test_both_copies_agree_with_each_other(window_size):
 
     assert hw_editor == hw_pt == (9, 13)
     assert X_editor is not None and X_pt is not None
-    assert np.array_equal(X_editor, X_pt), (
-        "the two copies must produce identical features for a plain "
-        "3-channel image with no NaN/Inf -- the only documented "
-        "difference between them (project_tab's NaN sanitization pass) "
-        "must not change output when there's nothing to sanitize")
+    # equal_nan: for window_size > 1 BOTH copies now mark the image-border
+    # rows NaN (the pixels training skips -- see
+    # utils.classification_invalid_rows), and NaN != NaN. The point of this
+    # test is that the two copies agree, including about WHERE those
+    # excluded rows are.
+    assert np.array_equal(X_editor, X_pt, equal_nan=True), (
+        "the two copies must produce identical features, including the same "
+        "set of training-ineligible (NaN-marked) rows")
 
 
 @pytest.mark.parametrize("window_size", [3, 5])
@@ -207,7 +210,22 @@ def test_editor_copy_matches_independent_reference(window_size):
               "green_channel": np.pad(chans[1], half, mode="edge"),
               "blue_channel": np.pad(chans[2], half, mode="edge")}
     ref = _old_loop_reference(padded, base_names, window_size, H, W)
-    assert np.array_equal(X, ref)
+
+    # The vectorized builder must still reproduce the original loop's values
+    # for every pixel whose window lies entirely INSIDE the image. The border
+    # is deliberately different now: those rows come back NaN because
+    # train_models skips them (`if yy - half < 0 or ...: continue`) and
+    # process_polygon skips them too, so classifying them from edge-padded
+    # neighbours made the viewer disagree with the CSV. See
+    # utils.window_edge_rows.
+    edge = utils.window_edge_rows(H, W, window_size)
+    interior = ~edge
+    assert interior.any(), "test setup: no interior pixels at this window size"
+    assert np.array_equal(X[interior], ref[interior]), (
+        "interior feature rows changed -- the vectorized builder no longer "
+        "reproduces the original per-pixel loop")
+    assert np.all(np.isnan(X[edge])), (
+        "window-edge rows must be marked ineligible, not edge-padded")
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +325,10 @@ def test_tiled_path_peak_memory_is_bounded_not_whole_image(monkeypatch):
         for row0, row1, X_tile, w in utils.iter_tiled_feature_matrices(
                 img, feat_names, [], window_size, base_names, budget, builder):
             n_tiles += 1
-            checksum += float(X_tile.sum())  # touch it, then let it be discarded
+            # nansum: window-edge rows come back NaN by design (see
+            # utils.window_edge_rows), and a plain sum() would make this
+            # sanity checksum NaN rather than "we touched real data".
+            checksum += float(np.nansum(X_tile))  # touch it, then discard
         _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
@@ -331,7 +352,17 @@ def test_tiled_path_peak_memory_is_bounded_not_whole_image(monkeypatch):
     X_full, _ = ImageEditorDialog._make_feature_stack_for_model(
         None, img, feat_names, expressions=None, window_size=window_size,
         base_feature_names=base_names)
-    assert np.array_equal(reassembled, X_full)
+    # equal_nan: the window-edge rows are NaN-marked in BOTH paths, and this
+    # assertion's real content is that tiling reproduces the whole-image
+    # result exactly -- including putting the ineligible rows in the same
+    # places. The halo rows iter_tiled_feature_matrices adds are what makes
+    # that true: an interior tile seam must NOT look like an image edge.
+    assert np.array_equal(reassembled, X_full, equal_nan=True)
+    edge = utils.window_edge_rows(H, W, window_size)
+    assert np.all(np.isnan(reassembled[edge])), "tiled path lost the edge marking"
+    assert not np.isnan(reassembled[~edge]).any(), (
+        "tiled path marked INTERIOR rows ineligible -- a tile seam was "
+        "mistaken for the image edge")
 
 
 # ---------------------------------------------------------------------------

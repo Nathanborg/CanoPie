@@ -369,24 +369,48 @@ def test_tile_band_math_honours_the_enable_flag(synthetic_project):
     assert out.shape == win.shape
 
 
-def test_tile_band_math_uses_the_same_bgr_rule_as_the_editor(synthetic_project):
-    """`_do_band_expr` treats an exactly-3-channel image as cv2-style BGR unless
-    the .ax overrides it, so `b1` is RED. The tile must agree or a 3-band index
-    comes out with its operands swapped."""
+def test_tile_band_math_resolves_b1_to_red_for_a_native_order_window(synthetic_project):
+    """CONVENTION: `b1` is RED everywhere, and whether channels 0 and 2 must be
+    exchanged to make that true is PROVENANCE, not the channel count.
+
+    A high-res tile is read by raster_reader's own windowed reader, which never
+    goes through cv2 and therefore always hands back the file's NATIVE band
+    order -- channel 0 IS Red. So the tile must NOT swap anything.
+
+    This test used to be named ..._uses_the_same_bgr_rule_as_the_editor and
+    asserted the opposite: that a 3-channel window is "cv2-style BGR unless the
+    .ax overrides it", i.e. b1 == channel 2. That was the shape guess this whole
+    change removes. It made a zoom tile's band math disagree with the very
+    preview it is drawn on top of (the preview replays the .ax through
+    apply_aux_modifications, which now keys off ImageData.channel_order). It
+    also honoured an `ax["channel_order"]` override that NOTHING in the codebase
+    has ever written -- only `ax["hist_match"]["channel_order"]` is -- so in
+    practice that branch was dead and every 3-band tile got swapped.
+    """
     win = np.zeros((2, 2, 3), dtype=np.float32)
-    win[..., 0] = 1.0        # cv2 blue plane
-    win[..., 2] = 9.0        # cv2 red plane
+    win[..., 0] = 1.0        # native band 1 -- Red
+    win[..., 2] = 9.0        # native band 3 -- Blue
 
-    default = synthetic_project._tile_apply_band_expression(
+    out = synthetic_project._tile_apply_band_expression(
         win, {"band_enabled": True, "band_expression": "b1"})
-    assert np.allclose(default[..., -1], 9.0), (
-        "b1 did not resolve to the RED plane for a 3-channel image")
+    assert np.allclose(out[..., -1], 1.0), (
+        "b1 must address the window's FIRST band: the tiled reader is always "
+        "native order, so no R/B exchange may happen here")
 
-    forced = synthetic_project._tile_apply_band_expression(
-        win, {"band_enabled": True, "band_expression": "b1",
-              "channel_order": "rgb"})
-    assert np.allclose(forced[..., -1], 1.0), (
-        'channel_order "rgb" was ignored')
+    # The dead `ax["channel_order"]` override must stay dead -- a key nobody
+    # writes must not be able to flip the meaning of b1 back.
+    for bogus in ("bgr", "rgb", "nonsense"):
+        forced = synthetic_project._tile_apply_band_expression(
+            win, {"band_enabled": True, "band_expression": "b1",
+                  "channel_order": bogus})
+        assert np.allclose(forced[..., -1], 1.0), (
+            f'ax["channel_order"]={bogus!r} changed what b1 means; the tile '
+            "reader's own provenance is the only authority")
+
+    # b3 is the other end of the same rule.
+    out_b3 = synthetic_project._tile_apply_band_expression(
+        win, {"band_enabled": True, "band_expression": "b3"})
+    assert np.allclose(out_b3[..., -1], 9.0)
 
 
 # ---------------------------------------------------------------------------

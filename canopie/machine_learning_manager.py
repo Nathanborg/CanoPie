@@ -62,6 +62,14 @@ from .utils import (
     collect_polygon_property_keys, iter_polygons_by_group,
     polygon_property_column, polygon_property_values,
 )
+# The single canonical answer to "which array index is b1?" -- see the
+# "CANONICAL BAND ORDER" block in utils.py. Imported explicitly (the star
+# import above already provides them) so grep for the helper lands here too.
+from .utils import (
+    to_rgb_band_order as _to_rgb_band_order,
+    is_bgr_channel_order as _is_bgr_channel_order,
+    channel_order_attr as _chan_attr,
+)
 from .loaders import ImageProcessor, ImageLoaderWorker
 from .image_data import ImageData
 from . import ml_augmentation
@@ -1232,6 +1240,16 @@ class MachineLearningManager(QtWidgets.QDialog):
         `img` directly (an expression can reference a band beyond the
         selected set), never `chans`.
 
+        CANONICAL BAND ORDER: because expressions read `img` and band features
+        read `chans`, the two have to agree about what `b1` is. `chans` is
+        provenance-aware (_channels_in_export_order yields R,G,B,4..N);
+        `img` was fed to eval_band_expression RAW, with no remap at all. So on
+        any cv2-loaded (BGR) image, training built feature column
+        "red_channel" from Red while the custom expression in the SAME feature
+        row computed `b1` from Blue -- an inconsistency inside a single
+        training run, and one that then disagreed with inference. Both sides
+        now go through the same order.
+
         Returns (selected_chans: list[np.ndarray|None],
         expr_images: list[np.ndarray|None]).
         """
@@ -1249,7 +1267,13 @@ class MachineLearningManager(QtWidgets.QDialog):
             except ImportError:
                 eval_band_expression = None
 
+            # Same first-3 reordering _channels_in_export_order applies to the
+            # band features, so `b1` in an expression and "red_channel" in the
+            # feature list name the same physical band. Bands 4+ untouched.
             img_for_expr = img.astype(np.float32, copy=False)
+            if isinstance(img_for_expr, np.ndarray):
+                img_for_expr = _to_rgb_band_order(
+                    img_for_expr, self._current_channel_order())
 
             for expr_name, expr_str in selected_expressions:
                 try:
@@ -2226,7 +2250,12 @@ class MachineLearningManager(QtWidgets.QDialog):
             # depending on which polygon happened to sample it) ----
             variant_chans_expr = []  # list of (selected_chans, expr_images), one per augmented variant
             if augmentation_enabled:
-                aug_nodata_mask = (build_nodata_mask(img, nodata_values, bgr_input=True)
+                # bgr_input is PROVENANCE: "b1<123" must exclude the same
+                # pixels the band features and expressions are built from.
+                aug_nodata_mask = (build_nodata_mask(
+                                        img, nodata_values,
+                                        bgr_input=_is_bgr_channel_order(
+                                            self._current_channel_order()))
                                     if nodata_values else np.zeros((H, W), dtype=bool))
                 if poly_mask is not None:
                     aug_nodata_mask = aug_nodata_mask | poly_mask
@@ -3162,7 +3191,7 @@ class MachineLearningManager(QtWidgets.QDialog):
             res = np.mean(res.astype(np.float32, copy=False), axis=2)
         return res.astype(np.float32, copy=False)  # keep NaNs; no nan_to_num
 
-    def _apply_ax_to_raw(self, raw_img, ax, force_hist=True):
+    def _apply_ax_to_raw(self, raw_img, ax, force_hist=True, src_channel_order=None):
         """
         Order-agnostic, stack-safe replay of scientific steps:
 
@@ -3173,12 +3202,25 @@ class MachineLearningManager(QtWidgets.QDialog):
             the rect is remapped so pixels/coords stay consistent.
           • For >4ch stacks, resize/rotate are applied per-channel where needed.
 
+        `src_channel_order` ("bgr"/"rgb") is the order `raw_img`'s first three
+        channels are actually in; it is the SINGLE authority for what `b1`
+        means in the band expression and the NoData expressions replayed here.
+        When omitted it falls back to `_current_channel_order()`, which reads
+        the provenance `_load_raw_image` / ProjectTab._get_export_image
+        recorded.
+
         Returns (float32 image in HxWxC, C)
         """
         import numpy as np, cv2, logging
 
         if raw_img is None:
             return None, 0
+
+        # Channel-order provenance for this replay. Everything below that has
+        # to decide "which array index is b1" reads THIS, never the channel
+        # count (see the "CANONICAL BAND ORDER" block in utils.py).
+        _src_order = str(src_channel_order or self._current_channel_order() or "bgr").lower()
+        _src_is_bgr = _is_bgr_channel_order(_src_order)
 
         # ---- helpers ----
         def _dims_after_rot(w, h, deg):
@@ -3272,8 +3314,8 @@ class MachineLearningManager(QtWidgets.QDialog):
             # to an RGB-ordered stack trains the model on Red/Blue-transposed
             # features -- silently, and differently from what the CSV export and
             # the viewer would show for the same .ax.
-            _src_order = str(getattr(getattr(self, "parent_tab", None),
-                                     "_last_export_channel_order", "") or "").lower()
+            _src_order = str(_chan_attr(_chan_attr(self, "parent_tab"),
+                                        "_last_export_channel_order") or "").lower()
             try:
                 return fn(img, mods,
                           nodata_values=nodata_vals,
@@ -3503,9 +3545,15 @@ class MachineLearningManager(QtWidgets.QDialog):
 
         # Uses shared utility supporting expressions
         def _build_nodata_mask(arr, nd_vals):
-            """Build boolean mask where True = NoData pixel. Supports both numeric literals and threshold expressions."""
+            """Build boolean mask where True = NoData pixel. Supports both numeric literals and threshold expressions.
+
+            bgr_input is PROVENANCE (_src_is_bgr), not a constant: a NoData
+            expression "b1<123" lives in the same b1=Red namespace as the band
+            expression replayed a few lines below, so both must resolve b1
+            through the order the array is really in.
+            """
             from .utils import build_nodata_mask as _shared_build_nodata_mask
-            return _shared_build_nodata_mask(arr, nd_vals, bgr_input=True)
+            return _shared_build_nodata_mask(arr, nd_vals, bgr_input=_src_is_bgr)
 
         def _do_hist():
             """Apply histogram matching now (explicit stage)."""
@@ -3628,24 +3676,21 @@ class MachineLearningManager(QtWidgets.QDialog):
             if not expr:
                 return
             x = img.astype(np.float32, copy=False)
-            
-            # FIX: Remap band references for 3-channel BGR images
-            # User sees image as RGB (display converts BGR→RGB), so when they type b1
-            # they expect it to refer to Red (what they see as channel 1).
-            # But data is BGR, so b1 would be Blue without remapping.
-            # Swap b1↔b3 so expression matches visual expectation.
-            effective_expr = expr
-            C = x.shape[2] if x.ndim == 3 else 1
-            if C == 3:
-                import re
-                # BGR→RGB remapping: b1↔b3 (b2 stays the same)
-                effective_expr = re.sub(r'\bb1\b', '__B1_TEMP__', effective_expr)
-                effective_expr = re.sub(r'\bb3\b', 'b1', effective_expr)
-                effective_expr = re.sub(r'__B1_TEMP__', 'b3', effective_expr)
-                if effective_expr != expr:
-                    logging.info(f"[_do_band_expr] Remapped BGR→RGB: '{expr}' → '{effective_expr}'")
-            
-            idx = self._eval_band_expression(x, effective_expr)
+
+            # CANONICAL BAND ORDER: b1 = Red. Reorder the ARRAY (first three
+            # channels only), driven by the loader's real channel order.
+            #
+            # Was: rewrite the EXPRESSION STRING (b1<->b3) whenever `C == 3` --
+            # a shape guess, and doubly wrong:
+            #   * it fired for tifffile-loaded (already native/RGB) stacks,
+            #     making the same .ax expression mean Blue here and Red in the
+            #     viewer;
+            #   * it only ever handled b1/b3, so `b4`+ on a wider stack was
+            #     never remapped, and a genuinely-BGR 4-band image kept b1=Blue.
+            # The appended expression band lands at index 3+ and is never
+            # reordered, so `x` (not the reordered view) is what we stack onto.
+            base_expr = _to_rgb_band_order(x, _src_order)
+            idx = self._eval_band_expression(base_expr, expr)
             img = np.dstack([x, idx.astype(np.float32, copy=False)]) if idx is not None else x
 
         # Execute crop/rotate in the correct order based on crop_rect_ref_size
@@ -3743,6 +3788,13 @@ class MachineLearningManager(QtWidgets.QDialog):
         - For .tif/.tiff: try tifffile first (full stack), then ImageData, then Pillow page stack, last OpenCV.
         - For everything else: try ImageData, then OpenCV.
         Always return 2D or HxWxC (channels last).
+
+        Also records `self._last_ml_raw_channel_order` -- "rgb" when
+        tifffile/Pillow produced the pixels (native file band order) and "bgr"
+        when ImageData/cv2 did. This method picks the WINNING candidate by band
+        count, so the order has to be tracked per candidate rather than inferred
+        afterwards from the extension. `_current_channel_order()` reads it, and
+        every b1-resolving decision downstream reads that.
         """
         import os, logging, numpy as np
 
@@ -3763,6 +3815,7 @@ class MachineLearningManager(QtWidgets.QDialog):
         # --- TIFF path: tifffile FIRST (full stacks), then ImageData, then Pillow, then OpenCV
         if ext in (".tif", ".tiff"):
             best = None; best_c = 0
+            best_order = "bgr"
 
             # 1) tifffile
             try:
@@ -3775,18 +3828,20 @@ class MachineLearningManager(QtWidgets.QDialog):
                 arr_tt = self._ensure_hwc(arr_tt, axes=_axes)
                 c_tt = _count_channels(arr_tt)
                 if c_tt > best_c:
-                    best, best_c = arr_tt, c_tt
+                    best, best_c, best_order = arr_tt, c_tt, "rgb"  # tifffile = native order
             except Exception as e:
                 logging.warning(f"tifffile failed on {filepath}: {e}")
 
-            # 2) ImageData 
+            # 2) ImageData
             try:
                 mode = getattr(self.parent_tab, "mode", None)
                 data = ImageData(filepath, mode=mode) if mode else ImageData(filepath)
                 arr_id = self._ensure_hwc(data.image)
                 c_id = _count_channels(arr_id)
                 if c_id > best_c:
-                    best, best_c = arr_id, c_id
+                    # ImageData reads through cv2.imread/imdecode -> BGR.
+                    best, best_c, best_order = arr_id, c_id, str(
+                        getattr(data, "channel_order", "bgr") or "bgr")
             except Exception:
                 pass
 
@@ -3807,7 +3862,7 @@ class MachineLearningManager(QtWidgets.QDialog):
                         arr_pil = self._ensure_hwc(arr_pil)
                         c_pil = _count_channels(arr_pil)
                         if c_pil > best_c:
-                            best, best_c = arr_pil, c_pil
+                            best, best_c, best_order = arr_pil, c_pil, "rgb"  # PIL = RGB
                 except Exception as ee:
                     logging.warning(f"Pillow fallback failed on {filepath}: {ee}")
 
@@ -3815,7 +3870,9 @@ class MachineLearningManager(QtWidgets.QDialog):
             if best is None:
                 arr_cv = cv2.imread(filepath, cv2.IMREAD_UNCHANGED)
                 best = self._ensure_hwc(arr_cv)
+                best_order = "bgr"  # cv2 always decodes colour to BGR
 
+            self._record_raw_channel_order(best_order)
             try:
                 logging.info(f"[ML TIFF] {os.path.basename(filepath)} -> shape={np.asarray(best).shape}")
             except Exception:
@@ -3826,11 +3883,13 @@ class MachineLearningManager(QtWidgets.QDialog):
         try:
             mode = getattr(self.parent_tab, "mode", None)
             data = ImageData(filepath, mode=mode) if mode else ImageData(filepath)
+            self._record_raw_channel_order(getattr(data, "channel_order", "bgr"))
             return self._ensure_hwc(data.image)
         except Exception:
             pass
 
         arr = cv2.imread(filepath, cv2.IMREAD_UNCHANGED)
+        self._record_raw_channel_order("bgr")  # cv2 always decodes to BGR
         return self._ensure_hwc(arr)
 
     def _apply_hist_match(self, img, mods):
@@ -3890,10 +3949,17 @@ class MachineLearningManager(QtWidgets.QDialog):
             except Exception:
                 pass
 
-        # Fallback: local RAW + .ax replay
+        # Fallback: local RAW + .ax replay.
+        # _load_raw_image just recorded which loader produced these pixels;
+        # pass that explicitly rather than letting _apply_ax_to_raw fall back to
+        # _current_channel_order(), whose first choice is the parent tab's
+        # _last_export_channel_order -- which, on this branch, is whatever the
+        # delegate above left behind before it failed.
         raw = self._load_raw_image(filepath)
         ax  = self._load_ax_mods(filepath)
-        img, C = self._apply_ax_to_raw(raw, ax, force_hist=True)
+        img, C = self._apply_ax_to_raw(
+            raw, ax, force_hist=True,
+            src_channel_order=self._last_raw_order_or_none())
         return img, C
 
     def _get_geometry_only_image(self, filepath):
@@ -4139,10 +4205,16 @@ class MachineLearningManager(QtWidgets.QDialog):
         resize_enabled = ax.get("resize_enabled", True)
 
         # Uses shared utility supporting expressions
+        _geom_is_bgr = _is_bgr_channel_order(self._current_channel_order())
+
         def _build_nodata_mask(arr, nd_vals):
-            """Build boolean mask where True = NoData pixel. Supports both numeric literals and threshold expressions."""
+            """Build boolean mask where True = NoData pixel. Supports both numeric literals and threshold expressions.
+
+            bgr_input is PROVENANCE, not a constant -- "b1<123" must name the
+            same physical band here that it does in band math and CSV export.
+            """
             from .utils import build_nodata_mask as _shared_build_nodata_mask
-            return _shared_build_nodata_mask(arr, nd_vals, bgr_input=True)
+            return _shared_build_nodata_mask(arr, nd_vals, bgr_input=_geom_is_bgr)
 
         # op order from ax - ONLY geometric operations
         # Use dynamic order detection based on crop_rect_ref_size
@@ -4426,7 +4498,13 @@ class MachineLearningManager(QtWidgets.QDialog):
             from .utils import build_nodata_mask as _shared_build_nodata_mask
             # Build full image from channels to pass to shared function
             full_img = np.stack([chans[i].astype(np.float32) for i in range(len(chans))], axis=-1) if len(chans) > 1 else chans[0][..., None]
-            nodata_mask = _shared_build_nodata_mask(full_img, nodata_values, bgr_input=True)
+            # CANONICAL BAND ORDER: `chans` came out of
+            # _channels_in_export_order, i.e. it is ALREADY R,G,B,(4..N) --
+            # b1 is index 0 here by construction. bgr_input=True (the old
+            # value) re-applied the swap on top of that, so a NoData
+            # expression "b1<123" read BLUE while the feature matrix built
+            # from the very same `chans` two lines below used RED.
+            nodata_mask = _shared_build_nodata_mask(full_img, nodata_values, bgr_input=False)
             if nodata_mask is not None:
                 combined_mask |= nodata_mask
         
@@ -4435,11 +4513,23 @@ class MachineLearningManager(QtWidgets.QDialog):
             combined_mask |= mask_polygon_mask
 
         X = np.stack([m.reshape(-1) for m in mats], axis=1)  # (H*W, F)
+
+        # Rows TRAINING would have dropped (non-finite, or a numeric NoData
+        # literal in any feature) must not be predicted. Two reasons: it keeps
+        # this preview describing the same pixel population as
+        # process_polygon's CSV class percentages, and it stops ONE NaN pixel
+        # from making model.predict raise and this whole function return None
+        # -- which previously produced no class map at all rather than a class
+        # map with a hole in it.
+        from .utils import classification_invalid_rows as _invalid_rows
+        combined_mask |= _invalid_rows(
+            X, H, W, 1, nodata_values).reshape(H, W)
+
         normalization_cfg = bundle.get("normalization")
         if normalization_cfg is not None:
             X = apply_normalization(X, normalization_cfg)
         valid = ~combined_mask.reshape(-1)  # Use combined mask
-        
+
         if not np.any(valid):
             return None
 
@@ -4471,6 +4561,56 @@ class MachineLearningManager(QtWidgets.QDialog):
         y_all[valid] = y_num
         return y_all.reshape(H, W)
 
+    def _current_channel_order(self):
+        """Which order the pixels this manager is currently working on are in.
+
+        THE one provenance lookup for this class -- every place in here that
+        has to decide "which array index is b1" must call this instead of
+        testing `C == 3` (see the "CANONICAL BAND ORDER" block in utils.py).
+
+        Priority:
+          1. `parent_tab._last_export_channel_order` -- set by
+             ProjectTab._get_export_image on EVERY call, and this manager's own
+             `_get_export_image` delegates there whenever a parent_tab exists,
+             so it always describes the array just handed back.
+          2. `self._last_ml_raw_channel_order` -- recorded by this class's own
+             `_load_raw_image` fallback (tifffile/PIL -> "rgb", ImageData/cv2 ->
+             "bgr"), used when there is no parent_tab to delegate to.
+          3. "bgr" -- the historical assumption, kept explicit here rather than
+             scattered across a dozen `or "bgr"` defaults.
+
+        Every lookup is wrapped: this class is a QDialog subclass, and reading
+        ANY missing attribute on an instance built with
+        `MachineLearningManager.__new__(...)` (which several QC tests and
+        headless helpers do, since the real __init__ builds a whole UI) raises
+        RuntimeError "super-class __init__() was never called" from sip -- not
+        AttributeError, so a plain `getattr(..., default)` does NOT absorb it.
+        An unavailable attribute simply means "provenance unknown", which is
+        precisely what the fallback chain is for.
+        """
+        pt = _chan_attr(self, "parent_tab") or None
+        return (str(_chan_attr(pt, "_last_export_channel_order") or "").strip().lower()
+                or str(_chan_attr(self, "_last_ml_raw_channel_order") or "").strip().lower()
+                or "bgr")
+
+    def _last_raw_order_or_none(self):
+        """What `_load_raw_image` recorded for the array it last returned, or
+        None if it has not run. Deliberately does NOT consult parent_tab: the
+        caller (this class's `_get_export_image` fallback) is holding pixels
+        THIS class just loaded, and parent_tab's flag describes whatever file
+        the ProjectTab export path last touched. Attribute access is wrapped
+        for the same sip/QDialog reason as _current_channel_order."""
+        v = str(_chan_attr(self, "_last_ml_raw_channel_order") or "").strip().lower()
+        return v or None
+
+    def _record_raw_channel_order(self, order):
+        """Store `_load_raw_image`'s provenance, tolerating a QDialog instance
+        that never ran __init__ (see _current_channel_order)."""
+        try:
+            self._last_ml_raw_channel_order = str(order or "bgr").strip().lower()
+        except Exception:
+            pass
+
     def _channels_in_export_order(self, img):
         """
         Return a list of 2D float32 arrays (each C-contiguous) in export order.
@@ -4500,18 +4640,24 @@ class MachineLearningManager(QtWidgets.QDialog):
         if pt is not None and hasattr(pt, "_channels_in_export_order"):
             return pt._channels_in_export_order(img)
 
+        # CANONICAL BAND ORDER: b1 = Red. Whether channels 0 and 2 must be
+        # exchanged is PROVENANCE (who loaded the array), never the channel
+        # count -- see _current_channel_order and utils.to_rgb_band_order.
+        # The old body swapped unconditionally for every C >= 3, so on this
+        # no-parent_tab fallback a tifffile-loaded (already native/RGB) stack
+        # came back with R and B transposed, disagreeing with the identical
+        # ProjectTab method this normally delegates to.
+        _is_bgr = _is_bgr_channel_order(self._current_channel_order())
         if img.ndim == 3:
             C = img.shape[2]
-            if C == 3:
-                chans = [img[:, :, 2], img[:, :, 1], img[:, :, 0]]  # R,G,B from B,G,R
-            elif C > 3:
-                # FIX: First 3 channels are BGR from OpenCV, swap to RGB
-                # Then append remaining bands (band_expression result, label band, etc.) as-is
-                chans = [img[:, :, 2], img[:, :, 1], img[:, :, 0]]  # BGR -> RGB for first 3
+            if C >= 3 and _is_bgr:
+                # First three channels are B,G,R -> emit R,G,B; bands 4..N keep
+                # their own index (their index IS their identity).
+                chans = [img[:, :, 2], img[:, :, 1], img[:, :, 0]]
                 for i in range(3, C):
-                    chans.append(img[:, :, i])  # Keep additional bands in order
+                    chans.append(img[:, :, i])
             else:
-                chans = [img[:, :, i] for i in range(C)]  # C == 1 or 2
+                chans = [img[:, :, i] for i in range(C)]
         else:
             chans = [img]  # single-band
 
@@ -4958,8 +5104,8 @@ class MachineLearningManager(QtWidgets.QDialog):
         after _get_export_image, which always sets the flag first.
         """
         import numpy as np, cv2
-        _order = str(getattr(getattr(self, "parent_tab", None),
-                             "_last_export_channel_order", "rgb") or "rgb").lower()
+        _order = str(_chan_attr(_chan_attr(self, "parent_tab"),
+                                "_last_export_channel_order", "rgb") or "rgb").lower()
         is_bgr = _order == "bgr"
         if arr is None:
             return None

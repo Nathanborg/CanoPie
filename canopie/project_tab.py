@@ -75,6 +75,14 @@ from .utils import eval_band_expression
 from .utils import (
     polygon_property_cells, collect_polygon_property_keys, polygon_property_column,
 )
+# The single canonical answer to "which array index is b1?" -- see the
+# "CANONICAL BAND ORDER" block in utils.py. Imported explicitly (not just via
+# the star-import above) so grep for it lands here.
+from .utils import (
+    to_rgb_band_order as _to_rgb_band_order,
+    is_bgr_channel_order as _is_bgr_channel_order,
+    channel_order_attr as _chan_attr,
+)
 
 # High-performance computation module
 try:
@@ -779,13 +787,21 @@ class ThumbnailExportWorker(QtCore.QThread):
     def cancel(self):
         self._cancelled = True
     
-    def _load_image_bgr(self, filepath):
+    def _load_image_raw(self, filepath):
         """
-        Thread-safe raw load in NATIVE (BGR) channel order, Unicode-path safe.
+        Thread-safe raw load, Unicode-path safe. Returns `(arr, channel_order)`.
 
-        Used before replaying the .ax: `_apply_ax_to_raw` assumes BGR for band
-        references (b1=Red at index 2 on 3-channel imagery) and for NoData, so the
-        image must NOT be flipped to RGB until just before saving.
+        channel_order is "rgb" when tifffile/PIL supplied the array (native band
+        order) and "bgr" when the cv2 fallback did. It must be handed to
+        `_apply_ax_to_raw(src_channel_order=...)` so band math / NoData
+        expressions resolve b1 to Red, and consulted again before saving.
+
+        This method used to be called `_load_image_bgr` and its docstring
+        claimed it returned BGR -- but its FIRST branch is tifffile, which
+        never returns BGR. Callers believed the name: the .ax replay evaluated
+        band math on the wrong channels for every TIFF, and the save step
+        applied an unconditional `[..., ::-1]` "BGR->RGB" flip that actually
+        swapped R and B on already-RGB data. Name and behaviour now match.
         """
         import os
         import numpy as np
@@ -798,7 +814,7 @@ class ThumbnailExportWorker(QtCore.QThread):
                     axes = (tf.series[0].axes or "").upper() if tf.series else ""
                     arr = np.squeeze(tf.asarray())
                     arr = ensure_hwc(arr, axes=axes)
-                    return np.ascontiguousarray(arr)
+                    return np.ascontiguousarray(arr), "rgb"
             except Exception:
                 pass
         try:
@@ -807,7 +823,7 @@ class ThumbnailExportWorker(QtCore.QThread):
             img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
             if img is not None:
                 from .raster_reader import ensure_hwc
-                return ensure_hwc(img)
+                return ensure_hwc(img), "bgr"
         except Exception:
             pass
         try:
@@ -817,17 +833,21 @@ class ThumbnailExportWorker(QtCore.QThread):
             if im.mode == "P":
                 im = im.convert("RGBA")
             arr = np.array(im)
-            # PIL yields RGB; convert to BGR so the .ax replay sees the expected order.
-            if arr.ndim == 3 and arr.shape[2] >= 3:
-                arr = np.ascontiguousarray(arr[..., :3][..., ::-1])
             from .raster_reader import ensure_hwc
-            return ensure_hwc(arr)
+            return ensure_hwc(arr), "rgb"   # PIL yields RGB natively
         except Exception:
             pass
-        return None
+        return None, "bgr"
 
     def _load_image_simple(self, filepath):
-        """Thread-safe image loading without Qt dependencies. Returns RGB."""
+        """Thread-safe image loading without Qt dependencies. Returns RGB.
+
+        NOTE: not used by run() any more -- it loads through `_load_image_raw`,
+        which reports the loader's real channel order instead of normalising to
+        RGB. Kept because it is a public-ish helper on this worker; held to the
+        same canonical rule so it cannot be revived as a fresh source of the
+        channel-order bug.
+        """
         import numpy as np
 
         # Try OpenCV first (usually more reliable)
@@ -836,10 +856,10 @@ class ThumbnailExportWorker(QtCore.QThread):
             data = np.fromfile(filepath, dtype=np.uint8)
             img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
             if img is not None:
-                # BGR->RGB for 3-channel
-                if img.ndim == 3 and img.shape[2] == 3:
-                    img = img[..., ::-1].copy()
-                return img
+                # cv2 always decodes colour to BGR: provenance known here, not
+                # guessed from the channel count. The helper also fixes BGRA
+                # (C == 4), which the old `shape[2] == 3` guard left in BGR.
+                return np.ascontiguousarray(_to_rgb_band_order(img, "bgr"))
         except Exception:
             pass
         
@@ -928,11 +948,12 @@ class ThumbnailExportWorker(QtCore.QThread):
                     # region); and it never rescaled points from image_ref_size.
                     # Background is the DEFAULT button, so most thumbnails came from here.
                     #
-                    # NOTE: load in BGR (no channel flip). _apply_ax_to_raw assumes BGR for
-                    # band references (b1=Red at index 2) and NoData; flipping to RGB before
-                    # the replay would silently evaluate band math on the wrong channels.
-                    # The flip to RGB happens once, just before saving.
-                    img = self._load_image_bgr(filepath)
+                    # NOTE: load WITHOUT flipping channels and carry the loader's
+                    # real order alongside the array. _apply_ax_to_raw resolves
+                    # b1=Red from that order (band math + NoData expressions);
+                    # the flip to RGB for saving happens once, at the end, and
+                    # only when the array really is BGR.
+                    img, _img_order = self._load_image_raw(filepath)
                     if img is None:
                         errors += 1
                         continue
@@ -941,6 +962,7 @@ class ThumbnailExportWorker(QtCore.QThread):
                         if ax:
                             img, _C = self.project_tab._apply_ax_to_raw(
                                 img, ax, filepath=filepath,
+                                src_channel_order=_img_order,
                                 all_polygons=getattr(self.project_tab, "all_polygons", None))
                     except Exception as e:
                         logging.warning(f"[ThumbnailWorker] .ax replay failed for {os.path.basename(filepath)}: {e}")
@@ -974,9 +996,13 @@ class ThumbnailExportWorker(QtCore.QThread):
                     # Crop
                     crop = img[y_min:y_max, x_min:x_max]
 
-                    # Prepare for saving: PIL/imwrite below expect RGB, and `crop` is BGR.
+                    # Prepare for saving: PIL/imwrite below expect RGB. Whether
+                    # `crop` needs an R/B swap depends on the LOADER, not on the
+                    # channel count -- the old unconditional `[..., ::-1]` here
+                    # swapped R and B on every tifffile-loaded (already-RGB) TIF.
                     if crop.ndim == 3 and crop.shape[2] >= 3:
-                        crop_rgb = np.ascontiguousarray(crop[:, :, :3][..., ::-1])
+                        crop_rgb = np.ascontiguousarray(
+                            _to_rgb_band_order(crop, _img_order)[:, :, :3])
                     elif crop.ndim == 2:
                         crop_rgb = crop
                     else:
@@ -1661,7 +1687,7 @@ class ImageStretchDialog(QtWidgets.QDialog):
 
     def __init__(self, parent, base_image, initial_params=None, image_filepath="",
                  band_names=None, preview_bands=None, reload_bands_cb=None,
-                 set_preview_cb=None):
+                 set_preview_cb=None, src_channel_order=None):
         """
         band_names / preview_bands / reload_bands_cb are set for rasters shown as
         a preview, where `base_image` holds only the few bands currently on
@@ -1669,6 +1695,12 @@ class ImageStretchDialog(QtWidgets.QDialog):
         on a 284-band cube that hides 281 of them. When they are supplied the
         combos list every band in the file and `reload_bands_cb` fetches the
         pixels for a newly picked band on demand.
+
+        src_channel_order ("bgr"/"rgb") is `base_image`'s real channel order,
+        taken from the viewer's ImageData. It only matters on the
+        classification branch below, which replays the .ax through
+        apply_aux_modifications to build its statistics source -- that replay
+        must resolve b1 to the same physical band the viewer itself did.
         """
         super().__init__(parent)
         from PyQt5 import QtCore, QtGui, QtWidgets
@@ -1729,6 +1761,7 @@ class ImageStretchDialog(QtWidgets.QDialog):
             if has_classification:
                 stats_img = self.parent_tab.apply_aux_modifications(
                     self.image_filepath, self._img, self.parent_tab.project_folder,
+                    src_channel_order=src_channel_order,
                     all_polygons=getattr(self.parent_tab, "all_polygons", None),
                 )
             else:
@@ -4833,10 +4866,22 @@ class ProjectTab(QtWidgets.QWidget):
 
         Viewer (default): classification is terminal and returns a colorized (RGB) or label map.
         Export (export_label_band=True): append band_expression and label-map as extra bands at the end.
+
+        `src_channel_order` ("bgr" for cv2-loaded arrays, "rgb" for tifffile/
+        native ones) is the SINGLE authority for what `b1` means here -- band
+        math, NoData expressions, classification features and appended bands all
+        resolve b1=Red through it. Callers get it from `ImageData.channel_order`
+        / `_Lite.channel_order`; see loaders.ImageLoaderWorker.
         """
         import os, json, logging, cv2, numpy as np
+        from .utils import to_rgb_band_order as _to_rgb, is_bgr_channel_order as _is_bgr_order
 
         HIST_MAX_SAMPLES = 250
+
+        # Channel-order provenance for this replay. "bgr" default matches
+        # _Lite.channel_order's own default and cv2 being the fallback loader.
+        _src_order = str(src_channel_order or "bgr").lower()
+        _src_is_bgr = _is_bgr_order(_src_order)
 
         # ---------- locate .ax ----------
         if global_mode:
@@ -4980,9 +5025,14 @@ class ProjectTab(QtWidgets.QWidget):
 
         # ---------- helper to build nodata mask (uses shared utility supporting expressions) ----------
         def _build_nodata_mask(arr, nd_vals):
-            """Build boolean mask where True = NoData pixel. Supports both numeric literals and threshold expressions."""
+            """Build boolean mask where True = NoData pixel. Supports both numeric literals and threshold expressions.
+
+            bgr_input comes from the loader's real channel order, not from the
+            channel count: a NoData expression ("b1<123") lives in the same
+            b1=Red namespace as band math and must agree with it.
+            """
             from .utils import build_nodata_mask as _shared_build_nodata_mask
-            return _shared_build_nodata_mask(arr, nd_vals, bgr_input=True)
+            return _shared_build_nodata_mask(arr, nd_vals, bgr_input=_src_is_bgr)
 
         # ---------- helpers ----------
         def resize_safe(img_, new_w, new_h, interp=cv2.INTER_LINEAR):
@@ -5335,21 +5385,18 @@ class ProjectTab(QtWidgets.QWidget):
                     except: pass
             
             try:
-                # Ensure band-expression evaluates on RGB when the working image is cv2-style BGR.
-                # Optional override via .ax:  ax["channel_order"] in {"rgb","bgr"}
-                _co = str((ax.get("channel_order") or "")).lower()
-                bgr_like = (result.ndim == 3 and result.shape[2] == 3)
-                if _co == "rgb":
-                    bgr_like = False
-                elif _co == "bgr":
-                    bgr_like = True
+                # CANONICAL BAND ORDER: b1 = Red, decided by the loader's real
+                # channel order (src_channel_order), never by the channel count.
+                # Was: `bgr_like = (C == 3)` with an `ax["channel_order"]`
+                # override that nothing in the codebase ever writes. That
+                # heuristic happened to be right for cv2-loaded 3-band images
+                # and wrong for everything else -- tifffile stacks got their R
+                # and B swapped, and genuinely-BGR C>3 stacks were not swapped
+                # at all (so b1 stayed Blue there, disagreeing with
+                # _channels_in_export_order and hence with CSV export).
+                base_expr = _to_rgb(result, _src_order)
 
-                # For exactly-3-channel images that look BGR, give the expression an RGB view.
-                # (For stacks >3 we keep band ordering untouched to preserve band_i semantics.)
-                base_expr = result[..., [2, 1, 0]] if bgr_like else result
-
-                # Compute expression on the RGB view (or unchanged stack if not bgr_like)
-                # FIX: Use eval_band_expression instead of non-existent process_band_expression_float
+                # Compute expression on the canonical RGB-ordered view.
                 res = eval_band_expression(base_expr.astype(np.float32, copy=False), expr_str)
                 
                 # Restore NoData values in result
@@ -5483,20 +5530,11 @@ class ProjectTab(QtWidgets.QWidget):
                     cls_input = pre_band_expr_result if pre_band_expr_result is not None else result
                     logging.info(f"[apply_aux_modifications] cls_input.shape={cls_input.shape}, cls_input.dtype={cls_input.dtype}")
 
-                    # --- NEW: ensure ML sees RGB, even if 'cls_input' is BGR (because cv2.imread) ---
-                    # Honor an explicit override if you ever store it in .ax:
-                    #   ax["channel_order"] in {"rgb","bgr"}
-                    _co = str((ax.get("channel_order") or "")).lower()
-                    is_bgr_like = (cls_input.ndim == 3 and cls_input.shape[2] == 3)
-                    if _co == "rgb":
-                        is_bgr_like = False
-                    elif _co == "bgr":
-                        is_bgr_like = True
-                    # If exactly 3 channels and we think it's BGR, flip to RGB for ML only
-                    if is_bgr_like:
-                        base_ml = cls_input[..., [2, 1, 0]]  # BGR -> RGB (view only for ML)
-                    else:
-                        base_ml = cls_input
+                    # CANONICAL BAND ORDER: red_channel/b1 = Red for ML.
+                    # Was: `(C == 3)` plus an `ax["channel_order"]` override
+                    # that nothing ever writes -- see the twin block in
+                    # _apply_ax_to_raw.
+                    base_ml = _to_rgb(cls_input, _src_order)
 
                     # Guarantee a 3D array for feature addressing
                     if base_ml.ndim == 2:
@@ -5643,7 +5681,21 @@ class ProjectTab(QtWidgets.QWidget):
                                             pass
                             # Also mark NaN/Inf as invalid
                             nodata_mask_flat |= ~np.all(np.isfinite(X), axis=1)
-                            
+
+                            # ... and the window-edge pixels TRAINING skipped.
+                            # The `np.pad(..., mode='edge')` above invents
+                            # neighbour values for the image border, so those
+                            # rows are numerically well-formed but were never
+                            # part of the training population -- and
+                            # process_polygon skips exactly the same pixels
+                            # when it computes the CSV class percentages
+                            # (`if yg - half < 0 or ...: continue`). Without
+                            # this, the exported label band classified a
+                            # border the CSV never counted.
+                            if window_size > 1:
+                                from .utils import window_edge_rows as _win_edge
+                                nodata_mask_flat |= _win_edge(H, W, window_size)
+
                             valid_mask = ~nodata_mask_flat
                             
                             # Get NoData fill value for classification result
@@ -5740,8 +5792,12 @@ class ProjectTab(QtWidgets.QWidget):
                         expr = band_info.get("expression", "").strip()
                         if expr:
                             try:
-                                # Evaluate on the current result (which may have been transformed)
-                                expr_result = eval_band_expression(result, expr)
+                                # CANONICAL BAND ORDER: b1 = Red, same as the
+                                # primary band_expression above. This block used
+                                # to apply NO remap at all, contradicting the
+                                # expression evaluated a few lines earlier in
+                                # this very function.
+                                expr_result = eval_band_expression(_to_rgb(result, _src_order), expr)
                                 if expr_result is not None:
                                     if expr_result.ndim == 3:
                                         expr_result = expr_result[:, :, -1]
@@ -5756,7 +5812,8 @@ class ProjectTab(QtWidgets.QWidget):
                         expr = band_info.get("expression", "").strip()
                         if expr:
                             try:
-                                expr_result = eval_band_expression(result, expr)
+                                # CANONICAL BAND ORDER: see the twin block above.
+                                expr_result = eval_band_expression(_to_rgb(result, _src_order), expr)
                                 if expr_result is not None:
                                     if expr_result.ndim == 3:
                                         expr_result = expr_result[:, :, -1]
@@ -5824,7 +5881,8 @@ class ProjectTab(QtWidgets.QWidget):
                                     return ProjectTab._make_feature_stack_for_model(
                                         None, img_slice, fn, expressions=ex,
                                         window_size=ws, base_feature_names=bn,
-                                        normalization_cfg=normalization_cfg)
+                                        normalization_cfg=normalization_cfg,
+                                        src_channel_order=_src_order)
                                 _tile_build_failed = False
                                 for _r0, _r1, _X_tile, _w in iter_tiled_feature_matrices(
                                         result, feat_names, expressions, window_size,
@@ -6793,18 +6851,30 @@ class ProjectTab(QtWidgets.QWidget):
         # keep a reference to the helper for use in create_toolbar (optional)
         self._shortcuts_only = _shortcuts_only
 
-    def _scientific_with_ax(self, filepath, base_img=None):
+    def _scientific_with_ax(self, filepath, base_img=None, src_channel_order=None):
         """
         Return the *scientific* image with .ax operations applied
         (rotate/crop/resize/band_expression + hist_match), float32, HxW or HxWxC.
         If base_img is provided, it is assumed to be the raw HWC image for filepath.
+
+        `src_channel_order` ("bgr"/"rgb") is the order base_img's first three
+        channels are in; it decides what `b1` means in the .ax band expression
+        and NoData expressions replayed below. When base_img is None this
+        function loads the image itself and knows the answer exactly
+        (_load_raw_image records it as _last_raw_channel_order).
         """
         img = base_img
+        _order = src_channel_order
         if img is None:
             # load RAW the same way as export path
             img = self._load_raw_image(filepath)
             if img is None:
                 return None
+            # We just loaded it, so we know its provenance for certain -- do
+            # NOT let _apply_ax_to_raw fall back to _last_export_channel_order,
+            # which describes whatever file the last EXPORT happened to read.
+            if _order is None:
+                _order = _chan_attr(self, "_last_raw_channel_order") or None
 
         # Ensure HWC (like export)
         img = self._ensure_hwc(img)
@@ -6814,6 +6884,7 @@ class ProjectTab(QtWidgets.QWidget):
             if hasattr(self, "_apply_ax_to_raw"):
                 img, _C = self._apply_ax_to_raw(img, self._load_ax_for(filepath),
                                                 filepath=filepath,
+                                                src_channel_order=_order,
                                                 all_polygons=getattr(self, "all_polygons", None))
             else:
                 # Fallback to the older helper if present
@@ -6821,6 +6892,7 @@ class ProjectTab(QtWidgets.QWidget):
                     filepath, img,
                     project_folder=getattr(self, "project_folder", None),
                     global_mode=False,
+                    src_channel_order=_order,
                     all_polygons=getattr(self, "all_polygons", None),
                 )
         except Exception:
@@ -10583,8 +10655,14 @@ class ProjectTab(QtWidgets.QWidget):
                             exprs = [v for v in nd_vals
                                      if isinstance(v, str) and not _looks_numeric(v)]
                             if exprs:
-                                from .utils import build_nodata_mask
-                                nodata_mask = build_nodata_mask(img_data, exprs, bgr_input=True)
+                                # The live viewer's ImageData carries its own
+                                # channel-order provenance; "b1<123" resolves
+                                # through it, not through the channel count.
+                                from .utils import build_nodata_mask, is_bgr_channel_order
+                                nodata_mask = build_nodata_mask(
+                                    img_data, exprs,
+                                    bgr_input=is_bgr_channel_order(
+                                        getattr(idata, "channel_order", "bgr") or "bgr"))
                         except Exception:
                             nodata_mask = None
 
@@ -10770,12 +10848,16 @@ class ProjectTab(QtWidgets.QWidget):
         QtWidgets.QMessageBox.information(self, "Complete", msg)
 
 
-    def _load_image_simple(self, filepath):
+    def _load_image_simple(self, filepath, return_order=False):
         """
         Thread-safe, Qt-free raw image load, Unicode-path safe. Used by the
         Random Shapes file workers (ProjectTab itself did not previously expose a
         loader; the export worker classes have their own private copies).
-        Returns an ndarray or None.
+        Returns an ndarray or None -- or, with `return_order=True`, the tuple
+        `(arr, channel_order)` where channel_order is "rgb" for the tifffile
+        branch (native band order) and "bgr" for the cv2 fallback. NoData
+        expressions ("b1<123") need that order to resolve b1 to Red; the tuple
+        form is opt-in so the existing bare-array callers keep working.
         """
         import os, numpy as np, cv2
         ext = os.path.splitext(filepath)[1].lower()
@@ -10783,16 +10865,18 @@ class ProjectTab(QtWidgets.QWidget):
             if ext in ('.tif', '.tiff'):
                 import tifffile
                 with tifffile.TiffFile(filepath) as tf:
-                    return np.ascontiguousarray(np.squeeze(tf.asarray()))
+                    arr = np.ascontiguousarray(np.squeeze(tf.asarray()))
+                return (arr, "rgb") if return_order else arr
             # imdecode via fromfile is safe for non-ASCII paths on Windows.
             data = np.fromfile(filepath, dtype=np.uint8)
-            return cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+            arr = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+            return (arr, "bgr") if return_order else arr
         except Exception as e:
             logging.debug(f"[_load_image_simple] failed for {filepath}: {e}")
-            return None
+            return (None, "bgr") if return_order else None
 
 
-    def _load_validity_bands(self, filepath, max_bands=3):
+    def _load_validity_bands(self, filepath, max_bands=3, return_order=False):
         """Read only the first few bands, for building a valid-area mask.
 
         Random Shapes used to decode every band of every image just to ask which
@@ -10800,6 +10884,10 @@ class ProjectTab(QtWidgets.QWidget):
         NoData footprint is the same across bands, so a couple of bands answer
         the question. Falls back to the old full read for anything the tiled
         reader cannot handle.
+
+        With `return_order=True` returns `(arr, channel_order)`. The windowed
+        raster_reader path is always native ("rgb"); the fallback reports
+        whatever `_load_image_simple` used.
         """
         try:
             from .raster_reader import probe, open_reader
@@ -10808,11 +10896,12 @@ class ProjectTab(QtWidgets.QWidget):
                 reader = open_reader(filepath, profile)
                 if reader is not None:
                     n = max(1, min(int(max_bands), profile.count))
-                    return reader.read_bands_full(list(range(n)))
+                    arr = reader.read_bands_full(list(range(n)))
+                    return (arr, "rgb") if return_order else arr
         except Exception as e:
             logging.debug("[random_shapes] windowed validity read failed for %s: %s",
                           filepath, e)
-        return self._load_image_simple(filepath)
+        return self._load_image_simple(filepath, return_order=return_order)
 
     def _random_shapes_compute_file(self, filepath, params, gsd, restrict_valid):
         """
@@ -10837,7 +10926,7 @@ class ProjectTab(QtWidgets.QWidget):
                     ax = {}
                 nd_vals = self.effective_nodata_values(filepath, ax)
 
-                img = self._load_validity_bands(filepath)
+                img, _img_order = self._load_validity_bands(filepath, return_order=True)
                 if img is None:
                     return filepath, [], None
                 # tifffile may return band-first (C, H, W); reorient to (H, W, C)
@@ -10854,8 +10943,12 @@ class ProjectTab(QtWidgets.QWidget):
                     exprs = [v for v in nd_vals if isinstance(v, str)
                              and not _looks_numeric(v)]
                     if exprs:
-                        from .utils import build_nodata_mask
-                        nodata_mask = build_nodata_mask(img, exprs, bgr_input=True)
+                        # bgr_input from the loader's real order, not a constant:
+                        # "b1<123" must mean Red here exactly as it does in band
+                        # math and CSV export.
+                        from .utils import build_nodata_mask, is_bgr_channel_order
+                        nodata_mask = build_nodata_mask(
+                            img, exprs, bgr_input=is_bgr_channel_order(_img_order))
                 except Exception:
                     nodata_mask = None
             else:
@@ -17781,7 +17874,7 @@ class ProjectTab(QtWidgets.QWidget):
 # THis  controles exported project image ax. file modifications - it has to be in parallell with apply_aux_modifcation here and 
 #apply_all_modifications_to_image in image_editor_dialog
     def _apply_ax_to_raw(self, raw_img, ax, *, export_label_band=True, _float_dtype=np.float32,
-                          filepath=None, all_polygons=None):
+                          filepath=None, all_polygons=None, src_channel_order=None):
         """
         Deterministic, stack-safe replay for export (viewer-independent).
         Order: crop → rotate → hist_match → resize → band_expression → (optional) classification
@@ -17792,10 +17885,35 @@ class ProjectTab(QtWidgets.QWidget):
         - ALWAYS returns (img, channels).
         - filepath: Optional path to original image (needed for mask polygon name lookup)
         - all_polygons: Optional dict of all_polygons for mask polygon name lookup
+        - src_channel_order: "bgr" or "rgb" -- the order `raw_img`'s first three
+          channels are actually in. REQUIRED for `b1` to mean Red (see
+          utils.to_rgb_band_order). Callers that loaded the array themselves
+          (ThumbnailExportWorker, export_project_images) must pass what their
+          loader produced; when omitted this falls back to
+          `self._last_export_channel_order`, which `_get_export_image` sets
+          right before calling here.
         """
         import numpy as np, cv2, logging, os, json
+        from .utils import to_rgb_band_order as _to_rgb, is_bgr_channel_order as _is_bgr_order
 
         HIST_MAX_SAMPLES = 250
+
+        # Channel-order provenance for this replay. Everything below that has to
+        # decide "which array index is b1" reads THIS, never the channel count.
+        #
+        # `_src_order_declared` is what somebody actually TOLD us -- "" when
+        # nobody did. `_src_order` adds the historical fallback ("bgr", because
+        # cv2 is the fallback loader everywhere) for the b1-resolution
+        # decisions, which must always pick one. Histogram-reference
+        # realignment deliberately uses the DECLARED value instead: guessing
+        # there could introduce the exact R/B swap it exists to remove (see
+        # _apply_hist_match's "When either order is unknown ... nothing is
+        # reordered").
+        _src_order_declared = str(src_channel_order
+                                  or _chan_attr(self, "_last_export_channel_order")
+                                  or "").lower()
+        _src_order = _src_order_declared or "bgr"
+        _src_is_bgr = _is_bgr_order(_src_order)
 
         # ---------- guards ----------
         if raw_img is None:
@@ -17827,14 +17945,17 @@ class ProjectTab(QtWidgets.QWidget):
         _nd_mask_memo = {}
 
         def _build_nodata_mask(img, nd_vals):
+            # bgr_input is PROVENANCE, not a constant: a NoData expression like
+            # "b1<123" shares the same b1=Red namespace as band math, so it must
+            # resolve b1 through the same channel order the array is really in.
             from .utils import build_nodata_mask as _shared_build_nodata_mask
             try:
                 key = (id(img), img.shape, tuple(sorted(str(v) for v in (nd_vals or []))))
             except Exception:
-                return _shared_build_nodata_mask(img, nd_vals, bgr_input=True)
+                return _shared_build_nodata_mask(img, nd_vals, bgr_input=_src_is_bgr)
             if key in _nd_mask_memo:
                 return _nd_mask_memo[key]
-            m = _shared_build_nodata_mask(img, nd_vals, bgr_input=True)
+            m = _shared_build_nodata_mask(img, nd_vals, bgr_input=_src_is_bgr)
             _nd_mask_memo[key] = m
             return m
 
@@ -18062,9 +18183,14 @@ class ProjectTab(QtWidgets.QWidget):
         band_enabled = ax.get("band_enabled", True)
 
         # ---------- helpers ----------
+        # NOTE: this REBINDS the memoised _build_nodata_mask defined near the top
+        # of this function -- every call textually below this point uses THIS
+        # version. Both must therefore agree on bgr_input; it is provenance
+        # (_src_is_bgr), never a constant, because a NoData expression ("b1<123")
+        # shares the b1=Red namespace with band math.
         def _build_nodata_mask(arr, nd_vals):
             from .utils import build_nodata_mask as _shared_build_nodata_mask
-            return _shared_build_nodata_mask(arr, nd_vals, bgr_input=True)
+            return _shared_build_nodata_mask(arr, nd_vals, bgr_input=_src_is_bgr)
 
         def _build_combined_mask(img, nd_vals, poly_points_list, poly_enabled):
             """Build combined mask from NoData values and multiple polygon masks.
@@ -18328,7 +18454,14 @@ class ProjectTab(QtWidgets.QWidget):
         # canonical routine instead of only whichever caller was patched. What
         # this path still owns is knowing WHICH order its own pixels are in;
         # that provenance is passed down via src_channel_order below.
-        _hm_src_order = str(getattr(self, "_last_export_channel_order", "") or "").lower()
+        #
+        # Uses the DECLARED order (see _src_order_declared at the top): "" when
+        # nobody said, which _apply_hist_match reads as "don't realign". It used
+        # to read _last_export_channel_order directly, ignoring an explicit
+        # src_channel_order= from a caller that loaded the array itself
+        # (ThumbnailExportWorker, export_project_images' foreground loop) --
+        # so those paths could realign against the wrong file's provenance.
+        _hm_src_order = _src_order_declared
 
         def _do_resize():
             nonlocal img, nodata_mask
@@ -18391,23 +18524,20 @@ class ProjectTab(QtWidgets.QWidget):
                     try: nd_restore_val = float(nv); break
                     except: pass
             
-            # FIX: Remap band references for 3-channel BGR images
-            # User sees image as RGB (display converts BGR→RGB), so when they type b1
-            # they expect it to refer to Red (what they see as channel 1).
-            # But data is BGR, so b1 would be Blue without remapping.
-            # Swap b1↔b3 so expression matches visual expectation.
-            import re
-            effective_expr = expr_str
-            C = img.shape[2] if img.ndim == 3 else 1
-            if C == 3:
-                # BGR→RGB remapping: b1↔b3 (b2 stays the same)
-                effective_expr = re.sub(r'\bb1\b', '__B1_TEMP__', effective_expr)
-                effective_expr = re.sub(r'\bb3\b', 'b1', effective_expr)
-                effective_expr = re.sub(r'__B1_TEMP__', 'b3', effective_expr)
-                if effective_expr != expr_str:
-                    logging.info(f"[_do_band_expr] Remapped BGR→RGB: '{expr_str}' → '{effective_expr}'")
-            
-            res = _eval_expr_with(img, effective_expr)
+            # CANONICAL BAND ORDER: b1 = Red. Reorder the ARRAY (first three
+            # channels only) according to the loader's real channel order.
+            #
+            # THIS WAS THE PRIMARY BUG. The old code rewrote the EXPRESSION
+            # STRING (b1<->b3) whenever `C == 3`, unconditionally -- a shape
+            # heuristic. But this export path is fed by tifffile (native/RGB
+            # order) while the viewer path is fed by cv2 (BGR), so the very same
+            # `.ax` expression resolved b1 to Red in the viewer and to BLUE
+            # here. Measured on a real 3-band RGB TIF: `b1>189` -> 783,943 px
+            # (viewer, b1=Red) vs 380,830 px (export, b1=Blue).
+            # The string rewrite was doubly wrong: it only ever handled b1/b3,
+            # so `b4`+ on a wider stack was never remapped at all.
+            base_expr = _to_rgb(img, _src_order)
+            res = _eval_expr_with(base_expr, expr_str)
             logging.info(f"[_do_band_expr] _eval_expr returned: type={type(res)}, shape={getattr(res, 'shape', None)}")
             if res is None:
                 logging.warning(f"[_do_band_expr] _eval_expr returned None for '{expr_str}'")
@@ -18610,20 +18740,15 @@ class ProjectTab(QtWidgets.QWidget):
                         base = base[..., None]
                     H, W, C = base.shape
                     
-                    # Match apply_aux_modifications: assume 3-channel = BGR (from cv2/viewer)
-                    # Honor explicit channel_order from .ax if present
-                    _co = str((ax.get("channel_order") or "")).lower()
-                    is_bgr_like = (C == 3)  # Default: assume BGR for 3-channel
-                    if _co == "rgb":
-                        is_bgr_like = False
-                    elif _co == "bgr":
-                        is_bgr_like = True
-                    
-                    # If BGR, convert to RGB for ML (model trained on RGB data)
-                    if is_bgr_like:
-                        base_for_ml = base[..., ::-1].copy()  # BGR -> RGB
-                    else:
-                        base_for_ml = base
+                    # CANONICAL BAND ORDER: b1/red_channel = Red.
+                    # Was: `is_bgr_like = (C == 3)` overridden by
+                    # `ax["channel_order"]` -- a key NOTHING in this codebase
+                    # ever writes (only ax["hist_match"]["channel_order"] is
+                    # written), so the override never fired and this always
+                    # degraded to the C==3 shape heuristic. It also used a
+                    # blanket `[..., ::-1]`, which reverses a WHOLE stack --
+                    # band 4 of a 5-band cube became band 2.
+                    base_for_ml = _to_rgb(base, _src_order)
 
                     # Pre-compute expression images if model has custom expressions
                     expr_images = {}  # name -> HxW array
@@ -18752,7 +18877,21 @@ class ProjectTab(QtWidgets.QWidget):
                                             pass
                             # Also mark NaN/Inf as invalid
                             nodata_mask_flat |= ~np.all(np.isfinite(X), axis=1)
-                            
+
+                            # ... and the window-edge pixels TRAINING skipped.
+                            # The `np.pad(..., mode='edge')` above invents
+                            # neighbour values for the image border, so those
+                            # rows are numerically well-formed but were never
+                            # part of the training population -- and
+                            # process_polygon skips exactly the same pixels
+                            # when it computes the CSV class percentages
+                            # (`if yg - half < 0 or ...: continue`). Without
+                            # this, the exported label band classified a
+                            # border the CSV never counted.
+                            if window_size > 1:
+                                from .utils import window_edge_rows as _win_edge
+                                nodata_mask_flat |= _win_edge(H, W, window_size)
+
                             valid_mask = ~nodata_mask_flat
                             
                             # Get NoData fill value for classification result
@@ -18853,8 +18992,15 @@ class ProjectTab(QtWidgets.QWidget):
                         expr = band_info.get("expression", "").strip()
                         if expr:
                             try:
-                                # Use eval_band_expression to evaluate
-                                expr_result = eval_band_expression(img, expr)
+                                # CANONICAL BAND ORDER: b1 = Red, same as the
+                                # primary band_expression above. This block used
+                                # to apply NO remap at all, so an appended
+                                # expression and the .ax's own expression -- in
+                                # the SAME function, on the SAME array --
+                                # disagreed about what b1 meant. Bands already
+                                # appended by earlier steps sit at index 3+ and
+                                # are never reordered.
+                                expr_result = eval_band_expression(_to_rgb(img, _src_order), expr)
                                 if expr_result is not None:
                                     if expr_result.ndim == 3:
                                         expr_result = expr_result[:, :, -1]
@@ -18870,7 +19016,8 @@ class ProjectTab(QtWidgets.QWidget):
                         expr = band_info.get("expression", "").strip()
                         if expr:
                             try:
-                                expr_result = eval_band_expression(img, expr)
+                                # CANONICAL BAND ORDER: see the twin block above.
+                                expr_result = eval_band_expression(_to_rgb(img, _src_order), expr)
                                 if expr_result is not None:
                                     if expr_result.ndim == 3:
                                         expr_result = expr_result[:, :, -1]
@@ -18942,7 +19089,8 @@ class ProjectTab(QtWidgets.QWidget):
                                 import functools as _functools
                                 _builder = _functools.partial(
                                     self._make_feature_stack_for_model,
-                                    normalization_cfg=normalization_cfg)
+                                    normalization_cfg=normalization_cfg,
+                                    src_channel_order=_src_order)
                                 _tile_build_failed = False
                                 for _r0, _r1, _X_tile, _w in iter_tiled_feature_matrices(
                                         img, feat_names, expressions, window_size,
@@ -19078,12 +19226,20 @@ class ProjectTab(QtWidgets.QWidget):
         return np.ascontiguousarray(ensure_hwc(arr, axes=axes))
 
     def _load_raw_image(self, filepath):
-        """Load raw image similarly to the viewer pipeline, but without display normalization."""
+        """Load raw image similarly to the viewer pipeline, but without display normalization.
+
+        Also records `self._last_raw_channel_order` ("bgr" when ImageData/cv2
+        supplied the array, "rgb" when tifffile did). Callers that then evaluate
+        band math / NoData expressions on the result MUST consult it -- see the
+        "CANONICAL BAND ORDER" block in utils.py.
+        """
         try:
             mode = getattr(self, "mode", None)
             data = ImageData(filepath, mode=mode) if mode else ImageData(filepath)
             img = data.image
             self._last_loader = "imagedata"
+            # ImageData always reads through cv2.imread/imdecode -> BGR.
+            self._last_raw_channel_order = str(getattr(data, "channel_order", "bgr") or "bgr")
             return img
         except Exception:
             pass
@@ -19132,6 +19288,7 @@ class ProjectTab(QtWidgets.QWidget):
                                 arr = np.moveaxis(arr, 0, -1)
 
                 self._last_loader = "tifffile"
+                self._last_raw_channel_order = "rgb"  # tifffile = native band order
                 return arr
             except ImportError:
                 logging.error("tifffile is required to read 5+ channel TIFFs. pip install tifffile")
@@ -19140,6 +19297,7 @@ class ProjectTab(QtWidgets.QWidget):
 
         # 3) Fallback to OpenCV (works for 1/3/4 channels)
         self._last_loader = "cv2"
+        self._last_raw_channel_order = "bgr"  # cv2 always decodes to BGR
         return cv2.imread(filepath, cv2.IMREAD_UNCHANGED)
 
 
@@ -19171,9 +19329,11 @@ class ProjectTab(QtWidgets.QWidget):
             img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
             if img is None:
                 raise ValueError("cv2.imdecode returned None")
-            # BGR->RGB for 3-channel
-            if img.ndim == 3 and img.shape[2] == 3:
-                img = img[..., ::-1]
+            # cv2 always decodes colour to BGR -- provenance known exactly at
+            # this point, so the swap is stated, not guessed. Uses the shared
+            # helper so BGRA (C == 4) gets its R/B exchanged too instead of
+            # being silently left in BGR order by a `shape[2] == 3` guard.
+            img = _to_rgb_band_order(img, "bgr")
             return img
         except Exception as e:
             logging.error(f"Generic load failed for '{filepath}': {e}")
@@ -19516,9 +19676,15 @@ class ProjectTab(QtWidgets.QWidget):
 
                 ax = _load_ax(fp)
                 try:
-                    # Deterministic replay (rotate/crop/hist/resize/expression), preserves band order
+                    # Deterministic replay (rotate/crop/hist/resize/expression), preserves band order.
+                    # `src_order` is what _read_raw_any just measured for THIS
+                    # file (tifffile -> "rgb", cv2 fallback -> "bgr"); pass it
+                    # so the .ax band expression / NoData expressions resolve
+                    # b1 to Red instead of falling back to whatever
+                    # _last_export_channel_order held from a previous file.
                     if hasattr(self, "_apply_ax_to_raw"):
-                        img, _C = self._apply_ax_to_raw(raw, ax, filepath=fp, 
+                        img, _C = self._apply_ax_to_raw(raw, ax, filepath=fp,
+                                                        src_channel_order=src_order,
                                                         all_polygons=getattr(self, "all_polygons", None))
                     else:
                         img = raw
@@ -19844,8 +20010,14 @@ class ProjectTab(QtWidgets.QWidget):
 
             # Apply AX modifications (Rotation, Crop, Hist Match, Resize, Band Expression)
             logging.info(f"[_get_export_image] Before _apply_ax_to_raw: img.shape={img.shape}")
+            # `_read_channel_order["value"]` is what the loader above actually
+            # produced for THIS file; passing it explicitly (rather than
+            # relying on the self._last_export_channel_order assignment a few
+            # lines up) keeps the two branches below identical and independent
+            # of any later mutation of that attribute.
             if hasattr(self, "_apply_ax_to_raw"):
                 img, _C = self._apply_ax_to_raw(img, ax, filepath=filepath,
+                                                src_channel_order=_read_channel_order["value"],
                                                 all_polygons=getattr(self, "all_polygons", None))
                 logging.info(f"[_get_export_image] After _apply_ax_to_raw: img.shape={img.shape}, C={_C}")
             else:
@@ -19855,6 +20027,7 @@ class ProjectTab(QtWidgets.QWidget):
                     img,
                     project_folder=getattr(self, "project_folder", None),
                     global_mode=False,
+                    src_channel_order=_read_channel_order["value"],
                     all_polygons=getattr(self, "all_polygons", None),
                 )
 
@@ -19870,7 +20043,7 @@ class ProjectTab(QtWidgets.QWidget):
             # Get cached NoData mask from _apply_ax_to_raw
             nd_mask = getattr(self, "_last_export_nodata_mask", None)
             nd_vals = getattr(self, "_last_export_nodata_values", [])
-            chan_order = getattr(self, "_last_export_channel_order", "bgr")
+            chan_order = _chan_attr(self, "_last_export_channel_order", "bgr") or "bgr"
 
             # Cache includes NoData mask, filepath, and channel order for consistent retrieval
             out = (img, {"H": H, "W": W, "C": C}, nd_mask, nd_vals, filepath, chan_order)
@@ -19992,20 +20165,29 @@ class ProjectTab(QtWidgets.QWidget):
         return mapping
 
     def _cached_master_nodata(self, filepath, img, nodata_values, H, W):
-        """Full-frame master NoData mask for a file, computed once and reused."""
+        """Full-frame master NoData mask for a file, computed once and reused.
+
+        `img` is whatever `_get_export_image` returned, so its channel order is
+        `self._last_export_channel_order` -- which decides whether a NoData
+        expression's `b1` is channel 0 or channel 2. That order is part of the
+        cache key: the same file can legitimately be read by tifffile on one
+        pass and by the cv2 fallback on another.
+        """
+        from .utils import is_bgr_channel_order as _is_bgr_order
         cache = getattr(self, "_master_nd_cache", None)
         if not isinstance(cache, OrderedDict):
             cache = self._master_nd_cache = OrderedDict(cache or {})
 
+        is_bgr = _is_bgr_order(_chan_attr(self, "_last_export_channel_order", "bgr") or "bgr")
         sig = tuple(sorted(str(v) for v in (nodata_values or [])))
-        key = (os.path.normcase(os.path.abspath(filepath)), sig, int(H), int(W))
+        key = (os.path.normcase(os.path.abspath(filepath)), sig, int(H), int(W), bool(is_bgr))
         hit = cache.get(key)
         if hit is not None:
             cache.move_to_end(key)
             return hit
 
         from .utils import build_nodata_mask as _bnm
-        mask = _bnm(img, nodata_values, bgr_input=True)
+        mask = _bnm(img, nodata_values, bgr_input=is_bgr)
         cache[key] = mask
         cache.move_to_end(key)
         while len(cache) > 4:          # H x W booleans, ~3.4 MB each
@@ -20661,7 +20843,7 @@ class ProjectTab(QtWidgets.QWidget):
             if self._is_lazy_channels(img):
                 return img
 
-            is_bgr = str(getattr(self, "_last_export_channel_order", "bgr") or "bgr").lower() == "bgr"
+            is_bgr = str(_chan_attr(self, "_last_export_channel_order", "bgr") or "bgr").lower() == "bgr"
 
             a = np.asarray(img)
             if a.ndim == 2:
@@ -23951,16 +24133,13 @@ class ProjectTab(QtWidgets.QWidget):
             return arr
         try:
             work = arr if arr.ndim == 3 else arr[..., None]
-            # Same BGR-view rule as _do_band_expr: an exactly-3-channel image is
-            # treated as cv2-style BGR unless the .ax says otherwise, so `b1` is
-            # red in both places.
-            _co = str(ax.get("channel_order") or "").lower()
-            bgr_like = (work.ndim == 3 and work.shape[2] == 3)
-            if _co == "rgb":
-                bgr_like = False
-            elif _co == "bgr":
-                bgr_like = True
-            base = work[..., [2, 1, 0]] if bgr_like else work
+            # CANONICAL BAND ORDER: b1 = Red. This window came out of
+            # raster_reader's own tiled reader, which is ALWAYS native band
+            # order (it never goes through cv2) -- so no swap, ever. The old
+            # code here swapped whenever the window happened to have 3 bands,
+            # which made a zoom tile's band math disagree with the preview it
+            # was drawn on top of.
+            base = _to_rgb_band_order(work, "rgb")
 
             res = eval_band_expression(base.astype(np.float32, copy=False), expr_str)
             expr2d = res if getattr(res, "ndim", 0) == 2 else res[..., 0]
@@ -24060,7 +24239,25 @@ class ProjectTab(QtWidgets.QWidget):
                 )
                 if classification_enabled:
                     # run on the edited 'base' (i.e., after rotate/crop/hist/resize/band expr upstream)
-                    cls_result = self._apply_sklearn_classification_with_indices(base)
+                    #
+                    # The .ax's NoData declaration has to reach the classifier:
+                    # process_polygon excludes those pixels from its CSV class
+                    # percentages, and apply_aux_modifications' own
+                    # classification block already excluded them, so a display
+                    # path that classified them anyway described a different
+                    # pixel set from every other consumer.
+                    _cls_nd = (list(ax.get("nodata_values", []) or [])
+                               if ax.get("nodata_enabled", True) else [])
+                    # `base` came from the VIEWER's loader (cv2 -> "bgr" for a
+                    # 3-band TIF), which is not necessarily what the export
+                    # path last recorded in _last_export_channel_order -- the
+                    # builder's only fallback. Passing it explicitly stops
+                    # red_channel/b1 meaning Red on one path and Blue on the
+                    # other for the same image.
+                    _cls_order = getattr(getattr(viewer, "image_data", None),
+                                         "channel_order", None)
+                    cls_result = self._apply_sklearn_classification_with_indices(
+                        base, nodata_values=_cls_nd, src_channel_order=_cls_order)
                     if cls_result is not None:
                         cls_img, cls_indices = cls_result
                         # Store raw integer indices on viewer for inspector
@@ -24695,7 +24892,8 @@ class ProjectTab(QtWidgets.QWidget):
 
         dlg = ImageStretchDialog(self, idata.image, initial_params=init, image_filepath=fp,
                                  band_names=band_names, preview_bands=preview_bands,
-                                 reload_bands_cb=reload_cb, set_preview_cb=set_preview_cb)
+                                 reload_bands_cb=reload_cb, set_preview_cb=set_preview_cb,
+                                 src_channel_order=getattr(idata, "channel_order", None))
 
         # Share the dialog's computed data range with the viewer's _StretchBar so it uses
         # the same absolute min/max (nodata-excluded, proper dtype) that the dialog shows.
@@ -24783,6 +24981,8 @@ class ProjectTab(QtWidgets.QWidget):
             band_idx = int(band_idx)
             idata = viewer.image_data
             fp = getattr(idata, "filepath", None)
+            profile = getattr(idata, "profile", None)
+            preview_bands = getattr(idata, "preview_bands", None)
 
             if band_idx < 0:
                 # Restore the actual composite stretch stashed just before the
@@ -24793,21 +24993,46 @@ class ProjectTab(QtWidgets.QWidget):
                              or self._load_root_stretch(root_name)
                              or self._load_project_stretch_default()
                              or self._project_default_stretch)
+
+                # BUG FIX: for a preview-loaded (windowed) raster, a prior
+                # single-band click replaced viewer.image_data.image/preview_bands
+                # with just that one band via set_viewer_preview_image -- the
+                # composite's PIXELS were discarded, only its stretch params were
+                # stashed. Re-applying just the stretch below left the resident
+                # array a single band, so _compute_stretched_preview's own
+                # C<3 "auto" fallback silently kept rendering that lone band as
+                # grayscale no matter what display_mode said, i.e. the viewer
+                # never actually returned to the original RGB/full-band composite.
+                # Reload the bands the composite actually needs before restretching.
+                if profile is not None and preview_bands:
+                    target_bands = (getattr(viewer, "_composite_preview_bands", None)
+                                     or self.get_display_bands(fp, profile))
+                    target_bands = [int(b) for b in (target_bands or [])
+                                     if 0 <= int(b) < profile.count]
+                    if target_bands and list(target_bands) != list(preview_bands):
+                        arr = self.reload_preview_bands(fp, target_bands, profile)
+                        if arr is not None:
+                            self.set_viewer_preview_image(viewer, arr, target_bands)
+                        else:
+                            logging.warning(
+                                "[band-bar] Could not reload composite bands %s of %s",
+                                target_bands, fp)
+
                 self._stretch_apply_preview(composite, viewer, root_name)
                 if fp:
                     self._save_file_stretch(fp, composite)
                 return
 
-            # Stash the actual composite stretch before overriding it, so the
-            # bar's leading button can restore it later. Keep refreshing this
-            # while already in composite mode (harmless no-op) so it always
-            # reflects the latest Auto/RGB configuration.
+            # Stash the actual composite stretch AND the file bands it was
+            # showing before overriding either, so the bar's leading button can
+            # restore real pixels (not just a stretch mapping) later. Keep
+            # refreshing this while already in composite mode (harmless no-op)
+            # so it always reflects the latest Auto/RGB configuration.
             current = getattr(viewer, "stretch_params", None)
             if current is not None and str(getattr(current, "display_mode", "")).lower() != "single":
                 viewer._composite_stretch_params = current
-
-            profile = getattr(idata, "profile", None)
-            preview_bands = getattr(idata, "preview_bands", None)
+                if preview_bands:
+                    viewer._composite_preview_bands = list(preview_bands)
 
             if profile is not None and preview_bands:
                 preview_bands = list(preview_bands)
@@ -29303,6 +29528,11 @@ class ProjectTab(QtWidgets.QWidget):
                         imgd.image,
                         project_folder=getattr(self, "project_folder", None),
                         global_mode=False,
+                        # Same provenance loaders.ImageLoadRunnable passes on the
+                        # initial async load. Without it this refresh replayed the
+                        # same .ax under a different b1, so a band expression
+                        # changed value just by refreshing the viewer.
+                        src_channel_order=getattr(imgd, "channel_order", None),
                         all_polygons=getattr(self, "all_polygons", None),
                     )
                 except Exception as e:
@@ -29476,6 +29706,9 @@ class ProjectTab(QtWidgets.QWidget):
                     filepath,
                     image_data.image,
                     project_folder=getattr(self, "project_folder", None),
+                    # See refresh_single_viewer: the same .ax must resolve b1 to
+                    # the same physical band here as on the initial async load.
+                    src_channel_order=getattr(image_data, "channel_order", None),
                     all_polygons=getattr(self, "all_polygons", None),
                 )
             except Exception as e:
@@ -29828,7 +30061,7 @@ class ProjectTab(QtWidgets.QWidget):
         cropped_bgr = _to_bgr_preview(cropped)
 
         # Check channel order from export image loader (tifffile loads native RGB)
-        last_order = getattr(self, "_last_export_channel_order", "bgr")
+        last_order = _chan_attr(self, "_last_export_channel_order", "bgr") or "bgr"
         if last_order == "rgb" and cropped_bgr.ndim == 3 and cropped_bgr.shape[2] == 3:
             cropped_bgr = np.ascontiguousarray(cropped_bgr[..., ::-1])
 
@@ -30614,11 +30847,19 @@ class ProjectTab(QtWidgets.QWidget):
             return None
         return eval_band_expression(np.asarray(img, dtype=np.float32), expr)
 
-    def _apply_ax_mods_and_optional_index(self, base_image, image_path):
+    def _apply_ax_mods_and_optional_index(self, base_image, image_path, src_channel_order=None):
         """
         Apply crop/resize from .ax (if any) to base_image, keep float32 scale,
         and append an 'index' channel (float32) if band_expression is present.
         Returns (img_float32, channel_names_list)
+
+        NOTE: this helper currently has no live caller inside the package (kept
+        as a small standalone utility). It is held to the same canonical
+        b1=Red / provenance rule as every live path so it cannot be revived as
+        a fresh source of the channel-order bug.
+
+        `src_channel_order`: "bgr"/"rgb" for base_image; defaults to
+        `self._last_raw_channel_order`, then "bgr".
         """
         img = base_image.copy()
         # Load modifications
@@ -30662,8 +30903,13 @@ class ProjectTab(QtWidgets.QWidget):
             C = img.shape[2]
             if C >= 3:
                 ch_names = ["R", "G", "B"] + [f"band_{i}" for i in range(4, C+1)]
-                # reorder to R,G,B,... (OpenCV typically loads BGR)
-                img = np.dstack([img[:, :, 2], img[:, :, 1], img[:, :, 0]] + ([img[:, :, i] for i in range(3, C)] if C > 3 else []))
+                # CANONICAL BAND ORDER: swap R/B only when the array really is
+                # BGR. The old code swapped unconditionally ("OpenCV typically
+                # loads BGR") -- wrong for every tifffile-loaded raster.
+                _order = str(src_channel_order
+                             or _chan_attr(self, "_last_raw_channel_order", "bgr")
+                             or "bgr").lower()
+                img = _to_rgb_band_order(img, _order)
             else:
                 ch_names = [f"b{i+1}" for i in range(C)]
         else:
@@ -31504,11 +31750,26 @@ class ProjectTab(QtWidgets.QWidget):
             pass
         return None
 
-    def _make_feature_stack_for_model(self, img, feature_names, expressions=None, window_size=1, base_feature_names=None, normalization_cfg=None):
+    def _make_feature_stack_for_model(self, img, feature_names, expressions=None, window_size=1, base_feature_names=None, normalization_cfg=None, src_channel_order=None, nodata_values=None):
         """Return (X, (H,W)) with X shape [H*W, F], float32.
 
-        For 3-channel BGR images (OpenCV default), converts to RGB order
-        to match the training data from Image Editor.
+        ROWS TRAINING WOULD HAVE DROPPED COME BACK ALL-NaN, deliberately.
+        `MachineLearningManager.train_models` never fits on a pixel whose
+        window contains a non-finite value or a declared NoData literal, nor
+        (for window_size > 1) on a pixel whose window leaves the image -- and
+        `process_polygon` excludes exactly the same pixels from its CSV class
+        percentages. This used to MEDIAN-IMPUTE non-finite features and
+        edge-pad the border, so the viewer confidently classified pixels the
+        CSV had never counted and the two disagreed on the same polygon.
+        Callers must therefore skip non-finite rows rather than feed them to
+        `model.predict` (see _apply_sklearn_classification[_with_indices]);
+        `utils.classification_invalid_rows` is the shared definition.
+
+        `src_channel_order` ("bgr"/"rgb") is the order `img`'s first three
+        channels are actually in; it decides whether channels 0 and 2 are
+        exchanged so that red_channel/b1 really is Red (see
+        utils.to_rgb_band_order). When None it falls back to
+        `self._last_export_channel_order`, then to "bgr".
 
         Args:
             img: Input image (HxW or HxWxC)
@@ -31536,13 +31797,20 @@ class ProjectTab(QtWidgets.QWidget):
             H, W, C = img.shape
             base = img.astype(np.float32, copy=False)
         
-        # FIX: For 3-channel images, convert BGR→RGB to match training data
-        # The model was trained in Image Editor which converts BGR→RGB
-        if C == 3:
-            # Create RGB-ordered base: swap channels 0 and 2
-            base_rgb = np.stack([base[:,:,2], base[:,:,1], base[:,:,0]], axis=2)
-        else:
-            base_rgb = base
+        # CANONICAL BAND ORDER: red_channel/b1 = Red, driven by provenance.
+        #
+        # The old code was `if C == 3: swap` with a comment claiming "the model
+        # was trained in Image Editor which converts BGR->RGB". That comment was
+        # FALSE: training goes through
+        # MachineLearningManager._channels_in_export_order, which is (and was)
+        # provenance-aware -- so this shape heuristic made INFERENCE disagree
+        # with TRAINING for every tifffile-loaded 3-band raster, and skipped the
+        # first-3 swap entirely for genuinely-BGR stacks with C > 3.
+        from .utils import to_rgb_band_order as _to_rgb_bo
+        _order = str(src_channel_order
+                     or _chan_attr(self, "_last_export_channel_order", "bgr")
+                     or "bgr").lower()
+        base_rgb = _to_rgb_bo(base, _order)
 
         # Build expression images if model has custom expressions
         expr_images = {}  # name -> HxW array
@@ -31631,15 +31899,23 @@ class ProjectTab(QtWidgets.QWidget):
             cube = build_windowed_feature_cube(band_arrays, base_names, window_size, H, W)
             X = cube.reshape(H * W, F)
 
-        # sanitize NaN/Inf
-        bad = ~np.isfinite(X)
-        if bad.any():
-            for j in range(X.shape[1]):
-                col = X[:, j]
-                good = np.isfinite(col)
-                med = np.median(col[good]) if good.any() else 0.0
-                col[~good] = med
-                X[:, j] = col
+        # ---- mark the rows TRAINING would have dropped, do NOT impute ----
+        #
+        # Was: a per-column MEDIAN IMPUTATION of every non-finite value, with
+        # no NoData check and no window-edge check at all. That silently
+        # manufactured a plausible-looking feature row for pixels the model
+        # was never trained on, so the viewer's class map covered a strictly
+        # LARGER pixel set than process_polygon's CSV percentages for the same
+        # polygon -- different populations, different percentages, no error.
+        #
+        # NaN is used as the "excluded" marker so it survives the tiling
+        # wrapper (which only ever slices rows) and the normalization below.
+        # Computing the window-edge mask HERE is correct even under tiling:
+        # iter_tiled_feature_matrices hands this function a halo-padded slice
+        # and discards exactly the halo rows, so the rows marked here are the
+        # image's true boundary and nothing else.
+        from .utils import mark_ineligible_rows as _mark_ineligible_rows
+        X = _mark_ineligible_rows(X, H, W, window_size, nodata_values)
 
         if normalization_cfg is not None:
             from .utils import apply_normalization
@@ -31648,16 +31924,37 @@ class ProjectTab(QtWidgets.QWidget):
         return X, (H, W)
 
     def _colorize_class_map(self, cls_idx_2d, n_classes=None):
-        """Return raw class indices as 3-channel grayscale - stretch handles display."""
+        """Return raw class indices as 3-channel grayscale - stretch handles display.
+
+        A NEGATIVE index means "not classified" -- the pixel was excluded from
+        prediction for the same reason training would have dropped it (NoData,
+        non-finite, or a window running off the image edge). It is rendered as
+        0 rather than wrapping round to 255 through the uint8 cast, matching
+        `_apply_ax_to_raw`'s existing default `nodata_fill = 0.0` for the
+        exported label band.
+        """
         import numpy as np
-        u8 = cls_idx_2d.astype(np.uint8, copy=False)
+        arr = np.asarray(cls_idx_2d)
+        if np.issubdtype(arr.dtype, np.signedinteger) or np.issubdtype(arr.dtype, np.floating):
+            arr = np.where(arr < 0, 0, arr)
+        u8 = arr.astype(np.uint8, copy=False)
         return np.stack([u8, u8, u8], axis=-1)
 
-    def _apply_sklearn_classification_with_indices(self, img):
+    #: class index meaning "this pixel was deliberately NOT classified".
+    #: See utils.classification_invalid_rows for what makes a pixel ineligible.
+    UNCLASSIFIED_INDEX = UNCLASSIFIED_CLASS_INDEX
+
+    def _apply_sklearn_classification_with_indices(self, img, nodata_values=None, src_channel_order=None):
         """
         Run the loaded sklearn model on 'img' (scientific array).
         Returns tuple: (BGR uint8 label-map for display, raw int32 indices for inspector)
         If no bundle is available, return None.
+
+        Pixels that TRAINING would have dropped are NOT predicted; their index
+        is `UNCLASSIFIED_INDEX` (-1). `nodata_values` comes from the image's
+        `.ax` (see _render_with_viewer_stretch) -- without it this path used to
+        classify NoData pixels that process_polygon excludes from the CSV's
+        class percentages, so screen and CSV described different pixel sets.
         """
         import numpy as np
         b = self._get_sklearn_bundle()
@@ -31680,6 +31977,7 @@ class ProjectTab(QtWidgets.QWidget):
             return None
         chunk = max(50_000, min(500_000, n // 8 or 50_000))
         out = np.empty((n,), dtype=object)
+        classified = np.zeros((n,), dtype=bool)
 
         # PERFORMANCE/MEMORY: builds and predicts in row-band tiles when the
         # feature matrix would exceed _CLASSIFY_FEATURE_BUDGET_BYTES, instead
@@ -31691,19 +31989,32 @@ class ProjectTab(QtWidgets.QWidget):
         from .utils import iter_tiled_feature_matrices
         import functools
         builder = functools.partial(self._make_feature_stack_for_model,
-                                     normalization_cfg=normalization_cfg)
+                                     normalization_cfg=normalization_cfg,
+                                     nodata_values=nodata_values,
+                                     src_channel_order=src_channel_order)
         for row0, row1, X_tile, w in iter_tiled_feature_matrices(
                 img, feat_names, expressions, window_size, base_feature_names,
                 _CLASSIFY_FEATURE_BUDGET_BYTES, builder):
             if X_tile is None:
                 return None
-            tile_n = (row1 - row0) * w
             out_offset = row0 * w
+            # The builder marks every row training would have dropped as NaN;
+            # predicting one anyway is what made this path disagree with the
+            # CSV. Only eligible rows are handed to the model.
+            valid = np.all(np.isfinite(X_tile), axis=1)
+            if not valid.any():
+                continue
+            X_valid = np.ascontiguousarray(X_tile[valid], dtype=np.float32)
+            n_valid = X_valid.shape[0]
+            preds = np.empty((n_valid,), dtype=object)
             i = 0
-            while i < tile_n:
-                j = min(i + chunk, tile_n)
-                out[out_offset + i: out_offset + j] = model.predict(X_tile[i:j])
+            while i < n_valid:
+                j = min(i + chunk, n_valid)
+                preds[i:j] = model.predict(X_valid[i:j])
                 i = j
+            where = np.flatnonzero(valid) + out_offset
+            out[where] = preds
+            classified[where] = True
 
         if labels:
             idx_map = {lab: k for k, lab in enumerate(labels)}
@@ -31711,17 +32022,23 @@ class ProjectTab(QtWidgets.QWidget):
             cls = list(getattr(model, "classes_", []))
             idx_map = {lab: k for k, lab in enumerate(cls)}
 
-        idx = np.vectorize(idx_map.get, otypes=[np.int32])(out).reshape(H, W)
-        idx = np.nan_to_num(idx, nan=0).astype(np.int32, copy=False)
+        idx = np.full((n,), self.UNCLASSIFIED_INDEX, dtype=np.int32)
+        if classified.any():
+            mapped = np.vectorize(idx_map.get, otypes=[np.int32])(out[classified])
+            idx[classified] = np.nan_to_num(mapped, nan=0).astype(np.int32, copy=False)
+        idx = idx.reshape(H, W)
 
         # Return both colorized image AND raw indices
         colorized = self._colorize_class_map(idx, n_classes=len(labels) if labels else None)
         return colorized, idx.copy()
 
-    def _apply_sklearn_classification(self, img):
+    def _apply_sklearn_classification(self, img, nodata_values=None, src_channel_order=None):
         """
         Run the loaded sklearn model on 'img' (scientific array), return BGR uint8 label-map.
         If no bundle is available, return None (caller will just continue normal rendering).
+
+        Same eligibility rule as _apply_sklearn_classification_with_indices:
+        pixels training would have dropped are left unclassified.
         """
         import numpy as np
         b = self._get_sklearn_bundle()
@@ -31745,6 +32062,7 @@ class ProjectTab(QtWidgets.QWidget):
         # chunked prediction to limit memory
         chunk = max(50_000, min(500_000, n // 8 or 50_000))
         out = np.empty((n,), dtype=object)
+        classified = np.zeros((n,), dtype=bool)
 
         # PERFORMANCE/MEMORY: builds and predicts in row-band tiles when the
         # feature matrix would exceed _CLASSIFY_FEATURE_BUDGET_BYTES -- see
@@ -31754,19 +32072,29 @@ class ProjectTab(QtWidgets.QWidget):
         from .utils import iter_tiled_feature_matrices
         import functools
         builder = functools.partial(self._make_feature_stack_for_model,
-                                     normalization_cfg=normalization_cfg)
+                                     normalization_cfg=normalization_cfg,
+                                     nodata_values=nodata_values,
+                                     src_channel_order=src_channel_order)
         for row0, row1, X_tile, w in iter_tiled_feature_matrices(
                 img, feat_names, expressions, window_size, base_feature_names,
                 _CLASSIFY_FEATURE_BUDGET_BYTES, builder):
             if X_tile is None:
                 return None
-            tile_n = (row1 - row0) * w
             out_offset = row0 * w
+            valid = np.all(np.isfinite(X_tile), axis=1)
+            if not valid.any():
+                continue
+            X_valid = np.ascontiguousarray(X_tile[valid], dtype=np.float32)
+            n_valid = X_valid.shape[0]
+            preds = np.empty((n_valid,), dtype=object)
             i = 0
-            while i < tile_n:
-                j = min(i + chunk, tile_n)
-                out[out_offset + i: out_offset + j] = model.predict(X_tile[i:j])
+            while i < n_valid:
+                j = min(i + chunk, n_valid)
+                preds[i:j] = model.predict(X_valid[i:j])
                 i = j
+            where = np.flatnonzero(valid) + out_offset
+            out[where] = preds
+            classified[where] = True
 
         # map labels -> indices (stable ordering)
         if labels:
@@ -31775,8 +32103,11 @@ class ProjectTab(QtWidgets.QWidget):
             cls = list(getattr(model, "classes_", []))
             idx_map = {lab: k for k, lab in enumerate(cls)}
 
-        idx = np.vectorize(idx_map.get, otypes=[np.int32])(out).reshape(H, W)
-        idx = np.nan_to_num(idx, nan=0).astype(np.int32, copy=False)
+        idx = np.full((n,), self.UNCLASSIFIED_INDEX, dtype=np.int32)
+        if classified.any():
+            mapped = np.vectorize(idx_map.get, otypes=[np.int32])(out[classified])
+            idx[classified] = np.nan_to_num(mapped, nan=0).astype(np.int32, copy=False)
+        idx = idx.reshape(H, W)
         return self._colorize_class_map(idx, n_classes=len(labels) if labels else None)
 
     def _install_polygon_resize_shortcuts(self):

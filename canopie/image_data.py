@@ -86,6 +86,16 @@ class ImageData:
         if self.image is None:
             raise ValueError(f"Could not read image file: {filepath}")
 
+        # Channel-order PROVENANCE. Every read above goes through cv2
+        # (imread/imdecode), and cv2 always decodes colour to BGR -- so this is
+        # a statement of fact about how the array was produced, not a guess from
+        # its shape. Consumers (band math, NoData expressions, ML features, the
+        # Pixel Inspector) must branch on THIS, never on `shape[2] == 3`; see
+        # the "CANONICAL BAND ORDER" block in utils.py. `_Lite` in
+        # ProjectTab._imagedata_or_fallback exposes the same attribute so the
+        # two loaders are interchangeable to callers.
+        self.channel_order = "bgr"
+
         self.is_rgb = False
         self.is_thermal = False
         self.is_multispectral = False

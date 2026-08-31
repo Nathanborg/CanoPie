@@ -89,6 +89,14 @@ FEATURE_MAP = {
     "test_contract_band_math": (
         "CONTRACT: band-math engine equivalence",
         "FastBandMathEngine == eval_band_expression on hostile inputs; cache cannot leak across images"),
+    "test_classification_pixel_eligibility": (
+        "CONTRACT: viewer and CSV classify the same pixels",
+        "NoData / non-finite / window-edge pixels excluded from prediction exactly as training "
+        "drops them; viewer class percentages == process_polygon's Class N % columns"),
+    "test_band_convention_contract": (
+        "CONTRACT: b1 = Red everywhere",
+        "viewer/export/process_polygon/editor/ML agree on b1 for BOTH cv2 and tifffile provenance; "
+        "bands 4+ never reordered; appended bands share the same b1; no __B1_TEMP__ token rewriting"),
     "test_contract_ax_consumers": (
         "CONTRACT: .ax replays agree across consumers",
         "viewer/CSV/ML/Inspect see identical pixels per .ax op; stats match a NumPy recompute"),

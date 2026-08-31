@@ -30,8 +30,20 @@ def _positional_array(h=4, w=6, c=3):
     return arr
 
 
-def _apply(pt, arr, ax):
-    img, _c = pt._apply_ax_to_raw(arr, ax)
+def _apply(pt, arr, ax, src_channel_order="rgb"):
+    """Drive the real replay.
+
+    `src_channel_order` is stated explicitly (and defaults to "rgb", i.e. "the
+    array is already in native band order, do not exchange any channels")
+    because `_apply_ax_to_raw` now resolves `b1` from the loader's PROVENANCE
+    rather than from the channel count -- see utils.to_rgb_band_order. These
+    fixtures are bare synthetic arrays built right here, not cv2 output, so
+    "rgb" is simply the truth about them; leaving it unsaid would make the
+    replay fall back to the historical "assume BGR" default and silently
+    exchange planes 0 and 2 of every fixture, which has nothing to do with the
+    geometry these tests are about.
+    """
+    img, _c = pt._apply_ax_to_raw(arr, ax, src_channel_order=src_channel_order)
     return np.asarray(img)
 
 
@@ -169,6 +181,47 @@ def test_band_expression_disabled_flag_is_honored(synthetic_project):
     ax = {"band_expression": "(b4-b1)/(b4+b1)", "band_enabled": False}
     out = _apply(synthetic_project, arr.copy(), ax)
     assert out.shape[2] == arr.shape[2], "band_enabled=False must append nothing"
+
+
+def test_band_expression_b1_is_red_under_both_channel_orders(synthetic_project):
+    """THE canonical rule, asserted on the same pixels from both provenances.
+
+    `b1` must name RED whichever loader produced the array, so the SAME .ax
+    expression has to pick out the same physical band from a tifffile-style
+    (native/RGB) array and from a cv2-style (BGR) one. Before this change the
+    decision was `if C == 3: swap`, a guess about SHAPE -- so the identical
+    expression on the identical pixels answered Red on one path and Blue on the
+    other (measured on a real 3-band TIF: `b1>189` counted 783,943 px vs
+    380,830 px).
+
+    Bands 4+ are not part of the RGB/BGR convention and must never move, so the
+    4-band case checks that b4 stays put under both orders too.
+    """
+    rgb = np.zeros((2, 2, 3), dtype=np.float32)
+    rgb[..., 0], rgb[..., 1], rgb[..., 2] = 10.0, 20.0, 30.0   # R, G, B
+    bgr = rgb[..., ::-1].copy()                                # same pixels, BGR
+
+    ax = {"band_expression": "b1", "band_enabled": True}
+    from_rgb = _apply(synthetic_project, rgb.copy(), ax, src_channel_order="rgb")
+    from_bgr = _apply(synthetic_project, bgr.copy(), ax, src_channel_order="bgr")
+    assert np.allclose(from_rgb[..., -1], 10.0), "b1 must be RED on a native-order array"
+    assert np.allclose(from_bgr[..., -1], 10.0), "b1 must be RED on a cv2/BGR array too"
+
+    ax3 = {"band_expression": "b3", "band_enabled": True}
+    assert np.allclose(_apply(synthetic_project, rgb.copy(), ax3, "rgb")[..., -1], 30.0)
+    assert np.allclose(_apply(synthetic_project, bgr.copy(), ax3, "bgr")[..., -1], 30.0)
+
+    # 4-band: b4 is ancillary, its index IS its identity under either order.
+    rgb4 = np.concatenate([rgb, np.full((2, 2, 1), 77.0, dtype=np.float32)], axis=2)
+    bgr4 = np.concatenate([bgr, np.full((2, 2, 1), 77.0, dtype=np.float32)], axis=2)
+    ax4 = {"band_expression": "b4", "band_enabled": True}
+    assert np.allclose(_apply(synthetic_project, rgb4, ax4, "rgb")[..., -1], 77.0)
+    assert np.allclose(_apply(synthetic_project, bgr4, ax4, "bgr")[..., -1], 77.0)
+    # ...and b1 still reaches Red on a 4-band BGRA-style stack, which the old
+    # `C == 3` guess skipped entirely.
+    assert np.allclose(
+        _apply(synthetic_project, bgr4, {"band_expression": "b1",
+                                         "band_enabled": True}, "bgr")[..., -1], 10.0)
 
 
 def test_crop_then_rotate_composition(synthetic_project):
