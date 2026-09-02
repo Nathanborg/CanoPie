@@ -33,7 +33,7 @@ import pytest
 
 from . import fixtures_manifest as fm
 from .fixtures_manifest import fixture_image_path, get_fixture
-from .project_builder import polygon_group_name
+from .project_builder import polygon_group_name, point_group_name
 
 pytestmark = [pytest.mark.perf, pytest.mark.extraction]
 
@@ -56,6 +56,13 @@ def _run_polygon(pt, name, opts=STATS_OPTS):
     group = polygon_group_name(name, spec["polygon"]["name"])
     poly = pt.all_polygons[group][fp]
     return pt.process_polygon(group, fp, poly, {}, [], False, opts=opts)
+
+
+def _run_point(pt, name, point_name, opts=STATS_OPTS):
+    fp = fixture_image_path(name)
+    group = point_group_name(name, point_name)
+    point_dict = pt.all_polygons[group][fp]
+    return pt.process_polygon(group, fp, point_dict, {}, [], False, opts=opts)
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +155,108 @@ def test_windowed_reads_are_bounded(synthetic_project, force_lazy_export, monkey
         f"{calls['n']} windowed reads for a {spec['bands']}-band cube "
         f"(budget {budget}) -- the reader is being called far more than once "
         "per band per pass")
+
+
+# ---------------------------------------------------------------------------
+# POINT extraction on the lazy path -- a real user report ("project ...
+# taking forever to do stats and use process polygon" on a real 139-band,
+# 2350x2031 prediction stack with a single point drawn on it).
+#
+# ROOT CAUSE: process_polygon's POINT branch indexed the lazily-read cube as
+# `chans[bi][yi, xi]` for every band it needed (RF features, R/G/B, extra
+# bands, band-math) -- i.e. plain LazyChannels.__getitem__(bi). That method's
+# contract (see its own docstring) is "one band, but the WHOLE FRAME": it
+# calls TiledRasterReader.read_window(0, 0, W, H, bands=[bi]) -- x0,y0,x1,y1
+# span the entire image, not the point's pixel. A single point on an N-band
+# image therefore issued N separate FULL-FRAME single-band decodes.
+#
+# It gets worse than "N times too much work" on a real band-interleaved
+# (planar=1) file: one physical tile already holds EVERY band, but decoding
+# it for a full-frame read produces an array far bigger than the shared tile
+# cache's budget (measured: a single band's full-frame decode of the reported
+# 139-band 2350x2031 stack is ~2.65 GB against a 640 MB cache budget), so nothing
+# from band 0's full-frame decode survives to be reused for band 1's -- EVERY
+# band re-decodes the ENTIRE compressed raster from disk. That combination is
+# what turned "read one pixel of a 139-band file" into a multi-minute hang.
+#
+# FIX: mirrors the identical, already-shipped fix in
+# MachineLearningManager.export_csv_data -- fetch the small bounding box of
+# the point cluster ONCE, for every band, via LazyChannels.read_window_offset
+# (one threaded windowed read), which returns a list of OffsetBand so every
+# existing `chans[bi][yi, xi]` call site keeps working unchanged. That fix
+# never covered process_polygon's own point path -- this pins that it now does.
+# ---------------------------------------------------------------------------
+def test_point_extraction_issues_one_windowed_read_not_one_per_band(
+        synthetic_project, force_lazy_export, monkeypatch):
+    from ..raster_reader import LazyChannels
+
+    calls = {"getitem_scalar": 0, "read_window_offset": 0}
+
+    original_getitem = LazyChannels.__getitem__
+
+    def counting_getitem(self, index):
+        if not isinstance(index, slice):
+            calls["getitem_scalar"] += 1
+        return original_getitem(self, index)
+
+    original_rwo = LazyChannels.read_window_offset
+
+    def counting_rwo(self, *a, **k):
+        calls["read_window_offset"] += 1
+        return original_rwo(self, *a, **k)
+
+    monkeypatch.setattr(LazyChannels, "__getitem__", counting_getitem)
+    monkeypatch.setattr(LazyChannels, "read_window_offset", counting_rwo)
+
+    _clear_caches(synthetic_project)
+    rows, _ = _run_point(synthetic_project, "hyperspectral_200band", "p_center")
+
+    assert rows, "point extraction produced no rows -- fixture/test problem, not a pass"
+    assert calls["read_window_offset"] == 1, (
+        f"expected exactly one windowed read for the whole point cluster, got "
+        f"{calls['read_window_offset']} -- the lazy point path is not using "
+        "LazyChannels.read_window_offset")
+    assert calls["getitem_scalar"] == 0, (
+        f"LazyChannels.__getitem__(band_index) was called {calls['getitem_scalar']} "
+        "time(s) during point extraction -- each such call reads a FULL-FRAME "
+        "single-band window (see LazyChannels.__getitem__'s docstring), which is "
+        "exactly the O(bands) full-frame-per-band regression this test pins. "
+        "Every per-band pixel access must go through the OffsetBand list "
+        "returned by read_window_offset instead.")
+
+
+def test_point_extraction_windowed_reads_are_bounded_by_bands_not_by_frame(
+        synthetic_project, force_lazy_export, monkeypatch):
+    """Companion to test_windowed_reads_are_bounded, for points: the
+    UNDERLYING reader must be asked for O(bands) tile-level reads for the
+    point cluster's tiny window, not O(bands) FULL-FRAME reads. Both bugs
+    would pass a naive 'count == bands' check, so this also checks the reads
+    are cheap (small nbytes), which a full-frame read on a real file would not be.
+    """
+    from ..raster_reader import TiledRasterReader
+
+    calls = {"n": 0, "max_out_px": 0}
+    original = TiledRasterReader.read_window
+
+    def counting(self, x0, y0, x1, y1, bands=None, level=0):
+        calls["n"] += 1
+        calls["max_out_px"] = max(calls["max_out_px"], max(0, x1 - x0) * max(0, y1 - y0))
+        return original(self, x0, y0, x1, y1, bands=bands, level=level)
+
+    monkeypatch.setattr(TiledRasterReader, "read_window", counting)
+
+    spec = get_fixture("hyperspectral_200band")
+    _clear_caches(synthetic_project)
+    _run_point(synthetic_project, "hyperspectral_200band", "p_center")
+
+    full_frame_px = spec["height"] * spec["width"]
+    assert calls["n"] <= 10, (
+        f"{calls['n']} underlying windowed reads for a single point -- "
+        "expected O(1), not O(bands)")
+    assert calls["max_out_px"] < full_frame_px, (
+        f"the largest single read covered {calls['max_out_px']} px, >= the "
+        f"full {full_frame_px}-px frame -- a point query is reading the whole "
+        "image instead of a small window around the point")
 
 
 # ---------------------------------------------------------------------------

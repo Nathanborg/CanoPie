@@ -7,11 +7,14 @@ THE BUG THIS PINS ("points drawn in the past go stray on reload"):
 
 EditablePolygonItem stores genuine SCENE coordinates directly
 (`self._polygon = polygon`, no indirection -- see its __init__).
-EditablePointItem does NOT: `self.points` is pixmap-LOCAL, floor()-truncated
-INTEGER pixel coordinates (see ImageViewer._scene_to_pix_local_int /
-add_point_to_scene), and the class provides `_scene_xy(p)` specifically to
-convert one of those back into a genuine scene position -- which is what its
-own paint()/boundingRect()/hit-testing already do internally.
+EditablePointItem does NOT: `self.points` is pixmap-LOCAL coordinates (see
+ImageViewer._scene_to_pix_local / add_point_to_scene), and the class provides
+`_scene_xy(p)` specifically to convert one of those back into a genuine scene
+position -- which is what its own paint()/boundingRect()/hit-testing already do
+internally. (Those coordinates used to be floor()ed to whole pixmap pixels;
+that quantisation was itself a second bug -- see
+test_point_drag_refresh_stability.py -- but the reconstruction pinned here is
+required either way.)
 
 Both places that turn a live item into the coordinate saved to disk --
 ProjectTab.on_polygon_drawn and .on_polygon_modified -- used to read

@@ -141,6 +141,46 @@ Stored hierarchically: `all_polygons[group_name][image_filepath] = [ {points, im
   cropped/resized/rotated versions.
 - `group_name` = a label/category (e.g. "canopy_mask", a species); `class` = optional per-polygon label.
 On disk they are mirrored as `*_polygons.json` sidecars, and embedded in `project.json`.
+
+**Point items carry SUB-PIXEL precision, and must keep it.** `EditablePolygonItem.polygon`
+holds genuine scene coordinates; `EditablePointItem.points` is pixmap-LOCAL instead, so a true
+scene position is `item.mapToScene(QPointF(*item._scene_xy(p)))` -- BOTH steps (`_scene_xy`
+converts pixmap-local -> item-local; `mapToScene` adds the `pos()` Qt's default drag
+accumulated). `ImageViewer._scene_to_pix_local` used to `floor()` that storage to a whole
+PIXMAP pixel. The saved coordinate is a float in the FULL-RASTER basis, so one pixmap pixel is
+one raster pixel only at 1:1 -- under an `.ax` resize (measured: a 2064x1544 capture displayed
+at 50x33) it is 41 x 47 RASTER pixels, and the reload quantised the user's drop position away:
+24/24 dragged points moved 19-61 raster pixels on the next refresh, and a freshly drawn point
+could jump a whole pixmap pixel because the load-side round trip (`stored * pm_w / ref_w`)
+lands a hair below the integer it started from. Pinned by
+`canopie/qc/test_point_drag_refresh_stability.py`.
+
+**The point PREVIEW and the committed point must come from one builder.** There are two
+point-preview call sites in `ImageViewer` -- `update_temp_drawing()` (after each click) and
+`mouseMoveEvent()`'s hover branch (the marker that follows the cursor) -- and they used to
+carry two independent copies of the same math. Making the finalize side sub-pixel updated only
+the first; the hover copy kept `int(math.floor(...))`, so the marker sat on the top-left corner
+of the containing PIXMAP pixel while the committed point kept its true fractional position, and
+it visibly jumped the instant the point was committed ("the temporary pixel point and the final
+drawn point not matching"). Measured with the real handlers on the reported image
+(IMG_0402_stacked.tif, 2064x1544): 0.93 scene units = **16.6 screen px = 38 raw raster px**
+under an `.ax` resize to 50x33, 0.4 screen px with no `.ax`. Both preview sites now call
+`ImageViewer._point_marker_path`, which must stay the single source of that geometry --
+it has to place the marker exactly where `EditablePointItem.paint()` will draw it
+(`QRectF(*_scene_xy(p), 1, 1)`). Note the temp item and the point item are NOT in different
+coordinate spaces (both are scene children at pos (0,0), identity transform) -- that was
+measured and refuted, and is pinned so a future reparent cannot reintroduce the symptom.
+
+**An `EditablePointItem`'s grab region is centred ON the point.** `shape()` uses
+`addEllipse(QPointF(sx, sy), POINT_GRAB_RADIUS, POINT_GRAB_RADIUS)`. The four-argument
+`addEllipse(sx, sy, 6, 6)` it replaces INSCRIBES the ellipse in that rect, so the region was
+centred on `(sx + 3, sy + 3)` and the point sat outside its own grab region -- measured, for a
+point at (40, 25) the region spanned x 40.1..45.9 / y 25.1..30.9 and `scene.itemAt(exact point)`
+returned the pixmap item. That was "to move the points the pan has to be further away from the
+point and not exact". Both copies of the shape geometry (the cached one in
+`_invalidate_point_cache` and the fallback inside `shape()`) must stay identical. Pinned by
+`canopie/qc/test_point_preview_matches_final.py`.
+
 There is **no in-memory undo transaction system for polygons** beyond the QUndoStack in
 ProjectTab/ImageViewer + file versioning — be careful with bulk operations.
 
