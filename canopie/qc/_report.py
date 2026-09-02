@@ -148,6 +148,12 @@ FEATURE_MAP = {
     "test_export_and_ax_regressions": (
         "Export path + .ax durability regressions",
         "atomic .ax writes (no truncation, None deletes, concurrent merges), CSV path-spelling dedupe, classification failures surfaced, cache-clear completeness"),
+    "test_point_drag_refresh_stability": (
+        "A point stays where it was dropped, across refreshes",
+        "EditablePointItem stored its geometry floor()ed to a whole PIXMAP pixel, but the SAVED coordinate is a float in the full-raster basis -- with an .ax resize one pixmap pixel is 41 x 47 raster pixels, so every reload quantised away the drop position (measured on the reported 5-band 2064x1544 capture: 24/24 dragged points moved 19-61 raster pixels on the next refresh, and freshly drawn ones jumped a full pixmap pixel when the load-side round trip landed at k - 1e-15)"),
+    "test_point_preview_matches_final": (
+        "Point drawing preview == the committed point",
+        "the temp marker that follows the cursor is built by the SAME helper as the finalized point (it used to keep its own floor()ing copy, so the marker jumped up to a whole pixmap pixel -- 16.6 screen px / 38 raster px on the reported .ax-resized capture -- the instant the point was committed), plus EditablePointItem's grab region is centred ON the point instead of 3px down-right of it"),
     "test_point_scene_coordinates": (
         "Point item scene-coordinate reconstruction",
         "drawn/moved points saved via _scene_xy, not raw pixmap-local storage -- fixes points going stray on project reload"),

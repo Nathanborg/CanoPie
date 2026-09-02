@@ -194,3 +194,33 @@ def test_declared_nodata_survives_a_windowed_read(tmp_path):
     got = reader.read_window(0, 0, 23, 9)
     assert np.all(got[0] == -9999.0), "fill row is not row 0 after the read"
     assert not np.any(got[1:] == -9999.0), "fill leaked into other rows"
+
+
+# ---------------------------------------------------------------------------
+# RasterProfile.tile_bytes() -- a separate, DORMANT bug in the same fixture
+# layout, found while investigating a real "COG loads the whole cube" report.
+# ---------------------------------------------------------------------------
+def test_tile_bytes_uses_rowsperstrip_not_whole_image(tmp_path):
+    """probe() left tile_w/tile_h at 0 for non-tiled files (only populated
+    `if tiled`), so tile_bytes()'s `self.tile_w or self.width` fallback
+    silently reported the WHOLE IMAGE as "one tile" for every strip-based
+    raster. Measured on a real 28315x25548, rowsperstrip=1 orthomosaic: a
+    25,548x overestimate (2.89 GB reported vs the true 110.6 KB). No live
+    caller reads tile_bytes() today (confirmed by grep across project_tab.py),
+    so this was dormant, not an active regression -- but a landmine for any
+    future memory-budgeting code that calls it, exactly the kind of primitive
+    this suite's other tests already rely on being correct."""
+    fp = tmp_path / "rowstrip_tilebytes.tif"
+    arr = _write_row_per_strip(fp, h=9, w=23, bands=5)
+
+    clear_reader_cache()
+    profile = probe(fp)
+    assert profile is not None and profile.strategy == STRATEGY_STRIPS
+
+    itemsize = np.dtype(arr.dtype).itemsize
+    expected = 23 * 1 * 5 * itemsize   # width * rowsperstrip * bands * itemsize
+    whole_image = arr.nbytes
+
+    got = profile.tile_bytes()
+    assert got == expected, f"tile_bytes()={got}, expected {expected} (rowsperstrip-based)"
+    assert got < whole_image, "tile_bytes() is still reporting the whole image as one tile"

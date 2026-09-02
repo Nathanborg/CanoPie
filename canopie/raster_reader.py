@@ -422,8 +422,22 @@ def probe(path):
 
             planar = int(page.planarconfig) if page.planarconfig else 1
             tiled = bool(page.is_tiled)
-            tile_w = int(page.tilewidth) if tiled else 0
-            tile_h = int(page.tilelength) if tiled else 0
+            if tiled:
+                tile_w = int(page.tilewidth)
+                tile_h = int(page.tilelength)
+            else:
+                # Mirror _level_geometry's own strip handling below -- treat
+                # each strip as a full-width tile. Leaving these at 0 (as a
+                # bare `if tiled` would) makes tile_bytes() fall back to
+                # `self.tile_w or self.width` and silently report the WHOLE
+                # IMAGE as "one tile": measured on a real 28315x25548,
+                # rowsperstrip=1 orthomosaic, a 25,548x overestimate
+                # (2.89 GB reported vs the true 110.6 KB). No live caller
+                # reads tile_bytes() today, but it is exactly the kind of
+                # memory-budget primitive a future caller would trust.
+                rps = int(page.rowsperstrip) or height
+                tile_w = width
+                tile_h = min(rps, height) if rps > 0 else height
 
             level_shapes = []
             try:

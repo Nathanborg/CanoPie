@@ -14425,6 +14425,47 @@ class ProjectTab(QtWidgets.QWidget):
                 logging.warning(f"All points for '{filepath}' are outside image bounds. Skipping.")
                 return data_rows, modified_polygons
 
+            # PERF: on a lazily-read cube, `chans[bi][yi, xi]` below reads band
+            # `bi` via LazyChannels.__getitem__, which fetches the WHOLE FRAME
+            # for that one band (x0,y0,x1,y1 = the full image) -- not just the
+            # point's pixel. Every one of this branch's per-band accesses
+            # (RF feature extraction, R/G/B, extra bands, band-math) issues one
+            # such full-frame single-band read, so a single point on a
+            # 139-band 2350x2031 stack triggered 139 full-frame decodes just to
+            # read 139 scalars -- measured in the wild as "taking forever".
+            # Worse, each of those full-frame reads decodes every tile of the
+            # image, and on a band-interleaved (planar=1) file a decoded tile
+            # holds EVERY band already but is far larger than the global tile
+            # cache budget at full-frame extent, so nothing survives to be
+            # reused by the next band's read either -- the entire compressed
+            # raster is re-decoded from disk on every single band. Reproduced
+            # on a synthetic file with the reported file's exact dimensions,
+            # tile layout (256x256, LZW) and planar config: ONE point took
+            # 1532.7 s (bands=139) before this fix; 0.052 s / 0.168 s / 1.538 s
+            # for bands=10/30/139 after it (see
+            # canopie/qc/test_perf_budgets.py's point-extraction tests).
+            #
+            # Fetch the small bounding box around this point cluster ONCE (all
+            # bands, one threaded windowed read) and keep every existing
+            # chans[bi][yi, xi] access unchanged via OffsetBand, which supports
+            # the same full-image [y, x] indexing over just that window. This
+            # mirrors the identical, already-shipped fix in
+            # MachineLearningManager.export_csv_data (see
+            # LazyChannels.read_window_offset's docstring) -- that fix never
+            # covered process_polygon's own point path.
+            if _chans_are_lazy:
+                try:
+                    pad = max(1, int(model_window_size or 1) // 2) + 1
+                    xs0 = [xi for xi, _ in pts_img]
+                    ys0 = [yi for _, yi in pts_img]
+                    chans = chans.read_window_offset(
+                        min(xs0) - pad, min(ys0) - pad,
+                        max(xs0) + pad + 1, max(ys0) + pad + 1)
+                except Exception as e:
+                    logging.warning(
+                        "[process_polygon] windowed point read failed for %s: %s",
+                        os.path.basename(filepath), e)
+
             # BATCH PREDICTION OPTIMIZATION START
             # Collect all feature vectors first
             point_features = []
@@ -26612,16 +26653,18 @@ class ProjectTab(QtWidgets.QWidget):
         # EditablePolygonItem.polygon stores genuine SCENE coordinates
         # directly (see its __init__: self._polygon = polygon, no
         # indirection). EditablePointItem.points does NOT -- it is
-        # pixmap-LOCAL, floor()-truncated integer pixel coordinates (see
-        # ImageViewer._scene_to_pix_local_int / add_point_to_scene), and the
-        # class provides `_scene_xy(p)` specifically to convert one of those
-        # back to a genuine scene position (add pixmap_item.pos(), or pass
-        # through unchanged when points_are_pixmap_local is False).
+        # pixmap-LOCAL coordinates (see ImageViewer._scene_to_pix_local /
+        # add_point_to_scene), and the class provides `_scene_xy(p)`
+        # specifically to convert one of those back to a genuine scene
+        # position (add pixmap_item.pos(), or pass through unchanged when
+        # points_are_pixmap_local is False). They carry sub-pixel precision;
+        # `_scene_to_pix_local` used to floor() them to whole pixmap pixels,
+        # which on an .ax-resized image discarded up to 41 x 47 RASTER pixels
+        # of the click position -- see that function.
         #
         # This used to do `scene_poly = polygon_item.points` and feed those
         # raw pixel-local values straight into scene_to_image_coords() below
-        # as if they were already scene coordinates -- discarding sub-pixel
-        # precision (the floor() truncation) and, whenever the pixmap the
+        # as if they were already scene coordinates -- and, whenever the pixmap the
         # point is anchored to is not at scene position (0, 0) or the
         # point's item-local transform is non-identity, applying the wrong
         # basis entirely. The WRONG "image pixel" coordinate that produced
@@ -26828,8 +26871,8 @@ class ProjectTab(QtWidgets.QWidget):
         # item's pos()/transform on top, which is what mapToScene is for).
         #
         # item.points (EditablePointItem) is the opposite: it is
-        # pixmap-LOCAL, floor()-truncated integer pixel coordinates (see
-        # ImageViewer._scene_to_pix_local_int). This USED to do
+        # pixmap-LOCAL coordinates (see
+        # ImageViewer._scene_to_pix_local). This USED to do
         # `item.mapToScene(pts)` directly on those raw pixel-local values --
         # mapToScene correctly composed item.pos()/transform, but on the
         # WRONG base value (skipping the pixmap-offset conversion), so a

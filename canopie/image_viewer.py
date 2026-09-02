@@ -295,6 +295,27 @@ POLYGON_Z        = 1.0     # ...and BELOW every annotation
 TEMP_DRAWING_Z   = 1e6     # in-progress rubber-band polygon
 LABEL_Z          = 1e7     # name labels, always on top
 
+# A drawn point is meant to represent exactly ONE RAW raster pixel (points are
+# stored/exported in raw coordinates everywhere else in the app -- CSV stats,
+# ML classification, etc.). But EditablePointItem's geometry lives in
+# PIXMAP-LOCAL scene units, and 1 pixmap-local unit == 1 raw pixel only while
+# the displayed pixmap is the raster shown 1:1. When raster_reader live-
+# decimates a huge, pyramid-less raster (no .ax involved at all -- confirmed
+# on a real 28315x25548 orthomosaic with zero overview levels, forced to a 3x
+# linear decimation), 1 pixmap-local unit is worth several raw pixels, and a
+# marker hardcoded to "1x1 unit" renders that many times too large. See
+# EditablePointItem.raw_to_pixmap_scale / ImageViewer._raw_to_pixmap_scale.
+# (Deliberately no view-scale-dependent "never shrink below N device px"
+# floor: boundingRect()/shape() are cached from item state alone and cannot
+# see the live view transform, so a paint() size that depended on it could
+# not be bounded by a fixed cache -- see EditablePointItem.paint(). A marker
+# can still shrink to sub-device-pixel at extreme zoom-out, exactly as it
+# always could before this fix; it is simply sized correctly now.)
+POINT_GRAB_RADIUS   = 3.0   # legacy hit-test footprint (was a 6x6 box, this
+                            # is its radius) -- grows with raw_to_pixmap_scale
+                            # but never shrinks below this, so a point stays
+                            # clickable at both 1:1 and extreme decimation.
+
 
 class PolygonPropertiesDialog(QtWidgets.QDialog):
     """Property (key/value) editor for a single polygon/point.
@@ -1360,7 +1381,8 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
     _LABEL_SCALE_THRESHOLD = 0.35
 
     def __init__(self, points, name="", is_rgb=False, parent=None,
-                 pixmap_item=None, points_are_pixmap_local=False):
+                 pixmap_item=None, points_are_pixmap_local=False,
+                 raw_to_pixmap_scale=(1.0, 1.0)):
         super(EditablePointItem, self).__init__(parent)
 
         self.points = points
@@ -1368,6 +1390,12 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
         self.is_rgb = is_rgb
         self.pixmap_item = pixmap_item
         self.points_are_pixmap_local = points_are_pixmap_local
+        # How many RAW raster pixels 1 pixmap-local unit represents along each
+        # axis -- see the module-level comment above POINT_GRAB_RADIUS.
+        # Default (1.0, 1.0) preserves every caller that doesn't pass this
+        # (every QC test file, and any 1:1-displayed image).
+        sx, sy = raw_to_pixmap_scale
+        self.raw_to_pixmap_scale = (max(1e-6, float(sx)), max(1e-6, float(sy)))
 
         # Same filtering/locking state as EditablePolygonItem -- see its
         # __init__ for the rationale.
@@ -1418,16 +1446,24 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
         return self.pixmap_item.pos() if self.pixmap_item is not None else QtCore.QPointF(0, 0)
 
     def _scene_xy(self, p):
-        """Return integer scene coords for a stored point `p`."""
+        """Return item-local coords for a stored point `p` (pixmap offset added).
+
+        Returns FLOATS, deliberately: see `ImageViewer._scene_to_pix_local`.
+        `self.points` carries sub-pixel precision, and truncating it here would
+        put the quantisation that function exists to avoid straight back into
+        the save path (this is the value ProjectTab.on_polygon_drawn /
+        .on_polygon_modified / .update_all_polygons map through
+        `item.mapToScene()` and then store).
+        """
         if hasattr(p, 'x'):
             px, py = p.x(), p.y()
         else:
             px, py = p[0], p[1]
         if self.points_are_pixmap_local:
             off = self._pixmap_pos()
-            return int(off.x() + px), int(off.y() + py)
+            return float(off.x() + px), float(off.y() + py)
         else:
-            return int(px), int(py)
+            return float(px), float(py)
 
     # ---- label-visibility properties (boundingRect depends on them) ----
     # Mirrors EditablePolygonItem: flipping either must go through
@@ -1470,10 +1506,16 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
             self._cached_shape = QtGui.QPainterPath()
             return
 
+        grab_r = max(POINT_GRAB_RADIUS, 0.5 * max(self.raw_to_pixmap_scale))
         path = QtGui.QPainterPath()
         for p in self.points:
             sx, sy = self._scene_xy(p)
-            path.addEllipse(sx, sy, 6, 6)
+            # Centred overload (QPointF, rx, ry) -- addEllipse(x, y, w, h)
+            # treats (x,y) as the top-left corner instead, which put the
+            # point itself OUTSIDE its own grab region (measured: a point at
+            # (40,25) had a grab region of x 41..45 / y 26..30, so a click
+            # exactly on the point hit whatever was underneath instead).
+            path.addEllipse(QtCore.QPointF(sx, sy), grab_r, grab_r)
         self._cached_shape = path
 
     def _update_bounding_rect(self):
@@ -1488,12 +1530,17 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
         for p in self.points:
             sx, sy = self._scene_xy(p)
             xs.append(sx); ys.append(sy)
-        rect = QtCore.QRectF(min(xs), min(ys), max(xs) - min(xs) + 1, max(ys) - min(ys) + 1)
+        # Extent must cover the true marker footprint -- see paint(), which
+        # draws raw_to_pixmap_scale-sized rects, not a fixed 1x1 unit.
+        w_extra = max(self.raw_to_pixmap_scale[0], POINT_GRAB_RADIUS)
+        h_extra = max(self.raw_to_pixmap_scale[1], POINT_GRAB_RADIUS)
+        rect = QtCore.QRectF(min(xs), min(ys), max(xs) - min(xs) + w_extra, max(ys) - min(ys) + h_extra)
 
         if rect.width() < 10 and rect.height() < 10:
             rect = rect.adjusted(-20, -20, 20, 20)
 
-        self._cached_brect_drag = rect.adjusted(-10, -10, 10, 10)
+        drag_pad = max(10, 2 * max(self.raw_to_pixmap_scale))
+        self._cached_brect_drag = rect.adjusted(-drag_pad, -drag_pad, drag_pad, drag_pad)
 
         full = QtCore.QRectF(rect)
         if self.name and (self._show_label or self._hover_showing_label):
@@ -1504,7 +1551,11 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
                 QtCore.QSizeF(label_width, label_height)
             )
             full = full.united(label_rect)
-        self._cached_brect = full.adjusted(-50, -50, 50, 50)
+        # Padding widened proportionally to the decimation ratio, since
+        # paint() now draws raw_to_pixmap_scale-sized markers, not a fixed
+        # 1-unit rect -- see test_bounding_rect_contains_the_actual_painted_marker.
+        pad = max(50, 8 * max(self.raw_to_pixmap_scale))
+        self._cached_brect = full.adjusted(-pad, -pad, pad, pad)
 
     def _get_res_boost(self):
         """Get resolution boost factor, cached."""
@@ -1528,9 +1579,10 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
         path = QtGui.QPainterPath()
         if self.points.isEmpty():
             return path
+        grab_r = max(POINT_GRAB_RADIUS, 0.5 * max(self.raw_to_pixmap_scale))
         for p in self.points:
             sx, sy = self._scene_xy(p)
-            path.addEllipse(sx, sy, 6, 6)
+            path.addEllipse(QtCore.QPointF(sx, sy), grab_r, grab_r)
         return path
 
     def itemChange(self, change, value):
@@ -1567,11 +1619,31 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
         self.update()
 
     def paint(self, painter, option, widget=None):
+        # A marker means "1 raw pixel" everywhere else in the app (CSV stats,
+        # ML classification), so it is drawn raw_to_pixmap_scale units
+        # wide/tall -- NOT a hardcoded 1x1 pixmap-local unit, which is only
+        # correct when the displayed pixmap shows the raster 1:1.
+        #
+        # Deliberately NOT floored by a "minimum device pixels" term tied to
+        # the live view scale: boundingRect()/shape() are cached once from
+        # item state alone (see _update_bounding_rect) and have no way to see
+        # the current view's transform, so a paint() size that depends on it
+        # cannot be bounded by a fixed cache -- confirmed by this fix's own
+        # test suite, which failed at extreme zoom-out (view scale 0.02,
+        # exactly what "fit to window" needs on the real 28315px-wide file
+        # this bug was reported against) until the dependency was removed.
+        # A view-independent size is also what boundingRect() already assumed
+        # BEFORE this fix (a fixed 1x1 scene-unit rect), so this keeps that
+        # same contract -- a marker can still shrink to sub-device-pixel at
+        # extreme zoom-out, exactly as it always could, just now scaled
+        # correctly (bigger, not smaller) relative to the old bug.
+        rw, rh = self.raw_to_pixmap_scale
+
         painter.setPen(QtCore.Qt.NoPen)
         painter.setBrush(self._brush_color)
         for p in self.points:
             sx, sy = self._scene_xy(p)
-            painter.drawRect(QtCore.QRectF(sx, sy, 1, 1))
+            painter.drawRect(QtCore.QRectF(sx, sy, rw, rh))
 
         # Skip label during active dragging to prevent ghost marks.
         # Smart suppression: same as EditablePolygonItem.
@@ -2704,18 +2776,77 @@ class ImageViewer(QtWidgets.QGraphicsView):
             self.pixel_clicked.emit(scene_pt, tuple(vals))
         return True
 
-    def _scene_to_pix_local_int(self, p: QtCore.QPointF) -> QtCore.QPointF:
-        """Map a scene point to *pixmap-local* integer pixel using floor (pixel that contains the point)."""
+    #: How close to the pixmap's far edge a clamped coordinate may sit. Must
+    #: stay < 1.0 raw pixmap unit so an in-bounds point is never dragged back
+    #: by a whole unit now that _scene_to_pix_local keeps sub-pixel precision.
+    _PIX_EDGE_EPS = 1e-3
+
+    def _scene_to_pix_local(self, p: QtCore.QPointF) -> QtCore.QPointF:
+        """Map a scene point to *pixmap-local* coordinates, clamped to the pixmap.
+
+        SUB-PIXEL PRECISION HERE IS DELIBERATE. This used to floor() to the
+        integer pixel containing the point, and that quantisation was the
+        cause of "whenever I move a point after refreshing, the paint goes
+        somewhere else, mostly for rescaled images":
+
+        `EditablePointItem` stores exactly what this returns, and the three
+        places that turn a live point item back into a SAVED coordinate
+        (ProjectTab.on_polygon_drawn / .on_polygon_modified /
+        .update_all_polygons) read it back out via `_scene_xy()`. The saved
+        value is a float in the FULL-RASTER basis, so one pixmap pixel equals
+        one raster pixel only while the viewer shows the raster 1:1 -- with an
+        `.ax` resize (measured on a 2064x1544 5-band stacked capture displayed
+        at 50x33) one pixmap pixel is 41 x 47 RASTER pixels. Flooring threw
+        away up to that much of the user's real click/drop position on every
+        load, so:
+
+          * after a drag, 24/24 measured points moved 19-61 raster pixels on
+            the very next refresh (the sub-pixel part of the drop position,
+            which `on_polygon_modified` had saved correctly, was destroyed by
+            the reload), and
+          * even with no drag at all, a freshly drawn point could jump a full
+            47 raster pixels on the first refresh, because the load-side round
+            trip (`stored * pm_w / ref_w`) lands on k - 1e-15 and floor() took
+            that to k - 1 (2/24 points at a 50x33 pixmap, 12/24 at 996x664).
+
+        Keeping the fractional part makes the load an exact inverse of the
+        save, so a point stays where the user put it across any number of
+        refreshes.
+        """
         if not self._image:
-            return QtCore.QPointF(int(math.floor(p.x())), int(math.floor(p.y())))
+            return QtCore.QPointF(p)
         off = self._image.pos()
-        # Use floor: point at (5.9, 5.9) is inside pixel (5, 5), not (6, 6)
-        lx = int(math.floor(p.x() - off.x()))
-        ly = int(math.floor(p.y() - off.y()))
+        lx = float(p.x() - off.x())
+        ly = float(p.y() - off.y())
         pm = self._image.pixmap()
-        lx = max(0, min(lx, pm.width()  - 1))
-        ly = max(0, min(ly, pm.height() - 1))
+        lx = max(0.0, min(lx, pm.width()  - self._PIX_EDGE_EPS))
+        ly = max(0.0, min(ly, pm.height() - self._PIX_EDGE_EPS))
         return QtCore.QPointF(lx, ly)
+
+    def _raw_to_pixmap_scale(self):
+        """(sx, sy): how many RAW raster pixels correspond to 1 pixmap-local
+        unit along each axis. (1.0, 1.0) unless the displayed pixmap is a
+        decimated preview of a larger raster -- see ProjectTab.polygon_basis_hw,
+        the single authority for the raw basis (never the decimated preview).
+        Threaded into EditablePointItem so its marker can be drawn/hit-tested
+        at true raw-pixel size regardless of decimation (see the module-level
+        comment above POINT_GRAB_RADIUS)."""
+        try:
+            if self._image is None:
+                return (1.0, 1.0)
+            pm = self._image.pixmap()
+            pw, ph = pm.width(), pm.height()
+            if pw <= 0 or ph <= 0:
+                return (1.0, 1.0)
+            owner = self._find_project_owner() if hasattr(self, "_find_project_owner") else None
+            if owner is None or not hasattr(owner, "polygon_basis_hw"):
+                return (1.0, 1.0)
+            raw_h, raw_w = owner.polygon_basis_hw(self)
+            if not (raw_h and raw_w):
+                return (1.0, 1.0)
+            return (raw_w / float(pw), raw_h / float(ph))
+        except Exception:
+            return (1.0, 1.0)
 
     def get_current_scale_factor(self):
         transform = self.transform()
@@ -3759,23 +3890,12 @@ class ImageViewer(QtWidgets.QGraphicsView):
                         self._shape_end_point = point
                         self.update_temp_drawing()
                 else:
-                    # For point mode, snap to pixel coordinates using floor
-                    path = QtGui.QPainterPath()
-                    off = self._image.pos() if self._image else QtCore.QPointF(0, 0)
-                    
-                    # Draw already-clicked points as pixel rects
-                    for p in self.currentPolygon:
-                        lp = self._image.mapFromScene(p)
-                        rx = int(math.floor(lp.x()))
-                        ry = int(math.floor(lp.y()))
-                        path.addRect(off.x() + rx, off.y() + ry, 1, 1)
-                    
-                    # Draw hover point as pixel rect too
-                    lp = self._image.mapFromScene(point)
-                    rx = int(math.floor(lp.x()))
-                    ry = int(math.floor(lp.y()))
-                    path.addRect(off.x() + rx, off.y() + ry, 1, 1)
-                    
+                    # Point mode hover preview. See _point_marker_path -- this
+                    # used to be an independent, floor()ing copy of
+                    # update_temp_drawing's point branch; the mismatch between
+                    # the two was "the temporary pixel point and the final
+                    # drawn point not matching".
+                    path = self._point_marker_path(self.currentPolygon, hover_point=point)
                     if isinstance(self.temp_drawing_item, QtWidgets.QGraphicsPathItem):
                         self.temp_drawing_item.setPath(path)
             event.accept()
@@ -4202,12 +4322,13 @@ class ImageViewer(QtWidgets.QGraphicsView):
 
         pix_local = QtGui.QPolygonF()
         for p in points:
-            pix_local.append(self._scene_to_pix_local_int(p))
+            pix_local.append(self._scene_to_pix_local(p))
 
         point_item = EditablePointItem(
             pix_local, name, is_rgb,
             pixmap_item=self._image,
-            points_are_pixmap_local=True
+            points_are_pixmap_local=True,
+            raw_to_pixmap_scale=self._raw_to_pixmap_scale()
         )
         point_item.is_locked = self.global_polygons_locked
         self._scene.addItem(point_item)
@@ -4308,6 +4429,32 @@ class ImageViewer(QtWidgets.QGraphicsView):
             except Exception:
                 pass
 
+    def _point_marker_path(self, points, hover_point=None):
+        """Build the point-mode drawing-preview path -- the SINGLE
+        implementation shared by update_temp_drawing() (after a click) and
+        mouseMoveEvent()'s hover branch (before any click). Previously each
+        had its own independent copy, and one floor()ed to a whole pixmap
+        pixel while the other didn't -- the marker visibly JUMPED the moment
+        the drawing was finalized, or between hovering and clicking, even
+        though the finalized EditablePointItem's own position (`_scene_xy`)
+        was already correct. This mirrors EditablePointItem.paint()'s own
+        QRectF(sx, sy, 1, 1) exactly (sub-pixel, no rounding) so the preview
+        can never disagree with where the point will actually land.
+
+        `points`: already-committed scene points (self.currentPolygon).
+        `hover_point`: an additional, not-yet-committed scene point (the
+        mouse's current position), or None.
+        """
+        path = QtGui.QPainterPath()
+        off = self._image.pos() if self._image else QtCore.QPointF(0, 0)
+        pts = list(points)
+        if hover_point is not None:
+            pts.append(hover_point)
+        for p in pts:
+            lp = self._image.mapFromScene(p) if self._image else QtCore.QPointF(p)
+            path.addRect(off.x() + lp.x(), off.y() + lp.y(), 1, 1)
+        return path
+
     def update_temp_drawing(self):
         if not self.temp_drawing_item:
             return
@@ -4363,16 +4510,8 @@ class ImageViewer(QtWidgets.QGraphicsView):
             self.temp_drawing_item.setPolygon(self.currentPolygon)
             return
 
-        # Point mode
-        path = QtGui.QPainterPath()
-        off = self._image.pos() if self._image else QtCore.QPointF(0, 0)
-        for p in self.currentPolygon:
-            lp = self._image.mapFromScene(p)
-            # Use floor: point at (5.9, 5.9) is inside pixel (5, 5)
-            rx = int(math.floor(lp.x()))
-            ry = int(math.floor(lp.y()))
-            path.addRect(off.x() + rx, off.y() + ry, 1, 1)
-        self.temp_drawing_item.setPath(path)
+        # Point mode. See _point_marker_path.
+        self.temp_drawing_item.setPath(self._point_marker_path(self.currentPolygon))
 
     def _generate_random_points(self):
         """
