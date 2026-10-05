@@ -532,7 +532,6 @@ class MainWindow(QMainWindow):
         loads the model, and sets it as the shared model for all project tabs.
         """
         options = QFileDialog.Options()
-        options |= QFileDialog.DontUseNativeDialog
         model_file, _ = QFileDialog.getOpenFileName(
             self, "Select scikit-learn Model", "", "Pickle Files (*.pkl);;All Files (*)", options=options)
         if model_file:
@@ -632,7 +631,6 @@ class MainWindow(QMainWindow):
 
     def load_project(self):
         options = QtWidgets.QFileDialog.Options()
-        options |= QtWidgets.QFileDialog.DontUseNativeDialog
         project_folder = QtWidgets.QFileDialog.getExistingDirectory(
             self, "Select Project Folder", os.path.expanduser("~"), options=options)
         if not project_folder:
@@ -1000,7 +998,6 @@ class MainWindow(QMainWindow):
         Each subfolder with a 'project.json' file is loaded as a new project tab.
         """
         options = QtWidgets.QFileDialog.Options()
-        options |= QtWidgets.QFileDialog.DontUseNativeDialog
         folder_path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Folder Containing Projects", os.path.expanduser("~"), options=options)
         if not folder_path:
             return

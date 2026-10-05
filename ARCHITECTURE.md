@@ -349,6 +349,26 @@ end-to-end; check the others by inspection when you add a new one.
   `_record_appended_band_error`): track a count + a few sample messages on `self`, reset it at
   the start of each export run, and append a `WARNING: ...` note to that run's completion
   message. Apply this pattern to any new swallowed-exception path that affects export output.
+- **Don't force `QFileDialog.DontUseNativeDialog`.** Every folder/file picker in the app
+  (`main_window.py`'s Load Project/Load All Projects/model picker, `project_tab.py`'s Open
+  Folder/Open RGB Folder/Save/Load Project/thumbnail-output/change-folder pickers,
+  `machine_learning_manager.py`'s export-folder picker — 13 sites total) used to set this flag
+  unconditionally, with no comment or documented reason at 12 of the 13 sites. Forcing Qt's own
+  non-native dialog widget means every picker depends on Qt's `QFileSystemModel`/
+  `QFileIconProvider` working correctly on this machine instead of the OS's native (COM
+  `IFileDialog`-backed) picker; when that Qt-side path misbehaves the symptom is exactly "folders
+  don't show up, and Cancel hangs the whole app" — reported across effectively every picker in the
+  app at once, on plain local folders as well as cloud-synced ones, so it isn't simply "slow
+  enumeration of a big/remote directory." **This was already diagnosed once before**, at exactly
+  one of the 13 sites (`image_editor_dialog.py`'s "Select scikit-learn model bundle" picker),
+  committed 2026-02-24 (`f93072bb`) with the comment "FIX: Removed DontUseNativeDialog to prevent
+  Windows freezing on drive scan" — but the same fix was never carried over to the other 13 sites
+  that shipped in that same commit, which is why the bug kept recurring. Removed the flag from all
+  13 (kept the now-inert `options = QFileDialog.Options()` line and the `options=options` kwarg as
+  harmless no-ops so the diff stays minimal) so every picker uses the native OS dialog. If a
+  *future* picker genuinely needs Qt's own non-native dialog (custom sidebar, multi-selection UI
+  beyond what `getExistingDirectory`/`getOpenFileName` support), document the reason right next to
+  the flag — don't reintroduce it silently, and check this list isn't missing a new site.
 
 ## Where to start for common tasks
 
