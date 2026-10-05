@@ -145,6 +145,9 @@ FEATURE_MAP = {
     "test_editor_refresh_preserves_view": (
         "Viewer state across Apply All Changes",
         "the post-editor refresh reaches the stretch-aware renderer instead of silently falling back"),
+    "test_fix_zoom_root_navigation": (
+        "Fix Zoom anchor across root navigation",
+        "the pinned view center reads back exactly what centerOn set (sub-pixel), so N root changes with no panning never move it"),
     "test_classification_render_eligibility_fast_path": (
         "Classification render: eligible-rows fast path",
         "all-valid tiles skip the boolean-index copy and scatter; partly-invalid tiles still exclude NoData rows; offsets correct"),
