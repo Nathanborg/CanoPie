@@ -6144,7 +6144,6 @@ class AnalysisOptionsDialog(QtWidgets.QDialog):
 
     def _on_browse_save_path(self):
         options = QtWidgets.QFileDialog.Options()
-        options |= QtWidgets.QFileDialog.DontUseNativeDialog
         folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Export Folder", "", options=options)
         if folder:
             self.le_save_path.setText(folder)

@@ -12181,7 +12181,6 @@ class ProjectTab(QtWidgets.QWidget):
 
         # --- 1) First folder (required) ---
         options = QtWidgets.QFileDialog.Options()
-        options |= QtWidgets.QFileDialog.DontUseNativeDialog
         initial_dir = os.path.expanduser("~")
         multispectral_folder = QtWidgets.QFileDialog.getExistingDirectory(
             self, "Select first image Folder", initial_dir, options=options
@@ -12266,7 +12265,6 @@ class ProjectTab(QtWidgets.QWidget):
 
         # Prompt to select RGB images folder
         options = QtWidgets.QFileDialog.Options()
-        options |= QtWidgets.QFileDialog.DontUseNativeDialog
         initial_dir = os.path.expanduser("~")
         rgb_folder = QtWidgets.QFileDialog.getExistingDirectory(
             self, "Select RGB Images Folder", initial_dir, options=options)
@@ -16194,7 +16192,6 @@ class ProjectTab(QtWidgets.QWidget):
             project_name = os.path.basename(os.path.normpath(self.project_folder))
         else:
             options = QtWidgets.QFileDialog.Options()
-            options |= QtWidgets.QFileDialog.DontUseNativeDialog
             chosen_path, _ = QtWidgets.QFileDialog.getSaveFileName(
                 self, "Save All CSV", os.path.expanduser("~"), "CSV Files (*.csv)", options=options)
             if not chosen_path:
@@ -17591,7 +17588,6 @@ class ProjectTab(QtWidgets.QWidget):
             project_name = os.path.basename(os.path.normpath(self.project_folder))
         else:
             options = QtWidgets.QFileDialog.Options()
-            options |= QtWidgets.QFileDialog.DontUseNativeDialog
             chosen_path, _ = QtWidgets.QFileDialog.getSaveFileName(
                 self, "Save EXIF CSV", os.path.expanduser("~"), "CSV Files (*.csv)", options=options)
             if not chosen_path:
@@ -27887,7 +27883,6 @@ class ProjectTab(QtWidgets.QWidget):
 
         # Prompt user to select a project folder
         options = QtWidgets.QFileDialog.Options()
-        options |= QtWidgets.QFileDialog.DontUseNativeDialog
         project_folder = QtWidgets.QFileDialog.getExistingDirectory(
             self, "Select Project Folder", os.path.expanduser("~"), options=options)
         if not project_folder:
@@ -28020,7 +28015,6 @@ class ProjectTab(QtWidgets.QWidget):
         # 1) Pick folder
         if project_folder is None:
             options = QtWidgets.QFileDialog.Options()
-            options |= QtWidgets.QFileDialog.DontUseNativeDialog
             project_folder = QtWidgets.QFileDialog.getExistingDirectory(
                 self, "Select Project Folder", os.path.expanduser("~"), options=options)
             if not project_folder:
@@ -30202,7 +30196,6 @@ class ProjectTab(QtWidgets.QWidget):
             default_dir = os.path.expanduser("~")
         
         options = QtWidgets.QFileDialog.Options()
-        options |= QtWidgets.QFileDialog.DontUseNativeDialog
         output_dir = QFileDialog.getExistingDirectory(
             self, "Select Output Directory for Thumbnails", default_dir, options=options
         )
@@ -31517,7 +31510,6 @@ class ProjectTab(QtWidgets.QWidget):
 
         def _pick_dir(title: str, start_dir: str = "") -> str:
             options = QtWidgets.QFileDialog.Options()
-            options |= QtWidgets.QFileDialog.DontUseNativeDialog
             start = start_dir if _existing_dir(start_dir) else os.path.expanduser("~")
             path = QtWidgets.QFileDialog.getExistingDirectory(self, title, start, options=options)
             return path or ""
@@ -33170,7 +33162,6 @@ class ImagePickerDialog(QtWidgets.QDialog):
 
     def _change_folder(self):
         options = QtWidgets.QFileDialog.Options()
-        options |= QtWidgets.QFileDialog.DontUseNativeDialog
         new_dir = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Folder", self._current_dir, options=options)
         if new_dir:
             self._current_dir = new_dir
