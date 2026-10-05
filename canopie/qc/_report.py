@@ -151,6 +151,9 @@ FEATURE_MAP = {
     "test_classification_render_eligibility_fast_path": (
         "Classification render: eligible-rows fast path",
         "all-valid tiles skip the boolean-index copy and scatter; partly-invalid tiles still exclude NoData rows; offsets correct"),
+    "test_band_expression_display_persists": (
+        "A band expression applied in the editor stays on screen",
+        "Apply stores the expression band as the .ax display (no revert to RGB on refresh/reopen); switching band math off restores the previous stretch"),
     "test_export_and_ax_regressions": (
         "Export path + .ax durability regressions",
         "atomic .ax writes (no truncation, None deletes, concurrent merges), CSV path-spelling dedupe, classification failures surfaced, cache-clear completeness"),
