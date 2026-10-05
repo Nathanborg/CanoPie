@@ -260,6 +260,85 @@ def test_point_extraction_windowed_reads_are_bounded_by_bands_not_by_frame(
 
 
 # ---------------------------------------------------------------------------
+# "_guess_label_band" full-frame-per-band scan -- a SECOND, unfixed call site
+# with the exact same anti-pattern as the point-extraction bug above.
+#
+# process_polygon's "Count 0/1" feature needs to guess which band (if any)
+# holds integer class labels when the .ax doesn't already say so (no
+# classification/band_expression block). It does this via _guess_label_band,
+# which probes each candidate band with chans[bi] -- i.e. plain
+# LazyChannels.__getitem__(bi), the SAME "one band, but the WHOLE FRAME"
+# contract implicated in the point-extraction bug just above. This code path
+# runs for BOTH point and polygon extraction, BEFORE the point/polygon split,
+# so 5ec209c's point-loop fix (which only touched code after that split) never
+# covered it: a real user re-tested the exact file/fix from that commit and
+# reported it "still slow" on a single point -- this is why. Reproduced on the
+# 200-band lazy fixture with stats={"count01": True} (and no ax classification/
+# band_expression hint, so the fallback scan runs): 201 full-frame single-band
+# reads for ONE point (one per band, plus the prefer-last probe), before this
+# fix; 0 after it. FIX: mirrors _band_scene_stats' existing lazy sampling
+# (chans.sample_bands, same budgets) -- _guess_label_band only ever looks at a
+# random 500-pixel SUBSAMPLE of whatever it's given anyway, so a spatial
+# sample is exactly as good an input as the full frame for this purpose.
+# ---------------------------------------------------------------------------
+def test_guess_label_band_does_not_scan_full_frame_per_band(
+        synthetic_project, force_lazy_export, monkeypatch):
+    from ..raster_reader import LazyChannels
+
+    calls = {"getitem_scalar": 0}
+    original_getitem = LazyChannels.__getitem__
+
+    def counting_getitem(self, index):
+        if not isinstance(index, slice):
+            calls["getitem_scalar"] += 1
+        return original_getitem(self, index)
+
+    monkeypatch.setattr(LazyChannels, "__getitem__", counting_getitem)
+
+    opts = {"stats": {"mean": True, "count01": True}}
+    _clear_caches(synthetic_project)
+    rows, _ = _run_point(synthetic_project, "hyperspectral_200band", "p_center", opts=opts)
+
+    assert rows, "point extraction produced no rows -- fixture/test problem, not a pass"
+    assert calls["getitem_scalar"] == 0, (
+        f"LazyChannels.__getitem__(band_index) was called {calls['getitem_scalar']} "
+        "time(s) while guessing the label band -- each such call reads a "
+        "FULL-FRAME single-band window, the exact O(bands) full-frame-per-band "
+        "regression the point-extraction fix above pins, just via a different "
+        "call site (_guess_label_band) that fix never touched. Band probing "
+        "must go through the sampled cube (chans.sample_bands), like "
+        "_band_scene_stats already does, not chans[bi].")
+
+
+def test_guess_label_band_scan_also_covers_polygon_extraction(
+        synthetic_project, force_lazy_export, monkeypatch):
+    """Same bug, polygon path: _guess_label_band runs before the point/polygon
+    split, so a polygon with 'Count 0/1' enabled is equally exposed."""
+    from ..raster_reader import LazyChannels
+
+    calls = {"getitem_scalar": 0}
+    original_getitem = LazyChannels.__getitem__
+
+    def counting_getitem(self, index):
+        if not isinstance(index, slice):
+            calls["getitem_scalar"] += 1
+        return original_getitem(self, index)
+
+    monkeypatch.setattr(LazyChannels, "__getitem__", counting_getitem)
+
+    opts = {"stats": {"mean": True, "count01": True}}
+    _clear_caches(synthetic_project)
+    rows, _ = _run_polygon(synthetic_project, "hyperspectral_200band", opts=opts)
+
+    assert rows, "polygon extraction produced no rows -- fixture/test problem, not a pass"
+    assert calls["getitem_scalar"] == 0, (
+        f"LazyChannels.__getitem__(band_index) was called {calls['getitem_scalar']} "
+        "time(s) while guessing the label band during POLYGON extraction -- "
+        "_guess_label_band runs before the point/polygon split, so this must "
+        "stay fixed for both.")
+
+
+# ---------------------------------------------------------------------------
 # Memory hygiene
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("name", ["rgb_8bit_untiled", "multiband_8band_ancillary"])

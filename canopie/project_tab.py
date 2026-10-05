@@ -14062,13 +14062,51 @@ class ProjectTab(QtWidgets.QWidget):
             mode_frac = float(cts.max() / max(ints.size, 1))
             return int(uniq.size), mode_k, mode_frac
 
+        # Lazily-computed, cached sample of EVERY band -- shared by every
+        # `_qualify` call below. On a lazy cube `chans[bi]` is a FULL-FRAME
+        # single-band read (see LazyChannels.__getitem__'s docstring): probing
+        # N candidate bands one at a time (the "no ax classification/
+        # band_expression hint" fallback, below) reproduced the exact
+        # per-band full-frame-decode cost that 5ec209c fixed for the point
+        # loop's own accesses -- just via a DIFFERENT call site that fix never
+        # touched, so a project with "Count 0/1" enabled and no classification/
+        # band_expression .ax stayed just as slow after that fix as before it,
+        # for points AND polygons alike. Reproduced: on the 200-band lazy
+        # fixture this call site alone issued 201 full-frame single-band reads
+        # (one per band, plus the prefer-last probe) for ONE point.
+        # Mirrors _band_scene_stats' existing lazy sampling (same budgets).
+        _label_band_sample_cache = {"arr": None, "done": False}
+
+        def _lazy_label_band_sample():
+            if not _label_band_sample_cache["done"]:
+                _label_band_sample_cache["done"] = True
+                try:
+                    _label_band_sample_cache["arr"] = np.asarray(
+                        chans.sample_bands(
+                            list(range(len(chans))),
+                            max_bytes=_SCENE_STATS_SAMPLE_BUDGET_BYTES,
+                            decode_budget=_SCENE_STATS_SAMPLE_DECODE_BUDGET_BYTES))
+                except Exception as e:
+                    logging.warning(
+                        "[process_polygon] label-band sample failed for '%s' "
+                        "(falling back to full-resolution reads): %s", filepath, e)
+                    _label_band_sample_cache["arr"] = None
+            return _label_band_sample_cache["arr"]
+
         def _guess_label_band(chans, nd_masks=None, prefer_last=True, sample=500,
                               max_cats=50, int_frac_thr=0.98, mode_frac_thr=0.30, tol=1e-6):
             N = len(chans)
             candidates = []
 
+            def _band_arr(bi):
+                if _chans_are_lazy:
+                    samp = _lazy_label_band_sample()
+                    if samp is not None and bi < samp.shape[2]:
+                        return samp[..., bi]
+                return chans[bi]
+
             def _qualify(bi):
-                s = _sample_band_values(chans[bi], (nd_masks[bi] if nd_masks is not None else None), n=sample)
+                s = _sample_band_values(_band_arr(bi), (nd_masks[bi] if nd_masks is not None else None), n=sample)
                 ok_int, frac_int = _band_is_integer_like(s, tol=tol, frac_thr=int_frac_thr)
                 if not ok_int:
                     return None
