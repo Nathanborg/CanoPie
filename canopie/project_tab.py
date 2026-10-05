@@ -8000,8 +8000,10 @@ class ProjectTab(QtWidgets.QWidget):
             except Exception:
                 pass
             if ax_cfg:
-                # Check for band expression (can be string or dict)
-                be = ax_cfg.get("band_expression")
+                # Check for band expression (can be string or dict). Honour
+                # band_enabled: switched off, nothing is appended, and pinning the
+                # last band would show alpha (RGBA) or the last file band instead.
+                be = ax_cfg.get("band_expression") if ax_cfg.get("band_enabled", True) else None
                 if isinstance(be, dict):
                     # Dict format: check for expression key
                     has_expr = bool((be.get("expression") or "").strip())
@@ -9795,6 +9797,18 @@ class ProjectTab(QtWidgets.QWidget):
         if copied > 0:
             QtWidgets.QMessageBox.information(self, "Copy Complete", f"Copied {copied} polygon(s) to next tab.")
 
+
+    @staticmethod
+    def _ax_active_expression(ax):
+        """The band expression an .ax actually applies, or "" -- honours
+        `band_enabled` (the editor keeps the text when band math is switched
+        off) and both stored forms (string, or dict with "expression")."""
+        if not isinstance(ax, dict) or not ax.get("band_enabled", True):
+            return ""
+        be = ax.get("band_expression")
+        if isinstance(be, dict):
+            be = be.get("expression")
+        return be.strip() if isinstance(be, str) else ""
 
     def _merge_write_ax(self, image_path: str, patch: dict, preserve_keys=("viewer_stretch",)):
         """
@@ -12144,6 +12158,63 @@ class ProjectTab(QtWidgets.QWidget):
                     pass
             except Exception as e:
                 logging.debug(f"Post-editor refresh failed: {e}")
+
+            # ---- STORE the expression view when this Apply changed the expression ----
+            #
+            # The snapshot below restores the PRE-editor viewer_stretch. When the
+            # Apply set or changed a band expression, that snapshot is the old
+            # composite ("rgb"), and every later load resolves it from the .ax
+            # first -- the expression showed once (pinned in memory by the
+            # refresh above) and reverted on the next navigation, refresh or
+            # reopen. Store the expression band as the display instead, and keep
+            # the user's own stretch beside it so switching band math off brings
+            # it back.
+            try:
+                after_ax = self._read_json_silently(self._ax_path_for(filepath)) or {}
+                expr_before = self._ax_active_expression(before)
+                expr_after = self._ax_active_expression(after_ax)
+                vs_now = (after_ax.get("viewer_stretch") if isinstance(after_ax, dict) else None) or {}
+                vs_prev = protected.get("viewer_stretch") or {}
+                img_now = getattr(getattr(viewer, "image_data", None), "image", None)
+                C_now = img_now.shape[2] if getattr(img_now, "ndim", 0) == 3 else 0
+                if expr_after and expr_after != expr_before and C_now > 3:
+                    keep = vs_prev if not vs_prev.get("auto_expression_pin") else \
+                        (after_ax.get("viewer_stretch_before_expression") or None)
+                    pin = dict(vs_prev) if vs_prev else {}
+                    for k in ("r_band", "g_band", "b_band", "band_mins", "band_maxs",
+                              "min_val", "max_val"):
+                        pin.pop(k, None)
+                    pin.update({"display_mode": "single", "display_band": C_now - 1,
+                                "auto_expression_pin": True})
+                    patch = {"viewer_stretch": pin}
+                    if keep:
+                        patch["viewer_stretch_before_expression"] = keep
+                    self._merge_write_ax(filepath, patch, preserve_keys=())
+                    viewer.stretch_params = self._stretch_from_dict(pin)
+                    viewer._auto_pinned_last_band = False
+                    protected = {}
+                elif expr_before and not expr_after and \
+                        (vs_prev.get("auto_expression_pin") or vs_now.get("auto_expression_pin")):
+                    restored = after_ax.get("viewer_stretch_before_expression")
+                    axp_now = self._ax_path_for(filepath)
+                    cur = self._read_json_silently(axp_now) or {}
+                    cur.pop("viewer_stretch_before_expression", None)
+                    if restored:
+                        cur["viewer_stretch"] = restored
+                    else:
+                        cur.pop("viewer_stretch", None)
+                    self._write_json_safely(axp_now, cur)
+                    if hasattr(self, "_invalidate_cached_ax"):
+                        self._invalidate_cached_ax(filepath)
+                    if hasattr(self, "_ax_cache"):
+                        self._ax_cache.pop(os.path.normcase(os.path.abspath(filepath)), None)
+                    viewer.stretch_params = self._stretch_from_dict(restored) if restored else None
+                    viewer._auto_pinned_last_band = False
+                    protected = {}
+                    if hasattr(self, "refresh_single_viewer"):
+                        self.refresh_single_viewer(viewer, reapply_mods=True, preserve_view=True)
+            except Exception as e:
+                logging.warning(f"edit_image_viewer: storing the expression display failed: {e}")
 
             # ---- RESTORE / MERGE protected keys if editor overwrote the .ax ----
             try:
@@ -24404,7 +24475,7 @@ class ProjectTab(QtWidgets.QWidget):
         # Also check band_expression with non-replace mode (adds extra band that should be displayed)
         try:
             if fp and not prefer_last_band:
-                be = ax.get("band_expression")
+                be = ax.get("band_expression") if ax.get("band_enabled", True) else None
                 if isinstance(be, dict):
                     mode = str(be.get("mode") or be.get("output") or "append").lower()
                     has_expr = bool((be.get("expression") or "").strip())
