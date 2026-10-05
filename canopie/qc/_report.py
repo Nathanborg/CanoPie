@@ -145,6 +145,9 @@ FEATURE_MAP = {
     "test_editor_refresh_preserves_view": (
         "Viewer state across Apply All Changes",
         "the post-editor refresh reaches the stretch-aware renderer instead of silently falling back"),
+    "test_classification_render_eligibility_fast_path": (
+        "Classification render: eligible-rows fast path",
+        "all-valid tiles skip the boolean-index copy and scatter; partly-invalid tiles still exclude NoData rows; offsets correct"),
     "test_export_and_ax_regressions": (
         "Export path + .ax durability regressions",
         "atomic .ax writes (no truncation, None deletes, concurrent merges), CSV path-spelling dedupe, classification failures surfaced, cache-clear completeness"),
