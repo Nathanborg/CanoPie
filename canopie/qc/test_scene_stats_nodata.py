@@ -159,20 +159,16 @@ def test_expression_nodata_only_affects_its_own_band_in_scene_stats(
 
     # ...while band 0 ("R") is NOT touched by a b2 expression.
     #
-    # DOCUMENTED, STILL-UNFIXED BEHAVIOR (flagged separately to the user):
-    # supplying ANY explicit nodata_values REPLACES the file's auto-detected
-    # GDAL_NODATA rather than adding to it -- the auto fallback only runs when
-    # nodata_values is otherwise empty. So with only `b2<threshold` supplied,
-    # band 0 keeps its -9999 fill pixels and its scene mean is dragged
-    # negative. That is the CURRENT contract, pinned here so the behavior
-    # cannot change silently; if custom rules are ever made additive, this
-    # assertion flips to the fill-excluded expectation.
+    # Explicit nodata_values (the export dialog's field) are ADDED to the
+    # file's own NoData since 2026-10-06 (one rule, canopie.nodata) -- they
+    # used to REPLACE it, so band 0 kept its -9999 fill and its scene mean was
+    # dragged negative. Now band 0 excludes its own fill and nothing else.
     band0 = raw[:, :, 0].astype(np.float64)
-    r_expected_current = float(np.nanmean(band0))          # fill INCLUDED
-    r_if_auto_were_additive = float(np.nanmean(band0[~np.isclose(band0, -9999.0, atol=1e-3)]))
-    assert r_expected_current != pytest.approx(r_if_auto_were_additive), (
+    r_old_replacing = float(np.nanmean(band0))              # fill INCLUDED (old)
+    r_expected = float(np.nanmean(band0[~np.isclose(band0, -9999.0, atol=1e-3)]))
+    assert r_old_replacing != pytest.approx(r_expected), (
         "fixture no longer distinguishes the two behaviors -- pick a band that "
         "actually contains fill pixels")
-    assert_close(by_channel["R"].get("Scene Mean"), r_expected_current, tol=1e-3,
-                 msg="R Scene Mean must be untouched by a b2 expression "
-                     "(and, per current behavior, still contains -9999 fill)")
+    assert_close(by_channel["R"].get("Scene Mean"), r_expected, tol=1e-3,
+                 msg="R Scene Mean must exclude only R's own fill (a b2 expression "
+                     "must not touch it, and the file's -9999 is still NoData)")

@@ -25,6 +25,14 @@ involved at all. This file exercises exactly that path, reusing the same
 conftest fixtures `test_forced_preview_decimation` already proves force real
 spatial decimation (empirically: step=2, a (32,32,3) preview decimated to
 (16,16,3), no multi-GB file needed).
+
+CORRECTION (2026-10-06): the first fix for this drew the marker
+`raw_to_pixmap_scale` pixmap units wide -- the ratio used as a WIDTH, which is
+3x LARGER than before on a 3x preview (9 raw pixels), the opposite of the
+diagnosis above -- and these tests pinned that. One raw (= exported-frame)
+pixel is 1 / raw_to_pixmap_scale pixmap units, and the marker is the cell
+CONTAINING the point (floor), i.e. exactly the pixel CSV export reads. See
+test_point_pixel_snapping.py for the end-to-end contract.
 """
 import numpy as np
 import pytest
@@ -124,22 +132,25 @@ def test_add_point_to_scene_computes_ratio_under_real_forced_decimation(
 # ---------------------------------------------------------------------------
 # 2) paint() draws a marker sized to a real, non-trivial ratio.
 # ---------------------------------------------------------------------------
-def test_paint_draws_marker_sized_to_raw_pixmap_ratio():
+def test_paint_draws_exactly_one_raw_pixel_containing_the_point():
     fp = fixture_image_path("rgb_8bit_untiled")
     ratio = _real_ratio_from_decimated_pixmap(fp, decimation=4)
 
     item = EditablePointItem(
-        QtGui.QPolygonF([QtCore.QPointF(5.0, 5.0)]),
+        QtGui.QPolygonF([QtCore.QPointF(5.3, 5.8)]),
         raw_to_pixmap_scale=ratio)
 
-    painter = _StubPainter(scale=1.0)   # scale=1.0 -> the min-device-px floor cannot engage
+    painter = _StubPainter(scale=1.0)
     item.paint(painter, None)
 
     assert len(painter.rects) == 1
     r = painter.rects[0]
-    assert r.width() == pytest.approx(ratio[0])
-    assert r.height() == pytest.approx(ratio[1])
-    assert (r.width(), r.height()) != (1.0, 1.0)
+    assert r.width() == pytest.approx(1.0 / ratio[0])
+    assert r.height() == pytest.approx(1.0 / ratio[1])
+    # the cell CONTAINING the point (floor), like process_polygon / ML
+    assert r.left() == pytest.approx(np.floor(5.3 * ratio[0]) / ratio[0])
+    assert r.top() == pytest.approx(np.floor(5.8 * ratio[1]) / ratio[1])
+    assert r.contains(QtCore.QPointF(5.3, 5.8))
 
 
 # ---------------------------------------------------------------------------
@@ -164,8 +175,8 @@ def test_paint_size_does_not_depend_on_view_scale():
     item.paint(zoomed_out, None)
 
     r_in, r_out = zoomed_in.rects[0], zoomed_out.rects[0]
-    assert (r_in.width(), r_in.height()) == pytest.approx((4.0, 4.0))
-    assert (r_out.width(), r_out.height()) == pytest.approx((4.0, 4.0))
+    assert (r_in.width(), r_in.height()) == pytest.approx((0.25, 0.25))
+    assert (r_out.width(), r_out.height()) == pytest.approx((0.25, 0.25))
 
 
 # ---------------------------------------------------------------------------
@@ -189,17 +200,18 @@ def test_shape_grab_ellipse_is_centred_on_the_point():
 # ---------------------------------------------------------------------------
 # 5) Grab radius grows with decimation but never shrinks below the legacy size.
 # ---------------------------------------------------------------------------
-def test_shape_grab_radius_grows_with_decimation_but_never_shrinks():
+def test_shape_grab_radius_covers_the_cell_but_never_shrinks():
+    """The grab region is at least POINT_GRAB_RADIUS (clickable at any
+    decimation, however small the raw pixel is on the preview) and grows when
+    one raw pixel is LARGER than that on the pixmap (an upsampled view)."""
     pt = QtCore.QPointF(10.0, 10.0)
-    small = EditablePointItem(QtGui.QPolygonF([pt]), raw_to_pixmap_scale=(1.0, 1.0))
-    big = EditablePointItem(QtGui.QPolygonF([pt]), raw_to_pixmap_scale=(30.0, 30.0))
+    decimated = EditablePointItem(QtGui.QPolygonF([pt]), raw_to_pixmap_scale=(30.0, 30.0))
+    one_to_one = EditablePointItem(QtGui.QPolygonF([pt]), raw_to_pixmap_scale=(1.0, 1.0))
+    upsampled = EditablePointItem(QtGui.QPolygonF([pt]), raw_to_pixmap_scale=(0.1, 0.1))
 
-    small_extent = small.shape().boundingRect().width()
-    big_extent = big.shape().boundingRect().width()
-
-    assert big_extent > small_extent
-    # `pytest.approx()` only supports `==`/`!=`, not `>=` -- compare directly.
-    assert small_extent >= 2 * POINT_GRAB_RADIUS - 0.01
+    for it in (decimated, one_to_one):
+        assert it.shape().boundingRect().width() >= 2 * POINT_GRAB_RADIUS - 0.01
+    assert upsampled.shape().boundingRect().width() > one_to_one.shape().boundingRect().width()
 
 
 # ---------------------------------------------------------------------------

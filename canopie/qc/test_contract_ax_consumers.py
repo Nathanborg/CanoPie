@@ -135,8 +135,8 @@ def _export_pixels(pt, fp, n_channels):
                      for c in chans[:n_channels]], axis=-1)
 
 
-# `nodata` is handled separately: the two replays deliberately differ there
-# (see test_nodata_fill_differs_between_display_and_export below).
+# `nodata` has its own test (test_viewer_and_export_mark_the_same_nodata_per_band):
+# NaN never compares equal, so it needs the NaN-aware comparison.
 PIXEL_EQUAL_CASES = [c for c in sorted(AX_CASES) if c != "nodata"]
 
 
@@ -192,53 +192,200 @@ def test_rotation_actually_moves_pixels(ax_project):
         "rotation changed pixel VALUES, not just their positions")
 
 
-def test_nodata_fill_differs_between_display_and_export(ax_project):
-    """DOCUMENTED BASELINE, not a bug -- but pinned so it cannot drift silently.
-
-    With a numeric `.ax` NoData value the two replays deliberately diverge:
-
-      viewer  keeps the original pixel, so the user can still SEE the value
-      export  zeroes the WHOLE pixel when ANY band matches, then masks it out
-              of the statistics
-
-    Measured on this fixture with nodata_values [0]: 46 of 4096 pixels differ,
-    e.g. raw (94, 47, 0) stays (94, 47, 0) on screen but becomes (0, 0, 0) in
-    the export array.
-
-    That is defensible (show the data, don't count it) and the exported
-    STATISTICS are self-consistent with the whole-pixel rule -- which is what
-    `test_nodata_statistics_follow_whole_pixel_masking` below verifies. The
-    thing that would be a real bug is the statistics disagreeing with the
-    pixels they claim to summarise, so that is what is asserted, rather than
-    forcing the two replays to render NoData identically.
-    """
+def test_viewer_and_export_mark_the_same_nodata_per_band(ax_project):
+    """ONE NoData rule (canopie.nodata, Nathan 2026-10-06): per band, GDAL style.
+    The viewer's data and the export hold NaN in exactly the same places, band
+    by band, and agree everywhere else. (They used to differ: the export zeroed
+    whole pixels, the viewer kept the raw values -- pinned here as a "documented
+    divergence" until the rule was decided.)"""
     pt, fp = ax_project(AX_CASES["nodata"])
     viewer, _ = _viewer_pixels(pt, fp)
     export = _export_pixels(pt, fp, viewer.shape[2])
-
-    diff = np.abs(viewer[..., ::-1] - export).max(axis=2)
-    n_diff = int((diff > 0).sum())
-    assert n_diff > 0, (
-        "display and export now agree on NoData pixels. That may be an "
-        "improvement -- if so, move `nodata` back into PIXEL_EQUAL_CASES and "
-        "delete this test.")
-
-    # Every differing pixel must be one the export zeroed, not arbitrary drift.
-    ys, xs = np.where(diff > 0)
-    for y, x in zip(ys[:20], xs[:20]):
-        assert np.allclose(export[y, x], 0.0), (
-            f"({x},{y}) differs but the export value is {export[y, x]}, not the "
-            "expected zero fill -- this is drift, not the documented rule")
+    v = viewer[..., ::-1]                      # cv2 fixture: viewer array is BGR
+    assert np.array_equal(np.isnan(v), np.isnan(export)), (
+        "viewer and export disagree on WHICH band values are NoData")
+    assert np.isnan(export).any(), "fixture has no NoData -- the test is vacuous"
+    ok = ~np.isnan(export)
+    assert np.allclose(v[ok], export[ok]), "viewer and export disagree off NoData"
+    # per band: a pixel with value 0 in ONE band is NoData only in that band
+    raw0 = (export == 0)
+    assert not raw0.any(), "a NoData value survived in the export"
 
 
-def test_nodata_statistics_follow_whole_pixel_masking(synthetic_project, tmp_path):
-    """The statistics must describe the pixel set the export actually used.
+_HIST = {"hist_enabled": True,
+         "hist_match": {"mode": "meanstd", "bands": 3,
+                        "ref_stats": [{"mean": 20.0, "std": 5.0}] * 3}}
+_CROP = {"crop_enabled": True,
+         "crop_rect": {"x": 8, "y": 6, "width": 30, "height": 24},
+         "crop_rect_ref_size": {"w": 64, "h": 64}}
 
-    Exported Mean is compared against BOTH candidate rules; it must match the
-    whole-pixel one (the documented behaviour) and the test says so explicitly,
-    so if the rule ever changes the failure names the new behaviour instead of
-    just going red.
-    """
+# NoData combined with every op that moves or mixes pixels.
+NODATA_CASES = {
+    "number": {"nodata_enabled": True, "nodata_values": [0]},
+    "shrink": {"nodata_enabled": True, "nodata_values": [0],
+               "resize_enabled": True, "resize": {"width": 50, "height": 50}},
+    "grow": {"nodata_enabled": True, "nodata_values": [0],
+             "resize_enabled": True, "resize": {"width": 150, "height": 150}},
+    "crop_rotate": {"nodata_enabled": True, "nodata_values": [0], **_CROP,
+                    "rotate_enabled": True, "rotate": 90},
+    "hist": {"nodata_enabled": True, "nodata_values": [0], **_HIST},
+    "hist_shrink": {"nodata_enabled": True, "nodata_values": [0], **_HIST,
+                    "resize_enabled": True, "resize": {"width": 50, "height": 50}},
+    "expression": {"nodata_enabled": True, "nodata_values": ["b1<40"]},
+    "band_math": {"nodata_enabled": True, "nodata_values": [0],
+                  "band_enabled": True, "band_expression": "b1>100"},
+    "band_math_ratio": {"nodata_enabled": True, "nodata_values": ["b1<40"],
+                        "band_enabled": True, "band_expression": "(b2-b3)/(b2+b3+1)"},
+    "appended": {"nodata_enabled": True, "nodata_values": ["b1<40"],
+                 "band_enabled": True, "band_expression": "b1>100",
+                 "appended_bands": [
+                     {"type": "boolean_expression", "expression": "b1>120", "index": 0},
+                     {"type": "band_expression", "expression": "b2-b3", "index": 1}]},
+}
+
+
+def _viewer_in_file_order(viewer):
+    """cv2 fixture: the viewer's first three channels are B,G,R; derived
+    bands follow in place."""
+    v = np.array(viewer, copy=True)
+    v[..., :3] = viewer[..., 2::-1]
+    return v
+
+
+@pytest.mark.parametrize("case", sorted(NODATA_CASES))
+def test_viewer_and_export_agree_on_nodata_under_every_op(ax_project, case):
+    """Viewer data == analysis image, NaN for NaN, for NoData combined with
+    resize (both ways), crop + rotate, histogram matching (before and after a
+    shrink), a NoData expression and band math -- including the derived band."""
+    pt, fp = ax_project(NODATA_CASES[case])
+    viewer, _ = _viewer_pixels(pt, fp)
+    export = _export_pixels(pt, fp, viewer.shape[2])
+    assert viewer.shape == export.shape, f"{case}: {viewer.shape} vs {export.shape}"
+    v = _viewer_in_file_order(viewer)
+    assert np.isnan(export).any(), f"{case}: no NoData at all -- the case is vacuous"
+    assert np.array_equal(np.isnan(v), np.isnan(export)), (
+        f"{case}: viewer and export disagree on WHICH band values are NoData "
+        f"({int(np.isnan(v).sum())} vs {int(np.isnan(export).sum())} NaN)")
+    ok = ~np.isnan(export)
+    assert np.allclose(v[ok], export[ok], atol=1e-4), f"{case}: values differ off NoData"
+
+
+def _reg(tx, ty, calc):
+    return {"enabled": True, "mode": "Translation", "is_reference": False,
+            "matrix": [[1.0, 0.0, tx], [0.0, 1.0, ty], [0.0, 0.0, 1.0]], "calc_shape": list(calc)}
+
+
+_CROP_ROT = {"crop_enabled": True,
+             "crop_rect": {"x": 8, "y": 6, "width": 40, "height": 30},
+             "crop_rect_ref_size": {"w": 64, "h": 64},
+             "rotate_enabled": True, "rotate": 90}
+
+# Registration: ONE matrix for every consumer (canopie.ax_registration). The
+# 64 x 64 fixture's exported frame is 64 x 64, 30 x 40 after _CROP_ROT
+# (rotated), 32 x 32 after a 50% resize.
+REG_CASES = {
+    "reg_shift": {"registration": _reg(3.0, -2.0, (64, 64))},
+    "reg_crop_rotate": {**_CROP_ROT, "registration": _reg(3.0, -2.0, (30, 40))},
+    "reg_crop_rotate_nodata": {**_CROP_ROT, "registration": _reg(2.0, 1.0, (30, 40)),
+                               "nodata_enabled": True, "nodata_values": [0]},
+    "reg_resize_hist": {"resize_enabled": True, "resize": {"width": 50, "height": 50},
+                        "registration": _reg(1.5, 0.5, (32, 32)), **_HIST},
+    "reg_band_math": {"registration": _reg(-2.0, 3.0, (64, 64)),
+                      "band_enabled": True, "band_expression": "b1>100"},
+}
+
+
+@pytest.mark.parametrize("case", sorted(REG_CASES))
+def test_viewer_and_export_apply_the_same_registration(ax_project, case):
+    """Registration used to be applied four different ways (viewer and editor:
+    raw frame, crop translation only; analysis: processed frame; image export:
+    twice). The viewer's data and the analysis image must now agree, NaN for
+    NaN (pixels from outside the raster are NoData)."""
+    pt, fp = ax_project(REG_CASES[case])
+    viewer, _ = _viewer_pixels(pt, fp)
+    export = _export_pixels(pt, fp, viewer.shape[2])
+    assert viewer.shape == export.shape, f"{case}: {viewer.shape} vs {export.shape}"
+    v = _viewer_in_file_order(viewer)
+    assert np.array_equal(np.isnan(v), np.isnan(export)), (
+        f"{case}: viewer and export disagree on NoData "
+        f"({int(np.isnan(v).sum())} vs {int(np.isnan(export).sum())} NaN)")
+    ok = ~np.isnan(export)
+    assert np.allclose(v[ok], export[ok], atol=1e-3), f"{case}: values differ"
+
+
+@pytest.mark.parametrize("case", ["reg_shift", "reg_crop_rotate"])
+def test_registration_shifts_the_exported_frame_by_exactly_its_matrix(ax_project, case):
+    """The matrix was computed on the EXPORTED frame (after crop, rotation and
+    resize): an integer translation (tx, ty) there must come out as exactly
+    that shift of the unregistered export, also under a crop + rotation --
+    the old raw-frame formula ignored the rotation and moved the image the
+    wrong way."""
+    ax = dict(REG_CASES[case])
+    t = ax["registration"]["matrix"]
+    tx, ty = int(t[0][2]), int(t[1][2])
+    pt, fp = ax_project({k: v for k, v in ax.items() if k != "registration"})
+    plain = _export_pixels(pt, fp, 3)
+    pt, fp = ax_project(ax)
+    reg = _export_pixels(pt, fp, 3)
+    H, W = plain.shape[:2]
+    m = 4
+    for y in range(m, H - m):
+        for x in range(m, W - m):
+            assert np.allclose(reg[y, x], plain[y + ty, x + tx], atol=1e-4), (
+                f"{case}: exported ({x},{y}) is {reg[y, x]}, expected the unregistered "
+                f"({x + tx},{y + ty}) {plain[y + ty, x + tx]}")
+
+
+@pytest.mark.parametrize("case", ["reg_shift", "reg_crop_rotate"])
+def test_image_export_applies_registration_once(ax_project, case):
+    """The image export (_apply_ax_to_raw: thumbnails, project images) used to
+    apply the matrix twice -- on the raw frame and again after the resize --
+    so an exported image was shifted twice as far as the viewer showed. With
+    an integer shift its pixels equal the analysis image's (off the border)."""
+    import cv2
+    pt, fp = ax_project(REG_CASES[case])
+    raw = cv2.imread(fp, cv2.IMREAD_UNCHANGED)
+    out, _c = pt._apply_ax_to_raw(raw, dict(REG_CASES[case]), filepath=fp, src_channel_order="bgr")
+    out = np.asarray(out, dtype=np.float64)
+    o = out[..., :3][..., ::-1] if out.ndim == 3 else out[..., None]        # BGR -> file order
+    export = _export_pixels(pt, fp, 3)
+    assert o.shape == export.shape, (o.shape, export.shape)
+    ok = np.isfinite(export)
+    ok[:4] = ok[-4:] = False
+    ok[:, :4] = ok[:, -4:] = False
+    assert np.allclose(o[ok], export[ok], atol=0.5), f"{case}: image export and analysis differ"
+
+
+def test_nodata_number_excludes_only_the_band_holding_it(ax_project):
+    """Per band, GDAL style: where ONE band holds the NoData value the other
+    bands keep their values."""
+    pt, fp = ax_project(NODATA_CASES["number"])
+    export = _export_pixels(pt, fp, 3)
+    nan = np.isnan(export)
+    partial = nan.any(axis=2) & ~nan.all(axis=2)
+    assert partial.any(), "no pixel with NoData in only some bands -- fixture too uniform"
+
+
+def test_nodata_expression_excludes_only_the_band_it_names(ax_project):
+    """`b1<40` excludes b1 (R) only; G and B keep every pixel; a derived band
+    reading b1 is NoData there, one not reading it is not."""
+    pt, fp = ax_project(NODATA_CASES["expression"])
+    export = _export_pixels(pt, fp, 3)
+    assert np.isnan(export[..., 0]).any()
+    assert not np.isnan(export[..., 1]).any() and not np.isnan(export[..., 2]).any()
+
+    pt, fp = ax_project(NODATA_CASES["band_math_ratio"])     # reads b2, b3 only
+    viewer, _ = _viewer_pixels(pt, fp)
+    export = _export_pixels(pt, fp, viewer.shape[2])
+    assert export.shape[2] == 4
+    assert np.isnan(export[..., 0]).any()
+    assert not np.isnan(export[..., 3]).any(), "a band b1 is not read by became NoData"
+
+
+def test_nodata_statistics_follow_per_band_masking(synthetic_project, tmp_path):
+    """The statistics must describe the pixel set the export actually used --
+    per band (canopie.nodata): band b's statistics exclude only the pixels where
+    band b itself is NoData."""
     from ._helpers import load_raw_npz
     from .generate_fixtures import _rasterize_polygon_mask
     from .project_builder import polygon_group_name
@@ -267,18 +414,16 @@ def test_nodata_statistics_follow_whole_pixel_masking(synthetic_project, tmp_pat
         raw = load_raw_npz(name).astype(np.float64)
         mask = _rasterize_polygon_mask(spec["polygon"]["points"],
                                        spec["height"], spec["width"])
-        any_zero = (raw[..., 0] == 0) | (raw[..., 1] == 0) | (raw[..., 2] == 0)
 
         by_ch = {r.get("Channel"): r for r in rows if isinstance(r, dict)}
         for b, ch in enumerate("RGB"):
             row = by_ch.get(ch)
             if row is None:
                 continue
-            whole_pixel = raw[..., b][mask & ~any_zero].mean()
-            assert row["Mean"] == pytest.approx(whole_pixel, abs=1e-3), (
-                f"{ch}: exported Mean {row['Mean']} does not match whole-pixel "
-                f"masking ({whole_pixel}). If the rule changed to per-band, "
-                "update this test and the baseline it documents.")
+            per_band = raw[..., b][mask & (raw[..., b] != 0)].mean()
+            assert row["Mean"] == pytest.approx(per_band, abs=1e-3), (
+                f"{ch}: exported Mean {row['Mean']} does not match per-band "
+                f"masking ({per_band})")
     finally:
         if prev is not None:
             open(axp, "w", encoding="utf-8").write(prev)
@@ -352,7 +497,7 @@ def test_ml_manager_matches_csv_export(ax_project, ml_manager_factory, case):
         f"{case}: ML sees {len(ml_chans)} bands, CSV sees {len(csv_chans)}")
     for i, (a, b) in enumerate(zip(ml_chans, csv_chans)):
         assert np.allclose(np.asarray(a, dtype=np.float64),
-                           np.asarray(b, dtype=np.float64), atol=1e-4), (
+                           np.asarray(b, dtype=np.float64), atol=1e-4, equal_nan=True), (
             f"{case}: band {i + 1} differs between ML manager and CSV export")
 
 

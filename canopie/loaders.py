@@ -116,9 +116,16 @@ class _ImageLoadRunnable(QtCore.QRunnable):
             # matching pairs reference bands POSITIONALLY, so it needs to know
             # which of the two this array is, or a BGR-measured reference applied
             # to RGB pixels silently swaps Red and Blue.
+            _bundle = None
+            try:
+                _get_b = getattr(self._tab, "_get_sklearn_bundle", None)
+                _bundle = _get_b() if callable(_get_b) else None
+            except Exception:
+                _bundle = None
             imgd.image = self._tab.__class__.apply_aux_modifications(
                 self._filepath, imgd.image, self._proj, global_mode=self._gmods,
-                src_channel_order=getattr(imgd, "channel_order", None)
+                src_channel_order=getattr(imgd, "channel_order", None),
+                model_bundle=_bundle,     # this tab's model (BUG-011)
             )
             # INVARIANT: `imgd.image` is now fully .ax-processed — crop/rotate,
             # HISTOGRAM MATCH, resize, band expression and classification have all been

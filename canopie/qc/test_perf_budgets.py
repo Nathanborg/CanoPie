@@ -76,7 +76,8 @@ def test_lazy_export_never_materialises_the_whole_cube(
     materialisation obvious at the call site. It now succeeds silently, so the
     only remaining signal is that the full cube got read. Count the calls.
     """
-    from ..raster_reader import LazyChannels
+    # the lazy export image is the windowed ANALYSIS image (overrides __array__)
+    from ..lazy_analysis import LazyAnalysis as LazyChannels
 
     calls = {"n": 0}
     original = LazyChannels.__array__
@@ -188,7 +189,9 @@ def test_windowed_reads_are_bounded(synthetic_project, force_lazy_export, monkey
 # ---------------------------------------------------------------------------
 def test_point_extraction_issues_one_windowed_read_not_one_per_band(
         synthetic_project, force_lazy_export, monkeypatch):
-    from ..raster_reader import LazyChannels
+    # the lazy export image is the windowed ANALYSIS image (a LazyChannels
+    # subclass that overrides these methods) since 2026-10-07
+    from ..lazy_analysis import LazyAnalysis as LazyChannels
 
     calls = {"getitem_scalar": 0, "read_window_offset": 0}
 
@@ -283,7 +286,8 @@ def test_point_extraction_windowed_reads_are_bounded_by_bands_not_by_frame(
 # ---------------------------------------------------------------------------
 def test_guess_label_band_does_not_scan_full_frame_per_band(
         synthetic_project, force_lazy_export, monkeypatch):
-    from ..raster_reader import LazyChannels
+    # the lazy export image is the windowed ANALYSIS image (overrides these)
+    from ..lazy_analysis import LazyAnalysis as LazyChannels
 
     calls = {"getitem_scalar": 0}
     original_getitem = LazyChannels.__getitem__
@@ -314,7 +318,8 @@ def test_guess_label_band_scan_also_covers_polygon_extraction(
         synthetic_project, force_lazy_export, monkeypatch):
     """Same bug, polygon path: _guess_label_band runs before the point/polygon
     split, so a polygon with 'Count 0/1' enabled is equally exposed."""
-    from ..raster_reader import LazyChannels
+    # the lazy export image is the windowed ANALYSIS image (overrides these)
+    from ..lazy_analysis import LazyAnalysis as LazyChannels
 
     calls = {"getitem_scalar": 0}
     original_getitem = LazyChannels.__getitem__

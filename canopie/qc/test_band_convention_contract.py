@@ -463,15 +463,19 @@ def test_both_provenances_yield_the_same_b1(bc_project, ml_manager_factory):
             f"{consumer}: the tifffile-loaded and cv2-loaded copies of the "
             f"SAME image disagree about `b1` ({a[0, 0]} vs {b[0, 0]})")
 
-    # And the export path really did see different orders for the two files,
-    # so the agreement above was earned rather than trivial.
-    _export_expression(pt, bc_project["tif"], "b1")
-    tif_order = getattr(pt, "_last_export_channel_order", None)
-    _export_expression(pt, bc_project["png"], "b1")
-    png_order = getattr(pt, "_last_export_channel_order", None)
-    assert str(tif_order).lower() == "rgb" and str(png_order).lower() == "bgr", (
-        f"expected provenances rgb/bgr, got {tif_order}/{png_order} -- the "
-        "dual-provenance coverage is not exercised")
+    # And the two files really do come out of their decoders in different
+    # channel orders (tifffile R,G,B; cv2 B,G,R), so the agreement above was
+    # earned rather than trivial. (The export normalises every image to file
+    # band order now, so its own `_last_export_channel_order` is "rgb" for
+    # both and no longer shows the provenance.)
+    import cv2
+    import tifffile
+    t = np.asarray(tifffile.imread(bc_project["tif"]))
+    c = cv2.imread(bc_project["png"], cv2.IMREAD_UNCHANGED)
+    assert t.shape == c.shape and t.ndim == 3 and t.shape[2] == 3
+    assert np.array_equal(t[..., 0], c[..., 2]) and not np.array_equal(t[..., 0], c[..., 0]), (
+        "the tifffile and cv2 copies do not arrive in different channel "
+        "orders -- the dual-provenance coverage is not exercised")
 
 
 # ---------------------------------------------------------------------------

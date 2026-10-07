@@ -215,8 +215,9 @@ def test_gather_helpers_are_actually_used_by_the_worker():
     from canopie import machine_learning_manager as mlm
 
     src = inspect.getsource(mlm._CsvExportWorker)
-    assert "_csvexp_gather_all_channels" in src
-    assert "_csvexp_gather_window_all_channels" in src
+    # the column-map versions (header columns by band NAME, canopie.band_layout)
+    assert "_csvexp_gather_by_map" in src
+    assert "_csvexp_gather_window_by_map" in src
 
 
 # ---------------------------------------------------------------------------

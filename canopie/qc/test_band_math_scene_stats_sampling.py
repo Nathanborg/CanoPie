@@ -283,13 +283,18 @@ def test_scene_stats_off_costs_no_sample_reads(synthetic_project, monkeypatch):
     `_want_scene` must gate the new sampling path the same way it already
     gates the raw-band one."""
     calls = {"n": 0}
-    original = LazyChannels.sample_bands
+    # the lazy export image is the windowed ANALYSIS image (overrides sample_bands)
+    from ..lazy_analysis import LazyAnalysis
+    originals = {cls: cls.sample_bands for cls in (LazyChannels, LazyAnalysis)}
 
-    def counting(self, *a, **k):
-        calls["n"] += 1
-        return original(self, *a, **k)
+    def _counting(cls):
+        def counting(self, *a, **k):
+            calls["n"] += 1
+            return originals[cls](self, *a, **k)
+        return counting
 
-    monkeypatch.setattr(LazyChannels, "sample_bands", counting)
+    for cls in originals:
+        monkeypatch.setattr(cls, "sample_bands", _counting(cls))
 
     opts = {"stats": {"mean": True},   # no scene_mean/median/std
             "band_math": {"enabled": True, "formulas": {"sum3": "b1+b2+b3"}}}

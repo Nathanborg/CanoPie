@@ -295,6 +295,67 @@ POLYGON_Z        = 1.0     # ...and BELOW every annotation
 TEMP_DRAWING_Z   = 1e6     # in-progress rubber-band polygon
 LABEL_Z          = 1e7     # name labels, always on top
 
+
+# ---------------------------------------------------------------------------
+# numpy <-> QPolygonF without a Python object per vertex
+# ---------------------------------------------------------------------------
+# A QPolygonF is a contiguous array of QPointF, i.e. (x, y) doubles, and PyQt
+# exposes that buffer through .data(). Filling it from numpy (the technique
+# pyqtgraph uses) measured 0.012 ms for a 1,200-vertex crown versus 1.41 ms for
+# QPolygonF([QPointF(x, y), ...]); reading it back 0.010 ms versus 0.97 ms for a
+# poly.at(i) loop. Those loops ran for every crown on every pyramid-level change
+# of the zoomed-out tiles, every LOD refine swap and every geometry change.
+# Verified once at import; any platform where the layout differs (qreal not a
+# double) silently keeps the per-vertex path.
+def _qpolygonf_from_xy_slow(xy):
+    return QtGui.QPolygonF([QtCore.QPointF(float(x), float(y)) for x, y in xy])
+
+
+def _xy_from_qpolygonf_slow(poly):
+    n = poly.size()
+    out = np.empty((n, 2), dtype=np.float64)
+    for i in range(n):
+        p = poly.at(i)
+        out[i, 0] = p.x()
+        out[i, 1] = p.y()
+    return out
+
+
+def _qpolygonf_from_xy_fast(xy):
+    a = np.ascontiguousarray(xy, dtype=np.float64).reshape(-1, 2)
+    n = a.shape[0]
+    poly = QtGui.QPolygonF(n)
+    if n:
+        ptr = poly.data()
+        ptr.setsize(n * 16)
+        np.frombuffer(ptr, dtype=np.float64, count=n * 2)[:] = a.ravel()
+    return poly
+
+
+def _xy_from_qpolygonf_fast(poly):
+    n = poly.size()
+    if not n:
+        return np.empty((0, 2), dtype=np.float64)
+    ptr = poly.data()
+    ptr.setsize(n * 16)
+    return np.frombuffer(ptr, dtype=np.float64, count=n * 2).reshape(n, 2).copy()
+
+
+def _fast_qpolygonf_ok():
+    try:
+        probe = np.array([[1.5, -2.25], [1e6 + 0.125, 3.0]])
+        p = _qpolygonf_from_xy_fast(probe)
+        return (p.size() == 2 and p.at(1).x() == 1e6 + 0.125 and p.at(0).y() == -2.25
+                and np.array_equal(_xy_from_qpolygonf_fast(p), probe))
+    except Exception:
+        return False
+
+
+if _fast_qpolygonf_ok():
+    qpolygonf_from_xy, xy_from_qpolygonf = _qpolygonf_from_xy_fast, _xy_from_qpolygonf_fast
+else:                                             # pragma: no cover - platform guard
+    qpolygonf_from_xy, xy_from_qpolygonf = _qpolygonf_from_xy_slow, _xy_from_qpolygonf_slow
+
 # A drawn point is meant to represent exactly ONE RAW raster pixel (points are
 # stored/exported in raw coordinates everywhere else in the app -- CSV stats,
 # ML classification, etc.). But EditablePointItem's geometry lives in
@@ -415,10 +476,23 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
     # of drawing thousands of labels when zoomed out.
     _LABEL_SCALE_THRESHOLD = 0.35
 
+    @property
+    def label_text(self):
+        """What the label shows: the display name, else the identity."""
+        return getattr(self, "display_name", None) or self.name
+
     def __init__(self, polygon, name="", is_rgb=False, parent=None, is_mask_polygon=False):
         super(EditablePolygonItem, self).__init__(parent)
         self._polygon = polygon
+        # `name` is the polygon's IDENTITY -- its group key in
+        # ProjectTab.all_polygons. Every lookup (delete, sync, save, select,
+        # zoom-to) matches on it. `display_name` is only the label text: a
+        # shapefile crown in group "oleifera_7114" is labelled "7114". The two
+        # used to be one field, set to the group by the importer and to the
+        # label by load_polygons, so after any refresh deletes missed the item
+        # and a moved crown was re-saved as a new, property-less group "7114".
         self.name = name
+        self.display_name = None
         self.is_rgb = is_rgb  # Determines polygon appearance
         self.is_mask_polygon = is_mask_polygon  # If True, draw with solid fill
 
@@ -737,13 +811,7 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
         try:
             n = poly.size()
             if n >= self._SIMPLIFY_MIN_POINTS:
-                import numpy as _np
-                arr = _np.empty((n, 2), dtype=_np.float64)
-                for i in range(n):
-                    p = poly.at(i)
-                    arr[i, 0] = p.x()
-                    arr[i, 1] = p.y()
-                self._pts_np = arr
+                self._pts_np = xy_from_qpolygonf(poly)    # buffer copy, not a poly.at(i) loop
         except Exception:
             self._pts_np = None
 
@@ -765,8 +833,8 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
                                                margin_tight, margin_tight)
 
         full = QtCore.QRectF(raw)
-        if self.name and (self._show_label or self._hover_showing_label):
-            label_width = len(self.name) * 50 + 100
+        if self.label_text and (self._show_label or self._hover_showing_label):
+            label_width = len(self.label_text) * 50 + 100
             label_height = 250
             label_rect = QtCore.QRectF(
                 full.topRight() + self.label_offset,
@@ -928,7 +996,10 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
         # Highlighted/selected items DO get the thicker 2px stroke: there are
         # only ever a handful of them, so paying the stroker there is free.
         self._ensure_pens()
-        highlighted = self.isUnderMouse() or self.isSelected()
+        # The hover flag, not isUnderMouse(): that asks every view for the
+        # cursor position on EVERY paint of EVERY crown (56,774 calls in one
+        # COG navigation).
+        highlighted = getattr(self, "_hovered", False) or self.isSelected()
         if highlighted:
             pen = self._pen_highlight
             fill_color = self._fill_highlight if self.is_mask_polygon else self._fill_base
@@ -952,7 +1023,7 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
         # (scale < _LABEL_SCALE_THRESHOLD) unless the item is hovered or
         # selected.  This dramatically reduces paint time at low zoom.
         should_show = self.show_label or self._hover_showing_label
-        if self.name and not self.is_moving and should_show:
+        if self.label_text and not self.is_moving and should_show:
             # Smart zoom suppression
             if scale < self._LABEL_SCALE_THRESHOLD and not highlighted:
                 return
@@ -978,17 +1049,19 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
             bbox = self._polygon.boundingRect()
             pos = bbox.topRight() + self.label_offset
 
-            painter.drawText(pos, self.name)
+            painter.drawText(pos, self.label_text)
 
     def hoverEnterEvent(self, event):
         self.setCursor(QtCore.Qt.PointingHandCursor)
         self._hover_showing_label = True
+        self._hovered = True
         self.update()
         super(EditablePolygonItem, self).hoverEnterEvent(event)
 
     def hoverLeaveEvent(self, event):
         self.setCursor(QtCore.Qt.ArrowCursor)
         self._hover_showing_label = False
+        self._hovered = False
         self.update()
         super(EditablePolygonItem, self).hoverLeaveEvent(event)
 
@@ -1255,9 +1328,8 @@ def image_points_to_scene(pixitem, img_pts, img_size_hw=None):
             img_h, img_w = h_eff or ph, w_eff or pw
             sx = pw / float(img_w)
             sy = ph / float(img_h)
-            local = QtGui.QPolygonF(
-                [QtCore.QPointF(float(x) * sx, float(y) * sy) for x, y in img_pts])
-            return pixitem.mapToScene(local)
+            xy = np.asarray(img_pts, dtype=np.float64).reshape(-1, 2) * (sx, sy)
+            return pixitem.mapToScene(qpolygonf_from_xy(xy))
 
     return QtGui.QPolygonF(
         [QtCore.QPointF(float(x), float(y)) for x, y in img_pts])
@@ -1353,8 +1425,7 @@ class PolygonTileItem(QtWidgets.QGraphicsItem):
             if entry is None:
                 entry = (QtGui.QPainterPath(), c)
                 group[key] = entry
-            entry[0].addPolygon(QtGui.QPolygonF(
-                [QtCore.QPointF(float(x), float(y)) for x, y in d]))
+            entry[0].addPolygon(qpolygonf_from_xy(d))     # numpy fill, no QPointF per vertex
             entry[0].closeSubpath()
         self._cache[level] = group
         return group
@@ -1380,13 +1451,19 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
     # Same threshold as EditablePolygonItem
     _LABEL_SCALE_THRESHOLD = 0.35
 
+    @property
+    def label_text(self):
+        """What the label shows: the display name, else the identity."""
+        return getattr(self, "display_name", None) or self.name
+
     def __init__(self, points, name="", is_rgb=False, parent=None,
                  pixmap_item=None, points_are_pixmap_local=False,
                  raw_to_pixmap_scale=(1.0, 1.0)):
         super(EditablePointItem, self).__init__(parent)
 
         self.points = points
-        self.name = name
+        self.name = name                # identity (group key) -- see EditablePolygonItem
+        self.display_name = None        # label text only
         self.is_rgb = is_rgb
         self.pixmap_item = pixmap_item
         self.points_are_pixmap_local = points_are_pixmap_local
@@ -1496,6 +1573,44 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
         self._hover_label = value
         self._update_bounding_rect()
 
+    def _cell_size(self):
+        """Size of one exported-frame pixel in pixmap-local units."""
+        kx, ky = self.raw_to_pixmap_scale
+        return (1.0 / kx, 1.0 / ky)
+
+    def _cell_rect_item(self, p):
+        """ITEM-local rect of the exported-frame pixel that contains stored
+        point `p` at its current position (item.pos() included, so the cell
+        follows a drag). Grid origin = the pixmap's top-left corner."""
+        kx, ky = self.raw_to_pixmap_scale
+        sx, sy = self._scene_xy(p)
+        off = self._pixmap_pos()
+        pos = self.pos()
+        lx = sx + pos.x() - off.x()
+        ly = sy + pos.y() - off.y()
+        i, j = math.floor(lx * kx), math.floor(ly * ky)
+        return QtCore.QRectF(i / kx + off.x() - pos.x(), j / ky + off.y() - pos.y(),
+                             1.0 / kx, 1.0 / ky)
+
+    def snap_points_to_cells(self):
+        """Move every point to the centre of the exported-frame pixel it is
+        over, folding item.pos() into the stored points. Called when a drag
+        ends, so a dropped point -- like a clicked one -- sits on exactly one
+        pixel with half a pixel of margin for the CSV / ML readers."""
+        if not self.points_are_pixmap_local:
+            return
+        kx, ky = self.raw_to_pixmap_scale
+        pos = self.pos()
+        new = QtGui.QPolygonF()
+        for p in self.points:
+            lx, ly = p.x() + pos.x(), p.y() + pos.y()          # true pixmap-local
+            new.append(QtCore.QPointF((math.floor(lx * kx) + 0.5) / kx,
+                                      (math.floor(ly * ky) + 0.5) / ky))
+        self.prepareGeometryChange()
+        self.points = new
+        self.setPos(0.0, 0.0)
+        self._invalidate_point_cache()
+
     def _invalidate_point_cache(self):
         """Recompute cached boundingRect and shape from current points."""
         self._update_bounding_rect()
@@ -1506,7 +1621,7 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
             self._cached_shape = QtGui.QPainterPath()
             return
 
-        grab_r = max(POINT_GRAB_RADIUS, 0.5 * max(self.raw_to_pixmap_scale))
+        grab_r = max(POINT_GRAB_RADIUS, 0.5 * max(self._cell_size()))
         path = QtGui.QPainterPath()
         for p in self.points:
             sx, sy = self._scene_xy(p)
@@ -1530,31 +1645,33 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
         for p in self.points:
             sx, sy = self._scene_xy(p)
             xs.append(sx); ys.append(sy)
-        # Extent must cover the true marker footprint -- see paint(), which
-        # draws raw_to_pixmap_scale-sized rects, not a fixed 1x1 unit.
-        w_extra = max(self.raw_to_pixmap_scale[0], POINT_GRAB_RADIUS)
-        h_extra = max(self.raw_to_pixmap_scale[1], POINT_GRAB_RADIUS)
-        rect = QtCore.QRectF(min(xs), min(ys), max(xs) - min(xs) + w_extra, max(ys) - min(ys) + h_extra)
+        # Extent must cover the true marker footprint -- see paint(): one
+        # exported-frame pixel (1/k pixmap units) around each point, plus the
+        # grab ellipse. The cell can start up to one cell before the point.
+        cw, ch = self._cell_size()
+        w_extra = max(cw, POINT_GRAB_RADIUS)
+        h_extra = max(ch, POINT_GRAB_RADIUS)
+        rect = QtCore.QRectF(min(xs) - w_extra, min(ys) - h_extra,
+                             max(xs) - min(xs) + 2 * w_extra, max(ys) - min(ys) + 2 * h_extra)
 
         if rect.width() < 10 and rect.height() < 10:
             rect = rect.adjusted(-20, -20, 20, 20)
 
-        drag_pad = max(10, 2 * max(self.raw_to_pixmap_scale))
+        drag_pad = max(10, 2 * max(self._cell_size()))
         self._cached_brect_drag = rect.adjusted(-drag_pad, -drag_pad, drag_pad, drag_pad)
 
         full = QtCore.QRectF(rect)
-        if self.name and (self._show_label or self._hover_showing_label):
-            label_width = len(self.name) * 50 + 100
+        if self.label_text and (self._show_label or self._hover_showing_label):
+            label_width = len(self.label_text) * 50 + 100
             label_height = 250
             label_rect = QtCore.QRectF(
                 full.topLeft() + self.label_offset,
                 QtCore.QSizeF(label_width, label_height)
             )
             full = full.united(label_rect)
-        # Padding widened proportionally to the decimation ratio, since
-        # paint() now draws raw_to_pixmap_scale-sized markers, not a fixed
-        # 1-unit rect -- see test_bounding_rect_contains_the_actual_painted_marker.
-        pad = max(50, 8 * max(self.raw_to_pixmap_scale))
+        # Generous fixed padding: paint() adds a COSMETIC outline (constant
+        # device pixels), which in scene units grows as the view zooms out.
+        pad = max(50, 8 * max(self._cell_size()))
         self._cached_brect = full.adjusted(-pad, -pad, pad, pad)
 
     def _get_res_boost(self):
@@ -1579,7 +1696,7 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
         path = QtGui.QPainterPath()
         if self.points.isEmpty():
             return path
-        grab_r = max(POINT_GRAB_RADIUS, 0.5 * max(self.raw_to_pixmap_scale))
+        grab_r = max(POINT_GRAB_RADIUS, 0.5 * max(self._cell_size()))
         for p in self.points:
             sx, sy = self._scene_xy(p)
             path.addEllipse(QtCore.QPointF(sx, sy), grab_r, grab_r)
@@ -1637,18 +1754,29 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
         # same contract -- a marker can still shrink to sub-device-pixel at
         # extreme zoom-out, exactly as it always could, just now scaled
         # correctly (bigger, not smaller) relative to the old bug.
-        rw, rh = self.raw_to_pixmap_scale
-
-        painter.setPen(QtCore.Qt.NoPen)
+        # THE MARKER IS THE PIXEL THE EXPORT READS: the exported-frame cell
+        # containing the point (floor, like process_polygon and the ML
+        # manager), raw_to_pixmap_scale = export pixels per pixmap unit. This
+        # drew a raw_to_pixmap_scale-SIZED rect instead -- the ratio used as a
+        # width, i.e. inverted: 3 x 3 export pixels per "pixel" on the BCI
+        # mosaic's 1/3 preview, and 28 x 32 once it was cropped and resized,
+        # since the ratio came from the raw file rather than the export frame.
+        # A cosmetic outline keeps a sub-device-pixel cell visible when zoomed
+        # out (boundingRect's fixed padding covers it); thicker when hovered or
+        # selected, which is the "highlighted pixel".
+        highlighted_px = getattr(self, "_hovered", False) or self.isSelected()
+        pen = QtGui.QPen(QtGui.QColor(self._brush_color))
+        pen.setCosmetic(True)
+        pen.setWidthF(2.5 if highlighted_px else 1.2)
+        painter.setPen(pen)
         painter.setBrush(self._brush_color)
         for p in self.points:
-            sx, sy = self._scene_xy(p)
-            painter.drawRect(QtCore.QRectF(sx, sy, rw, rh))
+            painter.drawRect(self._cell_rect_item(p))
 
         # Skip label during active dragging to prevent ghost marks.
         # Smart suppression: same as EditablePolygonItem.
         should_show = self.show_label or self._hover_showing_label
-        if self.name and not self.is_moving and should_show:
+        if self.label_text and not self.is_moving and should_show:
             t = painter.worldTransform()
             scale = (t.m11()**2 + t.m12()**2) ** 0.5 or 1.0
 
@@ -1679,17 +1807,19 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
             rx, ry = min(xs), min(ys)
             text_position = QtCore.QPointF(rx, ry) + self.label_offset
 
-            painter.drawText(text_position, self.name)
+            painter.drawText(text_position, self.label_text)
 
     def hoverEnterEvent(self, event):
         self.setCursor(QtCore.Qt.PointingHandCursor)
         self._hover_showing_label = True
+        self._hovered = True
         self.update()
         super(EditablePointItem, self).hoverEnterEvent(event)
 
     def hoverLeaveEvent(self, event):
         self.setCursor(QtCore.Qt.ArrowCursor)
         self._hover_showing_label = False
+        self._hovered = False
         self.update()
         super(EditablePointItem, self).hoverLeaveEvent(event)
 
@@ -1756,6 +1886,10 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
                 except Exception:
                     pass
 
+                try:
+                    self.snap_points_to_cells()
+                except Exception:
+                    logging.debug("[point] snap on release failed", exc_info=True)
                 self.point_modified.emit()
         super(EditablePointItem, self).mouseReleaseEvent(event)
 
@@ -2158,6 +2292,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
         profile = getattr(idata, "profile", None)
         preview_bands = getattr(idata, "preview_bands", None)
 
+        buttons = None
         if profile is not None and preview_bands:
             names = list(getattr(profile, "band_names", None) or [])
             count = int(profile.count)
@@ -2166,6 +2301,26 @@ class ImageViewer(QtWidgets.QGraphicsView):
         else:
             count = int(img.shape[2]) if hasattr(img, "ndim") and img.ndim == 3 else 1
             band_names = None
+            # A fully loaded image: buttons by FILE band (button "1" = file
+            # band 1, whatever order the loader put it in), derived bands by
+            # their expression text -- the CSV's names (BUG-009). A click
+            # still sends the array position.
+            try:
+                owner = self._find_project_owner() if hasattr(self, "_find_project_owner") else None
+                m = owner._display_band_map(self) if (owner is not None and hasattr(owner, "_display_band_map")) else None
+                if m:
+                    from .band_layout import file_band_names as _fbn
+                    n_file = sum(1 for kind, _r in m if kind == "file")
+                    csv_names = _fbn(n_file)
+                    files = sorted(((r, pos) for pos, (kind, r) in enumerate(m) if kind == "file"))
+                    derived = [(pos, r) for pos, (kind, r) in enumerate(m) if kind == "derived"]
+                    buttons = [(pos, str(fb + 1), f"Band {fb + 1} ({csv_names[fb]})") for fb, pos in files]
+                    for pos, nm in derived:
+                        txt = nm if len(nm) <= 6 else (nm[:5] + "\u2026")
+                        buttons.append((pos, txt, nm))
+            except Exception as e:
+                logging.debug(f"[ImageViewer] band bar names: {e}")
+                buttons = None
 
         # If a single band is currently displayed, highlight its button. Bar
         # buttons are indexed by FILE band, so a position within the resident
@@ -2198,7 +2353,8 @@ class ImageViewer(QtWidgets.QGraphicsView):
 
         try:
             bb.populate(band_names, count, active_band=active_band,
-                        composite_label=composite_label, composite_active=composite_active)
+                        composite_label=composite_label, composite_active=composite_active,
+                        buttons=buttons)
             bb.reposition()
             zb = getattr(self, "_zoombar", None)
             if zb is not None:
@@ -2512,6 +2668,29 @@ class ImageViewer(QtWidgets.QGraphicsView):
             except TypeError: self.pixel_clicked.emit(scene_pt, tuple())
             return False
 
+        # In the app: the EXPORT pixel under the click, read the way CSV / ML
+        # read it (ProjectTab.inspect_export_pixel -- full resolution, CSV band
+        # names, NoData per band). The code below is only for a viewer with no
+        # project behind it.
+        owner = self._find_project_owner() if hasattr(self, "_find_project_owner") else None
+        if owner is not None and hasattr(owner, "inspect_export_pixel"):
+            payload = Ellipsis
+            try:
+                ex, ey = self._export_pixel_index(scene_pt)
+                payload = owner.inspect_export_pixel(self, ex, ey)
+            except Exception as e:
+                logging.warning(f"[Inspector] export-pixel read failed, showing the preview value: {e}")
+            if payload is not Ellipsis:
+                if payload is None:
+                    try: self.pixel_clicked.emit(scene_pt, None)
+                    except TypeError: self.pixel_clicked.emit(scene_pt, tuple())
+                    return False
+                try:
+                    self.pixel_clicked.emit(scene_pt, payload)
+                except TypeError:
+                    self.pixel_clicked.emit(scene_pt, tuple(payload.get("values", ())))
+                return True
+
         # map pixmap local -> image_data.image coords
         # image_data.image is ALREADY modified (crop/rotate/hist/resize applied)
         # so we map directly to it without offset adjustments
@@ -2525,11 +2704,9 @@ class ImageViewer(QtWidgets.QGraphicsView):
             except TypeError: self.pixel_clicked.emit(scene_pt, tuple())
             return False
 
-        # channel names
-        if base_img.ndim == 2:
-            ch_names = ["b1"]
-        else:
-            ch_names = [f"b{i+1}" for i in range(base_img.shape[2])]
+        # channel names: the CSV's (canopie.band_layout)
+        from .band_layout import file_band_names as _file_band_names
+        ch_names = _file_band_names(1 if base_img.ndim == 2 else base_img.shape[2])
 
         # Read pixel values directly from the already-modified image
         img_mod = base_img.astype(np.float32, copy=False)
@@ -2628,7 +2805,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 else:
                     idx_plane = np.full((H, W), float(idx_res), dtype=np.float32)
                     img_mod = np.dstack([img_mod, idx_plane]) if img_mod.ndim == 3 else np.dstack([img_mod[..., None], idx_plane])
-                ch_names.append("index")
+                ch_names.append(expr)          # named by its text, like the CSV column
             except Exception as e:
                 logging.debug(f"Index eval error at ({xm},{ym}) expr='{expr}': {e}")
 
@@ -2739,7 +2916,8 @@ class ImageViewer(QtWidgets.QGraphicsView):
                             (op == '!=' and abs(band_val - threshold_val) >= 1e-6)
                         )
                         if matched:
-                            is_nodata = True
+                            # per band (canopie.nodata): `b1<123` excludes b1 only
+                            channel_is_nodata[ch_idx] = True
                             logging.debug(f"[Inspector] NoData match: expression '{nd_val}' matched, ch{ch_idx}={band_val}")
                     else:
                         try:
@@ -2824,13 +3002,16 @@ class ImageViewer(QtWidgets.QGraphicsView):
         return QtCore.QPointF(lx, ly)
 
     def _raw_to_pixmap_scale(self):
-        """(sx, sy): how many RAW raster pixels correspond to 1 pixmap-local
-        unit along each axis. (1.0, 1.0) unless the displayed pixmap is a
-        decimated preview of a larger raster -- see ProjectTab.polygon_basis_hw,
-        the single authority for the raw basis (never the decimated preview).
-        Threaded into EditablePointItem so its marker can be drawn/hit-tested
-        at true raw-pixel size regardless of decimation (see the module-level
-        comment above POINT_GRAB_RADIUS)."""
+        """(kx, ky): how many EXPORTED-frame pixels correspond to 1 pixmap-local
+        unit along each axis -- the grid a drawn point snaps to and is drawn as
+        (one cell = the pixel CSV export and the ML manager read).
+
+        The exported frame is the post-.ax image at full resolution
+        (ProjectTab.export_frame_hw). This used ProjectTab.polygon_basis_hw --
+        the RAW FILE -- which is only the same thing without crop/resize: on a
+        cropped + px_w-resized BCI mosaic it gave 28 x 32 here, so every point
+        marker covered 28 x 32 export pixels ("points are not rescaling to the
+        new image size"). (1.0, 1.0) when there is nothing to scale."""
         try:
             if self._image is None:
                 return (1.0, 1.0)
@@ -2839,14 +3020,72 @@ class ImageViewer(QtWidgets.QGraphicsView):
             if pw <= 0 or ph <= 0:
                 return (1.0, 1.0)
             owner = self._find_project_owner() if hasattr(self, "_find_project_owner") else None
-            if owner is None or not hasattr(owner, "polygon_basis_hw"):
+            if owner is None:
                 return (1.0, 1.0)
-            raw_h, raw_w = owner.polygon_basis_hw(self)
-            if not (raw_h and raw_w):
+            if hasattr(owner, "export_frame_hw"):
+                eh, ew = owner.export_frame_hw(self)
+            elif hasattr(owner, "polygon_basis_hw"):
+                eh, ew = owner.polygon_basis_hw(self)
+            else:
                 return (1.0, 1.0)
-            return (raw_w / float(pw), raw_h / float(ph))
+            if not (eh and ew):
+                return (1.0, 1.0)
+            return (ew / float(pw), eh / float(ph))
         except Exception:
             return (1.0, 1.0)
+
+    def _is_point_drawing_mode(self):
+        return getattr(self, "drawing_mode", "polygon") not in (
+            "polygon", "rectangle", "circle", "random_points")
+
+    def _snap_scene_to_export_pixel(self, scene_pt):
+        """Scene position of the CENTRE of the exported-frame pixel under
+        `scene_pt` -- where a click in point mode puts the point. The centre
+        (not the click itself) is what makes the stored point read the
+        highlighted pixel in CSV export and the ML manager with half a pixel of
+        margin, instead of tipping into a neighbour on a float round-trip."""
+        if self._image is None:
+            return QtCore.QPointF(scene_pt)
+        kx, ky = self._raw_to_pixmap_scale()
+        lp = self._image.mapFromScene(scene_pt)
+        cx = (math.floor(lp.x() * kx) + 0.5) / kx
+        cy = (math.floor(lp.y() * ky) + 0.5) / ky
+        return self._image.mapToScene(QtCore.QPointF(cx, cy))
+
+    def _export_pixel_index(self, scene_pt, grid=None):
+        """(column, row) of the exported-frame pixel under `scene_pt`."""
+        if self._image is None:
+            return (math.floor(scene_pt.x()), math.floor(scene_pt.y()))
+        kx, ky = grid or self._raw_to_pixmap_scale()
+        lp = self._image.mapFromScene(scene_pt)
+        return (math.floor(lp.x() * kx), math.floor(lp.y() * ky))
+
+    def _append_point_pixel(self, scene_pt):
+        """Point mode: add the exported pixel under `scene_pt` to the shape
+        being drawn -- snapped to its centre, and only if this shape does not
+        hold that pixel yet. A press-and-drag used to append the raw cursor
+        position every 15 screen pixels: 23 unsnapped points over 10 distinct
+        pixels on New Folder223, so the CSV repeated rows. Returns the point
+        added, or None."""
+        grid = self._raw_to_pixmap_scale()
+        idx = self._export_pixel_index(scene_pt, grid)
+        for i in range(self.currentPolygon.count()):
+            if self._export_pixel_index(self.currentPolygon.at(i), grid) == idx:
+                return None
+        point = self._snap_scene_to_export_pixel(scene_pt)
+        self.currentPolygon.append(point)
+        self.lastPoint = point
+        return point
+
+    def _export_pixel_scene_rect(self, scene_pt, grid=None):
+        """Scene rect of the exported-frame pixel containing `scene_pt`."""
+        if self._image is None:
+            return QtCore.QRectF(scene_pt.x(), scene_pt.y(), 1.0, 1.0)
+        kx, ky = grid or self._raw_to_pixmap_scale()
+        lp = self._image.mapFromScene(scene_pt)
+        i, j = math.floor(lp.x() * kx), math.floor(lp.y() * ky)
+        r = QtCore.QRectF(i / kx, j / ky, 1.0 / kx, 1.0 / ky)
+        return self._image.mapRectToScene(r)
 
     def get_current_scale_factor(self):
         transform = self.transform()
@@ -3264,6 +3503,10 @@ class ImageViewer(QtWidgets.QGraphicsView):
         super().centerOn(*args, **kwargs)
         self._trigger_highres_update()
 
+    #: Sharper viewport tiles are requested only above this many device pixels
+    #: per preview pixel (see _on_highres_timer_timeout).
+    _HIGHRES_MIN_DEVICE_PX_PER_PREVIEW_PX = 1.1
+
     def _trigger_highres_update(self):
         if not getattr(self, "_highres_enabled", False):
             return
@@ -3292,6 +3535,21 @@ class ImageViewer(QtWidgets.QGraphicsView):
         elif scale <= 1.05:
             self._clear_highres_overlay()
             return
+        # Only ask for a sharper tile once the preview itself is visibly
+        # coarser than the screen. Below ~1 device pixel per PREVIEW pixel the
+        # preview already has more detail than can be shown -- on the BCI mosaic
+        # (preview = 1/3 resolution) every zoom between fit (0.09) and 1.0 used
+        # to trigger a full-resolution read, stretch and pixmap build of the
+        # whole viewport, for no visible gain. Measured: 1.5 s GUI stalls.
+        try:
+            pix = getattr(self, "_image", None)
+            if pix is not None:
+                t = pix.sceneTransform() * self.transform()
+                if math.hypot(t.m11(), t.m12()) <= self._HIGHRES_MIN_DEVICE_PX_PER_PREVIEW_PX:
+                    self._clear_highres_overlay()
+                    return
+        except Exception:
+            pass
 
         vp_rect = self.viewport().rect()
         scene_rect = self.mapToScene(vp_rect).boundingRect()
@@ -3316,6 +3574,12 @@ class ImageViewer(QtWidgets.QGraphicsView):
         why the previous QTimer.singleShot approach silently dropped tiles.
         """
         try:
+            # Workers now hand over a QImage (QPixmap is GUI-thread only, and
+            # building it there held Python's lock for ~190 ms per tile).
+            if isinstance(pixmap, QtGui.QImage):
+                if request_id is not None and request_id != getattr(self, "_highres_request_id", 0):
+                    return                       # stale: don't pay for the conversion
+                pixmap = QtGui.QPixmap.fromImage(pixmap)
             self.update_highres_overlay(pixmap, scene_pos_x, scene_pos_y,
                                         scale_x, scale_y, request_id=request_id)
         except Exception as e:
@@ -3692,6 +3956,10 @@ class ImageViewer(QtWidgets.QGraphicsView):
                         self._zoombar.hide_immediately()
                         
                     point = self.mapToScene(event.pos())
+                    if self._is_point_drawing_mode():
+                        # Point mode: the point IS the highlighted pixel --
+                        # snap to the centre of the exported-frame pixel.
+                        point = self._snap_scene_to_export_pixel(point)
                     self.currentPolygon = QtGui.QPolygonF()
                     self.currentPolygon.append(point)
                     self.lastPoint = point
@@ -3742,9 +4010,11 @@ class ImageViewer(QtWidgets.QGraphicsView):
                         self.finish_polygon()
                         event.accept()
                         return
-                    
-                    self.currentPolygon.append(point)
-                    self.lastPoint = point
+                    if self._is_point_drawing_mode():
+                        self._append_point_pixel(point)
+                    else:
+                        self.currentPolygon.append(point)
+                        self.lastPoint = point
                     self.update_temp_drawing()
                     event.accept()
                 self.left_button_pressed = True
@@ -3872,6 +4142,10 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 if self.drawing_mode in ("rectangle", "circle"):
                     self._shape_end_point = point
                     self.update_temp_drawing()
+                elif self._is_point_drawing_mode():
+                    # dragging paints pixels: each new exported pixel once
+                    if self._append_point_pixel(point) is not None:
+                        self.update_temp_drawing()
                 else:
                     min_distance = 15 / self.get_current_scale_factor()
                     if self.lastPoint is None or QtCore.QLineF(self.lastPoint, point).length() > min_distance:
@@ -4285,6 +4559,22 @@ class ImageViewer(QtWidgets.QGraphicsView):
     def set_full_geometry_callback(self, cb):
         self._full_geometry_callback = cb
 
+    def ensure_full_geometry(self, item):
+        """True once `item` holds its EXACT geometry; upgrades a pyramid
+        (display-only) item first. Anything that treats an item's outline as
+        data -- vertex editing, copy, replicate -- must call this: they used to
+        read the 16-raw-pixel overview of an imported crown and save it over
+        the real outline."""
+        if not getattr(item, "is_lod_geometry", False):
+            return True
+        self.request_full_geometry(item)
+        if getattr(item, "is_lod_geometry", False):
+            logging.warning("[polygon_lod] '%s': exact geometry unavailable; "
+                            "refusing to use the simplified display outline",
+                            getattr(item, "name", "?"))
+            return False
+        return True
+
     def add_polygon_to_scene(self, polygon, name="", is_mask_polygon=False, is_lod=False):
         is_rgb = False
         if hasattr(self, 'image_data') and self.image_data is not None and self.image_data.image is not None:
@@ -4450,9 +4740,13 @@ class ImageViewer(QtWidgets.QGraphicsView):
         pts = list(points)
         if hover_point is not None:
             pts.append(hover_point)
+        # Highlight the EXPORTED-frame pixel under each point -- exactly the
+        # pixel the click will commit (see _snap_scene_to_export_pixel) and the
+        # one CSV export / the ML manager read. EditablePointItem.paint draws
+        # the same cell, so hover, click and the committed point can't differ.
+        grid = self._raw_to_pixmap_scale()
         for p in pts:
-            lp = self._image.mapFromScene(p) if self._image else QtCore.QPointF(p)
-            path.addRect(off.x() + lp.x(), off.y() + lp.y(), 1, 1)
+            path.addRect(self._export_pixel_scene_rect(p, grid))
         return path
 
     def update_temp_drawing(self):
@@ -4860,7 +5154,10 @@ class ImageViewer(QtWidgets.QGraphicsView):
         for item in self.get_all_polygons():
             if isinstance(item, EditablePolygonItem):
                 poly_name = getattr(item, 'name', '') or ''
-                new_is_mask = poly_name in mask_names
+                # Either spelling may be stored: the identity (group key) or the
+                # label (display name) -- see EditablePolygonItem.display_name.
+                new_is_mask = poly_name in mask_names or \
+                    (getattr(item, 'display_name', None) or '') in mask_names
                 if item.is_mask_polygon != new_is_mask:
                     item.is_mask_polygon = new_is_mask
                     item.update()  # Trigger repaint
@@ -4987,7 +5284,10 @@ class ImageViewer(QtWidgets.QGraphicsView):
         losing viewer speed" actually requires.
         """
         try:
-            n = len(self._batch_source_items())
+            # A count is all this needs. _batch_source_items() builds the full
+            # list -- this runs on EVERY paint, so that was an O(N) walk of all
+            # 3,504 crowns per frame while navigating.
+            n = len(getattr(self, "polygons", ()) or ())
             rect = self._scene.sceneRect()
             vp = self.viewport()
             area = rect.width() * rect.height()
@@ -4999,6 +5299,37 @@ class ImageViewer(QtWidgets.QGraphicsView):
             return max(0.02, min(self._BATCH_SCALE_CAP, scale))
         except Exception:
             return self._BATCH_SCALE_THRESHOLD
+
+    def prune_detached_polygon_records(self):
+        """Drop `self.polygons` records whose item is no longer in this scene.
+
+        Paths that take items out with a bare `scene.removeItem` (shapefile
+        re-import replacing same-group items, Edit Selected, JSON import) left
+        their records behind: after a second import of 2,801 crowns this list
+        held 5,603 entries for 2,802 items, and since the zoomed-out tiles are
+        built from it (`_batch_source_items`), they kept painting the removed
+        items too. Returns the number of records dropped."""
+        sc = getattr(self, "_scene", None)
+        recs = getattr(self, "polygons", None)
+        if sc is None or not recs:
+            return 0
+        keep = []
+        for r in recs:
+            it = r.get('item') if isinstance(r, dict) else None
+            if it is None:
+                keep.append(r)
+                continue
+            try:
+                if it.scene() is sc:
+                    keep.append(r)
+            except RuntimeError:          # C++ object already deleted
+                pass
+        dropped = len(recs) - len(keep)
+        if dropped:
+            self.polygons = keep
+            self._polygon_item_count = len(keep)
+            self.invalidate_polygon_batch()
+        return dropped
 
     def _batch_source_items(self):
         out = []
@@ -5211,7 +5542,75 @@ class ImageViewer(QtWidgets.QGraphicsView):
                     not getattr(self, "_batch_sync_queued", False):
                 self._batch_sync_queued = True
                 QtCore.QTimer.singleShot(0, self._deferred_batch_sync)
+        self._maybe_schedule_lod_refine()
         super().paintEvent(event)
+
+    # ---- QGIS-style on-the-fly level of detail --------------------------------
+    #
+    # Polygons are drawn from a coarse pyramid level (polygon_lod) so thousands
+    # of crowns load and paint fast. That level used to be the ONLY one ever
+    # shown: zoomed in to native resolution a crown still had the 16-raw-pixel
+    # overview outline (up to ~1 m off on a 7 cm orthomosaic) until it was
+    # dragged. Like QGIS's "simplify on the fly", the detail now follows the
+    # view: once a zoom/pan settles, the owning ProjectTab swaps the crowns IN
+    # VIEW to the coarsest level that is still under one device pixel, or to
+    # their exact geometry. See ProjectTab._refine_visible_polygon_lod.
+    _LOD_REFINE_DEBOUNCE_MS = 150
+
+    def set_lod_refine_callback(self, cb):
+        self._lod_refine_callback = cb
+
+    def _view_signature(self):
+        t = self.transform()
+        return (round(t.m11(), 6), round(t.m22(), 6),
+                self.horizontalScrollBar().value(), self.verticalScrollBar().value(),
+                self.viewport().width(), self.viewport().height())
+
+    def _maybe_schedule_lod_refine(self):
+        if not callable(getattr(self, "_lod_refine_callback", None)):
+            return
+        sig = self._view_signature()
+        if sig == getattr(self, "_lod_refined_sig", None) or \
+                sig == getattr(self, "_lod_pending_sig", None):
+            return
+        self._lod_pending_sig = sig
+        timer = getattr(self, "_lod_refine_timer", None)
+        if timer is None:
+            timer = QtCore.QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(self._LOD_REFINE_DEBOUNCE_MS)
+            timer.timeout.connect(self._run_lod_refine)
+            self._lod_refine_timer = timer
+        timer.start()
+
+    def _run_lod_refine(self):
+        cb = getattr(self, "_lod_refine_callback", None)
+        self._lod_pending_sig = None
+        if not callable(cb):
+            return
+        try:
+            self._lod_refined_sig = self._view_signature()
+            more = cb(self)
+        except Exception:
+            logging.exception("polygon LOD refine failed")
+            return
+        if more:
+            # Time budget spent, or geometry reads still in flight: continue
+            # shortly so the view stays responsive (progressive, like QGIS
+            # rendering a layer in chunks). A short delay rather than 0 so
+            # waiting on background reads does not spin the event loop.
+            #
+            # A timer OWNED by this viewer, not QTimer.singleShot(ms, bound
+            # method): the static form keeps no tie to the viewer, so it could
+            # fire into an ImageViewer whose C++ side was already deleted.
+            cont = getattr(self, "_lod_continue_timer", None)
+            if cont is None:
+                cont = QtCore.QTimer(self)
+                cont.setSingleShot(True)
+                cont.setInterval(15)
+                cont.timeout.connect(self._run_lod_refine)
+                self._lod_continue_timer = cont
+            cont.start()
 
     def _deferred_batch_sync(self):
         self._batch_sync_queued = False
@@ -5257,7 +5656,11 @@ class ImageViewer(QtWidgets.QGraphicsView):
         """
         if not isinstance(polygon_item, EditablePolygonItem):
             return
-        
+        # Never edit the simplified display outline of a pyramid item: the
+        # edit would be saved over the real geometry.
+        if not self.ensure_full_geometry(polygon_item):
+            return
+
         # Verify item is valid and in scene
         try:
             if polygon_item.scene() is None:
@@ -5707,6 +6110,9 @@ class ImageViewer(QtWidgets.QGraphicsView):
         src_h = pm.height() if pm else 0
 
         if isinstance(item, EditablePolygonItem):
+            # Copy/replicate the REAL outline, never the pyramid display level.
+            if not self.ensure_full_geometry(item):
+                return None
             poly_scene = item.mapToScene(item.polygon)
             pts = [(p.x(), p.y()) for p in poly_scene]
             kind = "polygon"
@@ -7656,8 +8062,12 @@ class _BandBar(QtWidgets.QFrame):
     _LEADING_ITEMS = 3
 
     def populate(self, band_names, count, active_band=None,
-                 composite_label="Auto", composite_active=False):
-        """Rebuild the numbered-band buttons for `count` bands (0-based indices)."""
+                 composite_label="Auto", composite_active=False, buttons=None):
+        """Rebuild the numbered-band buttons for `count` bands (0-based indices).
+
+        `buttons`: [(band_idx sent on click, text, tooltip), ...] in display
+        order -- overrides the plain 1..count numbering (a fully loaded image
+        whose array order is not file order, and its derived bands)."""
         self.setUpdatesEnabled(False)
         try:
             self._composite_btn.setText(composite_label)
@@ -7676,11 +8086,15 @@ class _BandBar(QtWidgets.QFrame):
                     w.setParent(None)
 
             count = max(0, int(count or 0))
-            for i in range(count):
-                nm = band_names[i] if (band_names and i < len(band_names) and band_names[i]) else None
+            if buttons is None:
+                buttons = []
+                for i in range(count):
+                    nm = band_names[i] if (band_names and i < len(band_names) and band_names[i]) else None
+                    buttons.append((i, str(i + 1), nm if nm else f"Band {i + 1}"))
+            for i, text, tip in buttons:
                 btn = QtWidgets.QToolButton(self._inner)
-                btn.setText(str(i + 1))
-                btn.setToolTip(nm if nm else f"Band {i + 1}")
+                btn.setText(text)
+                btn.setToolTip(tip)
                 btn.setCheckable(True)
                 btn.setFixedSize(42, 34)
                 btn.clicked.connect(lambda checked, band_idx=i: self._on_button_clicked(band_idx))

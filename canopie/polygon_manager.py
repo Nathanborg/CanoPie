@@ -3599,6 +3599,16 @@ class PolygonManager(QtWidgets.QDialog):
                         if scene:
                             scene.blockSignals(True)
                             scene.setItemIndexMethod(QtWidgets.QGraphicsScene.NoIndex)
+                        # No repaints until the whole import is in (as
+                        # load_polygons does). The processEvents() below keeps
+                        # the progress dialog alive, but each one also repainted
+                        # this viewer -- and above 800 polygons every repaint
+                        # REBUILT all zoomed-out tiles from scratch: 10 rebuilds
+                        # and ~4 s of the 2,801-crown import's GUI time.
+                        old_vp_mode = None
+                        if hasattr(viewer, "viewportUpdateMode"):
+                            old_vp_mode = viewer.viewportUpdateMode()
+                            viewer.setViewportUpdateMode(QtWidgets.QGraphicsView.NoViewportUpdate)
                         # name -> LIST of items, not a single item.
                         #
                         # A scene can already hold several items sharing a name;
@@ -3611,7 +3621,7 @@ class PolygonManager(QtWidgets.QDialog):
                                 nm = getattr(item, "name", None)
                                 if nm:
                                     existing_by_name.setdefault(nm, []).append(item)
-                        touched[id(viewer)] = (viewer, scene, old_idx, existing_by_name)
+                        touched[id(viewer)] = (viewer, scene, old_idx, existing_by_name, old_vp_mode)
                     else:
                         existing_by_name = touched[id(viewer)][3]
 
@@ -3633,6 +3643,11 @@ class PolygonManager(QtWidgets.QDialog):
                                 qpoly, group_name, is_lod=is_lod_pts)
                         elif hasattr(viewer, "add_polygon"):
                             viewer.add_polygon(qpoly, group_name)
+                        # Identity is the group key; the label is the record's
+                        # name, exactly as load_polygons draws it after a reload.
+                        _disp = poly_payload.get('name') if isinstance(poly_payload, dict) else None
+                        if new_item is not None and _disp and _disp != group_name:
+                            new_item.display_name = _disp
                         # Keep the index truthful: if this name comes round
                         # again, the item just added is the one to replace.
                         if new_item is not None:
@@ -3646,7 +3661,14 @@ class PolygonManager(QtWidgets.QDialog):
                             "[ImportShapefile] Failed to draw '%s' onto open viewer for %s: %s",
                             group_name, os.path.basename(filepath), e)
 
-        for viewer, scene, old_idx, _ in touched.values():
+        for viewer, scene, old_idx, _, old_vp_mode in touched.values():
+            # Same-group items replaced above were taken out of the scene but
+            # not out of viewer.polygons, which feeds the zoomed-out tiles.
+            try:
+                if hasattr(viewer, "prune_detached_polygon_records"):
+                    viewer.prune_detached_polygon_records()
+            except Exception as e:
+                logging.debug("[ImportShapefile] pruning replaced records failed: %s", e)
             try:
                 if scene is not None:
                     # Restore the pre-batch index method. NoIndex is only for
@@ -3657,6 +3679,8 @@ class PolygonManager(QtWidgets.QDialog):
                         scene.setItemIndexMethod(old_idx)
                     scene.blockSignals(False)
                 viewer.blockSignals(False)
+                if old_vp_mode is not None:
+                    viewer.setViewportUpdateMode(old_vp_mode)
                 if scene is not None:
                     scene.update()
                 if hasattr(viewer, "viewport"):
@@ -4041,6 +4065,8 @@ class PolygonManager(QtWidgets.QDialog):
                                 except Exception:
                                     pass
                                 break  # Assuming one polygon per group per image
+                    if hasattr(viewer, "prune_detached_polygon_records"):
+                        viewer.prune_detached_polygon_records()
 
                 # Determine the JSON file path
                 base_filename = os.path.splitext(os.path.basename(filepath))[0]
@@ -4568,6 +4594,8 @@ class PolygonManager(QtWidgets.QDialog):
                                     viewer._scene.removeItem(item)
                                 except Exception:
                                     pass
+                        if hasattr(viewer, "prune_detached_polygon_records"):
+                            viewer.prune_detached_polygon_records()
 
                     # Map image coords to scene coords through the pixmap.
                     # Vectorised -- see image_viewer.image_points_to_scene.

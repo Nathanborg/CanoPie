@@ -242,19 +242,27 @@ def test_ax_replay_still_normalises_the_real_pixels(synthetic_project, tmp_path)
 
 def test_viewer_replay_excludes_the_declared_nodata(synthetic_project, tmp_path):
     """Same wiring, the other replay path (`apply_aux_modifications`, used by
-    the viewer's loader). Both must agree or the viewer and CSV disagree."""
+    the viewer's loader). Both must agree or the viewer and CSV disagree.
+
+    The viewer data holds NoData as NaN per band (canopie.nodata, 2026-10-06),
+    like the analysis image: every declared fill pixel must be NoData after
+    the replay -- never rescaled into a "valid" value -- and nothing else."""
     import json
     fp, arr = _declared_nodata_raster(tmp_path, "viewer.tif")
     with open(tmp_path / "viewer.ax", "w", encoding="utf-8") as f:
         json.dump(AX_NO_NODATA, f)
 
     out = np.asarray(synthetic_project.__class__.apply_aux_modifications(
-        fp, arr, project_folder=str(tmp_path), global_mode=False))
+        fp, arr, project_folder=str(tmp_path), global_mode=False,
+        src_channel_order="rgb"))
 
-    before = int(np.isclose(arr[..., 2], FILL, atol=1e-3).sum())
-    after = int(np.isclose(out[..., 2], FILL, atol=1e-3).sum())
-    assert after == before, (
-        f"{before - after} fill pixels rewritten by the viewer replay path")
+    for b in range(arr.shape[2]):
+        fill = np.isclose(arr[..., b], FILL, atol=1e-3) | ~np.isfinite(arr[..., b])
+        assert np.array_equal(~np.isfinite(out[..., b]), fill), (
+            f"band {b + 1}: {int((fill & np.isfinite(out[..., b])).sum())} fill pixels became data, "
+            f"{int((~fill & ~np.isfinite(out[..., b])).sum())} data pixels became NoData")
+    assert not np.isclose(out[np.isfinite(out)], FILL, atol=1.0).any(), "a rescaled fill value survived"
+    assert out[..., 4].mean() == pytest.approx(100.0, abs=1.5), "matching became a no-op"
 
 
 # ---------------------------------------------------------------------------

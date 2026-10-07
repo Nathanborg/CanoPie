@@ -86,7 +86,7 @@ def test_process_polygon_lazy_matches_eager(synthetic_project, monkeypatch, name
     # satisfied by both being wrong in the same way.
     channel_names = expected_channel_names(spec["bands"])
     for b, ch in enumerate(channel_names):
-        band_gt = gt["polygon"]["bands"][str(b)]["process_polygon"]
+        band_gt = gt["polygon"]["bands"][str(b)]["per_band"]
         if band_gt["count"] == 0 or ch not in eager:
             continue
         assert_close(eager[ch]["Mean"], band_gt["mean"], tol=1e-2,
@@ -154,6 +154,6 @@ def test_crop_offset_identical_in_both_readers(synthetic_project, monkeypatch):
 
     # Ground truth for this fixture is computed in the POST-crop frame, so
     # agreeing with it proves both readers cropped to the same origin.
-    band0 = gt["polygon"]["bands"]["0"]["process_polygon"]
+    band0 = gt["polygon"]["bands"]["0"]["per_band"]
     assert_close(eager["R"]["Mean"], band0["mean"], tol=1e-2, msg="eager crop offset")
     assert_close(lazy["R"]["Mean"], band0["mean"], tol=1e-2, msg="lazy crop offset")

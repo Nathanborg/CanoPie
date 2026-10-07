@@ -5,8 +5,10 @@ QC regression tests for the Pixel Inspector tool
 Covers: correct per-band values at known coordinates (channel_order-aware,
 post the session's channel_order fix -- all 8 fixtures should now agree, not
 just the 3 originally-correct ones), the two distinct NoData display
-mechanisms (numeric per-channel vs. string-expression whole-pixel), and the
-band_expression "index" value for the .ax fixture that carries one.
+mechanisms (numeric values and `bN op x` expressions, both PER BAND since
+the one NoData rule of 2026-10-06), and the band expression's value -- named
+by its expression text, like the CSV column -- for the .ax fixture that
+carries one.
 """
 import pytest
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -98,10 +100,10 @@ def test_numeric_nodata_per_channel(synthetic_project, viewer_factory):
     assert not any(payload2["channel_nodata"]), f"expected no NoData at a clean pixel: {payload2['channel_nodata']}"
 
 
-def test_expression_nodata_whole_pixel(synthetic_project, viewer_factory):
-    """String-expression NoData (e.g. "b1>threshold") is a distinct mechanism
-    from numeric per-channel NoData: it sets a whole-pixel is_nodata flag that
-    suppresses ALL band values, not just the offending one. Verified in
+def test_expression_nodata_flags_only_the_band_it_names(synthetic_project, viewer_factory):
+    """String-expression NoData ("b1>threshold") excludes the band it names
+    and nothing else (canopie.nodata, per band, Nathan 2026-10-06) -- it used
+    to set a whole-pixel flag that blanked every band's value. Verified in
     isolation (monkeypatched .ax mods) rather than via a dedicated fixture
     file, since it's a pure Inspect-side behavior independent of what's on
     disk."""
@@ -121,7 +123,10 @@ def test_expression_nodata_whole_pixel(synthetic_project, viewer_factory):
 
     ok, payload = _inspect(viewer, p["x"], p["y"])
     assert ok
-    assert payload["is_nodata"] is True, "expression match should set the whole-pixel flag"
+    assert payload["is_nodata"] is False, "an expression is per band, not whole-pixel"
+    assert payload["channel_nodata"][0] is True, "b1 must be flagged"
+    assert not any(payload["channel_nodata"][1:]), (
+        f"only b1 is NoData here: {payload['channel_nodata']}")
 
 
 def test_band_expression_index_value(synthetic_project, viewer_factory):
@@ -138,8 +143,9 @@ def test_band_expression_index_value(synthetic_project, viewer_factory):
     p = gt["points"][gt["degenerate_point_name"]]
     ok, payload = _inspect(viewer, p["x"], p["y"])
     assert ok
-    assert "index" in payload["names"], f"expected an 'index' channel, got {payload['names']}"
-    idx_pos = payload["names"].index("index")
+    expr = get_fixture(name)["ax"]["band_expression"]
+    assert expr in payload["names"], f"expected a {expr!r} channel, got {payload['names']}"
+    idx_pos = payload["names"].index(expr)
     actual_index = payload["values"][idx_pos]
     expected_index = p["values"][-1]  # ground truth appended the index value last
     assert_close(actual_index, expected_index, tol=1e-3, msg=f"{name} band_expression index")

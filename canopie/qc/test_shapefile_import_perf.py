@@ -108,8 +108,12 @@ def test_a_4326_source_needs_no_transformer():
     from ..spatial_index import SpatialIndexManager
 
     mgr = SpatialIndexManager()
-    assert mgr._get_wgs84_transformer(pyproj.CRS.from_epsg(4326)) is None
-    key = mgr._crs_cache_key(pyproj.CRS.from_epsg(4326))
+    # ONE CRS object, as the import holds: the key is its id(), and a second
+    # from_epsg(4326) matched only when Python happened to reuse the first
+    # one's address (BUG-057: failed once in a full run)
+    crs = pyproj.CRS.from_epsg(4326)
+    assert mgr._get_wgs84_transformer(crs) is None
+    key = mgr._crs_cache_key(crs)
     assert key in mgr._wgs84_transformer_cache, (
         "the 'no transform needed' answer was not cached, so every feature "
         "re-parses the CRS to rediscover it")

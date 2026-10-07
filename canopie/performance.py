@@ -769,7 +769,8 @@ def fast_stats(arr: np.ndarray,
                 result[f'Q{q_str}'] = None
         return result
 
-    a_valid = a[finite_mask]
+    # (no copy when every value is finite: same values, same order)
+    a_valid = a if finite_mask.all() else a[finite_mask]
 
     # Compute requested statistics
     if compute_mean:
@@ -778,12 +779,9 @@ def fast_stats(arr: np.ndarray,
     if compute_std:
         result['Standard Deviation'] = float(np.std(a_valid, ddof=0))
 
-    if compute_median:
-        result['Median'] = float(np.median(a_valid))
-
+    q_norm = []
     if quantiles:
         # Normalize quantiles to 0-100 range
-        q_norm = []
         for q in quantiles:
             try:
                 qf = float(q)
@@ -794,13 +792,80 @@ def fast_stats(arr: np.ndarray,
             except Exception:
                 continue
 
-        if q_norm:
-            q_values = np.percentile(a_valid, [qf for _, qf in q_norm])
-            for (q_orig, _), q_val in zip(q_norm, q_values):
-                q_str = str(q_orig).rstrip('0').rstrip('.') if isinstance(q_orig, float) else str(q_orig)
-                result[f'Q{q_str}'] = float(q_val)
+    if compute_median or q_norm:
+        med, q_values = median_and_percentiles(a_valid, compute_median, [qf for _, qf in q_norm])
+        if compute_median:
+            result['Median'] = float(med)
+        for (q_orig, _), q_val in zip(q_norm, q_values):
+            q_str = str(q_orig).rstrip('0').rstrip('.') if isinstance(q_orig, float) else str(q_orig)
+            result[f'Q{q_str}'] = float(q_val)
 
     return result
+
+
+def median_and_percentiles(a: np.ndarray, want_median: bool, q_pcts):
+    """np.median(a) and np.percentile(a, q_pcts) -- the same float64 bits -- from
+    ONE partition of one copy (np.median and np.percentile each copy and
+    partition the array: on a large crown that was most of the stats time).
+
+    `a`: 1-D float64, every value finite, size >= 1. Returns (median or None,
+    list of percentile values). The order statistics are the same whatever
+    the partition; the arithmetic below is numpy's own (median: the mean of
+    the middle one or two; percentile 'linear': numpy's _lerp). One value has
+    two encodings: a zero picked where the data holds both -0.0 and +0.0 may
+    land with either sign depending on the partition, so that case is handed
+    to numpy itself.
+    """
+    n = int(a.size)
+    kth = []
+    med_idx = ()
+    if want_median:
+        med_idx = (n // 2 - 1, n // 2) if n % 2 == 0 else ((n - 1) // 2,)
+        kth.extend(med_idx)
+    prev = nxt = virtual = None
+    if q_pcts:
+        q = np.asanyarray(np.true_divide(np.asarray(q_pcts, dtype=np.float64), np.float64(100)))
+        virtual = np.asanyarray((n - 1) * q)
+        prev = np.asanyarray(np.floor(virtual))
+        nxt = np.asanyarray(prev + 1)
+        above = virtual >= n - 1
+        if above.any():
+            prev[above] = -1
+            nxt[above] = -1
+        below = virtual < 0
+        if below.any():
+            prev[below] = 0
+            nxt[below] = 0
+        prev = prev.astype(np.intp)
+        nxt = nxt.astype(np.intp)
+        kth.extend([0, n - 1])
+        kth.extend(int(i) % n for i in prev)
+        kth.extend(int(i) % n for i in nxt)
+    part = np.partition(a, sorted(set(kth)))
+
+    picked = [part[i] for i in med_idx]
+    if q_pcts:
+        previous = part[prev]
+        nextv = part[nxt]
+        picked.extend(previous.tolist())
+        picked.extend(nextv.tolist())
+    if any(v == 0 for v in picked) and np.signbit(part[part == 0]).any():
+        med = np.median(a) if want_median else None
+        return med, (list(np.percentile(a, list(q_pcts))) if q_pcts else [])
+
+    med = None
+    if want_median:
+        # np.median: mean(part[index:index+1]) or mean(part[index-1:index+1])
+        med = part[med_idx[0]] if len(med_idx) == 1 else (part[med_idx[0]] + part[med_idx[1]]) / 2
+    if not q_pcts:
+        return med, []
+    gamma = np.asanyarray(np.asanyarray(virtual - prev), dtype=virtual.dtype)
+    # numpy's _lerp
+    diff_b_a = np.subtract(nextv, previous)
+    lerp = np.asanyarray(np.add(previous, diff_b_a * gamma))
+    np.subtract(nextv, diff_b_a * (1 - gamma), out=lerp, where=gamma >= 0.5,
+                casting='unsafe', dtype=lerp.dtype)
+    return med, list(lerp)
 
 
 # ============================================================================

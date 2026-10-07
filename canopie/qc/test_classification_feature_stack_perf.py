@@ -279,7 +279,6 @@ def test_run_sklearn_classification_uses_tiled_iteration():
     ProjectTab._apply_sklearn_classification_with_indices,
     ProjectTab._apply_sklearn_classification,
     ProjectTab._apply_ax_to_raw,
-    ProjectTab.apply_aux_modifications,
 ])
 def test_project_tab_classification_call_sites_use_tiled_iteration(func):
     names = _names_in(func)
@@ -287,6 +286,17 @@ def test_project_tab_classification_call_sites_use_tiled_iteration(func):
         f"{func.__qualname__} must build/predict via the tiled, memory-"
         "bounded path, not a single whole-image builder call")
     assert "_CLASSIFY_FEATURE_BUDGET_BYTES" in names
+
+
+def test_the_viewer_replay_classifies_through_the_export_classifier():
+    """apply_aux_modifications no longer has a builder of its own: it calls
+    analysis_replay.classify_label_band (BUG-011), which is the tiled path."""
+    from .. import analysis_replay
+    import inspect
+    assert "classify_label_band" in inspect.getsource(ProjectTab.apply_aux_modifications)
+    names = _names_in(analysis_replay._classify)
+    assert "iter_tiled_feature_matrices" in names
+    assert "_CLASSIFY_FEATURE_BUDGET_BYTES" in names or "budget" in names
 
 
 # ---------------------------------------------------------------------------
@@ -573,6 +583,8 @@ def test_apply_aux_modifications_classification_replay_tiled_matches_untiled(tmp
     out_tiled = classify(500)
 
     assert out_untiled.shape[2] == out_tiled.shape[2] == 4
-    assert np.array_equal(out_untiled[:, :, 3], out_tiled[:, :, 3]), (
+    # unclassified (the window border) is NaN -- never 0, which is class 0
+    assert np.array_equal(out_untiled[:, :, 3], out_tiled[:, :, 3], equal_nan=True), (
         "the appended classification band must be identical whether built "
         "in one shot or tiled")
+    assert np.isnan(out_tiled[0, :, 3]).all(), "the window border must be unclassified (NaN)"

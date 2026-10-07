@@ -182,9 +182,10 @@ def test_band_expression_index_over_nan_is_nodata_not_zero(viewer_factory, tmp_p
     viewer = _viewer_with_array(viewer_factory, _nan_stack(), filepath=str(fp))
     payload = _inspect(viewer, 2, 3)
 
-    assert "index" in payload["names"], (
+    # the derived band is named by its expression text, like the CSV column
+    assert "(b2-b1)/(b2+b1)" in payload["names"], (
         f"band_expression produced no index channel: {payload['names']}")
-    i = payload["names"].index("index")
+    i = payload["names"].index("(b2-b1)/(b2+b1)")
     assert payload["channel_nodata"][i] is True, (
         f"index over NaN inputs reported {payload['values'][i]!r} instead of NoData")
 
