@@ -65,15 +65,7 @@
     "pixel_count_total": 169,
     "bands": {
       "0": {
-        "process_polygon": {
-          "mean": 532.0,
-          "median": 532.0,
-          "std": 118.91173196955799,
-          "q25": 432.0,
-          "q75": 632.0,
-          "count": 169
-        },
-        "ml_manager": {
+        "per_band": {
           "mean": 532.0,
           "median": 532.0,
           "std": 118.91173196955799,
@@ -91,15 +83,7 @@
         }
       },
       "1": {
-        "process_polygon": {
-          "mean": 509.0,
-          "median": 509.0,
-          "std": 118.91173196955799,
-          "q25": 409.0,
-          "q75": 609.0,
-          "count": 169
-        },
-        "ml_manager": {
+        "per_band": {
           "mean": 509.0,
           "median": 509.0,
           "std": 118.91173196955799,
@@ -117,15 +101,7 @@
         }
       },
       "2": {
-        "process_polygon": {
-          "mean": 486.0,
-          "median": 486.0,
-          "std": 118.91173196955799,
-          "q25": 386.0,
-          "q75": 586.0,
-          "count": 169
-        },
-        "ml_manager": {
+        "per_band": {
           "mean": 486.0,
           "median": 486.0,
           "std": 118.91173196955799,
@@ -143,15 +119,7 @@
         }
       },
       "3": {
-        "process_polygon": {
-          "mean": 463.0,
-          "median": 463.0,
-          "std": 118.91173196955799,
-          "q25": 363.0,
-          "q75": 563.0,
-          "count": 169
-        },
-        "ml_manager": {
+        "per_band": {
           "mean": 463.0,
           "median": 463.0,
           "std": 118.91173196955799,
@@ -169,15 +137,7 @@
         }
       },
       "4": {
-        "process_polygon": {
-          "mean": 440.0,
-          "median": 440.0,
-          "std": 118.91173196955799,
-          "q25": 340.0,
-          "q75": 540.0,
-          "count": 169
-        },
-        "ml_manager": {
+        "per_band": {
           "mean": 440.0,
           "median": 440.0,
           "std": 118.91173196955799,
@@ -195,15 +155,7 @@
         }
       },
       "5": {
-        "process_polygon": {
-          "mean": 417.0,
-          "median": 417.0,
-          "std": 118.91173196955799,
-          "q25": 317.0,
-          "q75": 517.0,
-          "count": 169
-        },
-        "ml_manager": {
+        "per_band": {
           "mean": 417.0,
           "median": 417.0,
           "std": 118.91173196955799,
@@ -221,15 +173,7 @@
         }
       },
       "6": {
-        "process_polygon": {
-          "mean": 394.0,
-          "median": 394.0,
-          "std": 118.91173196955799,
-          "q25": 294.0,
-          "q75": 494.0,
-          "count": 169
-        },
-        "ml_manager": {
+        "per_band": {
           "mean": 394.0,
           "median": 394.0,
           "std": 118.91173196955799,
@@ -247,21 +191,13 @@
         }
       },
       "7": {
-        "process_polygon": {
+        "per_band": {
           "mean": null,
           "median": null,
           "std": null,
           "q25": null,
           "q75": null,
           "count": 0
-        },
-        "ml_manager": {
-          "mean": -9999.0,
-          "median": -9999.0,
-          "std": 0.0,
-          "q25": -9999.0,
-          "q75": -9999.0,
-          "count": 169
         },
         "no_mask": {
           "mean": -9999.0,

@@ -50,15 +50,7 @@
     "pixel_count_total": 256,
     "bands": {
       "0": {
-        "process_polygon": {
-          "mean": 128.0,
-          "median": 131.0,
-          "std": 74.2057949219601,
-          "q25": 64.0,
-          "q75": 192.5,
-          "count": 256
-        },
-        "ml_manager": {
+        "per_band": {
           "mean": 128.0,
           "median": 131.0,
           "std": 74.2057949219601,
@@ -76,15 +68,7 @@
         }
       },
       "1": {
-        "process_polygon": {
-          "mean": 129.0,
-          "median": 129.0,
-          "std": 73.01027324972836,
-          "q25": 65.75,
-          "q75": 190.5,
-          "count": 256
-        },
-        "ml_manager": {
+        "per_band": {
           "mean": 129.0,
           "median": 129.0,
           "std": 73.01027324972836,
@@ -102,15 +86,7 @@
         }
       },
       "2": {
-        "process_polygon": {
-          "mean": 125.0,
-          "median": 125.0,
-          "std": 72.90747561121562,
-          "q25": 63.0,
-          "q75": 187.0,
-          "count": 256
-        },
-        "ml_manager": {
+        "per_band": {
           "mean": 125.0,
           "median": 125.0,
           "std": 72.90747561121562,

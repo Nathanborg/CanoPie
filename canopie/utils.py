@@ -488,7 +488,11 @@ def eval_band_expression(image: np.ndarray, expr: str) -> np.ndarray:
         raise ValueError("Empty expression.")
 
     import numpy as _np
-    x = _np.nan_to_num(_np.asarray(image, dtype=_np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    x = _np.asarray(image, dtype=_np.float32)
+    # nan_to_num copies the whole stack even when there is nothing to replace;
+    # the bands are only read below (every operation returns a new array)
+    if not _np.isfinite(x).all():
+        x = _np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     H, W = x.shape[:2]
     C = 1 if x.ndim == 2 else x.shape[2]
 
@@ -597,7 +601,12 @@ def eval_band_expression(image: np.ndarray, expr: str) -> np.ndarray:
     # ndarray → float32; bool → 0/1; scalar → broadcast
     if isinstance(res, np.ndarray):
         out = res.astype(np.float32, copy=False) if res.dtype != np.bool_ else res.astype(np.float32)
-        return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+        if np.may_share_memory(out, x):
+            # a band itself (`b1`): never hand back a view of the caller's image
+            return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+        if np.isfinite(out).all():
+            return out
+        return np.nan_to_num(out, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
     out = np.full((H, W), float(res), dtype=np.float32)
     return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 

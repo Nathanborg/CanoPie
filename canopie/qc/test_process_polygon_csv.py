@@ -4,10 +4,11 @@ QC regression tests for the main CSV export engine, ProjectTab.process_polygon
 a plain synchronous method) against every fixture's polygon and point
 annotations, comparing per-band stats against ground truth.
 
-Also pins down process_polygon's documented NoData-masking asymmetry (bands
-0/1/2 gated by band 0's own NoData status whenever there are 3+ bands; bands
->= 3 gated by their own band) as the current regression baseline -- NOT a bug
-to fix here, see the plan's "Bug fixes" section for what IS in scope.
+NoData is per band (canopie/nodata.py, Nathan 2026-10-06): band b's
+statistics exclude only the pixels where band b itself is NoData, and a band
+that is NoData everywhere in the polygon (or at the point) KEEPS its row, with
+empty statistics and Pixel Count 0. (Before, R/G/B were gated by band 0 and
+such rows were silently omitted.)
 """
 import pytest
 
@@ -50,18 +51,17 @@ def test_polygon_stats_match_ground_truth(synthetic_project, name):
 
     channel_names = expected_channel_names(spec["bands"])
     for b, ch_name in enumerate(channel_names):
-        band_gt = gt["polygon"]["bands"][str(b)]["process_polygon"]
-
-        if band_gt["count"] == 0:
-            # Zero valid pixels -> the row is silently omitted, never emitted
-            # with NaN/zero-count placeholders (confirmed by direct read of
-            # process_polygon's early-return branches).
-            assert ch_name not in by_channel, f"{name} band {b} ({ch_name}): expected omitted row, but got one"
-            continue
+        band_gt = gt["polygon"]["bands"][str(b)]["per_band"]
 
         assert ch_name in by_channel, f"{name} band {b} ({ch_name}): expected a row, got none. Rows: {list(by_channel)}"
         row = by_channel[ch_name]
         assert row["Pixel Count"] == band_gt["count"], f"{name} band {b} Pixel Count"
+        if band_gt["count"] == 0:
+            # Zero valid pixels -> the row is KEPT with empty statistics.
+            for col in _STAT_KEY_MAP.values():
+                assert row.get(col) is None, (
+                    f"{name} band {b} ({ch_name}): {col} must be empty, got {row.get(col)!r}")
+            continue
         for stat_key, col in _STAT_KEY_MAP.items():
             assert_close(row.get(col), band_gt[stat_key], tol=1e-2, msg=f"{name} band {b} ({ch_name}) {col}")
 
@@ -87,29 +87,21 @@ def test_point_values_match_ground_truth(synthetic_project, name):
             nodata_value = gt["nodata_value"]
             is_nodata_here = nodata_value is not None and abs(expected - nodata_value) < 1e-3
 
-            if is_nodata_here:
-                # Point mode drops a point entirely only if EVERY band is
-                # NoData; but within the RGB sub-block, if ANY of R/G/B is
-                # individually NaN, that point's RGB rows are skipped anyway.
-                # For bands >= 3 a NoData value is skipped individually.
-                # Either way: this channel's row must be absent here.
-                assert ch_name not in by_channel, (
-                    f"{name}/{p['name']} band {b} ({ch_name}): expected omitted (NoData), got a row"
-                )
-                continue
-
             assert ch_name in by_channel, f"{name}/{p['name']} band {b} ({ch_name}): expected a row"
+            if is_nodata_here:
+                # Per band: only this band is NoData here; its row is kept, empty.
+                assert by_channel[ch_name].get("Mean") is None, (
+                    f"{name}/{p['name']} band {b} ({ch_name}): NoData must give an empty Mean")
+                assert by_channel[ch_name].get("Pixel Count") == 0
+                continue
             assert_close(by_channel[ch_name].get("Mean"), expected, tol=1e-2,
                          msg=f"{name}/{p['name']} band {b} ({ch_name})")
 
 
-def test_nodata_asymmetry_documented_baseline(synthetic_project):
-    """Pins down the CURRENT, documented masking asymmetry as the regression
-    baseline (not something this suite fixes): for a 100%-fill ancillary band
-    (auto-detected GDAL_NODATA -> genuinely per-band masks), R/G/B are
-    band-0-gated (band 0 itself is never NoData here, so they see full valid
-    counts) while the fill band itself is correctly excluded via its own
-    mask."""
+def test_all_fill_band_keeps_an_empty_row(synthetic_project):
+    """A 100%-fill ancillary band (GDAL_NODATA tag) is NoData only in ITSELF:
+    R/G/B keep their full valid counts, and the fill band keeps its row with
+    Pixel Count 0 and empty statistics (Nathan 2026-10-06)."""
     name = "multiband_8band_ancillary"
     spec = get_fixture(name)
     gt = load_ground_truth(name)
@@ -122,14 +114,16 @@ def test_nodata_asymmetry_documented_baseline(synthetic_project):
     )
     by_channel = _rows_by_channel(rows)
 
-    assert "R" in by_channel, "band 0 (R) should have full valid pixels (band-0-gated, band 0 is clean)"
+    assert "R" in by_channel, "band 0 (R) should have full valid pixels (band 0 is clean)"
     assert by_channel["R"]["Pixel Count"] == gt["polygon"]["pixel_count_total"]
-    assert "band_8" not in by_channel, "the 100%-fill ancillary band (index 7) must be entirely excluded"
+    assert "band_8" in by_channel, "the 100%-fill ancillary band (index 7) must keep its row"
+    assert by_channel["band_8"]["Pixel Count"] == 0
+    assert by_channel["band_8"]["Mean"] is None
 
 
 def test_fragmented_nodata_polygon(synthetic_project):
-    """A polygon straddling a valid patch and a NoData hole: R/G/B (band-0-
-    gated) must exclude exactly the hole's pixels; the count must be strictly
+    """A polygon straddling a valid patch and a NoData hole: R must exclude
+    exactly the hole's pixels (its own NoData); the count must be strictly
     less than the polygon's total rasterized pixel count."""
     name = "nodata_fragmented_multiband"
     spec = get_fixture(name)
@@ -146,7 +140,7 @@ def test_fragmented_nodata_polygon(synthetic_project):
     total = gt["polygon"]["pixel_count_total"]
     r_count = by_channel["R"]["Pixel Count"]
     assert r_count < total, f"expected some pixels excluded by the hole, got full count {r_count} == {total}"
-    assert r_count == gt["polygon"]["bands"]["0"]["process_polygon"]["count"]
+    assert r_count == gt["polygon"]["bands"]["0"]["per_band"]["count"]
 
 
 def test_degenerate_point_vs_1px_polygon_agree(synthetic_project):
@@ -265,3 +259,64 @@ def test_properties_do_not_change_row_count_or_dedup(synthetic_project):
     before_keys = [tuple(r.get(k) for k in key_cols) for r in rows_before]
     after_keys = [tuple(r.get(k) for k in key_cols) for r in rows_after]
     assert before_keys == after_keys, "row identity/order changed by adding properties"
+
+
+# --------------------------------------------------------------------------
+# BUG-025: a "Label" row only with a classification
+# --------------------------------------------------------------------------
+def _clear_export_caches(pt):
+    for attr in ("_export_image_cache", "_export_cache", "_per_band_nd_cache",
+                 "_master_nd_cache", "_scene_stats_cache"):
+        c = getattr(pt, attr, None)
+        if hasattr(c, "clear"):
+            c.clear()
+
+
+def test_no_label_row_without_classification_and_counts_on_the_bands_own_row(synthetic_project):
+    """With "Count 0/1" on and NO classification, the 0/1 band the counting
+    finds (here a boolean band expression) keeps its OWN row, with the counts
+    -- it used to be taken for "the label": its row was replaced by a "Label"
+    row (BUG-025)."""
+    import json
+    import os
+    name = "rgb_8bit_untiled"
+    spec = get_fixture(name)
+    fp = fixture_image_path(name)
+    group = polygon_group_name(name, spec["polygon"]["name"])
+    pt = synthetic_project
+    axp = pt._ax_path_for(fp)
+    assert not os.path.exists(axp), "precondition: no .ax"
+    try:
+        with open(axp, "w", encoding="utf-8") as f:
+            json.dump({"band_enabled": True, "band_expression": "b1>100"}, f)
+        _clear_export_caches(pt)
+        rows, _ = pt.process_polygon(group, fp, pt.all_polygons[group][fp], {}, [], False,
+                                     opts={"stats": {"mean": True, "count01": True}})
+    finally:
+        os.remove(axp)
+        _clear_export_caches(pt)
+    by = _rows_by_channel(rows)
+    assert "Label" not in by, f"a Label row without classification: {sorted(by)}"
+    assert "b1>100" in by, f"the expression lost its own row: {sorted(by)}"
+    row = by["b1>100"]
+    assert (row.get("counts_0") or 0) + (row.get("counts_1") or 0) == row["Pixel Count"]
+
+
+def test_negative_expression_values_are_kept_with_count01(synthetic_project):
+    """The old "last band = label" guess also turned an expression's negative
+    values (NDVI-style) into NaN."""
+    name = "ax_band_expression_source"
+    spec = get_fixture(name)
+    gt = load_ground_truth(name)
+    fp = fixture_image_path(name)
+    group = polygon_group_name(name, spec["polygon"]["name"])
+    pt = synthetic_project
+    _clear_export_caches(pt)
+    rows, _ = pt.process_polygon(group, fp, pt.all_polygons[group][fp], {}, [], False,
+                                 opts={"stats": {"mean": True, "count01": True}})
+    by = _rows_by_channel(rows)
+    expr = spec["ax"]["band_expression"]
+    assert "Label" not in by
+    band_gt = gt["polygon"]["bands"][str(spec["bands"])]["per_band"]
+    assert by[expr]["Pixel Count"] == band_gt["count"]
+    assert_close(by[expr]["Mean"], band_gt["mean"], tol=1e-3, msg=f"{expr} Mean")

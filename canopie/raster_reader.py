@@ -59,6 +59,8 @@ __all__ = [
     "probe",
     "open_reader",
     "clear_reader_cache",
+    "read_preview",
+    "clear_preview_cache",
     "ensure_hwc",
     "axes_for",
     "selftest_against_full",
@@ -1029,8 +1031,15 @@ class TiledRasterReader:
 
     # -- public reads -----------------------------------------------------
 
-    def read_window(self, x0, y0, x1, y1, bands=None, level=0):
-        """Read ``[y0:y1, x0:x1]`` for ``bands``. Returns (h, w, C)."""
+    def read_window(self, x0, y0, x1, y1, bands=None, level=0, step=1):
+        """Read ``[y0:y1:step, x0:x1:step]`` for ``bands``. Returns (h, w, C).
+
+        ``step`` > 1 samples every step-th row and column, decoding only the
+        tiles/strips that hold a sampled pixel. That is what lets a raster
+        WITHOUT overviews (e.g. an uncompressed one-row-per-strip orthomosaic)
+        serve a zoomed view at screen resolution: a 1/3-resolution window of the
+        BCI mosaic decodes a third of the strips instead of every full-width row.
+        """
         lv = self._levels[level]
         x0 = max(0, int(x0)); y0 = max(0, int(y0))
         x1 = min(lv["width"], int(x1)); y1 = min(lv["height"], int(y1))
@@ -1040,9 +1049,14 @@ class TiledRasterReader:
         if bands is None:
             bands = range(lv["count"])
         bands = [int(b) for b in bands]
+        step = max(1, int(step or 1))
 
         if self._memmap is not None:
+            if step > 1:
+                return self._read_window_memmap_strided(x0, y0, x1, y1, bands, step)
             return self._read_window_memmap(x0, y0, x1, y1, bands)
+        if step > 1:
+            return self._read_window_strided(level, x0, y0, x1, y1, bands, step)
 
         h, w = y1 - y0, x1 - x0
         # Assemble band-major: out[bi] is a contiguous 2D block, so each blit is
@@ -1098,6 +1112,69 @@ class TiledRasterReader:
         dst[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0] = \
             tile[sy0 - ty0:sy1 - ty0, sx0 - tx0:sx1 - tx0]
 
+    def _read_window_strided(self, level, x0, y0, x1, y1, bands, step):
+        """``read_window`` with ``step`` > 1 on the tile/strip path.
+
+        Walks the tile rows that contain a sampled row, a bounded batch at a
+        time, and decodes only the tiles in those rows that hold a sampled
+        column. Output is identical to ``read_window(...)[::step, ::step]``.
+        """
+        lv = self._levels[level]
+        th, tw = lv["th"], lv["tw"]
+        rows = np.arange(y0, y1, step)
+        cols = np.arange(x0, x1, step)
+        out = np.empty((len(bands), len(rows), len(cols)), dtype=self.profile.dtype)
+        workers = lv["workers"]
+
+        # Sampled columns grouped by tile column: (tc, local cols, out slice).
+        col_groups = []
+        tcs = cols // tw
+        for tc in np.unique(tcs):
+            sel = np.nonzero(tcs == tc)[0]
+            col_groups.append((int(tc), cols[sel] - int(tc) * tw, slice(int(sel[0]), int(sel[-1]) + 1)))
+        # Sampled rows grouped by tile row.
+        row_groups = []
+        trs = rows // th
+        for tr in np.unique(trs):
+            sel = np.nonzero(trs == tr)[0]
+            row_groups.append((int(tr), rows[sel] - int(tr) * th, slice(int(sel[0]), int(sel[-1]) + 1)))
+
+        # Bound the decoded working set (~64 MB) -- with one-row strips a big
+        # window would otherwise hold every sampled full-width row at once.
+        tile_bytes = max(1, th * tw * (lv["count"] if lv["planar"] == 1 else 1)
+                         * np.dtype(self.profile.dtype).itemsize)
+        per_row = tile_bytes * (len(col_groups) * (len(bands) if lv["planar"] == 2 else 1))
+        batch = max(1, int((64 << 20) // max(1, per_row)))
+        for b0 in range(0, len(row_groups), batch):
+            chunk = row_groups[b0:b0 + batch]
+            if lv["planar"] == 2:
+                seg = [self._segment_index(lv, b, tr, tc)
+                       for (tr, _, _) in chunk for b in bands for (tc, _, _) in col_groups]
+            else:
+                seg = [self._segment_index(lv, 0, tr, tc)
+                       for (tr, _, _) in chunk for (tc, _, _) in col_groups]
+            decoded = self._decode_many(level, seg, workers)
+            for (tr, r_loc, r_out) in chunk:
+                for (tc, c_loc, c_out) in col_groups:
+                    for bi, b in enumerate(bands):
+                        if lv["planar"] == 2:
+                            tile = decoded[self._segment_index(lv, b, tr, tc)]
+                        else:
+                            t = decoded[self._segment_index(lv, 0, tr, tc)]
+                            tile = t[..., b] if t.ndim == 3 else t
+                        out[bi, r_out, c_out] = tile[np.ix_(r_loc, c_loc)]
+        return np.moveaxis(out, 0, -1)
+
+    def _read_window_memmap_strided(self, x0, y0, x1, y1, bands, step):
+        mm = self._memmap
+        axes = (self.profile.axes or "").upper()
+        if mm.ndim == 2:
+            return np.ascontiguousarray(mm[y0:y1:step, x0:x1:step])[..., None]
+        if axes.startswith(("S", "C", "I", "Z")):        # (bands, H, W)
+            sub = mm[:, y0:y1:step, x0:x1:step][bands, :, :]
+            return np.ascontiguousarray(np.moveaxis(sub, 0, -1))
+        return np.ascontiguousarray(mm[y0:y1:step, x0:x1:step, :][:, :, bands])
+
     def _read_window_memmap(self, x0, y0, x1, y1, bands):
         mm = self._memmap
         axes = (self.profile.axes or "").upper()
@@ -1135,7 +1212,9 @@ class TiledRasterReader:
             sy0 = ((ty0 + step - 1) // step) * step
             if sy0 >= ty1:
                 continue
-            rows = np.arange(sy0, ty1, step)
+            # every step-th row and column from (sy0, sx0): a strided view, not
+            # an np.ix_ gather (that copied every patch, per band, per tile)
+            rsl = slice(sy0 - ty0, ty1 - ty0, step)
             if lv["planar"] == 2:
                 seg = [self._segment_index(lv, b, tr, tc)
                        for b in bands for tc in range(lv["across"])]
@@ -1148,14 +1227,14 @@ class TiledRasterReader:
                 sx0 = ((tx0 + step - 1) // step) * step
                 if sx0 >= tx1:
                     continue
-                cols = np.arange(sx0, tx1, step)
+                csl = slice(sx0 - tx0, tx1 - tx0, step)
                 for bi, b in enumerate(bands):
                     if lv["planar"] == 2:
                         tile = decoded[self._segment_index(lv, b, tr, tc)]
                     else:
                         t = decoded[self._segment_index(lv, 0, tr, tc)]
                         tile = t[..., b] if t.ndim == 3 else t
-                    patch = tile[np.ix_(rows - ty0, cols - tx0)]
+                    patch = tile[rsl, csl]
                     out[bi,
                         sy0 // step: sy0 // step + patch.shape[0],
                         sx0 // step: sx0 // step + patch.shape[1]] = patch
@@ -1257,6 +1336,63 @@ def clear_reader_cache():
     for r in readers:
         r.close()
     _TILE_CACHE.clear()
+    clear_preview_cache()
+
+
+# --------------------------------------------------------------------------
+# Whole-image previews, remembered per SOURCE file
+# --------------------------------------------------------------------------
+# The viewer load, a band change in the stretch dialog and the image editor
+# all read the same decimated preview (read_bands_full at the level/step their
+# byte budget picks). On the 2.9 GB BCI strip TIFF that is all 8,516 strips,
+# ~4 s -- paid again on every editor open, every refresh after Apply or Reset
+# and every band change, although the file itself never changed. The key is
+# the file's identity, never the .ax: a preview holds pre-.ax pixels.
+_PREVIEW_CACHE_BUDGET_BYTES = 768 * 1024 * 1024
+_PREVIEW_CACHE = OrderedDict()
+_PREVIEW_CACHE_LOCK = threading.Lock()
+
+
+def _preview_key(path, bands, level, step):
+    st = os.stat(path)
+    return (os.path.normcase(os.path.abspath(str(path))), int(st.st_size),
+            int(st.st_mtime_ns), tuple(int(b) for b in bands), int(level), int(step))
+
+
+def read_preview(reader, path, bands, level=0, step=1):
+    """``reader.read_bands_full(bands, level=level, step=step)``, remembered.
+
+    Always returns a private copy, so a caller may modify it in place
+    (apply_aux_modifications, the editor) without touching the cached one.
+    """
+    try:
+        key = _preview_key(path, bands, level, step)
+    except (OSError, TypeError, ValueError):
+        key = None
+    if key is not None:
+        with _PREVIEW_CACHE_LOCK:
+            hit = _PREVIEW_CACHE.get(key)
+            if hit is not None:
+                _PREVIEW_CACHE.move_to_end(key)
+        if hit is not None:
+            return hit.copy()
+    arr = reader.read_bands_full(list(bands), level=level, step=step)
+    if (key is not None and isinstance(arr, np.ndarray)
+            and 0 < arr.nbytes <= _PREVIEW_CACHE_BUDGET_BYTES):
+        keep = arr.copy()
+        with _PREVIEW_CACHE_LOCK:
+            _PREVIEW_CACHE[key] = keep
+            _PREVIEW_CACHE.move_to_end(key)
+            total = sum(a.nbytes for a in _PREVIEW_CACHE.values())
+            while total > _PREVIEW_CACHE_BUDGET_BYTES and len(_PREVIEW_CACHE) > 1:
+                _, old = _PREVIEW_CACHE.popitem(last=False)
+                total -= old.nbytes
+    return arr
+
+
+def clear_preview_cache():
+    with _PREVIEW_CACHE_LOCK:
+        _PREVIEW_CACHE.clear()
 
 
 # --------------------------------------------------------------------------

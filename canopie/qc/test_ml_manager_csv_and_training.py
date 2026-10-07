@@ -89,7 +89,7 @@ def test_average_pixel_value_matches_process_polygon(synthetic_project, ml_manag
     for b, ch_name in enumerate(channel_names):
         col = f"mean_{ch_name}"
         assert col in row, f"missing column {col!r} in {list(row)}"
-        expected = gt["polygon"]["bands"][str(b)]["process_polygon"]["mean"]
+        expected = gt["polygon"]["bands"][str(b)]["per_band"]["mean"]
         assert_close(float(row[col]), expected, tol=1e-1, msg=f"{name} {col}")
 
 
@@ -123,23 +123,12 @@ def test_all_pixel_values_spot_check(synthetic_project, ml_manager_factory, monk
 
 
 @pytest.mark.parametrize("name", WITH_NODATA)
-def test_gdal_nodata_tag_ignored_by_ml_export(synthetic_project, ml_manager_factory, monkeypatch, tmp_path, name):
-    """REGRESSION BASELINE for a real, currently-unfixed defect.
-
-    Fixtures 4 and 6 declare their fill value ONLY via the raster's
-    GDAL_NODATA tag (no .ax sidecar). process_polygon honors that tag (via
-    effective_nodata_values) and masks correctly. export_csv_data does NOT --
-    it only ever reads nodata_values from a .ax file -- so it averages the raw
-    fill values straight into its means.
-
-    The damage is blatant on fixture 6, whose -9999 holes drag mean_R to
-    -2034.5, a value no real pixel in the image is anywhere near (valid pixels
-    are ~0-1000). Any downstream ML training on that CSV is being fed garbage
-    features for every polygon that touches a NoData region.
-
-    This test pins the CURRENT behavior so the suite stays green and the defect
-    stays visible; flip it to assert the process_polygon value once the tag is
-    honored in export_csv_data (see test_ml_manager_bugfix.py for the pattern)."""
+def test_gdal_nodata_tag_is_honoured_by_ml_export(synthetic_project, ml_manager_factory, monkeypatch, tmp_path, name):
+    """Fixtures 4 and 6 declare their fill value ONLY in the raster's
+    GDAL_NODATA tag (no .ax). The CSV export always honoured it; the ML export
+    did not, and averaged the -9999 holes straight into mean_R (-2034.5 on
+    fixture 6) -- pinned here as a defect until the one NoData rule
+    (canopie.nodata, 2026-10-06). Now both give process_polygon's value."""
     spec = get_fixture(name)
     gt = load_ground_truth(name)
     group = polygon_group_name(name, spec["polygon"]["name"])
@@ -152,26 +141,13 @@ def test_gdal_nodata_tag_ignored_by_ml_export(synthetic_project, ml_manager_fact
     row = rows[0]
 
     band0 = gt["polygon"]["bands"]["0"]
-    r_actual = float(row["mean_R"])
-
-    # No .ax on these fixtures => ML export applies NO masking whatsoever.
-    assert_close(r_actual, band0["no_mask"]["mean"], tol=1e-1,
-                 msg=f"{name} mean_R should equal the UNMASKED mean (GDAL_NODATA tag ignored)")
-
-    # And where that genuinely differs from correctly-masked output, prove the
-    # divergence rather than letting a coincidental match hide it.
-    pp_mean = band0["process_polygon"]["mean"]
-    if pp_mean is not None and abs(band0["no_mask"]["mean"] - pp_mean) > 1e-6:
-        assert abs(r_actual - pp_mean) > 1e-6, (
-            f"{name}: expected ML export to diverge from process_polygon's masked "
-            f"Mean ({pp_mean}), but it matched -- has the tag now been honored? "
-            f"If so, update this test."
-        )
-
+    pp_mean = band0["per_band"]["mean"]
+    assert_close(float(row["mean_R"]), pp_mean, tol=1e-1,
+                 msg=f"{name} mean_R must equal the CSV export's NoData-masked mean")
 
 def test_ax_declared_nodata_IS_honored_by_ml_export(synthetic_project, ml_manager_factory, monkeypatch, tmp_path):
     """The flip side of the test above: when NoData IS declared in a .ax
-    sidecar (fixture 7), export_csv_data does mask it correctly, whole-pixel.
+    sidecar (fixture 7), export_csv_data masks it too -- per band, like the CSV.
     This is what proves the defect above is specifically "the GDAL_NODATA tag
     is ignored", not "ML export can't mask at all"."""
     name = "ax_crop_nodata_source"
@@ -186,8 +162,8 @@ def test_ax_declared_nodata_IS_honored_by_ml_export(synthetic_project, ml_manage
     assert len(rows) == 1
 
     band0 = gt["polygon"]["bands"]["0"]
-    assert_close(float(rows[0]["mean_R"]), band0["ml_manager"]["mean"], tol=1e-1,
-                 msg=f"{name} mean_R should match the .ax-masked (whole-pixel) mean")
+    assert_close(float(rows[0]["mean_R"]), band0["per_band"]["mean"], tol=1e-1,
+                 msg=f"{name} mean_R should match the .ax-masked (per-band) mean")
 
 
 # ---------------------------------------------------------------------------

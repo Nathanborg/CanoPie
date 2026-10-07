@@ -35,9 +35,12 @@ enforces this by construction: it holds only the coarse level until something
 asks for 'points', at which moment it loads the real file. Nothing that needs
 exact geometry can accidentally get a decimated answer.
 """
+import copy
 import json
 import logging
 import os
+import threading
+from collections import OrderedDict
 
 import numpy as np
 
@@ -136,6 +139,144 @@ def level_for_scale(scale, available_levels):
 
 
 # ---------------------------------------------------------------------------
+# Per-polygon sidecar files
+# ---------------------------------------------------------------------------
+def dump_sidecar(path, data, remember=False):
+    """Write one polygon sidecar (`<group>_<image>_polygons.json`).
+
+    remember=True keeps the written text in the write-through cache (see
+    _remember_text) -- for bulk writers whose files this process reads back.
+
+    Every sidecar writer goes through here. They used
+    ``json.dump(data, f, indent=...)``, and that combination can never use
+    CPython's C encoder: ``json.dump`` streams through ``iterencode`` (the
+    pure-Python encoder), and any ``indent`` disables the C one besides.
+    Importing 2,801 BCI crowns (14 M coordinate floats) spent 88 of 93 GUI
+    seconds in ``encoder.py``. ``json.dumps`` with compact separators takes
+    the C encoder in one shot -- same JSON, read back identically by
+    ``json.load`` -- at a fraction of the time and about a third of the bytes.
+
+    Written to a temporary file and moved over the target, so a crash or a
+    full disk mid-write can no longer leave a truncated sidecar (the old
+    writers opened the real file with "w" and streamed into it).
+    """
+    text = json.dumps(data, separators=(',', ':'))
+    tmp = path + ".tmp"
+    with open(tmp, 'w', encoding='utf-8') as f:
+        f.write(text)
+    for attempt in range(4):
+        try:
+            os.replace(tmp, path)
+            if remember:
+                _remember_text(path, text)
+            return
+        except PermissionError:
+            # Windows: the target is briefly held open (indexer, antivirus,
+            # a reader thread). Back off a little and retry.
+            if attempt == 3:
+                break
+            import time as _time
+            _time.sleep(0.05 * (attempt + 1))
+    # Last resort: write in place rather than lose the save.
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(text)
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+
+
+def read_sidecar(path):
+    """Parse one sidecar; None (logged) when unreadable. Safe off the GUI thread:
+    it touches nothing but the file (and the write-through cache below)."""
+    hit = _recall_written(path)
+    if hit is not None:
+        return hit
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        logging.error("[polygon_lod] could not load full geometry from %s: %s", path, e)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Write-through cache of sidecars this session wrote in bulk
+# ---------------------------------------------------------------------------
+# Windows' real-time scanner reads every freshly written file on its first
+# open: 500 just-rewritten BCI sidecars took 9.7 s to read back, 0.1 s twenty
+# seconds later. After re-projecting 2,802 crowns for a new crop, the next
+# Reset (its backup zip included), CSV export or zoom refine paid that again --
+# 90 s for one Reset -- to read back what this process itself had just written.
+# So bulk writers keep the exact text they wrote, keyed on the file's
+# (mtime, size) right after the write; any other change to the file makes the
+# entry miss and the file is read as usual.
+_WRITTEN_BUDGET_BYTES = 256 * 1024 * 1024
+_WRITTEN = OrderedDict()
+_WRITTEN_LOCK = threading.Lock()
+_WRITTEN_TOTAL = [0]          # bytes of text held, kept as a running sum
+
+
+def _written_key(path):
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _remember_text(path, text):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return
+    key = _written_key(path)
+    with _WRITTEN_LOCK:
+        old = _WRITTEN.pop(key, None)
+        if old is not None:
+            _WRITTEN_TOTAL[0] -= len(old[2])
+        _WRITTEN[key] = (st.st_mtime_ns, st.st_size, text)
+        _WRITTEN_TOTAL[0] += len(text)
+        while _WRITTEN_TOTAL[0] > _WRITTEN_BUDGET_BYTES and len(_WRITTEN) > 1:
+            _, old = _WRITTEN.popitem(last=False)
+            _WRITTEN_TOTAL[0] -= len(old[2])
+
+
+def cached_text(path):
+    """The text this process last wrote to `path` with remember=True, if the
+    file is still exactly that (same mtime and size); else None."""
+    key = _written_key(path)
+    with _WRITTEN_LOCK:
+        hit = _WRITTEN.get(key)
+    if hit is None:
+        return None
+    mtime_ns, size, text = hit
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if st.st_mtime_ns != mtime_ns or st.st_size != size:
+        with _WRITTEN_LOCK:
+            old = _WRITTEN.pop(key, None)
+            if old is not None:
+                _WRITTEN_TOTAL[0] -= len(old[2])
+        return None
+    return text
+
+
+def _recall_written(path):
+    text = cached_text(path)
+    if text is None:
+        return None
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
+
+
+def forget_written():
+    with _WRITTEN_LOCK:
+        _WRITTEN.clear()
+        _WRITTEN_TOTAL[0] = 0
+
+
+# ---------------------------------------------------------------------------
 # The consolidated overview file
 # ---------------------------------------------------------------------------
 def overview_path(polygons_dir):
@@ -181,9 +322,11 @@ def write_overview(polygons_dir, records, level=OVERVIEW_LEVEL):
         })
 
     tmp = overview_path(polygons_dir) + ".tmp"
+    # json.dumps (C encoder), not json.dump (always pure Python) -- see dump_sidecar.
+    text = json.dumps({'version': 1, 'level': level, 'entries': entries},
+                      separators=(',', ':'))
     with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump({'version': 1, 'level': level, 'entries': entries},
-                  f, separators=(',', ':'))
+        f.write(text)
     os.replace(tmp, overview_path(polygons_dir))
     logging.info("[polygon_lod] overview: %d entries, %.2f MB, level %d",
                  len(entries),
@@ -236,17 +379,30 @@ class LazyPolygonRecord(dict):
     def is_materialised(self):
         return self._materialised
 
+    @property
+    def source_path(self):
+        return self._source_path
+
     def _materialise(self):
         if self._materialised:
             return
         self._materialised = True          # set first: a failed read must not loop
-        try:
-            with open(self._source_path, 'r', encoding='utf-8') as f:
-                full = json.load(f)
-        except Exception as e:
-            logging.error("[polygon_lod] could not load full geometry from %s: %s",
-                          self._source_path, e)
+        full = read_sidecar(self._source_path)
+        if full is not None:
+            self._merge_full(full)
+
+    def materialise_from(self, full):
+        """Materialise from an already-parsed sidecar (read off the GUI thread
+        by the LOD refiner) -- no IO here. A no-op if anything materialised the
+        record in the meantime: the first full read wins, and the record may
+        have been edited since."""
+        if self._materialised:
             return
+        self._materialised = True
+        if full is not None:
+            self._merge_full(full)
+
+    def _merge_full(self, full):
         if isinstance(full, dict):
             display = dict.get(self, 'display_points')
             dict.update(self, full)
@@ -289,3 +445,22 @@ class LazyPolygonRecord(dict):
 
     def copy(self):
         return dict(self._full())
+
+
+def point_count(rec):
+    """Vertex count of a polygon record WITHOUT reading a lazy record's file.
+
+    Listing names (the editor's mask-polygon menu) used `len(rec.get('points'))`,
+    which materialises every LazyPolygonRecord: 2,802 sidecar opens, 55 s of the
+    60 s it took to open the image editor on the BCI project. The overview
+    already stores the count ('np' -> 'full_point_count').
+    """
+    if isinstance(rec, LazyPolygonRecord) and not rec.is_materialised:
+        n = dict.get(rec, 'full_point_count')
+        if n is not None:
+            try:
+                return int(n)
+            except (TypeError, ValueError):
+                pass
+    pts = rec.get('points') if isinstance(rec, dict) else None
+    return len(pts) if pts else 0

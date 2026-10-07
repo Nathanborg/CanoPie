@@ -330,6 +330,18 @@ class MLAugmentationOptionsDialog(QDialog):
             img, _C = self._get_export_image(filepath)
         except Exception:
             img = None
+        if img is not None and not isinstance(img, np.ndarray) and hasattr(img, "read_window"):
+            # a large raster read window by window: the preview is
+            # illustrative, so the central window (<= 1024 x 1024) stands in
+            # for the whole image (augmenting it whole would need it in RAM)
+            try:
+                W, H = int(img.width), int(img.height)
+                w, h = min(W, 1024), min(H, 1024)
+                x0, y0 = (W - w) // 2, (H - h) // 2
+                chans = img.read_window(x0, y0, x0 + w, y0 + h)
+                img = np.dstack(chans) if len(chans) > 1 else np.asarray(chans[0])[..., None]
+            except Exception:
+                img = None
         self._preview_img_cache[filepath] = img
         return img
 

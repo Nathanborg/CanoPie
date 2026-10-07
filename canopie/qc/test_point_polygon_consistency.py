@@ -68,6 +68,12 @@ def test_point_equals_colocated_1px_polygon(synthetic_project, name):
     pby, dby = _rows_by_channel(prows), _rows_by_channel(drows)
     assert set(pby) == set(dby) and pby, f"{name}: channel sets differ ({set(pby)} vs {set(dby)})"
     for ch in pby:
+        if pby[ch]["Mean"] is None or dby[ch]["Mean"] is None:
+            # a band that is NoData there: both rows kept, both empty
+            assert pby[ch]["Mean"] is None and dby[ch]["Mean"] is None, (
+                f"{name}/{ch}: point and 1px-polygon disagree on NoData")
+            assert pby[ch]["Pixel Count"] == dby[ch]["Pixel Count"] == 0
+            continue
         assert_close(pby[ch]["Mean"], dby[ch]["Mean"], tol=0.0,
                      msg=f"{name}/{ch}: point vs 1px-polygon")
 
@@ -101,17 +107,22 @@ def test_polygon_mean_equals_mean_of_its_points(synthetic_project, name):
             _polygon_dict(f"consistency_pt_{x}_{y}", [(x, y)], "point", ref_w, ref_h),
             {}, [], False, opts=MEAN_OPTS)
         for ch, row in _rows_by_channel(rows).items():
-            per_channel_values.setdefault(ch, []).append(float(row["Mean"]))
+            per_channel_values.setdefault(ch, []).append(
+                None if row["Mean"] is None else float(row["Mean"]))
 
     for ch, poly_row in poly_by.items():
-        vals = per_channel_values.get(ch)
-        assert vals, f"{name}/{ch}: polygon reported this channel but no point did"
-        assert len(vals) == len(interior), (
-            f"{name}/{ch}: expected {len(interior)} point samples, got {len(vals)}")
+        samples = per_channel_values.get(ch)
+        assert samples, f"{name}/{ch}: polygon reported this channel but no point did"
+        assert len(samples) == len(interior), (
+            f"{name}/{ch}: expected {len(interior)} point samples, got {len(samples)}")
+        vals = [v for v in samples if v is not None]      # per band: NoData points are empty
+        assert poly_row["Pixel Count"] == len(vals), (
+            f"{name}/{ch}: polygon Pixel Count {poly_row['Pixel Count']} != {len(vals)}")
+        if not vals:
+            assert poly_row["Mean"] is None, f"{name}/{ch}: all-NoData band must be empty"
+            continue
         assert_close(poly_row["Mean"], sum(vals) / len(vals), tol=1e-6,
                      msg=f"{name}/{ch}: polygon Mean vs mean-of-points")
-        assert poly_row["Pixel Count"] == len(interior), (
-            f"{name}/{ch}: polygon Pixel Count {poly_row['Pixel Count']} != {len(interior)}")
 
 
 def test_process_polygon_and_ml_export_agree_per_pixel(

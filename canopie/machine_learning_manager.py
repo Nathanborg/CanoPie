@@ -692,6 +692,66 @@ def _write_mask_tiled(path, H, W, shapes, tile=_MASK_TILE):
                  tile=(tile, tile), compression="deflate")
 
 
+def _csvexp_gather_by_map(colmap, chans, ys, xs):
+    """One column per header band: `colmap[i]` is THIS file's band index for
+    header column i, or None when the file has no such band (empty column)."""
+    n = len(ys)
+    return [(_csvexp_gather_paired(chans[j], ys, xs) if (j is not None and j < len(chans))
+             else np.full(n, np.nan, dtype=np.float32)) for j in colmap]
+
+
+def _csvexp_gather_window_by_map(colmap, chans, ys, xs, k, H, W):
+    """`_csvexp_gather_window_all_channels` with a header column map."""
+    n = len(ys)
+    ys = np.asarray(ys)
+    xs = np.asarray(xs)
+    pad = k // 2
+    offsets = [(dy, dx) for dy in range(-pad, pad + 1) for dx in range(-pad, pad + 1)]
+    row_idx = [_csvexp_reflect_index_vec(ys + dy, H) for dy, _dx in offsets]
+    col_idx = [_csvexp_reflect_index_vec(xs + dx, W) for _dy, dx in offsets]
+    cols = []
+    for j in colmap:
+        if j is None or j >= len(chans):
+            cols.extend(np.full(n, np.nan, dtype=np.float32) for _ in offsets)
+        else:
+            cols.extend(_csvexp_gather_paired(chans[j], row_idx[i], col_idx[i]) for i in range(len(offsets)))
+    return cols
+
+
+def _csvexp_rows(cols, drop_all_nodata=True):
+    """Columns -> csv rows. NoData (NaN) is written as an EMPTY cell (one rule
+    for every export: canopie.nodata); a pixel with no data in any band is not
+    written. Returns (rows, kept_mask)."""
+    if not cols:
+        return [], np.zeros(0, dtype=bool)
+    stack = np.stack(cols, axis=1)
+    bad = ~np.isfinite(stack)
+    keep = ~bad.all(axis=1) if drop_all_nodata else np.ones(stack.shape[0], dtype=bool)
+    obj = stack.astype(object)
+    obj[bad] = None
+    return obj[keep].tolist(), keep
+
+
+def _csvexp_apply_nodata_rule(chans, rules):
+    """Raw-valued (lazily read) bands: NaN wherever the per-band NoData rule
+    (canopie.nodata) says so -- the same rule the analysis image encodes."""
+    from .nodata import band_mask
+    from .raster_reader import OffsetBand
+    out = []
+    for k, ch in enumerate(chans):
+        if _csvexp_is_offset_band(ch):
+            loc = np.array(ch.local, dtype=np.float32, copy=True)
+            loc[band_mask(loc, k, rules)] = np.nan
+            x0, y0 = ch.origin
+            fh, fw = ch.shape[:2]
+            out.append(OffsetBand(loc, x0, y0, fh, fw))
+        else:
+            a = np.array(ch, dtype=np.float32, copy=True)
+            a[band_mask(a, k, rules)] = np.nan
+            out.append(a)
+    return out
+
+
 class _CsvExportWorker(QtCore.QThread):
     """Background worker for MachineLearningManager.export_csv_data.
 
@@ -741,7 +801,7 @@ class _CsvExportWorker(QtCore.QThread):
 
     def __init__(self, mgr, output_path, all_entries, polygons_by_group,
                  extraction_mode, window_size, header, any_rgb, max_extras, max_small,
-                 prop_keys=(), parent=None):
+                 prop_keys=(), parent=None, band_names=None):
         super().__init__(parent)
         self.mgr = mgr
         self.output_path = output_path
@@ -753,6 +813,9 @@ class _CsvExportWorker(QtCore.QThread):
         self.any_rgb = any_rgb
         self.max_extras = max_extras
         self.max_small = max_small
+        #: header band columns, by NAME (canopie.band_layout); each file's own
+        #: bands are mapped onto them, so a column never means two bands
+        self.band_names = list(band_names) if band_names else None
         # Ordered property-column keys (already reflected in `header`, see
         # export_csv_data's pre-pass); () means no polygon in this export had
         # any properties, and every per-row splice below becomes a no-op.
@@ -817,13 +880,26 @@ class _CsvExportWorker(QtCore.QThread):
     # ---- per-file extraction (fully vectorized pixel gathering) ----------
 
     def _process_one_file(self, group_name, filepath, writer):
-        import os, json, logging
+        import os, logging
         import numpy as np
 
         mgr = self.mgr
         polydata = self.polygons_by_group.get(group_name, {}).get(filepath, {})
         raw_pts = polydata.get("points", [])
         poly_type = str(polydata.get("type", "")).lower()
+
+        # A mask polygon is not data: the CSV export skips it (and its pixels
+        # are NoData in every band of the analysis image).
+        ax = {}
+        try:
+            ax = mgr._load_ax_mods(filepath) or {}
+        except Exception:
+            ax = {}
+        mp = ax.get("mask_polygon") or {}
+        if isinstance(mp, dict) and mp.get("enabled", False):
+            mp_names = set(mp.get("names") or ([mp["name"]] if mp.get("name") else []))
+            if group_name in mp_names or polydata.get("name") in mp_names:
+                return 0
 
         # Fixed-order property values for THIS file's polygon, computed once
         # here and reused for every row/sub-polygon it produces below --
@@ -835,147 +911,94 @@ class _CsvExportWorker(QtCore.QThread):
         if img is None:
             logging.warning(f"Could not load/export image for {filepath}")
             return 0
-
+        info = mgr._export_info(filepath)
         H, W = img.shape[:2]
-        chans = mgr._channels_in_export_order(img)
+        chans = mgr._channels_for_analysis(img, info)
+        layout = info.get("layout")
+        names = layout.names() if layout is not None else [f"band_{j + 1}" for j in range(len(chans))]
+        colmap = ([names.index(nm) if nm in names else None for nm in self.band_names]
+                  if self.band_names else list(range(len(chans))))
 
-        # Lazily-read cubes: fetch just the bounding box of this file's
-        # points once, then keep full-image indexing via OffsetBand.
-        #
-        # `window_size` is None outside "All Pixels with Surrounding
-        # Window" mode. The original code did `int(window_size)` unguarded
-        # here -- inside a bare `except Exception`, so on every OTHER mode
-        # that TypeError was silently swallowed and this optimization never
-        # engaged at all for a lazily-read file: `chans` stayed a raw
-        # LazyChannels, whose __getitem__ reads a band's FULL FRAME on every
-        # access. That was survivable under the old per-pixel loop only
-        # because `chans[i]` doesn't get re-evaluated per PIXEL there either
-        # -- but it's still a full extra decode per channel this fixes for
-        # free. `window_size or 1` makes the windowing apply uniformly.
-        if hasattr(chans, "read_window_offset") and raw_pts:
+        # ---- the CSV export's own pixel mapping (floor, no clamp) ----------
+        if poly_type == "point":
+            pts_raw = self._parse_point_list(mgr, raw_pts, filepath)
+            if not pts_raw:
+                logging.warning(f"No valid points found for {filepath}")
+                return 0
+            shapes = [mgr._point_pixels(filepath, pts_raw, img.shape, polydata)]
+        else:
+            polys = mgr._normalize_to_polygons(raw_pts)
+            if not polys:
+                logging.warning(f"Unable to parse points/polygons for file {filepath}")
+                return 0
+            shapes = [mgr._polygon_pixels(filepath, poly, img.shape, polydata) for poly in polys]
+        shapes = [sh for sh in shapes if sh]
+        if not shapes:
+            return 0
+
+        # Lazily-read cubes: read the bounding box of the MAPPED pixels once.
+        # It used to be built from the RAW stored points -- a different frame
+        # whenever image_ref_size is not the export frame -- so edge-of-window
+        # pixels were read in place of the right ones (M1).
+        if hasattr(chans, "read_window_offset"):
             try:
                 pad = max(1, int(self.window_size or 1) // 2) + 1
-                xs0 = [int(round(p[0])) for p in raw_pts]
-                ys0 = [int(round(p[1])) for p in raw_pts]
-                chans = chans.read_window_offset(
-                    min(xs0) - pad, min(ys0) - pad,
-                    max(xs0) + pad + 1, max(ys0) + pad + 1)
+                xs0 = [p[0] for sh in shapes for p in sh]
+                ys0 = [p[1] for sh in shapes for p in sh]
+                x0 = max(0, min(xs0) - pad); y0 = max(0, min(ys0) - pad)
+                x1 = min(W, max(xs0) + pad + 1); y1 = min(H, max(ys0) + pad + 1)
+                if x1 > x0 and y1 > y0:
+                    chans = chans.read_window_offset(x0, y0, x1, y1)
             except Exception as e:
                 logging.warning("[export_csv_data] windowed read failed for %s: %s",
                                 os.path.basename(filepath), e)
-
-        # ---------- NoData: identical semantics to the pre-rewrite version,
-        # INCLUDING the documented gap (only .ax nodata_values are honored,
-        # not the raster's own GDAL_NODATA tag -- see
-        # test_gdal_nodata_tag_ignored_by_ml_export). Not this task's scope. ----------
-        nodata_values = []
-        try:
-            base = os.path.splitext(os.path.basename(filepath))[0] + ".ax"
-            pf = getattr(mgr, "project_folder", None)
-            ax_candidates = []
-            if pf:
-                ax_candidates.append(os.path.join(os.fspath(pf), base))
-                ax_candidates.append(os.path.join(os.fspath(pf), "global.ax"))
-            ax_candidates.append(os.path.join(os.path.dirname(filepath), base))
-            ax_candidates.append(os.path.join(os.path.dirname(filepath), "global.ax"))
-            for axp in ax_candidates:
-                if os.path.exists(axp):
-                    with open(axp, "r", encoding="utf-8") as f:
-                        ax_data = json.load(f) or {}
-                    if ax_data.get("nodata_enabled", True):
-                        nodata_values = list(ax_data.get("nodata_values", []) or [])
-                        if nodata_values:
-                            logging.info(f"[export_csv_data] Loaded nodata_values={nodata_values} from {axp}")
-                    break
-        except Exception as e:
-            logging.debug(f"[export_csv_data] Could not load .ax for {filepath}: {e}")
-
-        nd_mask = np.zeros((H, W), dtype=bool)
-        if nodata_values:
+        # Raw values (lazy path): apply the one per-band NoData rule here; the
+        # analysis image already holds NoData as NaN.
+        if info.get("nodata") == "rules" and not isinstance(chans, np.ndarray):
+            from .nodata import rules_from_values
             pt = getattr(mgr, "parent_tab", None)
-            tracked_mask = getattr(pt, "_last_export_nodata_mask", None) if pt else None
-            tracked_fp = getattr(pt, "_last_export_nodata_filepath", None) if pt else None
-            fp_key = os.path.normcase(os.path.abspath(filepath))
-            if (tracked_mask is not None and tracked_fp and
-                    tracked_mask.shape == (H, W) and
-                    os.path.normcase(os.path.abspath(tracked_fp)) == fp_key):
-                nd_mask = tracked_mask.copy()
-                logging.info(f"[export_csv_data] Using tracked NoData mask from ProjectTab ({nd_mask.sum()} masked pixels)")
-            else:
-                for ch in chans:
-                    nd_mask |= self._build_nodata_mask_2d(ch, nodata_values)
-                nd_count = nd_mask.sum()
-                if nd_count > 0:
-                    logging.info(f"[export_csv_data] Rebuilt NoData mask with {nd_count} masked pixels for {os.path.basename(filepath)}")
+            vals = (pt.effective_nodata_values(filepath, ax) if pt is not None and
+                    hasattr(pt, "effective_nodata_values") else
+                    (list(ax.get("nodata_values") or []) if ax.get("nodata_enabled", True) else []))
+            chans = _csvexp_apply_nodata_rule(list(chans), rules_from_values(vals))
 
         if poly_type == "point":
-            return self._emit_points(mgr, group_name, filepath, polydata, raw_pts,
-                                      img, chans, H, W, nd_mask, nodata_values, writer,
-                                      prop_vals)
+            return self._emit_points(group_name, filepath, shapes[0], chans, H, W, colmap,
+                                     writer, prop_vals)
+        return sum(self._emit_polygon(group_name, filepath, chans, H, W, sh, writer, colmap, prop_vals)
+                   for sh in shapes)
 
-        polys = mgr._normalize_to_polygons(raw_pts)
-        if not polys:
-            logging.warning(f"Unable to parse points/polygons for file {filepath}")
-            return 0
-
-        rows_here = 0
-        for poly in polys:
-            pts_img = mgr._map_points_scene_to_image(filepath, poly, img.shape, polygon_data=polydata)
-            if not pts_img:
-                continue
-            rows_here += self._emit_polygon(group_name, filepath, chans, H, W,
-                                             nd_mask, nodata_values, pts_img, writer,
-                                             prop_vals)
-        return rows_here
-
-    def _emit_points(self, mgr, group_name, filepath, polydata, raw_pts, img, chans, H, W,
-                      nd_mask, nodata_values, writer, prop_vals=()):
-        """Point-SHAPE entries: a "point set" can hold anywhere from one to
-        thousands of independently-drawn points (e.g. Random Shapes' "Point"
-        mode), each becoming its own row -- so this is vectorized the same
-        way the polygon path is, not left as a per-point loop."""
+    @staticmethod
+    def _parse_point_list(mgr, raw_pts, filepath):
         import logging
-        import numpy as np
-
-        pts_raw = []
         try:
             if isinstance(raw_pts, dict) and 'x' in raw_pts and 'y' in raw_pts:
-                pts_raw = [(raw_pts['x'], raw_pts['y'])]
-            elif isinstance(raw_pts, (list, tuple)):
+                return [(raw_pts['x'], raw_pts['y'])]
+            if isinstance(raw_pts, (list, tuple)):
                 if len(raw_pts) > 0 and isinstance(raw_pts[0], dict) and 'x' in raw_pts[0] and 'y' in raw_pts[0]:
-                    pts_raw = [(p['x'], p['y']) for p in raw_pts]
-                elif len(raw_pts) > 0 and isinstance(raw_pts[0], (list, tuple)) and len(raw_pts[0]) == 2 \
+                    return [(p['x'], p['y']) for p in raw_pts]
+                if len(raw_pts) > 0 and isinstance(raw_pts[0], (list, tuple)) and len(raw_pts[0]) == 2 \
                         and not isinstance(raw_pts[0][0], (list, tuple)):
-                    pts_raw = [(p[0], p[1]) for p in raw_pts]
-                else:
-                    parsed = mgr.parse_polygon_points(raw_pts)
-                    if parsed:
-                        pts_raw = [(x, y) for (x, y) in parsed]
+                    return [(p[0], p[1]) for p in raw_pts]
+                parsed = mgr.parse_polygon_points(raw_pts)
+                if parsed:
+                    return [(x, y) for (x, y) in parsed]
         except Exception as e:
             logging.warning(f"Could not parse point list for {filepath}: {e}")
-            pts_raw = []
+        return []
 
-        if not pts_raw:
-            logging.warning(f"No valid points found for {filepath}")
-            return 0
-
-        pts_img_list = mgr._map_points_scene_to_image(filepath, pts_raw, img.shape, polygon_data=polydata)
-        if not pts_img_list:
-            return 0
+    def _emit_points(self, group_name, filepath, pts_img_list, chans, H, W, colmap,
+                     writer, prop_vals=()):
+        """Point-SHAPE entries: a "point set" can hold anywhere from one to
+        thousands of independently-drawn points (e.g. Random Shapes' "Point"
+        mode), each becoming its own row -- vectorized like the polygon path.
+        `pts_img_list` is already mapped with the CSV's rule (_point_pixels)."""
+        import numpy as np
 
         xi_arr = np.array([p[0] for p in pts_img_list], dtype=np.int64)
         yi_arr = np.array([p[1] for p in pts_img_list], dtype=np.int64)
-
         in_bounds = (xi_arr >= 0) & (xi_arr < W) & (yi_arr >= 0) & (yi_arr < H)
-        if nodata_values and in_bounds.any():
-            xi_c = np.clip(xi_arr, 0, W - 1)
-            yi_c = np.clip(yi_arr, 0, H - 1)
-            is_nodata = nd_mask[yi_c, xi_c]
-        else:
-            is_nodata = np.zeros_like(in_bounds)
-
-        valid = in_bounds & ~is_nodata
-        xi_arr, yi_arr = xi_arr[valid], yi_arr[valid]
+        xi_arr, yi_arr = xi_arr[in_bounds], yi_arr[in_bounds]
         if xi_arr.size == 0:
             return 0
 
@@ -985,115 +1008,73 @@ class _CsvExportWorker(QtCore.QThread):
         keep = _csvexp_dedupe_points_locally(yi_arr, xi_arr, W)
         xi_arr, yi_arr = xi_arr[keep], yi_arr[keep]
 
-        any_rgb, max_extras, max_small = self.any_rgb, self.max_extras, self.max_small
         mode = self.extraction_mode
-
-        if mode == "Average Pixel Value":
-            # "Average" for a POINT shape is not actually an aggregate --
-            # matches the original: one row per point, per-channel value AT
-            # that pixel, just without x/y columns (see header construction).
-            cols = _csvexp_gather_all_channels(any_rgb, max_extras, max_small, chans, yi_arr, xi_arr)
-            value_rows = np.stack(cols, axis=1).tolist()
-            if prop_vals:
-                writer.writerows([group_name, filepath] + vals + prop_vals for vals in value_rows)
-            else:
-                writer.writerows([group_name, filepath] + vals for vals in value_rows)
-            return len(value_rows)
-
-        if mode == "All Pixel Values":
-            cols = _csvexp_gather_all_channels(any_rgb, max_extras, max_small, chans, yi_arr, xi_arr)
-        else:  # window
-            cols = _csvexp_gather_window_all_channels(
-                any_rgb, max_extras, max_small, chans, yi_arr, xi_arr, self.window_size, H, W)
-
-        value_rows = np.stack(cols, axis=1).tolist()
-        xs_list, ys_list = xi_arr.tolist(), yi_arr.tolist()
-        if prop_vals:
-            writer.writerows([group_name, filepath, x, y] + vals + prop_vals
-                              for x, y, vals in zip(xs_list, ys_list, value_rows))
+        if mode == "All Pixels with Surrounding Window":
+            cols = _csvexp_gather_window_by_map(colmap, chans, yi_arr, xi_arr, self.window_size, H, W)
         else:
-            writer.writerows([group_name, filepath, x, y] + vals
-                              for x, y, vals in zip(xs_list, ys_list, value_rows))
+            cols = _csvexp_gather_by_map(colmap, chans, yi_arr, xi_arr)
+        value_rows, kept = _csvexp_rows(cols)
+        pv = list(prop_vals or [])
+        if mode == "Average Pixel Value":
+            # "Average" for a POINT is the value AT that pixel (no x/y columns).
+            writer.writerows([group_name, filepath] + vals + pv for vals in value_rows)
+            return len(value_rows)
+        xs_list, ys_list = xi_arr[kept].tolist(), yi_arr[kept].tolist()
+        writer.writerows([group_name, filepath, x, y] + vals + pv
+                         for x, y, vals in zip(xs_list, ys_list, value_rows))
         return len(value_rows)
 
-    def _emit_polygon(self, group_name, filepath, chans, H, W, nd_mask, nodata_values, pts_img, writer,
-                       prop_vals=()):
+    def _emit_polygon(self, group_name, filepath, chans, H, W, pts_img, writer, colmap,
+                      prop_vals=()):
         import numpy as np
+        import cv2
 
-        any_rgb, max_extras, max_small = self.any_rgb, self.max_extras, self.max_small
         mode = self.extraction_mode
-
+        pv = list(prop_vals or [])
         if len(pts_img) == 1:
             xi, yi = pts_img[0]
             if not (0 <= xi < W and 0 <= yi < H):
                 return 0
-            if nodata_values and nd_mask[yi, xi]:
-                return 0
-
-            if mode == "Average Pixel Value":
-                vals = self._scalar_channel_values(chans, xi, yi, any_rgb, max_extras, max_small)
-                writer.writerow([group_name, filepath] + vals + prop_vals)
-                return 1
-            if mode == "All Pixel Values":
-                cols = _csvexp_gather_all_channels(any_rgb, max_extras, max_small, chans,
-                                                    np.array([yi]), np.array([xi]))
-                vals = [c[0] for c in cols]
-                writer.writerow([group_name, filepath, int(xi), int(yi)] + vals + prop_vals)
-                return 1
-            # window
-            cols = _csvexp_gather_window_all_channels(any_rgb, max_extras, max_small, chans,
-                                                        np.array([yi]), np.array([xi]),
-                                                        self.window_size, H, W)
-            vals = [c[0] for c in cols]
-            writer.writerow([group_name, filepath, int(xi), int(yi)] + vals + prop_vals)
-            return 1
-
-        # Real (multi-point) polygon.
-        mask = self._poly_mask_np(pts_img, H, W)
-        valid_mask = (mask == 255) & (~nd_mask) if nodata_values else (mask == 255)
+            ys, xs = np.array([yi]), np.array([xi])
+        else:
+            # Rasterise inside the polygon's bounding box only (like the CSV);
+            # a full-frame mask per polygon was 2.4 GB on a 48k x 50k raster.
+            a = np.asarray(pts_img, dtype=np.int64).reshape(-1, 2)
+            x0 = max(0, int(a[:, 0].min())); y0 = max(0, int(a[:, 1].min()))
+            x1 = min(W, int(a[:, 0].max()) + 1); y1 = min(H, int(a[:, 1].max()) + 1)
+            if x1 <= x0 or y1 <= y0:
+                ys = xs = np.zeros(0, dtype=np.int64)
+            else:
+                roi = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+                if len(a) >= 3:
+                    cv2.fillPoly(roi, [(a - (x0, y0)).astype(np.int32).reshape(-1, 1, 2)], 255)
+                ry, rx = np.nonzero(roi)
+                ys, xs = ry + y0, rx + x0
 
         if mode == "Average Pixel Value":
-            ys, xs = np.where(valid_mask)
-            means = []
-            n_ch = 3 if any_rgb else max_small
-            n_extra = max_extras if any_rgb else 0
-            for i in range(n_ch):
-                if i < len(chans) and ys.size:
-                    vals = _csvexp_gather_paired(chans[i], ys, xs)
-                    means.append(float(np.nanmean(vals)) if vals.size else float('nan'))
-                else:
-                    means.append(float('nan'))
-            for i in range(n_extra):
-                idx = 3 + i
-                if idx < len(chans) and ys.size:
-                    vals = _csvexp_gather_paired(chans[idx], ys, xs)
-                    means.append(float(np.nanmean(vals)) if vals.size else float('nan'))
-                else:
-                    means.append(float('nan'))
-            writer.writerow([group_name, filepath] + means + prop_vals)
+            # One row per polygon; each band's mean over ITS valid pixels
+            # (NoData is NaN per band); a band with none is an empty cell.
+            if ys.size:
+                cols = _csvexp_gather_by_map(colmap, chans, ys, xs)
+                with np.errstate(all="ignore"):
+                    means = [float(np.nanmean(c)) if np.isfinite(c).any() else None for c in cols]
+            else:
+                means = [None] * len(colmap)
+            writer.writerow([group_name, filepath] + means + pv)
             return 1
 
-        ys, xs = np.where(valid_mask)
         if ys.size == 0:
             return 0
-
-        # np.where() on a boolean mask cannot produce a duplicate (y, x)
-        # pair -- no dedup needed here, unlike the point-shape path.
         if mode == "All Pixel Values":
-            cols = _csvexp_gather_all_channels(any_rgb, max_extras, max_small, chans, ys, xs)
+            cols = _csvexp_gather_by_map(colmap, chans, ys, xs)
         else:  # window
-            cols = _csvexp_gather_window_all_channels(
-                any_rgb, max_extras, max_small, chans, ys, xs, self.window_size, H, W)
-
-        value_rows = np.stack(cols, axis=1).tolist()
-        xs_list, ys_list = xs.astype(np.int64).tolist(), ys.astype(np.int64).tolist()
-        if prop_vals:
-            writer.writerows([group_name, filepath, x, y] + vals + prop_vals
-                              for x, y, vals in zip(xs_list, ys_list, value_rows))
-        else:
-            writer.writerows([group_name, filepath, x, y] + vals
-                              for x, y, vals in zip(xs_list, ys_list, value_rows))
-        return len(xs_list)
+            cols = _csvexp_gather_window_by_map(colmap, chans, ys, xs, self.window_size, H, W)
+        value_rows, kept = _csvexp_rows(cols)
+        xs_list = xs[kept].astype(np.int64).tolist()
+        ys_list = ys[kept].astype(np.int64).tolist()
+        writer.writerows([group_name, filepath, x, y] + vals + pv
+                         for x, y, vals in zip(xs_list, ys_list, value_rows))
+        return len(value_rows)
 
     @staticmethod
     def _scalar_channel_values(chans, xi, yi, any_rgb, max_extras, max_small):
@@ -1225,7 +1206,8 @@ class MachineLearningManager(QtWidgets.QDialog):
 
         self.populate_polygon_groups()
 
-    def _select_bands_and_expressions(self, img, chans, selected_band_indices, selected_expressions):
+    def _select_bands_and_expressions(self, img, chans, selected_band_indices, selected_expressions,
+                                      order=None, nodata_rules=None, n_file_bands=None):
         """Extract the selected bands (in order, None for a band index
         beyond what `chans` has) and evaluate every custom band expression,
         from ONE source image array.
@@ -1250,13 +1232,35 @@ class MachineLearningManager(QtWidgets.QDialog):
         training run, and one that then disagreed with inference. Both sides
         now go through the same order.
 
+        `order`: the channel order of `img` / `chans` ("rgb" = file band order,
+        the analysis image's). None falls back to _current_channel_order().
+
+        NoData (canopie.nodata, one rule): the analysis image already holds it
+        as NaN per band. `nodata_rules` is given only for a lazy RAW read
+        (export info "rules"); it is applied here to the FILE bands (the first
+        `n_file_bands`), never to a derived band. A custom expression is NaN
+        wherever a band it reads is, so a row is eligible exactly when the
+        model could classify that pixel (no non-finite feature).
+
         Returns (selected_chans: list[np.ndarray|None],
         expr_images: list[np.ndarray|None]).
         """
+        from .nodata import band_mask as _nd_band_mask, expression_source_bands as _nd_sources
+        n_file = len(chans) if n_file_bands is None else int(n_file_bands)
+
+        def _with_rules(arr, band_idx):
+            if not nodata_rules or band_idx >= n_file:
+                return arr
+            m = _nd_band_mask(arr, band_idx, nodata_rules)
+            if m.any():
+                arr = np.array(arr, dtype=np.float32, copy=True)
+                arr[m] = np.nan
+            return arr
+
         selected_chans = []
         for band_idx in selected_band_indices:
             if band_idx < len(chans):
-                selected_chans.append(chans[band_idx].astype(np.float32, copy=False))
+                selected_chans.append(_with_rules(chans[band_idx].astype(np.float32, copy=False), band_idx))
             else:
                 selected_chans.append(None)
 
@@ -1270,10 +1274,29 @@ class MachineLearningManager(QtWidgets.QDialog):
             # Same first-3 reordering _channels_in_export_order applies to the
             # band features, so `b1` in an expression and "red_channel" in the
             # feature list name the same physical band. Bands 4+ untouched.
-            img_for_expr = img.astype(np.float32, copy=False)
+            if isinstance(img, np.ndarray):
+                img_for_expr = img.astype(np.float32, copy=False)
+            else:
+                # A lazy raw read (LazyChannels) has no .astype -- training with
+                # a custom expression on a large image raised AttributeError.
+                # Stack the file bands up to the highest one an expression reads.
+                need = 1
+                for _nm, _ex in selected_expressions:
+                    need = max(need, max(_nd_sources(_ex), default=-1) + 1)
+                need = min(need, len(chans))
+                img_for_expr = np.stack([np.asarray(chans[k], dtype=np.float32)
+                                         for k in range(need)], axis=2)
             if isinstance(img_for_expr, np.ndarray):
                 img_for_expr = _to_rgb_band_order(
-                    img_for_expr, self._current_channel_order())
+                    img_for_expr, order if order is not None else self._current_channel_order())
+                if nodata_rules:
+                    a3 = img_for_expr if img_for_expr.ndim == 3 else img_for_expr[..., None]
+                    a3 = np.array(a3, dtype=np.float32, copy=True)
+                    for k in range(min(n_file, a3.shape[2])):
+                        m = _nd_band_mask(a3[..., k], k, nodata_rules)
+                        if m.any():
+                            a3[..., k][m] = np.nan
+                    img_for_expr = a3
 
             for expr_name, expr_str in selected_expressions:
                 try:
@@ -1286,7 +1309,20 @@ class MachineLearningManager(QtWidgets.QDialog):
                     if result is not None:
                         if result.ndim == 3:
                             result = result[:, :, -1]
-                        expr_images.append(result.astype(np.float32, copy=False))
+                        result = result.astype(np.float32, copy=False)
+                        # NoData wherever a band the expression reads is NoData
+                        # (b1>150 on a NaN b1 is not "false")
+                        if isinstance(img_for_expr, np.ndarray):
+                            a3 = img_for_expr if img_for_expr.ndim == 3 else img_for_expr[..., None]
+                            bad = None
+                            for sb in _nd_sources(expr_str):
+                                if 0 <= sb < a3.shape[2]:
+                                    m = ~np.isfinite(a3[..., sb])
+                                    bad = m if bad is None else (bad | m)
+                            if bad is not None and bad.any() and bad.shape == result.shape:
+                                result = np.array(result, copy=True)
+                                result[bad] = np.nan
+                        expr_images.append(result)
                     else:
                         expr_images.append(None)
                         logging.warning(f"[train] Expression '{expr_name}' returned None")
@@ -1395,6 +1431,337 @@ class MachineLearningManager(QtWidgets.QDialog):
 
         return row, ok_row, n_dropped_nan, n_dropped_missing_band
 
+    def _sample_training_file(self, group_name, filepath, img, polygons_by_group, *,
+                              selected_band_indices, selected_expressions, window_size,
+                              samples_per_poly, num_features, augmentation_cfg,
+                              augmentation_enabled, n_variants, rng):
+        """train_models' pixel sampling for ONE (class, image) pair.
+
+        Moved here verbatim from train_models' per-file loop so it can be
+        tested on its own (qc/test_ml_training_rows.py). `img` is the image's
+        analysis image (ProjectTab._get_export_image via _get_export_image):
+        file band order, NoData as NaN per band (or a lazy raw read whose
+        export info says "rules").
+
+        Returns (X_report, y_report, X_train, y_train, dropped_nan,
+        dropped_missing_band). With augmentation off, X_train / y_train ARE
+        the report lists (same objects), exactly as train_models aliases them.
+        """
+        X_rows_report, y_rows_report = [], []
+        if augmentation_enabled:
+            X_rows_train, y_rows_train = [], []
+        else:
+            X_rows_train, y_rows_train = X_rows_report, y_rows_report
+        dropped_nan = 0
+        dropped_missing_band = 0
+
+        def _done():
+            return (X_rows_report, y_rows_report, X_rows_train, y_rows_train,
+                    dropped_nan, dropped_missing_band)
+
+        H, W = img.shape[:2]
+
+        # This image's own export info (M2): its channel order and how its
+        # NoData is encoded -- never the shared _last_export_channel_order.
+        _info = self._export_info(filepath)
+        _order = "rgb" if _info.get("channel_order") == "rgb" else None
+        _n_file = (_info["layout"].n_file if getattr(_info.get("layout"), "n_file", None) is not None
+                   else None)
+        _rules = None
+        if _info.get("nodata") == "rules":
+            from .nodata import rules_from_values as _nd_rules_from
+            _pt = getattr(self, "parent_tab", None)
+            _ax_l = self._load_ax_mods(filepath) or {}
+            _vals = (_pt.effective_nodata_values(filepath, _ax_l)
+                     if _pt is not None and hasattr(_pt, "effective_nodata_values")
+                     else (list(_ax_l.get("nodata_values") or []) if _ax_l.get("nodata_enabled", True) else []))
+            _rules = _nd_rules_from(_vals) or None
+
+        # NoData/mask-polygon loading is hoisted to run BEFORE chans is
+        # computed (it used to run after) -- it depends only on
+        # filepath/H/W/all_polygons, never on chans/img pixel data, and
+        # augmentation (below) needs these same exclusions to avoid
+        # perturbing NoData/masked pixels, so they must be known first.
+        # Load NoData values from .ax file for this image
+        nodata_values = []
+        mask_polygon_enabled = False
+        mask_polygon_names = []
+        mask_polygon_points_list = []
+        try:
+            import json
+            base = os.path.splitext(os.path.basename(filepath))[0] + ".ax"
+            pf = getattr(self, "project_folder", None)
+            ax_candidates = []
+            if pf:
+                ax_candidates.append(os.path.join(os.fspath(pf), base))
+                ax_candidates.append(os.path.join(os.fspath(pf), "global.ax"))  # Also check global.ax
+            ax_candidates.append(os.path.join(os.path.dirname(filepath), base))
+            ax_candidates.append(os.path.join(os.path.dirname(filepath), "global.ax"))
+            for axp in ax_candidates:
+                if os.path.exists(axp):
+                    with open(axp, "r", encoding="utf-8") as f:
+                        ax = json.load(f) or {}
+                    # Check if nodata is enabled (default True)
+                    if ax.get("nodata_enabled", True):
+                        nodata_values = list(ax.get("nodata_values", []) or [])
+                        if nodata_values:
+                            logging.info(f"[train] Loaded nodata_values={nodata_values} from {axp}")
+                    # Load mask_polygon (names-based)
+                    mp_cfg = ax.get("mask_polygon", {}) or {}
+                    if isinstance(mp_cfg, dict):
+                        mask_polygon_enabled = bool(mp_cfg.get("enabled", False))
+                        mask_polygon_names = mp_cfg.get("names", []) or []
+                        # Legacy: support old single-name format
+                        if not mask_polygon_names and mp_cfg.get("name"):
+                            mask_polygon_names = [mp_cfg.get("name")]
+                        # Legacy: support old points format
+                        legacy_points = mp_cfg.get("points", []) or []
+                        if legacy_points and len(legacy_points) >= 3:
+                            mask_polygon_points_list.append(legacy_points)
+                        if mask_polygon_enabled and (mask_polygon_names or mask_polygon_points_list):
+                            logging.debug(f"[train] Loaded mask_polygon from {axp}")
+                    break
+        except Exception as e:
+            logging.debug(f"[train] Could not load .ax for {filepath}: {e}")
+
+        # Look up polygon points by name from all_polygons
+        if mask_polygon_enabled and mask_polygon_names:
+            all_polygons = getattr(self, "all_polygons", None) or getattr(self.parent(), "all_polygons", None) if hasattr(self, "parent") and callable(self.parent) else None
+            if all_polygons:
+                fp_norm = os.path.normpath(filepath).lower()
+                # NOT `group_name`: that is the OUTER loop's class label
+                # (`for idx, (group_name, filepath) in enumerate(entries)`).
+                # Rebinding it here made every training polygon of an image
+                # with a mask polygon be read -- and labelled -- as the last
+                # group of all_polygons.
+                for mask_group, file_map in all_polygons.items():
+                    for stored_fp, poly_data in file_map.items():
+                        stored_fp_norm = os.path.normpath(stored_fp).lower() if stored_fp else ""
+                        if stored_fp_norm == fp_norm:
+                            if isinstance(poly_data, dict):
+                                poly_name = poly_data.get('name', mask_group)
+                                # the editor lists either spelling (see load_polygons)
+                                if poly_name in mask_polygon_names or mask_group in mask_polygon_names:
+                                    points = poly_data.get('points', [])
+                                    if points and len(points) >= 3:
+                                        # Scale points if stored at different resolution
+                                        ref_size = poly_data.get('image_ref_size', {}) or {}
+                                        ref_w = ref_size.get('w', 0) or 0
+                                        ref_h = ref_size.get('h', 0) or 0
+                                        if ref_w > 0 and ref_h > 0 and (ref_w != W or ref_h != H):
+                                            scale_x = W / float(ref_w)
+                                            scale_y = H / float(ref_h)
+                                            scaled_points = [(x * scale_x, y * scale_y) for (x, y) in points]
+                                            mask_polygon_points_list.append(scaled_points)
+                                            logging.debug(f"[train] Scaled mask polygon '{poly_name}' from {ref_w}x{ref_h} to {W}x{H}")
+                                        else:
+                                            mask_polygon_points_list.append(points)
+
+        # Build combined polygon mask for this image -- only for a raw lazy read:
+        # the analysis image ("nodata": "nan") already holds the mask polygons
+        # as NaN, and a full-frame mask is gigabytes on a large raster.
+        poly_mask = None
+        _lazy_img = not isinstance(img, np.ndarray)
+        if mask_polygon_enabled and mask_polygon_points_list and _info.get("nodata") != "nan":
+            poly_mask = np.zeros((H, W), dtype=bool)
+            for poly_pts in mask_polygon_points_list:
+                if poly_pts and len(poly_pts) >= 3:
+                    pts = np.array([[int(round(x)), int(round(y))] for x, y in poly_pts], dtype=np.int32)
+                    pts = pts.reshape((-1, 1, 2))
+                    mask_temp = np.zeros((H, W), dtype=np.uint8)
+                    cv2.fillPoly(mask_temp, [pts], 255)
+                    poly_mask |= (mask_temp > 0)
+            if poly_mask.any():
+                logging.debug(f"[train] Built combined polygon mask with {poly_mask.sum()} masked pixels")
+            else:
+                poly_mask = None
+
+        # ---- Per-image augmentation (once per loaded image, BEFORE the
+        # per-polygon pixel-sampling loop below runs against it -- see
+        # ml_augmentation.py's module docstring for why patch-level
+        # brightness is deliberately computed once per whole image, not
+        # once per polygon: multiple polygons often sample the same
+        # physical image, and per-polygon-independent perturbation would
+        # give the same physical tile two different random brightnesses
+        # depending on which polygon happened to sample it) ----
+        variant_chans_expr = []  # list of (selected_chans, expr_images), one per augmented variant
+        if augmentation_enabled and _lazy_img:
+            logging.warning("[train] %s is read window by window (large raster): augmentation "
+                            "needs the whole image and is skipped for it", os.path.basename(filepath))
+        if augmentation_enabled and not _lazy_img:
+            # Pixels augmentation must not perturb: NoData in any band
+            # (NaN in the analysis image) and the mask polygons.
+            if isinstance(img, np.ndarray):
+                _a3 = img if img.ndim == 3 else img[..., None]
+                aug_nodata_mask = ~np.isfinite(_a3).all(axis=2)
+            else:
+                aug_nodata_mask = np.zeros((H, W), dtype=bool)
+            if poly_mask is not None:
+                aug_nodata_mask = aug_nodata_mask | poly_mask
+            for _variant_idx in range(n_variants):
+                img_aug = ml_augmentation.augment_image_for_training(
+                    img, augmentation_cfg, rng, nodata_mask=aug_nodata_mask)
+                chans_aug = self._channels_for_analysis(img_aug, _info)
+                sel_chans_aug, expr_aug = self._select_bands_and_expressions(
+                    img_aug, chans_aug, selected_band_indices, selected_expressions,
+                    order=_order, nodata_rules=_rules, n_file_bands=_n_file)
+                variant_chans_expr.append((sel_chans_aug, expr_aug))
+
+        # PRISTINE bands/expressions -- computed from the unmodified img,
+        # unconditionally, regardless of whether augmentation ran.
+        chans = self._channels_for_analysis(img, _info)
+
+        # Check if this image has all required bands
+        max_required_band = max(selected_band_indices) if selected_band_indices else -1
+        if max_required_band >= 0 and len(chans) <= max_required_band:
+            logging.warning(f"[train] Image {filepath} has only {len(chans)} bands, "
+                           f"but band index {max_required_band} is required. Skipping.")
+            return _done()
+
+        if _lazy_img:
+            selected_chans = expr_images = None     # read per polygon window, below
+        else:
+            selected_chans, expr_images = self._select_bands_and_expressions(
+                img, chans, selected_band_indices, selected_expressions,
+                order=_order, nodata_rules=_rules, n_file_bands=_n_file)
+        _half = window_size // 2
+
+        # iterate polygons/points inside this file
+        file_polys = polygons_by_group.get(group_name, {}).get(filepath, {})
+        raw_pts = file_polys.get("points", [])
+        if not raw_pts:
+            return _done()
+
+        # Check if this is point data vs polygon data
+        extraction_type = (file_polys.get("type") or "polygon").lower()
+        is_point_extraction = (extraction_type == "point")
+
+        polys = self._normalize_to_polygons(raw_pts)
+        if not polys:
+            return _done()
+
+        # For each polygon: sample pixels and collect selected bands + expressions
+        for poly in polys:
+            if is_point_extraction:
+                # Same pixel as CSV export and the viewer's point marker,
+                # and out-of-frame points dropped, not clamped to the edge.
+                pts_img = self._point_pixels(filepath, poly, img.shape, file_polys)
+            else:
+                # The CSV's own vertex rule (floor, fillPoly clips): a
+                # polygon crossing the frame edge keeps its shape (M3).
+                pts_img = self._polygon_pixels(filepath, poly, img.shape, polygon_data=file_polys)
+            if not pts_img:
+                continue
+
+            # The shape's own bounding box (clipped to the frame), not an H x W
+            # mask: identical pixels in identical (row-major) order.
+            _v = np.asarray([[int(round(x)), int(round(y))] for (x, y) in pts_img], dtype=np.int64)
+            mx0 = max(0, int(_v[:, 0].min())); my0 = max(0, int(_v[:, 1].min()))
+            mx1 = min(W, int(_v[:, 0].max()) + 1); my1 = min(H, int(_v[:, 1].max()) + 1)
+            if mx1 <= mx0 or my1 <= my0:
+                continue
+            mask = np.zeros((my1 - my0, mx1 - mx0), dtype=np.uint8)
+
+            # Handle based on extraction type and number of points
+            if is_point_extraction or len(pts_img) <= 2:
+                # Point mode (or a 1-2 vertex shape): each coordinate is a pixel
+                for (xi, yi) in pts_img:
+                    xi, yi = int(round(xi)), int(round(yi))
+                    if 0 <= yi < H and 0 <= xi < W:
+                        mask[yi - my0, xi - mx0] = 255
+            else:
+                # Polygon - fill (vertices shifted into the box; fillPoly clips
+                # at the box edge exactly where it clipped at the frame edge)
+                arr = np.array([_v - (mx0, my0)], dtype=np.int32)
+                cv2.fillPoly(mask, arr, 255)
+
+            mask_bool = mask.astype(bool)
+            n_pix = int(mask_bool.sum())
+            if n_pix == 0:
+                continue
+
+            ys, xs = np.where(mask_bool)
+            ys = ys + my0
+            xs = xs + mx0
+
+            if _lazy_img:
+                # this polygon's window (+ the feature window's halo), only
+                from .raster_reader import OffsetBand
+                wx0 = max(0, mx0 - _half); wy0 = max(0, my0 - _half)
+                wx1 = min(W, mx1 + _half); wy1 = min(H, my1 + _half)
+                try:
+                    _win = img.read_window(wx0, wy0, wx1, wy1)
+                except MemoryError as e:
+                    # a window too large to hold (the lazy image refuses > 1 GB):
+                    # skip this polygon, never let it escape the Qt slot
+                    logging.warning("[train] %s / %s skipped: %s", os.path.basename(filepath), group_name, e)
+                    skipped = self.__dict__.setdefault("_train_skipped_polygons", [])
+                    skipped.append(f"{group_name} on {os.path.basename(filepath)} "
+                                   f"({wx1 - wx0} x {wy1 - wy0} px window)")
+                    continue
+                _stack = np.dstack(_win) if len(_win) > 1 else _win[0][..., None]
+                _sel, _ex = self._select_bands_and_expressions(
+                    _stack, _win, selected_band_indices, selected_expressions,
+                    order=_order, nodata_rules=_rules, n_file_bands=_n_file)
+                selected_chans = [OffsetBand(c, wx0, wy0, H, W) if c is not None else None for c in _sel]
+                expr_images = [OffsetBand(e, wx0, wy0, H, W) if e is not None else None for e in _ex]
+            # Only subsample if this is a true polygon with many pixels
+            # For points, use all pixels (no subsampling)
+            is_point_data = is_point_extraction or len(pts_img) <= 2
+            if not is_point_data and n_pix > samples_per_poly:
+                sel = rng.choice(n_pix, size=samples_per_poly, replace=False)
+                ys = ys[sel]; xs = xs[sel]
+
+            for (yy, xx) in zip(ys, xs):
+                # Skip pixels inside the mask polygon
+                if poly_mask is not None and poly_mask[yy, xx]:
+                    dropped_nan += 1  # Count as dropped (masked)
+                    continue
+
+                # For window-based extraction, skip edge pixels where window would go out of bounds
+                half = window_size // 2
+                if yy - half < 0 or yy + half >= H or xx - half < 0 or xx + half >= W:
+                    if window_size > 1:
+                        dropped_nan += 1  # Can't use edge pixels with windows
+                        continue
+
+                # nodata_values=None: NoData is NaN in the features (one
+                # rule, canopie.nodata); a literal must never be matched
+                # against a derived feature.
+                row, ok_row, n_nan, n_missing = self._build_training_row(
+                    selected_chans, expr_images, yy, xx, window_size, None, num_features)
+                dropped_nan += n_nan
+                dropped_missing_band += n_missing
+
+                if ok_row and len(row) == num_features:
+                    # Report/holdout collection: pristine, always, unconditionally.
+                    X_rows_report.append(row)
+                    y_rows_report.append(group_name)
+
+                    if augmentation_enabled:
+                        # Run this SAME pixel through every augmented
+                        # image variant's own chans/expr_images (built
+                        # once per image, above) -- augmented-row
+                        # failures are not counted into dropped_nan/
+                        # dropped_missing_band, since they're not a
+                        # genuine data-quality signal about the source
+                        # imagery (assemble_pixel_rows falls back to the
+                        # pristine row rather than dropping the pixel).
+                        augmented_results = []
+                        for (chans_aug, expr_aug) in variant_chans_expr:
+                            r_aug, ok_aug, _n1, _n2 = self._build_training_row(
+                                chans_aug, expr_aug, yy, xx, window_size, None, num_features)
+                            augmented_results.append(
+                                (ok_aug and len(r_aug) == num_features, r_aug))
+                        for train_row in ml_augmentation.assemble_pixel_rows(
+                                True, row, augmented_results, augmentation_cfg.get("row_policy", "add")):
+                            X_rows_train.append(train_row)
+                            y_rows_train.append(group_name)
+                    # else: X_rows_train IS X_rows_report (aliased above)
+                    # -- already updated by the append two lines up.
+
+        return _done()
+
     def train_models(self):
         """
         Train one or more sklearn classifiers from the currently selected groups.
@@ -1445,6 +1812,8 @@ class MachineLearningManager(QtWidgets.QDialog):
         # ---- 0.5) Detect available bands across all files (with caching) ----
         max_bands = 0
         _image_cache = {}  # Cache: filepath -> (img, C) to avoid loading twice
+        self._take_export_refusals()            # this training's refusals only
+        self._train_skipped_polygons = []       # polygons too large to read at once
         
         # Show progress during band detection (this can be slow for many large images)
         band_progress = QtWidgets.QProgressDialog("Detecting image bands...", "Cancel", 0, len(entries), self)
@@ -2148,236 +2517,21 @@ class MachineLearningManager(QtWidgets.QDialog):
             if img is None:
                 logging.warning(f"[train] Could not load {filepath}")
                 continue
-            H, W = img.shape[:2]
-
-            # NoData/mask-polygon loading is hoisted to run BEFORE chans is
-            # computed (it used to run after) -- it depends only on
-            # filepath/H/W/all_polygons, never on chans/img pixel data, and
-            # augmentation (below) needs these same exclusions to avoid
-            # perturbing NoData/masked pixels, so they must be known first.
-            # Load NoData values from .ax file for this image
-            nodata_values = []
-            mask_polygon_enabled = False
-            mask_polygon_names = []
-            mask_polygon_points_list = []
-            try:
-                import json
-                base = os.path.splitext(os.path.basename(filepath))[0] + ".ax"
-                pf = getattr(self, "project_folder", None)
-                ax_candidates = []
-                if pf:
-                    ax_candidates.append(os.path.join(os.fspath(pf), base))
-                    ax_candidates.append(os.path.join(os.fspath(pf), "global.ax"))  # Also check global.ax
-                ax_candidates.append(os.path.join(os.path.dirname(filepath), base))
-                ax_candidates.append(os.path.join(os.path.dirname(filepath), "global.ax"))
-                for axp in ax_candidates:
-                    if os.path.exists(axp):
-                        with open(axp, "r", encoding="utf-8") as f:
-                            ax = json.load(f) or {}
-                        # Check if nodata is enabled (default True)
-                        if ax.get("nodata_enabled", True):
-                            nodata_values = list(ax.get("nodata_values", []) or [])
-                            if nodata_values:
-                                logging.info(f"[train] Loaded nodata_values={nodata_values} from {axp}")
-                        # Load mask_polygon (names-based)
-                        mp_cfg = ax.get("mask_polygon", {}) or {}
-                        if isinstance(mp_cfg, dict):
-                            mask_polygon_enabled = bool(mp_cfg.get("enabled", False))
-                            mask_polygon_names = mp_cfg.get("names", []) or []
-                            # Legacy: support old single-name format
-                            if not mask_polygon_names and mp_cfg.get("name"):
-                                mask_polygon_names = [mp_cfg.get("name")]
-                            # Legacy: support old points format
-                            legacy_points = mp_cfg.get("points", []) or []
-                            if legacy_points and len(legacy_points) >= 3:
-                                mask_polygon_points_list.append(legacy_points)
-                            if mask_polygon_enabled and (mask_polygon_names or mask_polygon_points_list):
-                                logging.debug(f"[train] Loaded mask_polygon from {axp}")
-                        break
-            except Exception as e:
-                logging.debug(f"[train] Could not load .ax for {filepath}: {e}")
-
-            # Look up polygon points by name from all_polygons
-            if mask_polygon_enabled and mask_polygon_names:
-                all_polygons = getattr(self, "all_polygons", None) or getattr(self.parent(), "all_polygons", None) if hasattr(self, "parent") and callable(self.parent) else None
-                if all_polygons:
-                    fp_norm = os.path.normpath(filepath).lower()
-                    for group_name, file_map in all_polygons.items():
-                        for stored_fp, poly_data in file_map.items():
-                            stored_fp_norm = os.path.normpath(stored_fp).lower() if stored_fp else ""
-                            if stored_fp_norm == fp_norm:
-                                if isinstance(poly_data, dict):
-                                    poly_name = poly_data.get('name', group_name)
-                                    if poly_name in mask_polygon_names:
-                                        points = poly_data.get('points', [])
-                                        if points and len(points) >= 3:
-                                            # Scale points if stored at different resolution
-                                            ref_size = poly_data.get('image_ref_size', {}) or {}
-                                            ref_w = ref_size.get('w', 0) or 0
-                                            ref_h = ref_size.get('h', 0) or 0
-                                            if ref_w > 0 and ref_h > 0 and (ref_w != W or ref_h != H):
-                                                scale_x = W / float(ref_w)
-                                                scale_y = H / float(ref_h)
-                                                scaled_points = [(x * scale_x, y * scale_y) for (x, y) in points]
-                                                mask_polygon_points_list.append(scaled_points)
-                                                logging.debug(f"[train] Scaled mask polygon '{poly_name}' from {ref_w}x{ref_h} to {W}x{H}")
-                                            else:
-                                                mask_polygon_points_list.append(points)
-
-            # Build combined polygon mask for this image
-            poly_mask = None
-            if mask_polygon_enabled and mask_polygon_points_list:
-                poly_mask = np.zeros((H, W), dtype=bool)
-                for poly_pts in mask_polygon_points_list:
-                    if poly_pts and len(poly_pts) >= 3:
-                        pts = np.array([[int(round(x)), int(round(y))] for x, y in poly_pts], dtype=np.int32)
-                        pts = pts.reshape((-1, 1, 2))
-                        mask_temp = np.zeros((H, W), dtype=np.uint8)
-                        cv2.fillPoly(mask_temp, [pts], 255)
-                        poly_mask |= (mask_temp > 0)
-                if poly_mask.any():
-                    logging.debug(f"[train] Built combined polygon mask with {poly_mask.sum()} masked pixels")
-                else:
-                    poly_mask = None
-
-            # ---- Per-image augmentation (once per loaded image, BEFORE the
-            # per-polygon pixel-sampling loop below runs against it -- see
-            # ml_augmentation.py's module docstring for why patch-level
-            # brightness is deliberately computed once per whole image, not
-            # once per polygon: multiple polygons often sample the same
-            # physical image, and per-polygon-independent perturbation would
-            # give the same physical tile two different random brightnesses
-            # depending on which polygon happened to sample it) ----
-            variant_chans_expr = []  # list of (selected_chans, expr_images), one per augmented variant
+            _xr, _yr, _xt, _yt, _dn, _dm = self._sample_training_file(
+                group_name, filepath, img, polygons_by_group,
+                selected_band_indices=selected_band_indices,
+                selected_expressions=selected_expressions,
+                window_size=window_size, samples_per_poly=samples_per_poly,
+                num_features=num_features, augmentation_cfg=augmentation_cfg,
+                augmentation_enabled=augmentation_enabled, n_variants=n_variants, rng=rng)
+            X_rows_report.extend(_xr)
+            y_rows_report.extend(_yr)
             if augmentation_enabled:
-                # bgr_input is PROVENANCE: "b1<123" must exclude the same
-                # pixels the band features and expressions are built from.
-                aug_nodata_mask = (build_nodata_mask(
-                                        img, nodata_values,
-                                        bgr_input=_is_bgr_channel_order(
-                                            self._current_channel_order()))
-                                    if nodata_values else np.zeros((H, W), dtype=bool))
-                if poly_mask is not None:
-                    aug_nodata_mask = aug_nodata_mask | poly_mask
-                for _variant_idx in range(n_variants):
-                    img_aug = ml_augmentation.augment_image_for_training(
-                        img, augmentation_cfg, rng, nodata_mask=aug_nodata_mask)
-                    chans_aug = self._channels_in_export_order(img_aug)
-                    sel_chans_aug, expr_aug = self._select_bands_and_expressions(
-                        img_aug, chans_aug, selected_band_indices, selected_expressions)
-                    variant_chans_expr.append((sel_chans_aug, expr_aug))
-
-            # PRISTINE bands/expressions -- computed from the unmodified img,
-            # unconditionally, regardless of whether augmentation ran.
-            chans = self._channels_in_export_order(img)
-
-            # Check if this image has all required bands
-            max_required_band = max(selected_band_indices) if selected_band_indices else -1
-            if max_required_band >= 0 and len(chans) <= max_required_band:
-                logging.warning(f"[train] Image {filepath} has only {len(chans)} bands, "
-                               f"but band index {max_required_band} is required. Skipping.")
-                continue
-
-            selected_chans, expr_images = self._select_bands_and_expressions(
-                img, chans, selected_band_indices, selected_expressions)
-
-            # iterate polygons/points inside this file
-            file_polys = polygons_by_group.get(group_name, {}).get(filepath, {})
-            raw_pts = file_polys.get("points", [])
-            if not raw_pts:
-                continue
-
-            # Check if this is point data vs polygon data
-            extraction_type = (file_polys.get("type") or "polygon").lower()
-            is_point_extraction = (extraction_type == "point")
-
-            polys = self._normalize_to_polygons(raw_pts)
-            if not polys:
-                continue
-
-            # For each polygon: sample pixels and collect selected bands + expressions
-            for poly in polys:
-                pts_img = self._map_points_scene_to_image(filepath, poly, img.shape, polygon_data=file_polys)
-                if not pts_img:
-                    continue
-
-                mask = np.zeros((H, W), dtype=np.uint8)
-                
-                # Handle based on extraction type and number of points
-                if is_point_extraction or len(pts_img) == 1:
-                    # Point mode: each coordinate is a separate point
-                    for (xi, yi) in pts_img:
-                        xi, yi = int(round(xi)), int(round(yi))
-                        if 0 <= yi < H and 0 <= xi < W:
-                            mask[yi, xi] = 255
-                elif len(pts_img) == 2:
-                    # Two points - treat as two individual points (not a line)
-                    for (xi, yi) in pts_img:
-                        xi, yi = int(round(xi)), int(round(yi))
-                        if 0 <= yi < H and 0 <= xi < W:
-                            mask[yi, xi] = 255
-                elif len(pts_img) >= 3:
-                    # Polygon - fill
-                    arr = np.array([pts_img], dtype=np.int32)
-                    cv2.fillPoly(mask, arr, 255)
-
-                mask_bool = mask.astype(bool)
-                n_pix = int(mask_bool.sum())
-                if n_pix == 0:
-                    continue
-
-                ys, xs = np.where(mask_bool)
-                # Only subsample if this is a true polygon with many pixels
-                # For points, use all pixels (no subsampling)
-                is_point_data = is_point_extraction or len(pts_img) <= 2
-                if not is_point_data and n_pix > samples_per_poly:
-                    sel = rng.choice(n_pix, size=samples_per_poly, replace=False)
-                    ys = ys[sel]; xs = xs[sel]
-
-                for (yy, xx) in zip(ys, xs):
-                    # Skip pixels inside the mask polygon
-                    if poly_mask is not None and poly_mask[yy, xx]:
-                        dropped_nan += 1  # Count as dropped (masked)
-                        continue
-
-                    # For window-based extraction, skip edge pixels where window would go out of bounds
-                    half = window_size // 2
-                    if yy - half < 0 or yy + half >= H or xx - half < 0 or xx + half >= W:
-                        if window_size > 1:
-                            dropped_nan += 1  # Can't use edge pixels with windows
-                            continue
-
-                    row, ok_row, n_nan, n_missing = self._build_training_row(
-                        selected_chans, expr_images, yy, xx, window_size, nodata_values, num_features)
-                    dropped_nan += n_nan
-                    dropped_missing_band += n_missing
-
-                    if ok_row and len(row) == num_features:
-                        # Report/holdout collection: pristine, always, unconditionally.
-                        X_rows_report.append(row)
-                        y_rows_report.append(group_name)
-
-                        if augmentation_enabled:
-                            # Run this SAME pixel through every augmented
-                            # image variant's own chans/expr_images (built
-                            # once per image, above) -- augmented-row
-                            # failures are not counted into dropped_nan/
-                            # dropped_missing_band, since they're not a
-                            # genuine data-quality signal about the source
-                            # imagery (assemble_pixel_rows falls back to the
-                            # pristine row rather than dropping the pixel).
-                            augmented_results = []
-                            for (chans_aug, expr_aug) in variant_chans_expr:
-                                r_aug, ok_aug, _n1, _n2 = self._build_training_row(
-                                    chans_aug, expr_aug, yy, xx, window_size, nodata_values, num_features)
-                                augmented_results.append(
-                                    (ok_aug and len(r_aug) == num_features, r_aug))
-                            for train_row in ml_augmentation.assemble_pixel_rows(
-                                    True, row, augmented_results, augmentation_cfg.get("row_policy", "add")):
-                                X_rows_train.append(train_row)
-                                y_rows_train.append(group_name)
-                        # else: X_rows_train IS X_rows_report (aliased above)
-                        # -- already updated by the append two lines up.
+                # (off: X_rows_train IS X_rows_report -- already extended)
+                X_rows_train.extend(_xt)
+                y_rows_train.extend(_yt)
+            dropped_nan += _dn
+            dropped_missing_band += _dm
 
         progress.reset()
         progress.hide()
@@ -3046,7 +3200,16 @@ class MachineLearningManager(QtWidgets.QDialog):
                 details.append(f"{dropped_missing_band} missing bands")
             if details:
                 msg += f" ({', '.join(details)})."
-        QtWidgets.QMessageBox.information(self, "Training Complete", msg)
+        _refused = self._take_export_refusals()
+        msg += self._refusals_note(_refused)
+        _too_big = list(getattr(self, "_train_skipped_polygons", None) or [])
+        if _too_big:
+            msg += (f"\n\nWARNING: {len(_too_big)} polygon(s) skipped -- too large to read at once:\n"
+                    + "\n".join(_too_big[:3]) + (f"\n... and {len(_too_big) - 3} more" if len(_too_big) > 3 else ""))
+        if _refused or _too_big:
+            QtWidgets.QMessageBox.warning(self, "Training Complete", msg)
+        else:
+            QtWidgets.QMessageBox.information(self, "Training Complete", msg)
 
     def _rotate_any_channels(self, img, rot):
         """Rotate 2D or HxWxC arrays; supports C > 4 using NumPy."""
@@ -3914,6 +4077,63 @@ class MachineLearningManager(QtWidgets.QDialog):
             logging.warning(f"_apply_hist_match delegation failed: {e}")
             return img
 
+    def _take_export_refusals(self):
+        """Images ProjectTab._get_export_image refused since the last call (a
+        whole-image .ax step that does not fit in memory: no pixels, no
+        exception) -- {filepath: reason}, and forget them."""
+        pt = getattr(self, "parent_tab", None)
+        errs = dict(getattr(pt, "_export_errors", None) or {}) if pt is not None else {}
+        if pt is not None and errs:
+            try:
+                pt._export_errors = {}
+            except Exception:
+                pass
+        return errs
+
+    @staticmethod
+    def _refusals_note(errs):
+        if not errs:
+            return ""
+        lines = list(errs.values())
+        more = f"\n... and {len(lines) - 3} more" if len(lines) > 3 else ""
+        return (f"\n\nWARNING: {len(lines)} image(s) skipped (not enough memory for a whole-image "
+                f"step):\n" + "\n".join(lines[:3]) + more)
+
+    def _export_info(self, filepath):
+        """What ProjectTab._get_export_image said about `filepath` (layout,
+        NoData mode, channel order) -- {} when unknown."""
+        d = getattr(self, "_export_info_by_fp", None) or {}
+        return d.get(os.path.normcase(os.path.abspath(os.fspath(filepath))), {}) or {}
+
+    def _channels_for_analysis(self, img, info):
+        """Per-band 2-D views of an analysis image (file band order already; a
+        LazyChannels passes through). Never consults the shared, racy
+        `_last_export_channel_order`."""
+        import numpy as np
+        if isinstance(info, dict) and info.get("channel_order") == "rgb":
+            if not isinstance(img, np.ndarray):
+                return img
+            a = img if img.ndim == 3 else img[..., None]
+            return [a[..., k] for k in range(a.shape[2])]
+        return self._channels_in_export_order(img)
+
+    def _polygon_pixels(self, filepath, points, img_shape, polygon_data=None):
+        """Polygon vertices in export-frame pixels with the CSV's rule
+        (ProjectTab._points_to_export_frame, floor, NO clamping -- cv2.fillPoly
+        clips). This used to truncate and clamp every vertex, so a polygon
+        crossing the crop edge was rasterised with a different shape (M3)."""
+        import numpy as np
+        pt = getattr(self, "parent_tab", None)
+        if pt is not None and hasattr(pt, "_points_to_export_frame") and points:
+            try:
+                f = pt._points_to_export_frame(filepath, points, polygon_data or {}, img_shape)
+                if f:
+                    a = np.floor(np.asarray(f, dtype=np.float64).reshape(-1, 2)).astype(np.int64)
+                    return [tuple(v) for v in a.tolist()]
+            except Exception as e:
+                logging.debug("[ML] _points_to_export_frame failed for %s: %s", filepath, e)
+        return self._map_points_scene_to_image(filepath, points, img_shape, polygon_data=polygon_data)
+
     def _get_export_image(self, filepath):
         """
         Deterministically produce the export image used by ML Manager (export_csv + training).
@@ -3935,6 +4155,9 @@ class MachineLearningManager(QtWidgets.QDialog):
                 if isinstance(out, tuple) and len(out) == 2:
                     img, meta = out
                     if isinstance(meta, dict):
+                        if not hasattr(self, "_export_info_by_fp"):
+                            self._export_info_by_fp = {}
+                        self._export_info_by_fp[os.path.normcase(os.path.abspath(os.fspath(filepath)))] = meta
                         try:
                             C = int(meta.get("C", (img.shape[2] if getattr(img, "ndim", 0) == 3 else 1)))
                         except Exception:
@@ -3946,8 +4169,12 @@ class MachineLearningManager(QtWidgets.QDialog):
                     except Exception:
                         return img, (img.shape[2] if getattr(img, "ndim", 0) == 3 else 1)
                 # Unexpected shape: fall back
-            except Exception:
-                pass
+            except Exception as e:
+                # NOT the local replay below: it is a second, different .ax
+                # implementation, so a failure here used to produce silently
+                # different pixels. Report it and skip the file instead.
+                logging.error("[ML] export image failed for %s: %s", filepath, e, exc_info=True)
+                return None, 0
 
         # Fallback: local RAW + .ax replay.
         # _load_raw_image just recorded which loader produced these pixels;
@@ -4674,6 +4901,26 @@ class MachineLearningManager(QtWidgets.QDialog):
         return out
 
 
+    def _point_pixels(self, filepath, points, img_shape, polygon_data=None):
+        """Pixel (col, row) for each POINT -- the rule ProjectTab.process_polygon
+        (CSV) uses and the viewer's point marker shows: floor of the point
+        scaled from its image_ref_size to the exported frame, NOT clamped
+        (a point outside the current crop must be dropped by the caller's
+        bounds check, never turned into the nearest edge pixel). Records
+        without an image_ref_size fall back to _map_points_scene_to_image."""
+        import numpy as np
+        cs = str((polygon_data or {}).get('coord_space') or '').lower()
+        ref = (polygon_data or {}).get('image_ref_size') or {}
+        rw = int(ref.get('w') or 0) if isinstance(ref, dict) else 0
+        rh = int(ref.get('h') or 0) if isinstance(ref, dict) else 0
+        if cs in ('image', 'pixel') and rw > 0 and rh > 0 and points:
+            H, W = int(img_shape[0]), int(img_shape[1])
+            a = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+            xs = np.floor(a[:, 0] * (W / float(rw))).astype(np.int64)
+            ys = np.floor(a[:, 1] * (H / float(rh))).astype(np.int64)
+            return list(zip(xs.tolist(), ys.tolist()))
+        return self._map_points_scene_to_image(filepath, points, img_shape, polygon_data=polygon_data)
+
     def _map_points_scene_to_image(self, filepath, points, img_shape, polygon_data=None):
         """
         Map polygon coords -> image pixel coords for the given export image shape.
@@ -4944,15 +5191,29 @@ class MachineLearningManager(QtWidgets.QDialog):
             any_rgb = False
             max_extras = 0
             max_small = 0
+            # Band columns by NAME (canopie.band_layout): the union over every
+            # file, in order of first appearance. Positional columns
+            # ("R, G, B, band_4 ...") made one column mean different bands in
+            # different files -- an RGBA file's alpha and another file's
+            # expression both landed in band_4.
+            from .band_layout import file_band_names
+            band_names = []
+
+            def _add_names(nms):
+                for nm in nms:
+                    if nm not in band_names:
+                        band_names.append(nm)
 
             for _g, fp in all_entries:
                 C = _channel_count_cheap(fp)
-                if C is None:
+                if C is not None and C > 0:
+                    _add_names(file_band_names(C))
+                else:
                     img, C = self._get_export_image(fp)
                     if img is None or C <= 0:
                         continue
-                if C <= 0:
-                    continue
+                    lay = self._export_info(fp).get("layout")
+                    _add_names(lay.names() if lay is not None else [f"band_{j + 1}" for j in range(C)])
                 if C >= 3:
                     any_rgb = True
                     max_extras = max(max_extras, C - 3)
@@ -4965,10 +5226,7 @@ class MachineLearningManager(QtWidgets.QDialog):
             else:
                 prefix = ["group_name", "image_file", "x", "y"]
 
-            if any_rgb:
-                channel_names = ["R", "G", "B"] + [f"band_{i}" for i in range(4, 4 + max_extras)]
-            else:
-                channel_names = [f"channel_{i}" for i in range(1, max_small + 1)]
+            channel_names = list(band_names)
 
             if extraction_mode == "All Pixels with Surrounding Window":
                 header = list(prefix)
@@ -4999,10 +5257,11 @@ class MachineLearningManager(QtWidgets.QDialog):
             progress.setWindowModality(QtCore.Qt.WindowModal)
             progress.setMinimumDuration(0)
 
+            self._take_export_refusals()        # this export's refusals only
             worker = _CsvExportWorker(
                 self, save_path, all_entries, polygons_by_group,
                 extraction_mode, window_size, header, any_rgb, max_extras, max_small,
-                prop_keys,
+                prop_keys, band_names=channel_names,
             )
 
             loop = QtCore.QEventLoop(self)
@@ -5034,7 +5293,12 @@ class MachineLearningManager(QtWidgets.QDialog):
             worker.wait()
 
             if result.get("success"):
-                QtWidgets.QMessageBox.information(self, "Export Complete", result.get("message", ""))
+                _refused = self._take_export_refusals()
+                _msg = result.get("message", "") + self._refusals_note(_refused)
+                if _refused:
+                    QtWidgets.QMessageBox.warning(self, "Export Complete", _msg)
+                else:
+                    QtWidgets.QMessageBox.information(self, "Export Complete", _msg)
             else:
                 QtWidgets.QMessageBox.critical(self, "Export Failed", result.get("message", "Unknown error"))
 
@@ -6023,7 +6287,7 @@ class AnalysisOptionsDialog(QtWidgets.QDialog):
         nodata_frame = QtWidgets.QGroupBox("NoData masking")
         nodata_layout = QtWidgets.QGridLayout(nodata_frame)
         
-        self.chk_nodata = QtWidgets.QCheckBox("Mask these NoData values in all stats & band-math")
+        self.chk_nodata = QtWidgets.QCheckBox("Also mask these NoData values (this export)")
         self.chk_nodata.setChecked(False)
 
         self.le_nodata = QtWidgets.QLineEdit()
@@ -6031,13 +6295,16 @@ class AnalysisOptionsDialog(QtWidgets.QDialog):
         self.le_nodata.setEnabled(False)
         self.chk_nodata.toggled.connect(self.le_nodata.setEnabled)
         
-        # Try to auto-detect nodata values
-        self._try_prepopulate_nodata(parent)
+        # No prefill: each image's own NoData is always applied (below). The
+        # field used to be prefilled from the FIRST .ax in the project folder
+        # and then REPLACED every image's own NoData with that one image's list.
 
         nodata_layout.addWidget(self.chk_nodata, 0, 0, 1, 2)
         nodata_layout.addWidget(QtWidgets.QLabel("Values:"), 1, 0)
         nodata_layout.addWidget(self.le_nodata,             1, 1)
-        hint_label = QtWidgets.QLabel("(Auto-detected from .ax files if available)")
+        hint_label = QtWidgets.QLabel("Each image's own NoData (its .ax values and the file's NoData tag) "
+                                      "is always masked, band by band. Values here are masked in addition.")
+        hint_label.setWordWrap(True)
         hint_label.setStyleSheet("color: gray; font-size: 10px;")
         nodata_layout.addWidget(hint_label, 2, 0, 1, 2)
         

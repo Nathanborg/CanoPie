@@ -19,10 +19,10 @@ FEATURE_MAP = {
         "loader routing, band count, channel_order, raw pixel values, preview decimation"),
     "test_inspect_tool": (
         "Pixel Inspector",
-        "per-band values at known coords, NoData display modes, band-expression index"),
+        "per-band values at known coords, NoData per band (values and expressions), the band expression named by its text"),
     "test_process_polygon_csv": (
         "Main CSV export (process_polygon)",
-        "per-band Mean/Median/Std/Q25/Q75/PixelCount vs ground truth, NoData masking"),
+        "per-band Mean/Median/Std/Q25/Q75/PixelCount vs ground truth, NoData per band; an all-NoData band keeps an empty row"),
     "test_ml_manager_csv_and_training": (
         "ML manager CSV export",
         "all 3 extraction modes, agreement with process_polygon, NoData handling"),
@@ -151,6 +151,93 @@ FEATURE_MAP = {
     "test_classification_render_eligibility_fast_path": (
         "Classification render: eligible-rows fast path",
         "all-valid tiles skip the boolean-index copy and scatter; partly-invalid tiles still exclude NoData rows; offsets correct"),
+    "test_polygon_identity_vs_label": (
+        "Polygon identity is the group key, not the label",
+        "reloaded crowns named by group and labelled by name; moving keeps group, name and properties; PM delete and Clean Vector remove them from the screen"),
+    "test_polygon_sidecar_writes": (
+        "Polygon sidecars: written once, by the C encoder",
+        "one write per dirty polygon per save (no second flush write), one canonical format with properties, no pure-Python JSON encoding"),
+    "test_navigation_speed_contracts": (
+        "Navigation never reads or draws more than the screen shows",
+        "strided reads == sliced full reads (memmap, tiles, strips); no sharp tile below 1.1 device px per preview px; no LOD swap for sub-2-px gains; exact numpy<->QPolygonF"),
+    "test_lazy_point_nodata": (
+        "Points on NoData give empty rows on both read paths",
+        "large files (lazy windowed read) no longer export a point on NoData with the fill value as its mean -- the row is kept, empty; eager and lazy CSVs agree"),
+    "test_ax_geometry_exact": (
+        "Crop / rotate / resize geometry matches the export exactly",
+        "frame size and point forward/inverse maps equal _apply_ax_to_raw's rounding, rotation order and resize modes on every .ax combination"),
+    "test_polygons_follow_ax": (
+        "Polygons and points stay on their trees when crop / rotation / resize change",
+        "exact re-projection on every image type with a zip backup first, resize-only changes free, one move per image "
+        "whatever its path spelling, lazy crowns stay lazy, Reset counted once, stale items never read back; editor "
+        "opens without paging crowns in; the zoom tile shows exported pixels; a point drag paints each pixel once"),
+    "test_post_ax_size_helpers": (
+        "Copy/replicate size helpers give the exported frame size",
+        "_raw_hw_quick reads the header (it raised TypeError); the post-.ax size equals the exported image's size for crop, "
+        "rotation, px_w resize, disabled crop and a stale orig_size"),
+    "test_editor_open_state": (
+        "The image editor opens knowing its pixels",
+        "a reopen served from the viewer's or the editor's cache keeps the channel order (b1 = Red on a stack); "
+        "orig_size is the raster header size; the editor's expression is NoData where a band it reads is"),
+    "test_lazy_analysis": (
+        "Large rasters: band math and booleans computed window by window",
+        "the windowed analysis image equals the whole-image replay for crop, every rotation, integer and odd down-sizes, "
+        "NoData (number / expression / NaN), booleans, appended bands and mask polygons -- in one window, in odd-sized "
+        "windows and in row strips; steps needing the whole image are refused; a huge full band is refused, not attempted"),
+    "test_stretch_dialog_previews": (
+        "The stretch dialog on preview-loaded rasters",
+        "a preview loads the file band its stretch shows; 'all viewers' loads it into every preview and draws it; a "
+        "band the viewer does not hold is saved as its file band (not band 1); the dialog opens on the saved band and "
+        "keeps the saved Absolute range (it reset it to the band's data range on every open)"),
+    "test_polygon_sync_scaling": (
+        "A synced polygon keeps its place on every image of the root",
+        "drawn with sync on, the copies sit at the same fraction of each frame (as copy-to-root) and are stamped "
+        "with each image's basis -- also when an image is shown resized, cropped or as a decimated preview"),
+    "test_export_speed_exactness": (
+        "Faster CSV export, same bytes",
+        "median/quantiles from one partition keep numpy's bits; the expression evaluator never returns the caller's "
+        "memory; band math after an .ax edit comes from the new image and is dropped per file; the label-band guess "
+        "runs once per file; thumbnails and the augmentation preview work on windowed rasters; a whole-image replay "
+        "that cannot fit is refused and reported; previews hold at most 16 Mpx; saving a polygon's size reads no pixels"),
+    "test_band_bar_names": (
+        "The band bar names bands like the CSV",
+        "on a B,G,R-loaded image button 1 is file band 1 (Red) and selects its array position; "
+        "the band expression's button carries its expression text"),
+    "test_stretch_band_basis": (
+        "A saved stretch names file bands (red stays red)",
+        "a stretch saved on a B,G,R-loaded image draws natural colour on a file-order one; a legacy 2/1/0 entry shows "
+        "file Red as red (it showed Blue); root stretches follow each image's band order; a derived band is kept by name"),
+    "test_tile_stretch": (
+        "Zoom tiles keep the preview's stretch; 0/1 bands stay black/white",
+        "a tile maps with the bounds the preview was drawn with (both stretch engines, wiring included); "
+        "a boolean band maps 0 -> black, 1 -> white even when a tile is all True; back to RGB in the stretch "
+        "dialog the tiles get the RGB bounds (they kept a boolean's 0..1); bounds of another stretch are never reused"),
+    "test_export_dialog_nodata": (
+        "Export dialog NoData adds to each image's own",
+        "values typed in the CSV export dialog are masked in addition to every image's own NoData (eager and lazy), "
+        "never instead of it; the field is no longer prefilled from another image's .ax"),
+    "test_inspect_export_pixel": (
+        "Inspect reads the exported pixel",
+        "full resolution on a decimated preview (eager and lazy), CSV band names with no duplicate index, NoData per band incl. the raster's own tag"),
+    "test_ml_training_rows": (
+        "ML training samples the exported pixels",
+        "training rows are raw file pixels in file band order whatever another export left behind; NoData drops a row "
+        "only when one of its features is NoData (eager and lazy); an expression reading NoData is NoData; rows keep "
+        "their class label when the image has a mask polygon; expressions work on lazily read images"),
+    "test_viewer_nodata_display": (
+        "NoData on screen: white only where a shown band is NoData",
+        "the display whitens a pixel when a band it shows is NaN, never for a band that is not on screen; "
+        "a raster's own GDAL_NODATA tag reaches the viewer data with no .ax, NaN exactly where the export's is"),
+    "test_undo_trash_and_mask_replay": (
+        "Undo keeps the trash; mask polygons replay from memory",
+        "the undo reload does not purge .trash (only opening a project does); a mask polygon held only in memory "
+        "no longer breaks the viewer's .ax replay"),
+    "test_point_pixel_snapping": (
+        "A point is one export pixel: click, highlight, marker, CSV and ML agree",
+        "clicks and drags snap to the export pixel centre; hover and marker cover exactly that pixel on decimated previews; points follow a crop / rotate change; ML neither clamps nor shifts edge points"),
+    "test_polygon_lod_follows_zoom": (
+        "Polygon detail follows the zoom (QGIS-style)",
+        "exact outlines zoomed in, coarsest sub-pixel level in between, decimated-preview aware, display-only; Edit Vertices upgrades first"),
     "test_band_expression_display_persists": (
         "A band expression applied in the editor stays on screen",
         "Apply stores the expression band as the .ax display (no revert to RGB on refresh/reopen); switching band math off restores the previous stretch"),

@@ -107,15 +107,18 @@ def test_applied_expression_is_the_stored_display(editor_case, monkeypatch):
         f"precondition: the editor did not store the expression (.ax = {ax})")
     vs = ax.get("viewer_stretch") or {}
     C = viewer.image_data.image.shape[2]
-    assert str(vs.get("display_mode")).lower() == "single" and vs.get("display_band") == C - 1, (
+    # The derived band is stored by NAME (band_basis "file", BUG-024): its
+    # position moves with the loader's channel order and with appended bands.
+    assert str(vs.get("display_mode")).lower() == "single" and vs.get("display_band") == "b1>100"         and vs.get("band_basis") == "file", (
         "After Apply of a band expression the .ax still stores the pre-editor "
-        f"display {vs.get('display_mode')!r} r/g/b={vs.get('r_band')}/{vs.get('g_band')}/"
-        f"{vs.get('b_band')} -- edit_image_viewer wrote its snapshot back over it. Every "
-        "later load (navigation, refresh, reopen) resolves this stretch and rebuilds the "
+        f"display {vs.get('display_mode')!r} band={vs.get('display_band')!r} r/g/b={vs.get('r_band')}/"
+        f"{vs.get('g_band')}/{vs.get('b_band')} -- edit_image_viewer wrote its snapshot back over it. "
+        "Every later load (navigation, refresh, reopen) resolves this stretch and rebuilds the "
         "RGB composite, so the expression shows once and then reverts.")
 
-    # The loader resolves the stretch from the .ax exactly like this.
-    sp = pt._stretch_from_dict(vs)
+    # The loader resolves the stretch from the .ax like this, and draws the
+    # expression band -- the last position of this viewer's array.
+    sp = pt._sp_to_positions(pt._stretch_from_dict(vs), viewer)
     assert sp is not None and sp.display_mode == "single" and sp.display_band == C - 1
 
 

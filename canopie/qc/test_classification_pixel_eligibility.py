@@ -502,3 +502,68 @@ def test_window_edge_rows_matches_the_training_skip_condition():
                     assert bool(got[y, x]) == expected, (
                         f"({x},{y}) h={h} w={w} win={win}: got {got[y, x]}, "
                         f"expected {expected}")
+
+
+# ---------------------------------------------------------------------------
+# BUG-011 (2026-10-06): the viewer's replay classifies with the export's
+# classifier -- same label per pixel, unclassified = NaN (never 0 = class 0),
+# and the model of the tab that asks.
+# ---------------------------------------------------------------------------
+def _with_classification(pt, fp):
+    p = pt._ax_path_for(fp)
+    with open(p, "r", encoding="utf-8") as f:
+        ax = json.load(f) or {}
+    ax["classification"] = {"mode": "sklearn", "enabled": True}
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(ax, f)
+    _clear_caches(pt)
+
+
+def _viewer_replay_labels(pt, fp):
+    lite = pt._imagedata_or_fallback(fp)
+    out = ProjectTab.apply_aux_modifications(
+        fp, lite.image, pt.project_folder, global_mode=False,
+        src_channel_order=lite.channel_order, model_bundle=pt._get_sklearn_bundle())
+    return np.asarray(out, dtype=np.float64)
+
+
+def _export_labels(pt, fp):
+    img, info = pt._get_export_image(fp)
+    j = info["layout"].label_index
+    assert j is not None, "the export has no label band"
+    return np.asarray(img[..., j], dtype=np.float64)
+
+
+@pytest.mark.parametrize("window", [1, 3])
+def test_viewer_replay_labels_equal_the_export_label_band(scenario, window):
+    pt, fp, _b = scenario("nodata", window, [ND_VALUE])
+    _with_classification(pt, fp)
+    v = _viewer_replay_labels(pt, fp)
+    e = _export_labels(pt, fp)
+    assert v.shape == e.shape, (v.shape, e.shape)
+    assert np.array_equal(v, e, equal_nan=True), (
+        f"viewer and export labels differ on {int((~np.isclose(v, e, equal_nan=True)).sum())} pixels")
+    # unclassified is NaN, never class 0
+    assert np.isnan(v[NAN_BLOCK]).all() and np.isnan(v[ND_BLOCK]).all()
+    assert set(np.unique(v[np.isfinite(v)]).tolist()) <= {0.0, 1.0}
+    if window > 1:
+        assert np.isnan(v[0, :]).all(), "the window border must be unclassified"
+
+
+def test_viewer_replay_uses_the_tabs_model_not_the_class_wide_one(scenario):
+    from sklearn.tree import DecisionTreeClassifier
+    pt, fp, bundle = scenario("nan", 1, [])
+    _with_classification(pt, fp)
+    rng = np.random.default_rng(3)
+    X = rng.uniform(0.0, 255.0, size=(400, 3)).astype(np.float32)
+    inverted = dict(bundle)
+    inverted["model"] = DecisionTreeClassifier(max_depth=3, random_state=0).fit(X, (X[:, 0] <= 128.0).astype(int))
+    saved = ProjectTab.shared_random_forest_model
+    try:
+        ProjectTab.shared_random_forest_model = inverted      # another tab's model
+        pt.random_forest_model = bundle                       # this tab's
+        v = _viewer_replay_labels(pt, fp)
+        e = _export_labels(pt, fp)
+    finally:
+        ProjectTab.shared_random_forest_model = saved
+    assert np.array_equal(v, e, equal_nan=True), "the viewer classified with another tab's model"

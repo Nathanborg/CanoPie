@@ -279,50 +279,53 @@ class ImageEditorDialog(QDialog):
         parent = self.parent()
         raw = None
         
-        # 1. Try legacy _raw_cache first
+        # A cached array is only usable together with the order of its
+        # channels (BUG-008: a cache hit used to leave the editor assuming
+        # B,G,R, so b1 meant Blue on a tifffile stack). Entries without a
+        # recorded order are skipped. (The _export_cache is NOT a raw source:
+        # it holds the analysis image, edits already applied.)
+        # 1. The viewer loader's _raw_cache
         try:
             cache = getattr(parent, "_raw_cache", None)
+            orders = getattr(parent, "_raw_cache_order", None) or {}
             if cache:
                 key = os.path.normcase(os.path.abspath(self.image_filepath))
-                raw = cache.get(key)
+                if orders.get(key):
+                    raw = cache.get(key)
+                    if raw is not None:
+                        self._editor_channel_order = orders[key]
         except Exception:
-            pass
-        
+            raw = None
+
         # 2. Try new _raw_image_cache (PERFORMANCE: skips disk I/O on editor re-open)
         if raw is None:
             try:
                 cache = getattr(parent, "_raw_image_cache", None)
                 lock = getattr(parent, "_raw_image_cache_lock", None)
+                orders = getattr(parent, "_raw_image_cache_order", None) or {}
                 if cache is not None and lock is not None and self.image_filepath:
                     fp_norm = os.path.normcase(os.path.abspath(self.image_filepath))
                     file_mtime = os.path.getmtime(self.image_filepath)
                     cache_key = (fp_norm, file_mtime)
                     with lock:
-                        if cache_key in cache:
+                        if cache_key in cache and orders.get(cache_key):
                             raw = cache[cache_key]
+                            self._editor_channel_order = orders[cache_key]
                             logging.debug(f"[Editor] Raw image from cache: {os.path.basename(self.image_filepath)}")
-            except Exception:
-                pass
-        
-        # 3. Try _export_cache
-        if raw is None:
-            try:
-                cache = getattr(parent, "_export_cache", None)
-                lock  = getattr(parent, "_export_cache_lock", None)
-                if cache and lock:
-                    with lock:
-                        tup = cache.get(self.image_filepath)
-                        if tup and tup[0] is not None:
-                            raw = tup[0]
             except Exception:
                 pass
         
         # 4. Load from disk and store in cache for future opens
         if raw is None:
             raw = self._load_raw_image()
-            # Store in parent's raw image cache for future editor opens
+            # Store in parent's raw image cache for future editor opens -- but
+            # not a decimated preview: served from this cache, the next open
+            # skipped _load_editor_preview and lost its _editor_full_shape /
+            # channel order (BUG-008). raster_reader.read_preview already makes
+            # that reload free.
             try:
-                if raw is not None and parent is not None and self.image_filepath:
+                if (raw is not None and parent is not None and self.image_filepath
+                        and not getattr(self, "_editor_full_shape", None)):
                     cache = getattr(parent, "_raw_image_cache", None)
                     lock = getattr(parent, "_raw_image_cache_lock", None)
                     if cache is not None and lock is not None:
@@ -336,6 +339,10 @@ class ImageEditorDialog(QDialog):
                                 oldest = next(iter(cache))
                                 del cache[oldest]
                             cache[cache_key] = raw
+                            if not hasattr(parent, "_raw_image_cache_order"):
+                                parent._raw_image_cache_order = {}
+                            parent._raw_image_cache_order[cache_key] = str(
+                                getattr(self, "_editor_channel_order", "") or "bgr").lower()
                             logging.debug(f"[Editor] Raw image cached: {os.path.basename(self.image_filepath)} (cache size: {len(cache)})")
             except Exception:
                 pass
@@ -366,13 +373,13 @@ class ImageEditorDialog(QDialog):
         loaded = self.load_modifications_from_file()
         if loaded:
             self.modifications.update(loaded)
-            if "orig_size" not in self.modifications:
-                sh = self._raw_shape()
-                if sh:
-                    h, w = sh[:2]
-                    c = 1 if len(sh) == 2 else int(sh[2])
-                    self.modifications["orig_size"] = {"h": int(h), "w": int(w), "c": int(c)}
-                    self.modifications["anchor_to_original"] = True
+            # orig_size is the RASTER's size (its header), whatever the .ax says:
+            # a value stamped from a preview (9439 x 8516 on a 28315 x 25548
+            # mosaic) misled every size helper that reads it (BUG-008).
+            hdr = self._header_size()
+            if hdr is not None and self.modifications.get("orig_size") != hdr:
+                self.modifications["orig_size"] = hdr
+                self.modifications["anchor_to_original"] = True
         self._ax_loaded_on_open = bool(loaded)
         # NOTE: do NOT pop 'classification' here; we want it to persist.
 
@@ -424,17 +431,31 @@ class ImageEditorDialog(QDialog):
 
 
     # ---------- helpers for .ax paths ----------
-    def _auto_refresh_after_reset(self, root_name=None):
+    def _auto_refresh_after_reset(self, root_name=None, single=False):
         """
         Centralized refresh after any reset:
-          1) Try parent.refresh_all_groups()
-          2) Else try parent.refresh_viewer(root_name=...)
-          3) Else  try parent.load_image_group(root_name)
+          0) parent._after_editor_ax_write(): the .ax files are already gone, so
+             re-project the polygons and points of every image whose crop /
+             rotate / resize just changed -- they stay on their trees
+          1) single=True (Reset Image): parent.refresh_single_viewer(this viewer)
+          2) Else try parent.refresh_all_groups()
+          3) Else try parent.refresh_viewer(root_name=...)
+          4) Else  try parent.load_image_group(root_name)
         Ensures to make ONE refresh call.
         """
         parent = self.parent()
         try:
             if parent is None:
+                return
+            hook = getattr(parent, "_after_editor_ax_write", None)
+            if callable(hook):
+                try:
+                    hook()
+                except Exception as e:
+                    logging.warning(f"Re-projecting polygons after reset failed: {e}")
+            viewer = getattr(self, "viewer", None)
+            if single and viewer is not None and hasattr(parent, "refresh_single_viewer"):
+                parent.refresh_single_viewer(viewer, reapply_mods=True, preserve_view=True)
                 return
             if hasattr(parent, "refresh_all_groups"):
                 parent.refresh_all_groups()
@@ -1001,6 +1022,7 @@ class ImageEditorDialog(QDialog):
         if parent is None or not hasattr(parent, 'all_polygons'):
             return set()
         
+        from .polygon_lod import point_count
         all_names = set()
         all_polygons = getattr(parent, 'all_polygons', {}) or {}
         
@@ -1008,8 +1030,7 @@ class ImageEditorDialog(QDialog):
             for stored_fp, poly_data in file_map.items():
                 if isinstance(poly_data, dict):
                     poly_name = poly_data.get('name', group_name)
-                    points = poly_data.get('points', [])
-                    if points and len(points) >= 3:
+                    if point_count(poly_data) >= 3:     # never reads a lazy record's file
                         all_names.add(poly_name)
                 else:
                     all_names.add(group_name)
@@ -1027,6 +1048,7 @@ class ImageEditorDialog(QDialog):
         if not fp:
             return set()
         
+        from .polygon_lod import point_count
         fp_norm = os.path.normpath(fp).lower()
         names = set()
         all_polygons = getattr(parent, 'all_polygons', {}) or {}
@@ -1037,8 +1059,7 @@ class ImageEditorDialog(QDialog):
                 if stored_fp_norm == fp_norm:
                     if isinstance(poly_data, dict):
                         poly_name = poly_data.get('name', group_name)
-                        points = poly_data.get('points', [])
-                        if points and len(points) >= 3:
+                        if point_count(poly_data) >= 3:
                             names.add(poly_name)
         
         return names
@@ -1596,7 +1617,7 @@ class ImageEditorDialog(QDialog):
         """
         import logging, time
         try:
-            from .raster_reader import probe, open_reader
+            from .raster_reader import probe, open_reader, read_preview
         except Exception:
             return None
 
@@ -1604,7 +1625,9 @@ class ImageEditorDialog(QDialog):
             profile = probe(self.image_filepath)
             if profile is None or not profile.is_windowable:
                 return None
-            if profile.bytes_if_fully_loaded <= self._EDITOR_PREVIEW_BYTES:
+            from .project_tab import _PREVIEW_MAX_PIXELS
+            if (profile.bytes_if_fully_loaded <= self._EDITOR_PREVIEW_BYTES
+                    and int(profile.width) * int(profile.height) <= _PREVIEW_MAX_PIXELS):
                 return None            # small enough to load whole, keep old path
 
             reader = open_reader(self.image_filepath, profile)
@@ -1619,11 +1642,18 @@ class ImageEditorDialog(QDialog):
                 bands = (getter(self.image_filepath, profile) if callable(getter)
                          else [b for b in (0, 1, 2) if b < profile.count]) or [0]
 
-            budget = self._EDITOR_PREVIEW_BYTES
-            level = reader.level_for_bytes(len(bands), budget, decode_budget=budget * 4)
+            # and no more pixels than the viewer's preview (_PREVIEW_MAX_PIXELS):
+            # band math turns the working image into float32 (BUG: an 80 Mpx
+            # editor image of the BCI mosaic with a boolean)
+            budget = int(min(self._EDITOR_PREVIEW_BYTES,
+                             _PREVIEW_MAX_PIXELS * max(1, len(bands)) * np.dtype(profile.dtype).itemsize))
+            level = reader.level_for_bytes(len(bands), budget, decode_budget=self._EDITOR_PREVIEW_BYTES * 4)
             step = reader.step_for_bytes(len(bands), budget, level)
             t0 = time.time()
-            arr = reader.read_bands_full(bands, level=level, step=step)
+            # Shared with the viewer's own preview read (same budget -> same
+            # level/step on the BCI mosaic): reopening the editor, or opening it
+            # right after the viewer loaded, no longer re-decodes the file.
+            arr = read_preview(reader, self.image_filepath, bands, level=level, step=step)
 
             self._editor_full_shape = (profile.height, profile.width, profile.count)
             self._editor_bands = list(bands)
@@ -1949,9 +1979,22 @@ class ImageEditorDialog(QDialog):
             return []
 
         def _pre_resize_shape():
+            # Only crop and rotation (resize is removed here) change the frame
+            # size. The band expression, histogram matching, NoData and mask
+            # polygons change nothing in H x W and cost seconds on a large
+            # preview, so they are left out; the display state the call sets
+            # (expression band, NoData mask) belongs to the image on screen and
+            # is kept as it was.
             mods_wo = dict(self.modifications)
             mods_wo.pop("resize", None)
-            img_pre = self.apply_all_modifications_to_image(self.base_image, mods_wo)
+            for _k in ("band_expression", "hist_match", "mask_polygon", "classification", "nodata_values"):
+                mods_wo.pop(_k, None)
+            mods_wo.update(band_enabled=False, hist_enabled=False, nodata_enabled=False)
+            _keep = (getattr(self, "_has_expression_band", False), getattr(self, "_display_nodata_mask", None))
+            try:
+                img_pre = self.apply_all_modifications_to_image(self.base_image, mods_wo)
+            finally:
+                self._has_expression_band, self._display_nodata_mask = _keep
             if img_pre is not None and getattr(img_pre, "size", 0) > 0:
                 hh, ww = img_pre.shape[:2]
                 return int(ww), int(hh)
@@ -2050,18 +2093,11 @@ class ImageEditorDialog(QDialog):
 
         # ==================== END ENABLED STATES ====================
 
-        # ensure anchor metadata exists
-        if "orig_size" not in self.modifications and self.base_image is not None:
-            # On a decimated preview base_image is NOT the original, so record the
-            # real on-disk dimensions -- otherwise every consumer of orig_size
-            # would think the file is preview-sized.
-            full = getattr(self, "_editor_full_shape", None)
-            if full:
-                H0, W0, C0 = int(full[0]), int(full[1]), int(full[2])
-            else:
-                H0, W0 = self.base_image.shape[:2]
-                C0 = 1 if self.base_image.ndim == 2 else int(self.base_image.shape[2])
-            ui_mods["orig_size"] = {"h": int(H0), "w": int(W0), "c": int(C0)}
+        # orig_size = the raster's header size, on EVERY Apply (it used to be
+        # written once and never corrected; BUG-008).
+        _hdr = self._header_size()
+        if _hdr is not None:
+            ui_mods["orig_size"] = _hdr
             ui_mods["anchor_to_original"] = True
 
         # merge: ALWAYS OVERWRITE with UI values. The UI is the source of truth when hitting 'Save'.
@@ -2801,9 +2837,14 @@ class ImageEditorDialog(QDialog):
 
         # --- helper to build NoData mask (uses shared utility supporting expressions) ---
         def _build_nodata_mask(img, nd_vals):
-            """Build boolean mask where True = NoData pixel. Supports both numeric literals and threshold expressions."""
+            """Build boolean mask where True = NoData pixel. Supports both numeric literals and threshold expressions.
+
+            bgr_input is the editor's REAL channel order (was always True:
+            `b1<123` then tested Blue on a tifffile-loaded image)."""
             from .utils import build_nodata_mask as _shared_build_nodata_mask
-            return _shared_build_nodata_mask(img, nd_vals, bgr_input=True)
+            return _shared_build_nodata_mask(
+                img, nd_vals,
+                bgr_input=_is_bgr_channel_order(_chan_attr(self, "_editor_channel_order", "bgr") or "bgr"))
 
         # --- helper to build combined mask (nodata + polygons) ---
         def _build_combined_mask(img, nd_vals, poly_points_list, poly_enabled):
@@ -2876,7 +2917,9 @@ class ImageEditorDialog(QDialog):
             combined_mask = None
             if nodata_vals:
                 from .utils import build_nodata_mask as _shared_build_nodata_mask
-                combined_mask = _shared_build_nodata_mask(x, nodata_vals, bgr_input=True)
+                combined_mask = _shared_build_nodata_mask(
+                    x, nodata_vals,
+                    bgr_input=_is_bgr_channel_order(_chan_attr(self, "_editor_channel_order", "bgr") or "bgr"))
             
             # Add polygon masks
             if poly_enabled and poly_points_list:
@@ -3407,23 +3450,28 @@ class ImageEditorDialog(QDialog):
             # actually evaluated on. When no reorder was needed `to_rgb_band_order`
             # returns `image` itself, so this is byte-for-byte the previous
             # behaviour in every non-BGR case.
-            if nodata_mask is not None and isinstance(res, np.ndarray) \
-                    and isinstance(base_expr, np.ndarray):
-                if res.shape[:2] == nodata_mask.shape:
-                    # Preserve original values where nodata
-                    if res.ndim == base_expr.ndim:
+            # The expression is NoData wherever a band it READS is NoData
+            # (canopie.nodata, one rule -- the viewer and the export do the
+            # same). It used to copy the raw band value into those pixels, so
+            # `b1>100` showed a number there instead of NoData.
+            if isinstance(res, np.ndarray) and isinstance(base_expr, np.ndarray):
+                try:
+                    from .nodata import rules_from_values, band_mask, expression_source_bands
+                    rules = rules_from_values(nodata_values or [])
+                    b3 = base_expr if base_expr.ndim == 3 else base_expr[..., None]
+                    bad = None
+                    for sb in expression_source_bands(expr):
+                        if 0 <= sb < b3.shape[2]:
+                            m = band_mask(b3[..., sb], sb, rules)
+                            bad = m if bad is None else (bad | m)
+                    if bad is not None and bad.any() and bad.shape == res.shape[:2]:
+                        res = np.array(res, dtype=np.float32, copy=True)
                         if res.ndim == 2:
-                            res[nodata_mask] = base_expr.astype(res.dtype)[nodata_mask]
+                            res[bad] = np.nan
                         else:
-                            n_ch = min(res.shape[2], base_expr.shape[2] if base_expr.ndim == 3 else 1)
-                            if base_expr.ndim == 3 and n_ch == base_expr.shape[2] == res.shape[2]:
-                                # Common case: identical channel counts -- one
-                                # broadcast assignment covers every band.
-                                res[nodata_mask] = base_expr.astype(res.dtype)[nodata_mask]
-                            else:
-                                for c in range(n_ch):
-                                    img_ch = base_expr[..., c] if base_expr.ndim == 3 else base_expr
-                                    res[..., c][nodata_mask] = img_ch.astype(res.dtype)[nodata_mask]
+                            res[bad, :] = np.nan
+                except Exception as e:
+                    logging.debug(f"[Editor] expression NoData skipped: {e}")
 
             self.last_band_float_result = res.copy()
 
@@ -4545,7 +4593,9 @@ class ImageEditorDialog(QDialog):
             # CRITICAL: Use shared build_nodata_mask which supports both numeric values
             # AND expression-based NoData like "b1>143". This ensures the histogram
             # stats are calculated excluding all NoData pixels.
-            combined_mask = _shared_build_nodata_mask(ref_f, nodata_values, bgr_input=True)
+            combined_mask = _shared_build_nodata_mask(
+                ref_f, nodata_values,
+                bgr_input=_is_bgr_channel_order(_chan_attr(self, "_editor_channel_order", "bgr") or "bgr"))
             if combined_mask is not None:
                 logging.info(f"[on_hist_match_clicked] Built NoData mask with {combined_mask.sum()} masked pixels using shared utility")
         
@@ -4993,7 +5043,7 @@ class ImageEditorDialog(QDialog):
         # and caches were just cleared above. Fires synchronously the instant
         # Reset is clicked (inside the still-open dialog), independent of a
         # later OK/Cancel on the dialog itself.
-        self._auto_refresh_after_reset(root_name=root_name)
+        self._auto_refresh_after_reset(root_name=root_name, single=True)
         logging.info("Image modifications reset.")
 
     def on_reset_group(self):
@@ -5205,6 +5255,21 @@ class ImageEditorDialog(QDialog):
             self.independent_widget.show()
             logging.debug("Aspect ratio not kept during resizing.")
 
+
+    def _header_size(self):
+        """{"h", "w", "c"} of the raster on disk (its header): the decimated
+        preview's full shape when one is loaded, else _raw_shape(); None when
+        unknown."""
+        try:
+            full = getattr(self, "_editor_full_shape", None)
+            if full:
+                return {"h": int(full[0]), "w": int(full[1]), "c": int(full[2])}
+            sh = self._raw_shape()
+            if sh:
+                return {"h": int(sh[0]), "w": int(sh[1]), "c": 1 if len(sh) == 2 else int(sh[2])}
+        except Exception as e:
+            logging.debug(f"[Editor] header size unknown: {e}")
+        return None
 
     def _raw_shape(self):
         """
@@ -5890,7 +5955,9 @@ class ImageEditorDialog(QDialog):
 
                 elif res.ndim == 3:  # color or multispectral
                     H, W, C = res.shape
-                    has_expr_band = getattr(self, "_has_expression_band", False) or bool((self.modifications or {}).get("band_expression"))
+                    _mods_now = self.modifications or {}
+                    has_expr_band = getattr(self, "_has_expression_band", False) or (
+                        bool(_mods_now.get("band_expression")) and bool(_mods_now.get("band_enabled", True)))
                     if has_expr_band:
                         # Display the stacked expression result channel (channel -1) as stretched preview
                         expr_ch = res[:, :, -1]

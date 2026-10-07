@@ -44,15 +44,7 @@
     "pixel_count_total": 169,
     "bands": {
       "0": {
-        "process_polygon": {
-          "mean": 119.67455621301775,
-          "median": 108.0,
-          "std": 79.18591338894136,
-          "q25": 49.0,
-          "q75": 195.0,
-          "count": 169
-        },
-        "ml_manager": {
+        "per_band": {
           "mean": 119.67455621301775,
           "median": 108.0,
           "std": 79.18591338894136,

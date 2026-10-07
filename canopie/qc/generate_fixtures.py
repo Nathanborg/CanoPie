@@ -21,18 +21,17 @@ during development):
   - A COG-style overview pyramid is written via TiffWriter(subifds=N) on the
     main write, followed by N more tif.write(..., subfiletype=1) calls.
 
-process_polygon's NoData masking (see project_tab.py) is asymmetric by
-design: for images with 3+ bands, channels 0/1/2 (R/G/B) are always gated by
-band 0's own NoData status ("master_nodata_mask = nd_roi[0]"), while bands
-index >= 3 are gated by their OWN band's NoData status. This holds
-regardless of whether the NoData source was an auto-detected GDAL_NODATA tag
-(genuinely per-band masks) or explicit .ax nodata_values (a single any-band
-master mask) -- the RGB-vs-extra-bands split happens downstream of that.
-MachineLearningManager, by contrast, uniformly excludes a pixel from every
-band the instant ANY band matches NoData. Ground truth stores both rules'
-resulting stats per band, so fixtures with no real NoData naturally produce
-identical numbers under both (a useful cross-check in itself), and fixtures
-4/6/7 (which do carry real NoData) produce the documented divergence.
+NoData is ONE rule everywhere (canopie/nodata.py, Nathan 2026-10-06): per
+band, GDAL style. A NoData number excludes a pixel only in the band holding
+that value; a derived band (band expression) is NoData wherever any band it
+reads is. The NoData numbers are the .ax `nodata_values` plus the raster's own
+GDAL_NODATA tag, for the CSV export and the ML export alike. Ground truth
+stores that per-band result as "per_band" (and the unmasked "no_mask"), so
+fixtures without NoData give identical numbers under both, and fixtures 4/6/7
+(which do carry NoData) differ exactly where a band holds its fill value.
+(Before 2026-10-06 the CSV gated R/G/B by band 0 and the ML export masked
+whole pixels and ignored the tag; the "process_polygon" / "ml_manager" blocks
+that pinned those were replaced by "per_band".)
 """
 import argparse
 import json
@@ -297,62 +296,42 @@ def _nodata_equal(arr_band, nodata_value, tol=1e-3):
     return np.isclose(arr_band, nodata_value, atol=max(tol, abs(nodata_value) * 1e-4))
 
 
-def compute_polygon_ground_truth(arr_hwc, poly_mask, nodata_value, ax_nodata_value=None):
-    """Per-band stats under EACH consumer's real masking rule.
+def compute_polygon_ground_truth(arr_hwc, poly_mask, nodata_value, ax_nodata_value=None,
+                                 derived_sources=None):
+    """Per-band stats under the one NoData rule (see the module docstring).
 
-    The two consumers do NOT see the same NoData values, which matters more
-    than the (also real) difference in how they combine them across bands:
-
-    - `process_polygon` resolves NoData via ProjectTab.effective_nodata_values,
-      which merges the .ax `nodata_values` with the raster's own GDAL_NODATA
-      TAG. It then applies them asymmetrically: bands 0/1/2 are gated by band
-      0's own NoData status (whenever the file has 3+ bands), while bands >= 3
-      are gated by their own band.
-
-    - `MachineLearningManager.export_csv_data` reads `nodata_values` ONLY from
-      the .ax sidecar (machine_learning_manager.py's own ax_candidates loop) --
-      it never consults GDAL_NODATA. It then applies them whole-pixel: ANY
-      band matching invalidates that pixel for every band.
-
-    Consequence, verified empirically against these fixtures: for a raster
-    that declares its fill value ONLY via the GDAL_NODATA tag and has no .ax
-    (fixtures 4 and 6), ML-manager CSV export applies NO masking at all and
-    averages the raw fill values into its means -- e.g. mean_R = -2034.5 on
-    nodata_fragmented_multiband, where the -9999 holes drag the mean far below
-    any real pixel value, versus process_polygon's correctly-masked 620.33.
-    That is current behavior, encoded here as the regression baseline; see the
-    suite's README/notes for it being flagged rather than silently fixed.
+    `per_band`: band b's statistics exclude exactly the pixels where band b is
+    NoData -- its value matches a NoData number (the GDAL_NODATA tag or the
+    .ax `nodata_values`) or is not finite. A derived band (index in
+    `derived_sources`, mapped to the file bands it reads) is never matched
+    against the numbers; it is NoData wherever any of its source bands is.
+    Both the CSV export and the ML export must give these numbers.
 
     `no_mask` is also emitted so a test can assert the unmasked value directly
     when that IS the expected result.
     """
     H, W, C = arr_hwc.shape
     pixel_count_total = int(poly_mask.sum())
+    derived_sources = dict(derived_sources or {})
+    numbers = [v for v in (nodata_value, ax_nodata_value) if v is not None]
 
     band_nodata = np.zeros((C, H, W), dtype=bool)
-    if nodata_value is not None:
-        for b in range(C):
-            band_nodata[b] = _nodata_equal(arr_hwc[:, :, b], nodata_value)
-
-    # ML manager sees ONLY .ax-declared NoData, never the GDAL_NODATA tag.
-    ml_band_nodata = np.zeros((C, H, W), dtype=bool)
-    if ax_nodata_value is not None:
-        for b in range(C):
-            ml_band_nodata[b] = _nodata_equal(arr_hwc[:, :, b], ax_nodata_value)
-    any_band_invalid = np.any(ml_band_nodata, axis=0)
+    for b in range(C):
+        if b in derived_sources:
+            continue
+        band_nodata[b] = ~np.isfinite(arr_hwc[:, :, b])
+        for v in numbers:
+            band_nodata[b] |= _nodata_equal(arr_hwc[:, :, b], v)
+    for b, srcs in derived_sources.items():
+        band_nodata[b] = ~np.isfinite(arr_hwc[:, :, b])
+        for j in srcs:
+            band_nodata[b] |= band_nodata[j]
 
     out = {"pixel_count_total": pixel_count_total, "bands": {}}
     for b in range(C):
-        if C >= 3 and b < 3:
-            pp_invalid = band_nodata[0] if nodata_value is not None else np.zeros((H, W), dtype=bool)
-        else:
-            pp_invalid = band_nodata[b] if nodata_value is not None else np.zeros((H, W), dtype=bool)
-        pp_valid_mask = poly_mask & (~pp_invalid)
-        ml_valid_mask = poly_mask & (~any_band_invalid)
-
+        valid = poly_mask & (~band_nodata[b])
         out["bands"][str(b)] = {
-            "process_polygon": _stat_block(arr_hwc[:, :, b][pp_valid_mask]),
-            "ml_manager": _stat_block(arr_hwc[:, :, b][ml_valid_mask]),
+            "per_band": _stat_block(arr_hwc[:, :, b][valid]),
             "no_mask": _stat_block(arr_hwc[:, :, b][poly_mask]),
         }
     return out
@@ -383,6 +362,7 @@ def build_ground_truth(spec, raw_arr_hwc):
     ax = spec.get("ax")
     working = raw_arr_hwc
     extra = {}
+    derived_sources = {}
 
     if ax and "crop_rect" in ax:
         working = _crop_array(raw_arr_hwc, ax["crop_rect"])
@@ -402,6 +382,7 @@ def build_ground_truth(spec, raw_arr_hwc):
         with np.errstate(divide="ignore", invalid="ignore"):
             index_band = np.where((b4 + b1) != 0, (b4 - b1) / (b4 + b1), 0.0)
         working = np.concatenate([working, index_band[..., None]], axis=2)
+        derived_sources[working.shape[2] - 1] = [0, 3]   # reads b1 and b4
         extra["band_expression_appended_index"] = spec["bands"]  # new band's index
 
     nodata_value = spec.get("nodata_value")
@@ -414,8 +395,8 @@ def build_ground_truth(spec, raw_arr_hwc):
     poly = spec["polygon"]
     H, W = working.shape[:2]
     poly_mask = _rasterize_polygon_mask(poly["points"], H, W)
-    # The .ax-declared NoData (if any) is the ONLY NoData MachineLearningManager
-    # ever sees -- see compute_polygon_ground_truth's docstring.
+    # The .ax-declared NoData numbers join the GDAL_NODATA tag (one rule,
+    # see compute_polygon_ground_truth); expressions are not numeric fills.
     _ax_nd_list = (ax or {}).get("nodata_values") or []
     ax_nodata_value = None
     for _v in _ax_nd_list:
@@ -426,7 +407,8 @@ def build_ground_truth(spec, raw_arr_hwc):
             continue  # string expressions like "b1>182" aren't numeric fills
 
     poly_gt = compute_polygon_ground_truth(working, poly_mask, nodata_value,
-                                           ax_nodata_value=ax_nodata_value)
+                                           ax_nodata_value=ax_nodata_value,
+                                           derived_sources=derived_sources)
     poly_gt["name"] = poly["name"]
     poly_gt["points"] = poly["points"]
 
