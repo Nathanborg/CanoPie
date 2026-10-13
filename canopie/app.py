@@ -37,6 +37,16 @@ def _logo_path():
     return None
 
 
+def use_pyqt_qt_plugins():
+    """The full opencv-python wheel (Linux) points QT_QPA_PLATFORM_PLUGIN_PATH
+    at its own bundled Qt when cv2 is imported; PyQt5 then aborts creating its
+    QApplication. CanoPie needs opencv-python-headless, but if the full wheel
+    is installed anyway, drop that path so PyQt5 uses its own plugins."""
+    p = os.environ.get("QT_QPA_PLATFORM_PLUGIN_PATH", "")
+    if p and "cv2" in p.replace("\\", "/").split("/"):
+        os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH", None)
+
+
 def main():
     if os.name == "nt":
         _windows_setup()
@@ -44,6 +54,7 @@ def main():
     from PyQt5 import QtGui
     from PyQt5.QtWidgets import QApplication
     from canopie.main_window import MainWindow
+    use_pyqt_qt_plugins()
     app = QApplication(sys.argv)
     logo = _logo_path()
     icon = QtGui.QIcon(logo) if logo else None

@@ -102,6 +102,8 @@ def pytest_unconfigure(config):
 def qapp():
     """Exactly one QApplication for the whole test process -- PyQt allows
     only one per process, so this must be session-scoped and reused."""
+    from ..app import use_pyqt_qt_plugins
+    use_pyqt_qt_plugins()                    # a full opencv-python on Linux (see canopie/app.py)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(["canopie-qc"])
     yield app
 
