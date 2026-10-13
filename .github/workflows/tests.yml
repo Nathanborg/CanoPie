@@ -54,11 +54,6 @@ jobs:
           print('Qt platform:', app.platformName())
           " 2>&1 | tail -40
 
-      - name: Test collection (diagnostic)
-        run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then RUN="xvfb-run -a"; else RUN=""; fi
-          $RUN python -X faulthandler -m pytest canopie/qc --collect-only -q -p no:cacheprovider 2>&1 | tail -40 || true
-
       # The suite runs in parts (as in CONTRIBUTING.md): one process for every
       # file keeps the Qt / raster caches of hundreds of tests from piling up.
       - name: QC suite
@@ -66,10 +61,21 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then RUN="xvfb-run -a -s '-screen 0 1920x1080x24'"; else RUN=""; fi
           status=0
+          # A part is retried ONCE only when its process dies natively (no
+          # report written: the rare PyQt5/Windows crash documented in
+          # canopie/qc/conftest.py). A test that fails is never retried.
+          run_once() {
+            rm -f canopie/qc/last_run_report.txt
+            eval $RUN python -u -m pytest "$@" -v -p no:cacheprovider --timeout=600 --durations=15
+          }
           run_part() {
             echo "::group::$1"
-            rm -f canopie/qc/last_run_report.txt
-            eval $RUN python -m pytest "${@:2}" -v -p no:cacheprovider --timeout=600 --durations=15 || status=1
+            run_once "${@:2}"; rc=$?
+            if [ ! -f canopie/qc/last_run_report.txt ]; then
+              echo "::warning::$1: the test process died natively (exit $rc) -- retrying the part once"
+              run_once "${@:2}"; rc=$?
+            fi
+            [ $rc -ne 0 ] && status=1
             mkdir -p qc_reports
             if [ -f canopie/qc/last_run_report.txt ]; then
               grep -E "TOTAL|FAILED" canopie/qc/last_run_report.txt || true
