@@ -38,6 +38,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
+          pip install pytest-timeout
           pip install --no-deps .
 
       - name: The package starts (import + entry point)
@@ -56,13 +57,14 @@ jobs:
       # The suite runs in parts (as in CONTRIBUTING.md): one process for every
       # file keeps the Qt / raster caches of hundreds of tests from piling up.
       - name: QC suite
+        timeout-minutes: 60
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then RUN="xvfb-run -a -s '-screen 0 1920x1080x24'"; else RUN=""; fi
           status=0
           run_part() {
             echo "::group::$1"
             rm -f canopie/qc/last_run_report.txt
-            eval $RUN python -m pytest "${@:2}" -q -p no:cacheprovider || status=1
+            eval $RUN python -m pytest "${@:2}" -v -p no:cacheprovider --timeout=600 --durations=15 || status=1
             mkdir -p qc_reports
             if [ -f canopie/qc/last_run_report.txt ]; then
               grep -E "TOTAL|FAILED" canopie/qc/last_run_report.txt || true
