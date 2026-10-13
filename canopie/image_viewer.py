@@ -3893,10 +3893,20 @@ class ImageViewer(QtWidgets.QGraphicsView):
                     self._wheel_sync_timer.setSingleShot(True)
                     self._wheel_sync_timer.setInterval(100)  # Reduced to 100ms
                     def _do_sync():
+                        # The timer can fire after this viewer was closed and its
+                        # zoom bar destroyed (a tab closed right after a wheel
+                        # zoom): calling into the freed C++ object was a native
+                        # access violation. Read the CURRENT bar and bail out on
+                        # anything gone or hidden (hideEvent also stops the timer).
                         try:
+                            import sip
+                            zb_now = getattr(self, "_zoombar", None)
+                            if (sip.isdeleted(self) or zb_now is None or sip.isdeleted(zb_now)
+                                    or not self.isVisible()):
+                                return
                             cur = self.current_zoom_factor() if hasattr(self, "current_zoom_factor") else None
                             if cur and not _ZoomBar._syncing:
-                                zb._sync_zoom_to_all_viewers(cur)
+                                zb_now._sync_zoom_to_all_viewers(cur)
                         except Exception:
                             pass
                     self._wheel_sync_timer.timeout.connect(_do_sync)
@@ -3917,6 +3927,19 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 self._wheel_coalesce_timer = timer
             if not timer.isActive():
                 timer.start()
+
+    def hideEvent(self, event):
+        # A hidden or closing viewer has nothing to sync, refine or zoom: stop
+        # what the last wheel zoom left pending (see _do_sync) so it cannot
+        # fire into a viewer being torn down.
+        for name in ("_wheel_sync_timer", "_wheel_coalesce_timer", "_highres_timer"):
+            t = getattr(self, name, None)
+            if t is not None:
+                try:
+                    t.stop()
+                except RuntimeError:
+                    pass
+        super().hideEvent(event)
 
     def mousePressEvent(self, event):
         self.setFocus(QtCore.Qt.MouseFocusReason)

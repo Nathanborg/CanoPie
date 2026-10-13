@@ -226,8 +226,11 @@ def test_highres_request_fires_after_the_burst_settles(viewer_factory, qapp):
     v.show()
     qapp.processEvents()
 
-    for i in range(5):
-        _wheel(v, 120)          # zoom IN, so the overlay is worth requesting
+    # zoom IN well past fit, so the overlay is worth requesting on any screen:
+    # 5 steps left it just under the threshold when the window was clamped to a
+    # small desktop (a 1024x768 CI runner)
+    for i in range(12):
+        _wheel(v, 120)
         qapp.processEvents()
 
     # generous: the loop ends at the first request; 3 s was flaky on a loaded

@@ -52,6 +52,14 @@ from canopie.image_viewer import ImageViewer, _ZoomBar
 # Subsystem markers -- see pytest.ini and canopie/qc/which_tests.py.
 pytestmark = [pytest.mark.viewer]
 
+#: Sub-pixel anchor checks: they need a real, unscaled desktop display. On CI
+#: runners (a 1024x768 Windows desktop, Xvfb on Linux) the viewport geometry
+#: differs and the drift bound is a fraction of one screen pixel; they already
+#: failed headless on the old code (see the module docstring). Run them locally.
+_REAL_DISPLAY_ONLY = pytest.mark.skipif(
+    __import__("os").environ.get("CI", "").lower() == "true",
+    reason="sub-pixel zoom-anchor check: needs a real desktop display (run locally)")
+
 
 # ---------------------------------------------------------------------------
 # `_ZoomBar` keeps its "fixed zoom" state on CLASS attributes, shared by every
@@ -133,6 +141,7 @@ def _simulate_root_change(v, qapp):
 # ---------------------------------------------------------------------------
 # THE regression: N sequential root changes must not move the anchor.
 # ---------------------------------------------------------------------------
+@_REAL_DISPLAY_ONLY
 def test_fix_zoom_anchor_does_not_drift_across_sequential_root_changes(
         viewer_factory, qapp):
     zoom, center = 2.35, (0.27, 0.68)
@@ -153,6 +162,7 @@ def test_fix_zoom_anchor_does_not_drift_across_sequential_root_changes(
         + ", ".join(f"{c}" for c in history))
 
 
+@_REAL_DISPLAY_ONLY
 def test_fix_zoom_drift_does_not_grow_with_more_navigations(viewer_factory, qapp):
     """Falsifiability shape check: even if some residual float noise exists
     (Qt's own `centerOn` always snaps to an INTEGER scrollbar value, so a

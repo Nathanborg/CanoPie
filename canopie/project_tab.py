@@ -13341,7 +13341,17 @@ class ProjectTab(QtWidgets.QWidget):
                 except Exception:
                     pass
             return 0.0
-        ax_mtime = _get_ax_mtime(filepath)
+        # The cache keys below use the .ax's mtime AND its content: file times
+        # tick every ~15 ms on Windows, so two .ax edits inside one tick had the
+        # same mtime and a re-export read the band math of the image BEFORE the
+        # second edit (found on CI; ax_cfg was just read from disk anyway).
+        try:
+            import hashlib as _hl
+            _ax_digest = _hl.sha1(json.dumps(ax_cfg, sort_keys=True, default=str).encode("utf-8")).hexdigest() \
+                if ax_cfg else ""
+        except Exception:
+            _ax_digest = ""
+        ax_mtime = (_get_ax_mtime(filepath), _ax_digest)
 
         # PERF 4: Compute project label once (was repeated per-row)
         project_label = (os.path.basename(os.path.normpath(self.project_folder))
