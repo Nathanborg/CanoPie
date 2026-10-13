@@ -82,6 +82,9 @@ A feature-level report is written to `canopie/qc/last_run_report.txt`. See [CONT
 Bug reports, questions and pull requests are welcome through the
 [issue tracker](https://github.com/Nathanborg/CanoPie/issues); see [CONTRIBUTING.md](CONTRIBUTING.md).
 
+### License
+CanoPie is released under the [MIT License](LICENSE).
+
 ### Citing CanoPie
 Gonçalves, N. B., & Stark, S. C. CanoPie: A Graphical User Interface for Multitemporal Canopy Imagery Data
 Analysis. (In revision, Journal of Open Source Software.) <https://github.com/Nathanborg/CanoPie>
