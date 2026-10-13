@@ -12,6 +12,7 @@ pystackreg
 scikit_learn==1.6.1
 scipy
 Shapely
+pyshp
 sip==6.7.12
 tifffile
 imagecodecs

@@ -35,6 +35,7 @@ dependencies = [
   "ExifRead",
   "pyproj",
   "shapely",
+  "pyshp",                           # shapefile import
   "scikit-learn>=1.2",
   "joblib",
   "matplotlib",
