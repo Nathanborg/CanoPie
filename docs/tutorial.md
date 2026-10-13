@@ -195,9 +195,12 @@ The same search works between orthomosaics and raw drone frames (located by thei
 GPS), between flights, in other projects or folders, and in phenocam frames. The
 **Canopy browser** pages through each crown on every date: drag an outline to move it,
 tick *Edit vertices* to reshape it, rotate a tile (only the view turns), or **Reject** a
-date. **Export crowns** writes, per crown, the crop of every date aligned on the first
-one (GeoTIFF or JPEG), each date's polygon (JSON) and a metadata CSV, by default into
-`canopie_example/canopy_exports/`.
+date. **Export crowns** writes, per crown, the crop of every date over the same ground
+and orientation as the first one, each at its own image's original resolution (GeoTIFF
+or JPEG), a metadata CSV, and the crown on every crop as CanoPie polygon files -- the
+crown's folder (by default in `canopie_example/canopy_exports/`) is itself a CanoPie
+project: **File > Load Project** on it shows every date side by side with the crown
+drawn.
 
 ## 11. Run the tests
 

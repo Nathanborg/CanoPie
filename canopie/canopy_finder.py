@@ -1870,11 +1870,32 @@ def _geo_extratags(src_fp, x0, y0, geo=None):
 # ════════════════════════════════════════════════════════════════════════
 # Aligned crown stack
 # ════════════════════════════════════════════════════════════════════════
-def aligned_crown(src, r, frames=None):
-    """The target's crown window resampled onto the SOURCE crown window: the
-    source square's own pixel grid (size, orientation, resolution), every file
-    band of the target, through its post-.ax frame. float32, NaN outside the
-    target. The found pose maps source-crop pixels to target frame pixels."""
+#: an aligned crop at a target's own resolution is capped at this many pixels
+NATIVE_CROP_MAX_PX = 64_000_000
+
+
+def native_scale(src, r):
+    """Target pixels per source-crop pixel at the found pose (its own
+    resolution relative to the source's), capped by NATIVE_CROP_MAX_PX."""
+    r0, c0, r1, c1 = src.bbox
+    sx, sy = r.extra.get("work_scale", (1.0, 1.0))
+    A = r.q2raw[:, :2] @ np.diag([1.0 / sx, 1.0 / sy])
+    f = math.sqrt(abs(np.linalg.det(A))) or 1.0
+    cap = math.sqrt(NATIVE_CROP_MAX_PX / max(1.0, float((r1 - r0) * (c1 - c0))))
+    return min(f, cap)
+
+
+def aligned_crown(src, r, frames=None, native=False):
+    """The target's crown window resampled onto the SOURCE crown window (same
+    ground extent and orientation), every file band of the target, through its
+    post-.ax frame. float32, NaN outside the target. The found pose maps
+    source-crop pixels to target frame pixels.
+
+    native=False: on the source crop's own pixel grid (same size: they stack).
+    native=True: at the TARGET's own resolution -- the source crop's extent
+    divided into pixels of the target's size, so a 2 cm raw frame matched from
+    a 15 cm mosaic keeps its 2 cm (the grid is native_scale(src, r) times the
+    source crop's). Returns the array (native=False) or (array, scale)."""
     frames = frames or _DEFAULT_FRAMES
     r0, c0, r1, c1 = src.bbox
     ch, cw = r1 - r0, c1 - c0
@@ -1882,6 +1903,30 @@ def aligned_crown(src, r, frames=None):
     M = np.empty((2, 3))
     M[:, :2] = r.q2raw[:, :2] @ np.diag([1.0 / sx, 1.0 / sy])
     M[:, 2] = r.q2raw[:, 2]
+    if native:
+        g = native_scale(src, r)
+        ow, oh = max(1, int(round(cw * g))), max(1, int(round(ch * g)))
+        Mn = np.empty((2, 3))
+        Mn[:, :2] = M[:, :2] @ np.diag([cw / float(ow), ch / float(oh)])        # output px -> source px -> target
+        Mn[:, 2] = M[:, 2]
+        corners = np.array([[0, 0], [ow, 0], [ow, oh], [0, oh]], np.float64) @ Mn[:, :2].T + Mn[:, 2]
+        x0, y0 = np.floor(corners.min(axis=0)) - 2
+        x1, y1 = np.ceil(corners.max(axis=0)) + 2
+        n = file_band_count(r.target_fp)
+        arr, valid, (fx, fy), (ox, oy) = frames.read(r.target_fp, r.extra.get("ax") or {}, x0, y0, x1, y1,
+                                                     list(range(n)), factor=1.0, zero_is_nodata=False)
+        arr = arr.astype(np.float32)
+        Mw = np.empty((2, 3))
+        Fi = np.diag([1.0 / fx, 1.0 / fy])
+        Mw[:, :2] = Fi @ Mn[:, :2]
+        Mw[:, 2] = Fi @ (Mn[:, 2] - (ox, oy))
+        flags = cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP
+        out = np.stack([cv2.warpAffine(arr[:, :, b], Mw, (ow, oh), flags=flags, borderMode=cv2.BORDER_CONSTANT,
+                                       borderValue=0) for b in range(arr.shape[2])], axis=2)
+        ok = cv2.warpAffine(valid.astype(np.float32), Mw, (ow, oh), flags=flags, borderMode=cv2.BORDER_CONSTANT,
+                            borderValue=0) > 0.999
+        out[~ok] = np.nan
+        return out, (ow / float(cw), oh / float(ch))
     corners = np.array([[0, 0], [cw, 0], [cw, ch], [0, ch]], np.float64) @ M[:, :2].T + M[:, 2]
     x0, y0 = np.floor(corners.min(axis=0)) - 2
     x1, y1 = np.ceil(corners.max(axis=0)) + 2
@@ -1944,9 +1989,26 @@ def _jpeg_u8(arr, bands, keep_u8):
     return out
 
 
-def _write_crop(src, arr, path, fmt, keep_u8):
-    """One crop on the SOURCE crown grid: a GeoTIFF with the source crop's
-    georeference (all bands), or a JPEG of the shown bands."""
+def _crop_geo(src, scale=(1.0, 1.0)):
+    """(GeoRef of a crop over the source crown window with pixels `scale`
+    times finer than the source's, GDAL geotransform) -- the crop's own grid."""
+    import dataclasses
+    r0, c0, r1, c1 = src.bbox
+    geo = src.geo
+    if geo is None or not geo.located:
+        return None, ("",) * 6
+    t = geo.transform
+    kx, ky = scale
+    gt = (t[0] + c0 * t[1] + r0 * t[2], t[1] / kx, t[2] / ky, t[3] + c0 * t[4] + r0 * t[5], t[4] / kx, t[5] / ky)
+    g = dataclasses.replace(geo, transform=gt, raw_w=int(round((c1 - c0) * kx)), raw_h=int(round((r1 - r0) * ky)),
+                            base=None)
+    return g, gt
+
+
+def _write_crop(src, arr, path, fmt, keep_u8, scale=(1.0, 1.0)):
+    """One crop over the source crown window, at `scale` x the source crop's
+    resolution: a GeoTIFF with that grid's georeference (all bands), or a JPEG
+    of the shown bands."""
     r0, c0, _r1, _c1 = src.bbox
     if fmt == "jpg":
         q = _jpeg_u8(arr, src.bands, keep_u8)
@@ -1956,49 +2018,58 @@ def _write_crop(src, arr, path, fmt, keep_u8):
             raise ValueError(f"cannot encode {os.path.basename(path)}")
         buf.tofile(path)
         return path
+    if tuple(scale) != (1.0, 1.0):
+        g, _gt = _crop_geo(src, scale)
+        return write_geotiff_crop(src.fp, arr, 0, 0, path, geo=g)
     return write_geotiff_crop(src.fp, arr, c0, r0, path, geo=src.geo)
 
 
 def _previous_export(meta_path):
-    """Files listed by an earlier export's metadata CSV (they are ours)."""
+    """Files listed by an earlier export's metadata CSV (they are ours), plus
+    the project files the export writes beside them."""
     import csv
+    out = ["project.json"]
     try:
         with open(meta_path, encoding="utf-8", newline="") as f:
-            return [v for row in csv.DictReader(f) for v in (row.get("file"), row.get("polygon_json")) if v]
+            out += [v for row in csv.DictReader(f) for v in (row.get("file"), row.get("polygon_json")) if v]
     except Exception:
-        return []
+        pass
+    return out
 
 
-def _write_polygon_json(path, crown, shape_type, role, image, points, ref, crop_pts, crop_file, extra=None):
-    """The crown's polygon on one exported image: in that IMAGE's frame as a
-    CanoPie polygon record (points / image_ref_size / coord_space, what the
-    project's polygons/*.json hold), and in the aligned CROP's pixels."""
+def _write_polygon_json(path, crown, shape_type, crop_pts, crop_wh, properties):
+    """The crown on one exported crop as a CanoPie polygon record -- the same
+    format as a project's polygons/<group>_<image>_polygons.json -- in that
+    crop's own pixels, so the exported folder opens in CanoPie with the crown
+    drawn on every crop. `properties` (CanoPie's per-polygon properties) keep
+    the match and the polygon in the ORIGINAL image's frame."""
     import json
-    rec = {"name": crown, "type": shape_type or "polygon", "coord_space": "image",
-           "points": [[round(float(x), 4), round(float(y), 4)] for x, y in points],
-           "image_ref_size": {"w": int(ref["w"]), "h": int(ref["h"])},
-           "image": image, "role": role, "crop_file": crop_file,
-           "crop_points": [[round(float(x), 3), round(float(y), 3)] for x, y in crop_pts]}
-    rec.update(extra or {})
+    rec = {"name": crown, "type": shape_type or "polygon", "coord_space": "image", "root": "1",
+           "points": [[round(float(x), 3), round(float(y), 3)] for x, y in crop_pts],
+           "image_ref_size": {"w": int(crop_wh[0]), "h": int(crop_wh[1])},
+           "properties": properties}
     with open(path, "w", encoding="utf-8") as f:
         json.dump(rec, f, indent=1)
-    return path
+    return path, rec
 
 
 def export_crowns(src, results, out_dir, fmt="tif", frames=None, saved=None):
     """The crown of `src` in every image it was found in, as crops ALIGNED on
-    the source crown crop (same grid, size and orientation: they stack), into
-    <out_dir>/<crown>_<source>/:
+    the source crown crop -- same ground extent and orientation -- each at its
+    own image's resolution (a finer target gives a larger crop: nothing is
+    downsampled), into <out_dir>/<crown>_<source>/:
 
       <crown>_00_SOURCE_<image>.<tif|jpg>   the source crop
       <crown>_01_<image>.<tif|jpg> ...      each target, by date then name
-      <crown>_00_SOURCE_<image>.json ...    the crown's polygon on each image
+      polygons/<crown>_<crop>_polygons.json the crown on each crop (CanoPie format)
+      project.json                          a CanoPie project: File > Load Project
       <crown>_metadata.csv                  one row per image
 
-    fmt "tif": GeoTIFF, every band, with the source crop's georeference (the
-    targets resampled onto it are float32, NaN outside the image); "jpg": the
-    shown bands, compressed (8-bit data as it is, else stretched per image).
-    The metadata holds the crop's geotransform, so JPEGs are located too.
+    fmt "tif": GeoTIFF, every band, georeferenced on the crop's own grid (the
+    targets are float32, NaN outside the image); "jpg": the shown bands,
+    compressed (8-bit data as it is, else stretched per image). The metadata
+    holds each crop's size, pixel size and geotransform, so JPEGs are located
+    too, and the polygon JSON holds the crown in each crop's pixels.
     `results`: the Results to write (the caller leaves rejected ones out);
     `saved`: optional {target path: saved state} for the metadata. Files of an
     earlier export of this crown into the same folder are replaced. Returns
@@ -2012,7 +2083,9 @@ def export_crowns(src, results, out_dir, fmt="tif", frames=None, saved=None):
     os.makedirs(d, exist_ok=True)
     meta_path = os.path.join(d, _META_NAME.format(group=group))
     for name in _previous_export(meta_path):
-        p = os.path.join(d, os.path.basename(name))
+        p = os.path.normpath(os.path.join(d, name))
+        if os.path.dirname(os.path.relpath(p, d)) not in ("", "polygons"):
+            continue                                   # only what an export writes
         if os.path.isfile(p):
             try:
                 os.remove(p)
@@ -2023,25 +2096,39 @@ def export_crowns(src, results, out_dir, fmt="tif", frames=None, saved=None):
     s_arr, s_valid, _f, _o = frames.read(src.fp, src.ax or {}, c0, r0, c1, r1, list(range(n)), zero_is_nodata=False)
     keep_u8 = np.asarray(s_arr).dtype == np.uint8
     geo = src.geo
-    t = geo.transform if geo is not None and geo.located else None
-    gt = ((t[0] + c0 * t[1] + r0 * t[2], t[1], t[2], t[3] + c0 * t[4] + r0 * t[5], t[4], t[5])
-          if t is not None else ("",) * 6)
-    common = {"crown": src.group, "source_image": src.fp, "width": c1 - c0, "height": r1 - r0,
-              "epsg": (geo.epsg or "") if geo is not None and geo.located else "",
-              "gt0_x": gt[0], "gt1_dx": gt[1], "gt2_rx": gt[2], "gt3_y": gt[3], "gt4_ry": gt[4], "gt5_dy": gt[5],
-              "pixel_size_m": round(float(min(src.gsd)), 6) if src.gsd else ""}
+
+    def grid(scale, shape):
+        _g, gt = _crop_geo(src, scale)
+        return {"width": int(shape[1]), "height": int(shape[0]),
+                "pixel_size_m": round(float(min(src.gsd)) / max(scale), 6) if src.gsd and geo.located else "",
+                "gt0_x": gt[0], "gt1_dx": gt[1], "gt2_rx": gt[2], "gt3_y": gt[3], "gt4_ry": gt[4], "gt5_dy": gt[5]}
+    common = {"crown": src.group, "source_image": src.fp,
+              "epsg": (geo.epsg or "") if geo is not None and geo.located else ""}
     ext = ".jpg" if fmt == "jpg" else ".tif"
     rows, written = [], []
     name = f"{group}_00_SOURCE_{_safe(sstem)}{ext}"
     written.append(_write_crop(src, s_arr, os.path.join(d, name), fmt, keep_u8))
-    crop_pts = np.asarray(src.raw_pts, np.float64) - (c0, r0)           # the same on every (aligned) crop
+    crop_pts = np.asarray(src.raw_pts, np.float64) - (c0, r0)           # in source-crop pixels
     s_pts, s_ref, _in = geo.to_record(src.raw_pts)
-    jname = os.path.splitext(name)[0] + ".json"
-    written.append(_write_polygon_json(os.path.join(d, jname), src.group, src.shape_type, "source", src.fp,
-                                       s_pts, s_ref, crop_pts, name))
+    pdir = os.path.join(d, "polygons")
+    os.makedirs(pdir, exist_ok=True)
+    project_polys, crop_files = {}, []
+
+    def polygon_file(crop_name, pts, wh, props):
+        stem = os.path.splitext(crop_name)[0]
+        rel = f"polygons/{src.group}_{stem}_polygons.json"
+        pth, rec = _write_polygon_json(os.path.join(d, rel), src.group, src.shape_type, pts, wh, props)
+        written.append(pth)
+        crop_fp = os.path.join(d, crop_name).replace("\\", "/")
+        project_polys[crop_fp] = rec
+        crop_files.append(crop_fp)
+        return rel
+    jname = polygon_file(name, crop_pts, (np.asarray(s_arr).shape[1], np.asarray(s_arr).shape[0]),
+                         {"role": "source", "image": src.fp, "image_points": [list(p) for p in s_pts],
+                          "image_ref_size": s_ref})
     cm = src.cmask
-    rows.append(dict(common, file=name, polygon_json=jname, role="source", image=os.path.basename(src.fp),
-                     image_path=src.fp,
+    rows.append(dict(common, **grid((1.0, 1.0), np.asarray(s_arr).shape), file=name, polygon_json=jname,
+                     role="source", image=os.path.basename(src.fp), image_path=src.fp,
                      date=_date_of(src.fp), status="source", score="", offset_m="", rotation_deg="", scale="",
                      method="", saved="", bands=int(np.asarray(s_arr).shape[2]),
                      crown_valid_frac=round(float((s_valid & cm).sum()) / max(1, int(cm.sum())), 4)))
@@ -2049,31 +2136,31 @@ def export_crowns(src, results, out_dir, fmt="tif", frames=None, saved=None):
     found.sort(key=lambda r: (_date_of(r.target_fp) or "9999", os.path.basename(r.target_fp).lower()))
     for k, r in enumerate(found, start=1):
         try:
-            a = aligned_crown(src, r, frames)
+            a, sc = aligned_crown(src, r, frames, native=True)
         except Exception as e:
             logging.warning("[canopy_finder] aligned crown of %s: %s", r.target_fp, e)
             continue
         tstem = os.path.splitext(os.path.basename(r.target_fp))[0]
         name = f"{group}_{k:02d}_{_safe(tstem)}{ext}"
         t_u8 = keep_u8 and file_dtype_is_u8(r.target_fp)
-        written.append(_write_crop(src, a, os.path.join(d, name), fmt, t_u8))
-        jname = os.path.splitext(name)[0] + ".json"
-        if r.record_points is not None and r.image_ref_size:
-            written.append(_write_polygon_json(
-                os.path.join(d, jname), src.group, src.shape_type, "target", r.target_fp, r.record_points,
-                r.image_ref_size, crop_pts, name,
-                {"status": r.status, "score": None if r.score is None else round(float(r.score), 4),
-                 "offset_m": round(r.offset_m, 3), "rotation_deg": round(r.angle, 3), "method": r.method}))
-        else:
-            jname = ""
+        written.append(_write_crop(src, a, os.path.join(d, name), fmt, t_u8, scale=sc))
+        jname = polygon_file(
+            name, crop_pts * np.asarray(sc), (a.shape[1], a.shape[0]),
+            {"role": "target", "image": r.target_fp, "status": r.status,
+             "score": None if r.score is None else round(float(r.score), 4), "offset_m": round(r.offset_m, 3),
+             "rotation_deg": round(r.angle, 3), "method": r.method,
+             "image_points": [[float(x), float(y)] for x, y in (r.record_points or [])],
+             "image_ref_size": r.image_ref_size})
         ok = np.isfinite(a).all(axis=2)
-        rows.append(dict(common, file=name, polygon_json=jname, role="target", image=os.path.basename(r.target_fp),
+        cm_t = cv2.resize(cm.astype(np.uint8), (a.shape[1], a.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
+        rows.append(dict(common, **grid(sc, a.shape), file=name, polygon_json=jname, role="target",
+                         image=os.path.basename(r.target_fp),
                          image_path=r.target_fp, date=_date_of(r.target_fp), status=r.status,
                          score="" if r.score is None else round(float(r.score), 4),
                          offset_m=round(r.offset_m, 3), rotation_deg=round(r.angle, 3),
                          scale=r.extra.get("scale", ""), method=r.method,
                          saved=(saved or {}).get(r.target_fp, ""), bands=int(a.shape[2]),
-                         crown_valid_frac=round(float((ok & cm).sum()) / max(1, int(cm.sum())), 4)))
+                         crown_valid_frac=round(float((ok & cm_t).sum()) / max(1, int(cm_t.sum())), 4)))
     cols = ["file", "polygon_json", "role", "crown", "image", "date", "status", "score", "offset_m", "rotation_deg", "scale",
             "method", "saved", "bands", "width", "height", "crown_valid_frac", "pixel_size_m", "epsg",
             "gt0_x", "gt1_dx", "gt2_rx", "gt3_y", "gt4_ry", "gt5_dy", "image_path", "source_image"]
@@ -2083,6 +2170,17 @@ def export_crowns(src, results, out_dir, fmt="tif", frames=None, saved=None):
         for row in rows:
             wr.writerow(row)
     written.append(meta_path)
+    # the folder is a CanoPie project: one root with every crop, the crown on each
+    import json
+    proj = {"project_name": f"{src.group} -- {sstem}", "mode": "rgb_only", "root_offset": 0,
+            "current_root_index": 0, "root_coordinates": {}, "rgb_folder_path": d.replace("\\", "/"),
+            "batch_size": max(1, len(crop_files)), "multispectral_root_names": [str(src.group)],
+            "multispectral_image_data_groups": {str(src.group): crop_files},
+            "all_polygons": {str(src.group): project_polys}}
+    pj = os.path.join(d, "project.json")
+    with open(pj, "w", encoding="utf-8") as f:
+        json.dump(proj, f, indent=1)
+    written.append(pj)
     return d, written
 
 

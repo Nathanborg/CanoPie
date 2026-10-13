@@ -76,8 +76,9 @@ Images can come from the current root, every root of the project, or other folde
 each folder treated as one flight). The crown is registered with StackReg (rigid body) or an exhaustive
 rotation and shift search, saved as the same polygon group on each image, and can be reviewed (moved, reshaped,
 rejected) in the canopy browser. **Export crowns** writes, per crown, the source crop and every image's crop
-aligned on it (GeoTIFF or JPEG), the crown polygon of each image (JSON), and a metadata CSV, by default into
-`canopy_exports` inside the project.
+over the same ground and orientation, each at its own image's original resolution (GeoTIFF or JPEG), a metadata
+CSV, and the crown on every crop as CanoPie polygon files: each crown's folder (by default in `canopy_exports`
+inside the project) opens in CanoPie with **File > Load Project**.
 
 ### Running the tests
 ```sh

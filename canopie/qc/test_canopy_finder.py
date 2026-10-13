@@ -232,37 +232,73 @@ def _meta(d):
         return list(csv.DictReader(f))
 
 
-def test_the_export_is_the_aligned_crops_and_one_metadata_csv(scene, tmp_path):
-    """Only what is needed: the source crop, each target's crop aligned on it
-    (same grid and georeference), one metadata CSV -- nothing else."""
+def _poly_files(d):
+    pdir = os.path.join(d, "polygons")
+    return {f: json.load(open(os.path.join(pdir, f), encoding="utf-8")) for f in sorted(os.listdir(pdir))}
+
+
+def test_the_export_is_the_aligned_crops_at_their_own_resolution(scene, tmp_path):
+    """The source crop and each target's crop over the same ground, each at its
+    OWN image's resolution (the 20 cm target is not stretched to the 15 cm
+    source grid), CanoPie polygon files, a CanoPie project and one metadata CSV."""
     from ..shapefile_io import get_geotiff_transform
     ctx = CF.prepare_source(scene.src, scene.record(), {}, {"method": "stackreg"})
     ctx.group = "crown"
     r = CF.find_in_target(ctx, scene.tgt, {}, {"method": "stackreg"})
     d, files = CF.export_crowns(ctx, [r], str(tmp_path), fmt="tif", saved={scene.tgt: "saved"})
-    assert sorted(os.listdir(d)) == sorted(os.path.basename(f) for f in files)
-    assert len(files) == 5 and os.path.basename(d) == "crown_src"          # 2 crops + 2 polygons + csv
-    src_f = next(f for f in files if "_00_SOURCE_" in f)
-    tgt_f = next(f for f in files if "_01_" in f)
+    assert os.path.basename(d) == "crown_src"
+    assert sorted(os.listdir(d)) == sorted(["crown_00_SOURCE_src.tif", "crown_01_tgt.tif", "crown_metadata.csv",
+                                            "polygons", "project.json"])
+    src_f, tgt_f = os.path.join(d, "crown_00_SOURCE_src.tif"), os.path.join(d, "crown_01_tgt.tif")
     r0, c0, r1, c1 = ctx.bbox
     raw = tifffile.imread(scene.src)
     assert np.array_equal(tifffile.imread(src_f), raw[r0:r1, c0:c1])          # the source pixels as they are
     ts, tt = get_geotiff_transform(src_f)[0], get_geotiff_transform(tgt_f)[0]
-    assert np.allclose(ts, tt) and abs(ts[0] - (OX + c0 * GSD)) < 1e-6 and abs(ts[3] - (OY - r0 * GSD)) < 1e-6
-    assert tifffile.imread(tgt_f).shape == raw[r0:r1, c0:c1].shape
+    assert abs(ts[1] - GSD) < 1e-9 and abs(abs(tt[1]) - scene.tgsd) < 0.01 * scene.tgsd    # each its own pixel size
+    assert abs(tt[0] - ts[0]) < 1e-6 and abs(tt[3] - ts[3]) < 1e-6                         # the same ground
+    al = tifffile.imread(tgt_f)
+    k = GSD / scene.tgsd
+    assert abs(al.shape[0] - (r1 - r0) * k) <= 1 and abs(al.shape[1] - (c1 - c0) * k) <= 1
     rows = _meta(d)
     assert [x["role"] for x in rows] == ["source", "target"]
     assert rows[1]["status"] == "found" and rows[1]["saved"] == "saved" and float(rows[1]["score"]) > 0.5
-    assert rows[1]["file"] == os.path.basename(tgt_f) and rows[1]["image_path"] == scene.tgt
-    assert abs(float(rows[0]["gt0_x"]) - ts[0]) < 1e-6 and float(rows[1]["crown_valid_frac"]) > 0.9
-    # the polygon of each registered image: a CanoPie record in that image's frame + the crop's pixels
-    js = {x["role"]: json.load(open(os.path.join(d, x["polygon_json"]), encoding="utf-8")) for x in rows}
+    assert int(rows[1]["width"]) == al.shape[1] and abs(float(rows[1]["pixel_size_m"]) - scene.tgsd) < 1e-3
+    assert abs(float(rows[1]["gt1_dx"]) - tt[1]) < 1e-9 and float(rows[1]["crown_valid_frac"]) > 0.9
+    # CanoPie polygon files, in each crop's pixels
+    polys = _poly_files(d)
+    assert sorted(polys) == ["crown_crown_00_SOURCE_src_polygons.json", "crown_crown_01_tgt_polygons.json"]
+    ps, pt_ = polys["crown_crown_00_SOURCE_src_polygons.json"], polys["crown_crown_01_tgt_polygons.json"]
+    for rec, img in ((ps, raw[r0:r1, c0:c1]), (pt_, al)):
+        assert rec["name"] == "crown" and rec["coord_space"] == "image"
+        assert rec["image_ref_size"] == {"w": img.shape[1], "h": img.shape[0]}
+    assert np.abs(np.asarray(ps["points"]) - (ctx.raw_pts - (c0, r0))).max() < 1e-2
+    assert np.abs(np.asarray(pt_["points"]) - np.asarray(ps["points"]) * k).max() < 1.0
     tg = CF.frame_for(scene.tgt)
-    assert np.abs(tg.from_record(js["target"]) - np.asarray(r.raw_pts)).max() < 1e-3
-    assert np.abs(CF.frame_for(scene.src).from_record(js["source"]) - ctx.raw_pts).max() < 1e-3
-    assert js["target"]["crop_points"] == js["source"]["crop_points"]
-    assert js["target"]["crop_file"] == os.path.basename(tgt_f) and js["target"]["status"] == "found"
-    assert np.abs(np.asarray(js["source"]["crop_points"]) - (ctx.raw_pts - (c0, r0))).max() < 1e-2
+    assert np.abs(tg.from_record({"points": pt_["properties"]["image_points"], "coord_space": "image",
+                                   "image_ref_size": pt_["properties"]["image_ref_size"]})
+                  - np.asarray(r.raw_pts)).max() < 1e-3
+    assert pt_["properties"]["status"] == "found" and rows[1]["polygon_json"] == "polygons/crown_crown_01_tgt_polygons.json"
+
+
+def test_a_finer_target_keeps_its_resolution(scene, tmp_path):
+    """The other way round -- the crown drawn on the 20 cm image, found in the
+    15 cm one: the target crop is LARGER than the source crop (nothing is
+    downsampled to the source's resolution)."""
+    from ..shapefile_io import get_geotiff_transform
+    T = scene.truth()
+    m = scene.m
+    rec = {"points": T.tolist(), "coord_space": "image", "image_ref_size": {"w": m, "h": m}}
+    ctx = CF.prepare_source(scene.tgt, rec, {}, {"method": "stackreg"})
+    ctx.group = "c"
+    r = CF.find_in_target(ctx, scene.src, {}, {"method": "stackreg"})
+    assert r.status == "found"
+    d, _files = CF.export_crowns(ctx, [r], str(tmp_path))
+    s_img = tifffile.imread(os.path.join(d, "c_00_SOURCE_tgt.tif"))
+    t_img = tifffile.imread(os.path.join(d, "c_01_src.tif"))
+    k = scene.tgsd / GSD
+    assert t_img.shape[0] > s_img.shape[0] and abs(t_img.shape[0] - s_img.shape[0] * k) <= 1
+    tt = get_geotiff_transform(os.path.join(d, "c_01_src.tif"))[0]
+    assert abs(abs(tt[1]) - GSD) < 0.01 * GSD
 
 
 def test_a_jpeg_export_keeps_8_bit_pixels_and_is_located_by_the_csv(scene, tmp_path):
@@ -270,17 +306,52 @@ def test_a_jpeg_export_keeps_8_bit_pixels_and_is_located_by_the_csv(scene, tmp_p
     ctx.group = "crown"
     r = CF.find_in_target(ctx, scene.tgt, {}, {"method": "stackreg"})
     d, files = CF.export_crowns(ctx, [r], str(tmp_path), fmt="jpg")
-    jpgs = [f for f in files if f.endswith(".jpg")]
-    assert len(jpgs) == 2 and len(files) == 5
+    jpgs = sorted(f for f in files if f.endswith(".jpg"))
+    assert len(jpgs) == 2
     r0, c0, r1, c1 = ctx.bbox
     raw = tifffile.imread(scene.src)[r0:r1, c0:c1]
     got = cv2.cvtColor(cv2.imread(next(f for f in jpgs if "_SOURCE_" in f)), cv2.COLOR_BGR2RGB)
     assert got.shape == raw.shape and np.abs(got.astype(int) - raw.astype(int)).mean() < 4   # not re-stretched
     al = cv2.imread(next(f for f in jpgs if "_01_" in f))
-    assert al.shape == raw.shape
+    k = GSD / scene.tgsd
+    assert abs(al.shape[0] - raw.shape[0] * k) <= 1                                        # the target's own size
     rows = _meta(d)
-    assert rows[0]["gt0_x"] and rows[0]["epsg"] == "32721"
-    assert os.path.getsize(jpgs[0]) < raw.nbytes / 3                               # compressed
+    assert rows[0]["gt0_x"] and rows[0]["epsg"] == "32721" and int(rows[1]["width"]) == al.shape[1]
+    assert os.path.getsize(jpgs[0]) < raw.nbytes / 3                                       # compressed
+    assert _poly_files(d)["crown_crown_01_tgt_polygons.json"]["image_ref_size"] == {"w": al.shape[1], "h": al.shape[0]}
+
+
+def test_an_exported_crown_folder_opens_in_canopie_with_the_crown_on_every_crop(scene, tmp_path, qapp):
+    from PyQt5 import QtWidgets
+    from ..canopy_finder_dialog import record_scene_polygon
+    from ..project_tab import ProjectTab
+    ctx = CF.prepare_source(scene.src, scene.record(), {}, {"method": "stackreg"})
+    ctx.group = "crown"
+    r = CF.find_in_target(ctx, scene.tgt, {}, {"method": "stackreg"})
+    d, _files = CF.export_crowns(ctx, [r], str(tmp_path), fmt="tif")
+    tabs = QtWidgets.QTabWidget()
+    pt = ProjectTab("exported", tabs)
+    try:
+        pt.load_project(d)
+        _pump(qapp, 10.0, lambda: len(pt.viewer_widgets) == 2 and all(
+            getattr(w["viewer"], "_image", None) is not None for w in pt.viewer_widgets))
+        _pump(qapp, 1.0)
+        assert sorted(os.path.basename(w["image_data"].filepath) for w in pt.viewer_widgets) == \
+            ["crown_00_SOURCE_src.tif", "crown_01_tgt.tif"]
+        polys = _poly_files(d)
+        for w in pt.viewer_widgets:
+            v = w["viewer"]
+            stem = os.path.splitext(os.path.basename(w["image_data"].filepath))[0]
+            rec = polys[f"crown_{stem}_polygons.json"]
+            drawn = [p["item"] for p in v.polygons if getattr(p.get("item"), "name", None) == "crown"]
+            assert len(drawn) == 1, stem
+            it = drawn[0]
+            got = np.array([[it.mapToScene(it.polygon[i]).x(), it.mapToScene(it.polygon[i]).y()]
+                            for i in range(it.polygon.count())])
+            want = np.array([[q.x(), q.y()] for q in record_scene_polygon(v, rec["points"], rec["image_ref_size"])])
+            assert got.shape == want.shape and np.abs(got - want).max() < 1.0, stem
+    finally:
+        pt.deleteLater()
 
 
 # ───────────────────────── the app: menus, dialog, browser ─────────────────────────
@@ -989,9 +1060,10 @@ def test_a_biased_ground_size_is_still_found(flight, tmp_path, monkeypatch, bias
 
 @pytest.mark.parametrize("rotate", [0, 90])
 def test_the_aligned_crops_show_the_source_crown(scene, tmp_path, rotate):
-    """Each target resampled onto the source crown crop: the same pixels as the
-    source on the crown (within interpolation), the source crop's grid and
-    georeference -- also from a rotated source frame."""
+    """Each target resampled over the source crown window at its own
+    resolution: the same pixels as the source on the crown (within
+    interpolation, once the source is brought to the target's pixel size) --
+    also from a rotated source frame."""
     n = scene.B.shape[0]
     ax = {"rotate": rotate} if rotate else {}
     e = np.asarray(CF.G.forward_np(CF.G.frame_plan(ax, n, n)[0], scene.P)) if rotate else scene.P
@@ -1000,16 +1072,17 @@ def test_the_aligned_crops_show_the_source_crown(scene, tmp_path, rotate):
     r = CF.find_in_target(ctx, scene.tgt, {}, {"method": "stackreg"})
     assert r.status == "found"
     d, files = CF.export_crowns(ctx, [r], str(tmp_path))
-    src_sq = tifffile.imread(next(f for f in files if "_SOURCE_" in f)).astype(np.float32)
-    al_f = next(f for f in files if "_01_" in f)
+    src_sq = tifffile.imread(next(f for f in files if "_SOURCE_" in f and f.endswith(".tif"))).astype(np.float32)
+    al_f = next(f for f in files if "_01_" in f and f.endswith(".tif"))
     al = tifffile.imread(al_f).astype(np.float32)
-    assert al.shape == src_sq.shape
+    src_at_t = cv2.resize(src_sq, (al.shape[1], al.shape[0]), interpolation=cv2.INTER_AREA)
+    cm = cv2.resize(ctx.cmask.astype(np.uint8), (al.shape[1], al.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
+    cm = cv2.erode(cm.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
     # the target is 0.8 x + 20 of the source (other light): undo it and compare on the crown
-    cm = ctx.cmask
     ok = cm & np.isfinite(al).all(axis=2)
     assert ok.sum() > 0.9 * cm.sum()
-    diff = np.abs((al[ok] - 20.0) / 0.8 - src_sq[ok])
-    assert np.median(diff) < 6.0, np.median(diff)
+    diff = np.abs((al[ok] - 20.0) / 0.8 - src_at_t[ok])
+    assert np.median(diff) < 8.0, np.median(diff)
     if rotate:
         assert 34264 in tifffile.TiffFile(al_f).pages[0].tags, "a rotated source frame: a ModelTransformation"
 
@@ -1037,7 +1110,9 @@ def test_rejected_images_are_left_out_of_the_export(geo_project, qapp):
     names = [x["image"] for x in _meta(d)]
     assert os.path.basename(imgs[2]) not in names and len(names) == 2
     assert not any(os.path.splitext(os.path.basename(imgs[2]))[0] in f for f in os.listdir(d))
-    assert len(os.listdir(d)) == 5                       # source + 1 target (crop + polygon each) + metadata
+    assert sorted(f for f in os.listdir(d) if os.path.isfile(os.path.join(d, f)) and f.endswith(".tif")) == \
+        sorted(f for f in os.listdir(d) if f.endswith(".tif")) and len([f for f in os.listdir(d) if f.endswith(".tif")]) == 2
+    assert len(os.listdir(os.path.join(d, "polygons"))) == 2                 # the rejected image's polygon is gone
     # the table restores it
     dlg.set_rejected(row, False)
     assert any(x["fp"] == imgs[2] for x in b.entries)
