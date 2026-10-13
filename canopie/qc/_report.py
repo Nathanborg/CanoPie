@@ -184,11 +184,21 @@ FEATURE_MAP = {
         "the windowed analysis image equals the whole-image replay for crop, every rotation, integer and odd down-sizes, "
         "NoData (number / expression / NaN), booleans, appended bands and mask polygons -- in one window, in odd-sized "
         "windows and in row strips; steps needing the whole image are refused; a huge full band is refused, not attempted"),
+    "test_preview_px_resize": (
+        "A pixel resize on a decimated preview",
+        "viewer and editor apply the export's resize FACTOR to a preview (they blew it back up to the full size); "
+        "the editor's resize boxes and save work in full-frame pixels and an open + save writes no resize; "
+        "a full image keeps the exact pixel size"),
     "test_stretch_dialog_previews": (
         "The stretch dialog on preview-loaded rasters",
         "a preview loads the file band its stretch shows; 'all viewers' loads it into every preview and draws it; a "
         "band the viewer does not hold is saved as its file band (not band 1); the dialog opens on the saved band and "
-        "keeps the saved Absolute range (it reset it to the band's data range on every open)"),
+        "keeps the saved Absolute range (it reset it to the band's data range on every open); an image without the "
+        "band a root / project stretch shows keeps its own display (and its own stretch); reloaded bands keep the .ax crop"),
+    "test_polygon_zoom": (
+        "Polygon manager: click and Zoom to polygon",
+        "a list click pans only, Zoom to polygon fits a real polygon with a native-resolution cap; the zoom rect is "
+        "where the polygon is drawn -- also on a decimated COG / mosaic preview with an .ax (it drifted ~7x off)"),
     "test_polygon_sync_scaling": (
         "A synced polygon keeps its place on every image of the root",
         "drawn with sync on, the copies sit at the same fraction of each frame (as copy-to-root) and are stamped "
