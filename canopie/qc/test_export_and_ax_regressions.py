@@ -1037,3 +1037,35 @@ def test_a_user_chosen_stretch_is_never_auto_dropped():
         "display_image_group applies a resolved stretch without clearing the "
         "automatic-pin marker, so a single-band view the user deliberately "
         "chose would later be auto-dropped as if the app had set it")
+
+
+def test_the_byte_budgeted_cache_never_deadlocks_on_pop_or_eviction():
+    """Python 3.10's C OrderedDict.pop() of a subclass calls the subclass's
+    __getitem__, which takes the cache lock again while pop()/eviction holds it.
+    With a plain Lock the image editor froze on Apply (CI, Python 3.10). Here
+    the re-entry is forced on any Python version: every operation runs while
+    the lock is already held by the same thread, as that nested call does."""
+    import threading
+    c = ByteBudgetedLRUDict(10 ** 6)
+    c["a"] = np.zeros(10)
+    c["b"] = np.zeros(10)
+    done = []
+
+    def nested():
+        with c._cache_lock:
+            _ = c["a"]
+            c.pop("a", None)
+            c["c"] = np.zeros(10)
+            del c["b"]
+            done.append(True)
+    t = threading.Thread(target=nested, daemon=True)
+    t.start()
+    t.join(5)
+    assert done == [True], "the cache lock is not reentrant: pop/__getitem__/eviction deadlock"
+    # eviction under a tiny budget, with the lock held
+    small = ByteBudgetedLRUDict(1)
+    with small._cache_lock:
+        small["x"] = np.zeros(1000)
+        small["y"] = np.zeros(1000)
+    assert len(small) <= 1
+
