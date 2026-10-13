@@ -265,9 +265,9 @@ class CanopyBrowser(QtWidgets.QWidget):
         self.save_all_btn = QtWidgets.QPushButton("Save all")
         self.save_all_btn.setToolTip("Save every outline not saved yet on this project's images")
         self.save_all_btn.clicked.connect(self._save_all)
-        self.export_btn = QtWidgets.QPushButton("Export this crown…")
-        self.export_btn.setToolTip("Registration squares / aligned crown stack of the crown shown "
-                                   "(the dialog's export options)")
+        self.export_btn = QtWidgets.QPushButton("Export this crown")
+        self.export_btn.setToolTip("Aligned crops of this crown (rejected images left out) + metadata CSV, "
+                                   "in the dialog's export format and folder")
         self.export_btn.clicked.connect(lambda: self.dlg.export(groups=[self.group]))
         self.filter = QtWidgets.QComboBox()
         for label, key in (("All", "all"), ("Found", "found"), ("Low score", "low_score"),
@@ -317,7 +317,7 @@ class CanopyBrowser(QtWidgets.QWidget):
                "external": False, "status": "source", "score": None, "ax": ctx.ax or {}}
         out = [src]
         rows = sorted(((i, r, t, s) for i, (r, t, s) in enumerate(results)
-                       if r.has_polygon and t.get("group", self.group) == self.group),
+                       if r.has_polygon and t.get("group", self.group) == self.group and not t.get("rejected")),
                       key=lambda e: -(e[1].score if e[1].score is not None else -2))
         for i, r, t, s in rows:
             x0, y0, x1, y1 = r.square
@@ -492,7 +492,13 @@ class CanopyBrowser(QtWidgets.QWidget):
         self._build_page()
 
     def result_changed(self, row):
-        """The dialog moved a result (dragged in a grid viewer): follow it."""
+        """The dialog moved, rejected or restored a result: follow it."""
+        if self.ctx is not None and any(e.get("row") == row for e in self.entries) != \
+                (not self.dlg.results[row][1].get("rejected")
+                 and self.dlg.results[row][0].has_polygon
+                 and self.dlg.results[row][1].get("group", self.group) == self.group):
+            self._show_crown(self.group)
+            return
         r = self.dlg.results[row][0]
         for e in self.entries:
             if e.get("row") == row and r.raw_pts is not None:
@@ -523,6 +529,12 @@ class CanopyBrowser(QtWidgets.QWidget):
         self._build_page()
 
     def _reject(self, e):
+        """Leave this image out of Save all and the export (the dialog's table
+        can restore it). It only left this window before: the export kept it."""
+        if e.get("row") is not None:
+            self.dlg.results[e["row"]][1]["rejected"] = True
+            self.dlg._update_row(e["row"])
+            self.dlg._drop_temp_outline(e["row"])
         self.visible = [x for x in self.visible if x is not e]
         self.entries = [x for x in self.entries if x is not e]
         self.set_page(self.page, force=True)

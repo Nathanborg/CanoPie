@@ -2897,7 +2897,10 @@ class PolygonManager(QtWidgets.QDialog):
         if action == edit_action:
             self.edit_selected_polygons(target_groups)
         elif action == find_action:
-            self.find_canopy_for_group(clicked_group)
+            if len(target_groups) > 1:
+                self.find_canopy_for_groups(target_groups)
+            else:
+                self.find_canopy_for_group(clicked_group)
         elif action == delete_action:
             self.delete_selected_polygons(target_groups)
         elif action == copy_action:
@@ -3074,24 +3077,36 @@ class PolygonManager(QtWidgets.QDialog):
             lay.addWidget(btns)
 
             dlg.exec_()
-    def find_canopy_for_group(self, group):
-        """Open the crown finder for `group`, sourced from the first viewer of
-        this root that holds it (else any image holding it)."""
+    def _canopy_source_of(self, group):
+        """The image a crown is searched from: the first viewer of this root
+        holding it, else any image holding it (any root)."""
         parent = self.parent()
-        if not group or not hasattr(parent, "open_canopy_finder"):
-            return
         from .canopy_finder_dialog import existing_record
-        src = None
         for w, viewer in self._iter_viewers():
             fp = getattr(w.get("image_data"), "filepath", None)
             if fp and existing_record(parent, group, fp)[1] is not None:
-                src = fp
-                break
-        if src is None:
-            src = next(iter((parent.all_polygons.get(group) or {}).keys()), None)
-        if src is None:
+                return fp
+        return next(iter((parent.all_polygons.get(group) or {}).keys()), None)
+
+    def find_canopy_for_group(self, group):
+        """Open the crown finder for `group`."""
+        parent = self.parent()
+        if not group or not hasattr(parent, "open_canopy_finder"):
             return
-        parent.open_canopy_finder(group, src)
+        src = self._canopy_source_of(group)
+        if src is not None:
+            parent.open_canopy_finder(group, src)
+
+    def find_canopy_for_groups(self, groups):
+        """Open the crown finder for several crowns at once -- each from its own
+        image, whatever root it is in."""
+        parent = self.parent()
+        if not groups or not hasattr(parent, "open_canopy_finder"):
+            return
+        pairs = [(g, self._canopy_source_of(g)) for g in groups]
+        pairs = [(g, fp) for g, fp in pairs if fp is not None]
+        if pairs:
+            parent.open_canopy_finder(pairs[0][0], pairs[0][1], crowns=pairs)
 
     def _iter_viewers(self):
         """

@@ -36,7 +36,7 @@ from . import ax_geometry as G
 
 __all__ = ["DEFAULTS", "GeoRef", "georef", "map_px", "local_affine", "gsd_m",
            "record_to_raw", "raw_to_record", "read_raw_window", "prepare_source",
-           "find_in_target", "frame_for", "pair_kind", "write_geotiff_crop", "write_summary", "SourceContext",
+           "find_in_target", "frame_for", "pair_kind", "write_geotiff_crop", "export_crowns", "SourceContext",
            "Result", "compute_polygon_bbox", "build_canopy_mask", "exhaustive_align",
            "stackreg_align"]
 
@@ -1867,75 +1867,6 @@ def _geo_extratags(src_fp, x0, y0, geo=None):
     return extratags
 
 
-def write_summary(results, out_dir, source=None):
-    import csv
-    import json
-    rows = []
-    for r in results:
-        rows.append({
-            "target": r.target_fp, "status": r.status, "message": r.message, "method": r.method,
-            "score": None if r.score is None else round(float(r.score), 4),
-            "ncc_window": None if r.ncc_window is None else round(float(r.ncc_window), 4),
-            "ncc_mask": None if r.ncc_mask is None else round(float(r.ncc_mask), 4),
-            "angle_deg": round(r.angle, 3), "offset_m": round(r.offset_m, 3),
-            "offset_px_x": round(r.offset_px[0], 2), "offset_px_y": round(r.offset_px[1], 2),
-            "square": list(r.square) if r.square else None, "seconds": round(r.seconds, 3),
-        })
-    meta = {"source": getattr(source, "fp", None), "group": getattr(source, "group", None), "targets": rows}
-    with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
-    with open(os.path.join(out_dir, "summary.csv"), "w", encoding="utf-8", newline="") as f:
-        wr = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else ["target"])
-        wr.writeheader()
-        for row in rows:
-            wr.writerow({k: (json.dumps(v) if isinstance(v, list) else v) for k, v in row.items()})
-    return out_dir
-
-
-def export_result(src, r, out_dir, *, native=True, aligned=False, quicklook=False, frames=None):
-    """Files for one target. The square is cut from the target's post-.ax frame
-    (what its viewer shows), all file bands, georeferenced. Returns the paths."""
-    os.makedirs(out_dir, exist_ok=True)
-    frames = frames or _DEFAULT_FRAMES
-    ax = r.extra.get("ax") or {}
-    geo = r.extra.get("frame")
-    written = []
-    stem = os.path.splitext(os.path.basename(r.target_fp))[0]
-    if native and r.square:
-        x0, y0, x1, y1 = r.square
-        n = file_band_count(r.target_fp)
-        arr, _v, _f, _o = frames.read(r.target_fp, ax, x0, y0, x1, y1, list(range(n)), zero_is_nodata=False)
-        written.append(write_geotiff_crop(r.target_fp, arr, x0, y0,
-                                          os.path.join(out_dir, f"{stem}_square.tif"), geo=geo))
-    if aligned and r.extra.get("aligned_u8") is not None:
-        p = os.path.join(out_dir, f"{stem}_aligned.png")
-        a = r.extra["aligned_u8"]
-        cv2.imwrite(p, cv2.cvtColor(a, cv2.COLOR_RGB2BGR) if a.ndim == 3 and a.shape[2] == 3 else a)
-        written.append(p)
-    if quicklook and r.square and r.raw_pts is not None:
-        x0, y0, x1, y1 = r.square
-        arr, v, _f, _o = frames.read(r.target_fp, ax, x0, y0, x1, y1, src.bands)
-        q = to_uint8(arr, v)
-        q = np.ascontiguousarray(q[:, :, :3] if q.shape[2] >= 3 else np.repeat(q[:, :, :1], 3, axis=2))
-        pts = np.round(np.asarray(r.raw_pts) - (x0, y0)).astype(np.int32).reshape(-1, 1, 2)
-        cv2.polylines(q, [pts], True, (255, 255, 0), max(1, q.shape[0] // 300))
-        p = os.path.join(out_dir, f"{stem}_quicklook.png")
-        cv2.imwrite(p, cv2.cvtColor(q, cv2.COLOR_RGB2BGR))
-        written.append(p)
-    return written
-
-
-def export_source_square(src, out_dir, frames=None):
-    os.makedirs(out_dir, exist_ok=True)
-    frames = frames or _DEFAULT_FRAMES
-    r0, c0, r1, c1 = src.bbox
-    n = file_band_count(src.fp)
-    arr, _v, _f, _o = frames.read(src.fp, src.ax or {}, c0, r0, c1, r1, list(range(n)), zero_is_nodata=False)
-    stem = os.path.splitext(os.path.basename(src.fp))[0]
-    return write_geotiff_crop(src.fp, arr, c0, r0, os.path.join(out_dir, f"SOURCE_{stem}_square.tif"),
-                              geo=src.geo)
-
-
 # ════════════════════════════════════════════════════════════════════════
 # Aligned crown stack
 # ════════════════════════════════════════════════════════════════════════
@@ -1987,51 +1918,184 @@ def _date_of(path):
     return f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else ""
 
 
-def export_aligned_stack(src, results, out_dir, frames=None):
-    """For one crown: every found target resampled onto the source crown window
-    (aligned_crown) -- aligned/<target>_aligned.tif each, with the source
-    square's georeference, plus aligned_stack.tif (page 0 = the source square)
-    and aligned_stack.csv (page -> image, date, status, score, offset, rotation,
-    scale). Returns the written paths."""
+EXPORT_FORMATS = {"tif": "GeoTIFF (all bands)", "jpg": "JPEG (compressed)"}
+_META_NAME = "{group}_metadata.csv"
+
+
+def _safe(name):
+    return "".join(c if (c.isalnum() or c in "-_.") else "_" for c in str(name)).strip("_") or "crown"
+
+
+def _jpeg_u8(arr, bands, keep_u8):
+    """(h, w, 1 or 3) uint8 of the shown bands for a JPEG: 8-bit data as it is,
+    anything else stretched (0.5-99.5 %) over its valid pixels; outside = 0."""
+    a = np.asarray(arr)
+    b = [k for k in bands if k < a.shape[2]] or [0]
+    a = a[:, :, b[:3]]
+    valid = np.isfinite(a).all(axis=2) if np.issubdtype(a.dtype, np.floating) else np.ones(a.shape[:2], bool)
+    if keep_u8:
+        out = np.where(valid[:, :, None], np.nan_to_num(a), 0)
+        out = np.clip(out, 0, 255).astype(np.uint8)
+    else:
+        out = to_uint8(np.nan_to_num(a.astype(np.float32)), valid)
+        out[~valid] = 0
+    if out.shape[2] == 2:
+        out = out[:, :, :1]
+    return out
+
+
+def _write_crop(src, arr, path, fmt, keep_u8):
+    """One crop on the SOURCE crown grid: a GeoTIFF with the source crop's
+    georeference (all bands), or a JPEG of the shown bands."""
+    r0, c0, _r1, _c1 = src.bbox
+    if fmt == "jpg":
+        q = _jpeg_u8(arr, src.bands, keep_u8)
+        img = q[:, :, 0] if q.shape[2] == 1 else cv2.cvtColor(q, cv2.COLOR_RGB2BGR)
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if not ok:
+            raise ValueError(f"cannot encode {os.path.basename(path)}")
+        buf.tofile(path)
+        return path
+    return write_geotiff_crop(src.fp, arr, c0, r0, path, geo=src.geo)
+
+
+def _previous_export(meta_path):
+    """Files listed by an earlier export's metadata CSV (they are ours)."""
     import csv
-    import tifffile
+    try:
+        with open(meta_path, encoding="utf-8", newline="") as f:
+            return [v for row in csv.DictReader(f) for v in (row.get("file"), row.get("polygon_json")) if v]
+    except Exception:
+        return []
+
+
+def _write_polygon_json(path, crown, shape_type, role, image, points, ref, crop_pts, crop_file, extra=None):
+    """The crown's polygon on one exported image: in that IMAGE's frame as a
+    CanoPie polygon record (points / image_ref_size / coord_space, what the
+    project's polygons/*.json hold), and in the aligned CROP's pixels."""
+    import json
+    rec = {"name": crown, "type": shape_type or "polygon", "coord_space": "image",
+           "points": [[round(float(x), 4), round(float(y), 4)] for x, y in points],
+           "image_ref_size": {"w": int(ref["w"]), "h": int(ref["h"])},
+           "image": image, "role": role, "crop_file": crop_file,
+           "crop_points": [[round(float(x), 3), round(float(y), 3)] for x, y in crop_pts]}
+    rec.update(extra or {})
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(rec, f, indent=1)
+    return path
+
+
+def export_crowns(src, results, out_dir, fmt="tif", frames=None, saved=None):
+    """The crown of `src` in every image it was found in, as crops ALIGNED on
+    the source crown crop (same grid, size and orientation: they stack), into
+    <out_dir>/<crown>_<source>/:
+
+      <crown>_00_SOURCE_<image>.<tif|jpg>   the source crop
+      <crown>_01_<image>.<tif|jpg> ...      each target, by date then name
+      <crown>_00_SOURCE_<image>.json ...    the crown's polygon on each image
+      <crown>_metadata.csv                  one row per image
+
+    fmt "tif": GeoTIFF, every band, with the source crop's georeference (the
+    targets resampled onto it are float32, NaN outside the image); "jpg": the
+    shown bands, compressed (8-bit data as it is, else stretched per image).
+    The metadata holds the crop's geotransform, so JPEGs are located too.
+    `results`: the Results to write (the caller leaves rejected ones out);
+    `saved`: optional {target path: saved state} for the metadata. Files of an
+    earlier export of this crown into the same folder are replaced. Returns
+    (folder, written paths)."""
+    import csv
+    fmt = "jpg" if str(fmt).lower() in ("jpg", "jpeg") else "tif"
     frames = frames or _DEFAULT_FRAMES
-    adir = os.path.join(out_dir, "aligned")
-    os.makedirs(adir, exist_ok=True)
+    group = _safe(src.group or "crown")
+    sstem = os.path.splitext(os.path.basename(src.fp))[0]
+    d = os.path.join(out_dir, f"{group}_{_safe(sstem)}")
+    os.makedirs(d, exist_ok=True)
+    meta_path = os.path.join(d, _META_NAME.format(group=group))
+    for name in _previous_export(meta_path):
+        p = os.path.join(d, os.path.basename(name))
+        if os.path.isfile(p):
+            try:
+                os.remove(p)
+            except OSError as e:
+                logging.warning("[canopy_finder] could not replace %s: %s", p, e)
     r0, c0, r1, c1 = src.bbox
     n = file_band_count(src.fp)
-    s_arr, _v, _f, _o = frames.read(src.fp, src.ax or {}, c0, r0, c1, r1, list(range(n)), zero_is_nodata=False)
-    tags = _geo_extratags(src.fp, c0, r0, src.geo)
-    pages = [("SOURCE", src.fp, np.asarray(s_arr, np.float32), None)]
-    written = []
-    for r in results:
-        if not r.has_polygon:
-            continue
+    s_arr, s_valid, _f, _o = frames.read(src.fp, src.ax or {}, c0, r0, c1, r1, list(range(n)), zero_is_nodata=False)
+    keep_u8 = np.asarray(s_arr).dtype == np.uint8
+    geo = src.geo
+    t = geo.transform if geo is not None and geo.located else None
+    gt = ((t[0] + c0 * t[1] + r0 * t[2], t[1], t[2], t[3] + c0 * t[4] + r0 * t[5], t[4], t[5])
+          if t is not None else ("",) * 6)
+    common = {"crown": src.group, "source_image": src.fp, "width": c1 - c0, "height": r1 - r0,
+              "epsg": (geo.epsg or "") if geo is not None and geo.located else "",
+              "gt0_x": gt[0], "gt1_dx": gt[1], "gt2_rx": gt[2], "gt3_y": gt[3], "gt4_ry": gt[4], "gt5_dy": gt[5],
+              "pixel_size_m": round(float(min(src.gsd)), 6) if src.gsd else ""}
+    ext = ".jpg" if fmt == "jpg" else ".tif"
+    rows, written = [], []
+    name = f"{group}_00_SOURCE_{_safe(sstem)}{ext}"
+    written.append(_write_crop(src, s_arr, os.path.join(d, name), fmt, keep_u8))
+    crop_pts = np.asarray(src.raw_pts, np.float64) - (c0, r0)           # the same on every (aligned) crop
+    s_pts, s_ref, _in = geo.to_record(src.raw_pts)
+    jname = os.path.splitext(name)[0] + ".json"
+    written.append(_write_polygon_json(os.path.join(d, jname), src.group, src.shape_type, "source", src.fp,
+                                       s_pts, s_ref, crop_pts, name))
+    cm = src.cmask
+    rows.append(dict(common, file=name, polygon_json=jname, role="source", image=os.path.basename(src.fp),
+                     image_path=src.fp,
+                     date=_date_of(src.fp), status="source", score="", offset_m="", rotation_deg="", scale="",
+                     method="", saved="", bands=int(np.asarray(s_arr).shape[2]),
+                     crown_valid_frac=round(float((s_valid & cm).sum()) / max(1, int(cm.sum())), 4)))
+    found = [r for r in results if r.has_polygon]
+    found.sort(key=lambda r: (_date_of(r.target_fp) or "9999", os.path.basename(r.target_fp).lower()))
+    for k, r in enumerate(found, start=1):
         try:
             a = aligned_crown(src, r, frames)
         except Exception as e:
             logging.warning("[canopy_finder] aligned crown of %s: %s", r.target_fp, e)
             continue
-        stem = os.path.splitext(os.path.basename(r.target_fp))[0]
-        p = os.path.join(adir, f"{stem}_aligned.tif")
-        written.append(write_geotiff_crop(src.fp, a, c0, r0, p, geo=src.geo))
-        pages.append((stem, r.target_fp, a, r))
-    stack = os.path.join(out_dir, "aligned_stack.tif")
-    with tifffile.TiffWriter(stack) as tw:
-        for _name, _fp, a, _r in pages:
-            data = a[:, :, 0] if a.shape[2] == 1 else a
-            kw = {} if a.shape[2] == 1 else {"planarconfig": "contig"}
-            tw.write(data, photometric="minisblack", compression="deflate", extratags=tags, **kw)
-    written.append(stack)
-    csvp = os.path.join(out_dir, "aligned_stack.csv")
-    with open(csvp, "w", encoding="utf-8", newline="") as f:
-        wr = csv.writer(f)
-        wr.writerow(["page", "image", "date", "bands", "status", "score", "offset_m", "rotation_deg", "scale"])
-        for i, (name, fp, a, r) in enumerate(pages):
-            wr.writerow([i, os.path.basename(fp), _date_of(fp), a.shape[2],
-                         "source" if r is None else r.status,
-                         "" if r is None or r.score is None else round(float(r.score), 4),
-                         "" if r is None else round(r.offset_m, 3), "" if r is None else round(r.angle, 3),
-                         "" if r is None else r.extra.get("scale", "")])
-    written.append(csvp)
-    return written
+        tstem = os.path.splitext(os.path.basename(r.target_fp))[0]
+        name = f"{group}_{k:02d}_{_safe(tstem)}{ext}"
+        t_u8 = keep_u8 and file_dtype_is_u8(r.target_fp)
+        written.append(_write_crop(src, a, os.path.join(d, name), fmt, t_u8))
+        jname = os.path.splitext(name)[0] + ".json"
+        if r.record_points is not None and r.image_ref_size:
+            written.append(_write_polygon_json(
+                os.path.join(d, jname), src.group, src.shape_type, "target", r.target_fp, r.record_points,
+                r.image_ref_size, crop_pts, name,
+                {"status": r.status, "score": None if r.score is None else round(float(r.score), 4),
+                 "offset_m": round(r.offset_m, 3), "rotation_deg": round(r.angle, 3), "method": r.method}))
+        else:
+            jname = ""
+        ok = np.isfinite(a).all(axis=2)
+        rows.append(dict(common, file=name, polygon_json=jname, role="target", image=os.path.basename(r.target_fp),
+                         image_path=r.target_fp, date=_date_of(r.target_fp), status=r.status,
+                         score="" if r.score is None else round(float(r.score), 4),
+                         offset_m=round(r.offset_m, 3), rotation_deg=round(r.angle, 3),
+                         scale=r.extra.get("scale", ""), method=r.method,
+                         saved=(saved or {}).get(r.target_fp, ""), bands=int(a.shape[2]),
+                         crown_valid_frac=round(float((ok & cm).sum()) / max(1, int(cm.sum())), 4)))
+    cols = ["file", "polygon_json", "role", "crown", "image", "date", "status", "score", "offset_m", "rotation_deg", "scale",
+            "method", "saved", "bands", "width", "height", "crown_valid_frac", "pixel_size_m", "epsg",
+            "gt0_x", "gt1_dx", "gt2_rx", "gt3_y", "gt4_ry", "gt5_dy", "image_path", "source_image"]
+    with open(meta_path, "w", encoding="utf-8", newline="") as f:
+        wr = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+        wr.writeheader()
+        for row in rows:
+            wr.writerow(row)
+    written.append(meta_path)
+    return d, written
+
+
+def file_dtype_is_u8(fp):
+    """The file's samples are 8-bit (a JPEG / 8-bit TIFF): kept as they are in a JPEG export."""
+    if not str(fp).lower().endswith((".tif", ".tiff")):
+        return True
+    try:
+        rd = _reader(fp)
+        if rd is not None:
+            return np.dtype(rd.profile.dtype) == np.uint8
+        import tifffile
+        with tifffile.TiffFile(fp) as tif:
+            return tif.pages[0].dtype == np.uint8
+    except Exception:
+        return False

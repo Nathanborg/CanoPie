@@ -22965,9 +22965,10 @@ class ProjectTab(QtWidgets.QWidget):
             self.polygon_manager.set_polygons(all_polygon_groups)
             self.polygon_manager.show()
 
-    def open_canopy_finder(self, group, source_fp):
+    def open_canopy_finder(self, group, source_fp, crowns=None):
         """'Find canopy in other images…' (viewer polygon menu, polygon manager):
-        one non-modal finder per tab, re-aimed at the clicked crown."""
+        one non-modal finder per tab, re-aimed at the clicked crown. `crowns`:
+        [(group, source image)] -- several crowns at once, from any root."""
         from .canopy_finder_dialog import CanopyFinderDialog
         dlg = getattr(self, "_canopy_finder_dialog", None)
         try:
@@ -22982,6 +22983,8 @@ class ProjectTab(QtWidgets.QWidget):
         except RuntimeError:            # the Qt side was deleted
             dlg = CanopyFinderDialog(self, group, source_fp)
             self._canopy_finder_dialog = dlg
+        if crowns:
+            dlg.set_crowns(crowns)
         dlg.show(); dlg.raise_(); dlg.activateWindow()
         return dlg
 

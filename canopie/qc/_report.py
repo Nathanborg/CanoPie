@@ -220,7 +220,11 @@ FEATURE_MAP = {
         "priority) give the result of one search after another, also for GPS-only frames; a replaced or "
         "browser-edited crown replaces the outline drawn in the grid viewer; the dialog sections fold; a crown "
         "dragged in a rotated browser tile lands where it was put on the (unrotated) image; a mosaic with no "
-        "data under the crown does not hold it"),
+        "data under the crown does not hold it; the export is only the source crop + each target's crop aligned "
+        "on it (GeoTIFF or JPEG) + one metadata CSV, into the project's canopy_exports by default, rejected "
+        "images left out (a re-export drops their earlier files), with each image's crown polygon as JSON (its own "
+        "frame + the crop's pixels); crowns selected together in the polygon manager, from different roots, are "
+        "each searched from their own image"),
     "test_polygon_sync_scaling": (
         "A synced polygon keeps its place on every image of the root",
         "drawn with sync on, the copies sit at the same fraction of each frame (as copy-to-root) and are stamped "
