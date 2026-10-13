@@ -8,7 +8,7 @@ tags:
   - thermal imagery
   - multispectral imagery
   - forest ecology
-  - image registration
+  - time series
 authors:
   - name: Nathan B. Gonçalves
     # orcid: 0000-0000-0000-0000   # TODO: add the ORCID
@@ -97,25 +97,33 @@ through time after correcting the raw images to radiance, so that a single
 project CSV tracks the statistics of those trees across dates while retaining
 all image metadata.
 
-Beyond polygon-based extraction, CanoPie now **finds the same crown in other
-images**. A crown outlined once is located, saved under the same polygon
-group, and exported in every other image that holds it, across:
+In practice, a CanoPie project provides:
 
-- orthomosaics of different dates, coordinate systems, and resolutions
-  (through their GeoTIFF georeference);
-- orthomosaics and raw UAV frames, in both directions: raw frames are located
-  from EXIF GPS and a camera model, and GPS-only cameras without
-  height-above-ground or heading (e.g., FLIR Duo Pro R, MicaSense) are
-  calibrated from the overlap of consecutive frames of their own flight line;
-- raw frames of different flights and dates;
-- phenocam images, matched in image coordinates.
-
-Candidate images are chosen by a KD-tree on their GPS positions; the crown is
-then registered with the StackReg (TurboReg) rigid-body method
-[@thevenaz1998pyramid] or an exhaustive rotation and shift search scored by
-normalized cross-correlation. The result is exported as aligned crown crops on
-a common grid (GeoTIFF or JPEG), one polygon file per image, and a metadata
-CSV -- a ready-made time series of the same tree.
+- **Projects and roots**: images grouped into *roots* -- the bands of one
+  capture, the sensors of one flight, or one phenocam timestamp -- shown side by
+  side in synchronized viewers; two folders (e.g., multispectral and thermal/RGB)
+  can be paired with an offset, and GPS positions are shown on a map.
+- **Polygon and point annotation**: groups of polygons (e.g., one per tree)
+  drawn once and synchronized across the images of a root, managed in a polygon
+  manager, imported from and exported to shapefiles, and drawn at interactive
+  speed for thousands of crowns.
+- **Non-destructive editing**: crop, rotation, resizing, histogram matching,
+  band registration, NoData rules, band math and vegetation indices (e.g., NDVI,
+  GCC, ExG), boolean masks, and derived bands, applied to one image, a root, or
+  the whole project without altering the original files.
+- **Data extraction**: per-polygon statistics of every band and index, written
+  to CSV together with each image's EXIF metadata and timestamp, so the same
+  trees can be compared across dates and sensors.
+- **Machine learning**: pixel classification with scikit-learn models trained
+  from labelled polygons, and export of thumbnails and segmentation masks for
+  deep-learning datasets.
+- **Large rasters and image selection**: orthomosaics and Cloud-Optimized
+  GeoTIFFs are read window by window, and phenocam series can be filtered by
+  similarity to a reference image.
+- **Crown matching across images**: a crown drawn once can be located in other
+  orthomosaics, raw UAV frames (from EXIF GPS), or phenocam images, registered
+  with StackReg [@thevenaz1998pyramid], saved as the same polygon group, and
+  exported as aligned crops.
 
 ![Multiple sensors, with different bands and resolutions, loaded and annotated in CanoPie.\label{fig:overview}](figures/canopie_overview.png)
 
@@ -135,43 +143,47 @@ utilities correct frames to radiance or reflectance but provide no
 multitemporal annotation or extraction. CanoPie complements rather than
 replaces these tools: it reads their outputs (corrected frames, orthomosaics,
 phenocam images) and adds the missing piece -- a single interactive project in
-which the same crowns are drawn, edited, registered, and measured across
+which the same crowns are drawn, edited, and measured across
 sensors, roots (groups of co-registered images), and dates. Contributing this
 to an existing package was not practical, as none of them are built around
 frame-level, multitemporal polygon management with non-destructive edits.
 
 # Software design
 
-A CanoPie project groups images into *roots*: sets shown side by side in
-synchronized viewers (e.g., the bands, sensors, or dates of one site). Edits
--- crop, rotation, resize, band math, NoData rules, histogram matching, band
-registration, classification -- are never written into the images; they are
-stored in a small `.ax` sidecar per image and replayed identically by the
-viewer, the CSV and machine-learning exports, and the pixel inspector, so the
-statistics a user exports are those of the pixels they see. Polygons are
-stored per image as JSON records relative to the edited frame, so they stay on
-their object when an edit changes the geometry.
+CanoPie is a PyQt5 application organized around a project controller that
+loads images into roots, renders them in synchronized viewers, and owns the
+polygon store; dialogs (image editor, polygon manager, machine-learning
+manager, crown finder) operate on that shared state. Three design choices shape
+the software.
 
-Large rasters (orthomosaics of tens of gigapixels, COGs) are read window by
-window from their overviews, with the `.ax` replay computed per window rather
-than on the whole image; this trades some code complexity for analyses that
-fit in memory on a laptop. The crown finder is a Qt-free module: each image is
-described by a georeference (GeoTIFF, an EXIF camera model, or its own pixel
-frame) composed with its `.ax` geometry, and matching happens on a working grid
-at the coarser of the two resolutions, so a 2 cm raw frame is never compared
-pixel by pixel with a 15 cm mosaic. CanoPie does not orthorectify: raw-frame
-locations rely on GPS and a nadir camera model, and registration solves for a
-rigid transform plus scale, which suits individual crowns but not
-terrain-induced distortion over large areas. Because the registration library
-holds Python's global interpreter lock, searches and flight-line calibrations
-run in worker processes at below-normal priority, keeping the interface
-responsive. EXIF data are read from file headers and cached per image folder,
-so a folder of thousands of frames is indexed once.
+First, edits are never written into the images. Each image's edits -- crop,
+rotation, resize, histogram matching, band registration, NoData rules, band
+expressions, classification -- are stored in a small `.ax` sidecar and
+replayed in a fixed order by every consumer: the viewer, the CSV and
+machine-learning exports, and the pixel inspector. A statistic exported from
+CanoPie is therefore computed from exactly the pixels the user sees, and the
+original radiometry can always be recovered.
+
+Second, polygons are stored per image as JSON records relative to the edited
+frame, so a polygon stays on its object when an edit changes the image
+geometry, and the same group name links a tree across images and dates in the
+exported CSV.
+
+Third, CanoPie favours responsiveness on ordinary laptops over raw throughput.
+Images load asynchronously, exports run in background workers, band math uses
+NumExpr when available, polygons are drawn from simplified levels of detail
+when zoomed out, and rasters too large for memory are processed window by
+window from their overviews instead of as whole images. The trade-off is added
+code complexity in the replay paths, which is controlled by keeping one
+canonical implementation of each step. CanoPie deliberately does not
+orthorectify: analyses stay in each frame's own geometry, which preserves
+radiometry but means that locating objects in raw frames relies on GPS and
+simple camera models rather than on a terrain model.
 
 CanoPie ships with an automated quality-control suite (`canopie/qc`, more than
-1,700 pytest tests with a feature-level report) covering geometry replays,
-exports, polygon handling, and registration on synthetic scenes with known
-answers.
+1,700 pytest tests with a feature-level report) covering the edit replays,
+exports, band math, classification, polygon handling, and crown matching on
+synthetic scenes with known answers.
 
 # Research impact statement
 
