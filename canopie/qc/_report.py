@@ -199,6 +199,10 @@ FEATURE_MAP = {
         "Polygon manager: click and Zoom to polygon",
         "a list click pans only, Zoom to polygon fits a real polygon with a native-resolution cap; the zoom rect is "
         "where the polygon is drawn -- also on a decimated COG / mosaic preview with an .ax (it drifted ~7x off)"),
+    "test_example_project": (
+        "The tutorial's example project",
+        "examples/make_example_project.py writes the roots, images, crowns and training classes docs/tutorial.md "
+        "lists; the crowns are found at the documented offsets, and tree_3's NDVI drops on the last date"),
     "test_canopy_finder": (
         "Find canopy in other images (GeoTIFF)",
         "a crown goes through world coordinates (any CRS / resolution) and the .ax crop into other GeoTIFFs and the "
