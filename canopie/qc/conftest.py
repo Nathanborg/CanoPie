@@ -95,6 +95,14 @@ def pytest_sessionfinish(session, exitstatus):
 
 
 def pytest_unconfigure(config):
+    # os._exit() discards Python's buffered output: when stdout is a pipe (CI,
+    # a log file) the collection errors and the failure details were lost.
+    import sys
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
     os._exit(_exit_status["code"])
 
 

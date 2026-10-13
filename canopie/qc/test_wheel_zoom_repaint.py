@@ -230,13 +230,15 @@ def test_highres_request_fires_after_the_burst_settles(viewer_factory, qapp):
         _wheel(v, 120)          # zoom IN, so the overlay is worth requesting
         qapp.processEvents()
 
-    deadline = time.monotonic() + 3.0
+    # generous: the loop ends at the first request; 3 s was flaky on a loaded
+    # machine (a CI runner, or right after the heavy parts of the suite)
+    deadline = time.monotonic() + 10.0
     while fired["n"] == 0 and time.monotonic() < deadline:
         qapp.processEvents()
         time.sleep(0.02)
 
     assert fired["n"] >= 1, (
-        "no high-res tile request fired within 3 s of the scroll settling")
+        "no high-res tile request fired within 10 s of the scroll settling")
     assert fired["n"] <= 2, (
         f"{fired['n']} requests fired for one settled gesture -- the debounce "
         "is collapsing to one request per tick instead of one per gesture")

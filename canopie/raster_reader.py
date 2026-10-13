@@ -636,12 +636,22 @@ class ByteBudgetedLRUDict(OrderedDict):
         self._budget = int(budget_bytes)
         self._bytes = 0
         self._sizeof = sizeof_fn or estimate_cache_entry_bytes
-        # REENTRANT: on Python 3.10 the C OrderedDict.pop() of a subclass calls
-        # the subclass's own __getitem__ -- which takes this lock again inside
-        # pop() / the eviction in __setitem__. A plain Lock deadlocked there
-        # (the image editor froze on Apply when an edit dropped a cached image;
-        # found by CI on Python 3.10, Python 3.12 does not make that call).
+        # Python 3.10's C OrderedDict.pop()/popitem() of a SUBCLASS call the
+        # subclass's own __getitem__ and __delitem__: a byte total subtracted
+        # twice, a KeyError on the second delete, and -- with a plain Lock --
+        # a deadlock (the image editor froze on Apply; found by CI on 3.10,
+        # 3.12 does not dispatch). So the mutators below never call
+        # super().pop()/popitem(): they use _take(), the base class's own
+        # __getitem__/__delitem__, which never re-dispatch. The lock is also
+        # reentrant, so a nested call cannot deadlock either way.
         self._cache_lock = threading.RLock()
+
+    def _take(self, key):
+        """Remove `key` (lock held) through the base class only; its value."""
+        value = OrderedDict.__getitem__(self, key)
+        OrderedDict.__delitem__(self, key)
+        self._bytes -= self._sizeof(value)
+        return value
 
     def __setitem__(self, key, value):
         with self._cache_lock:
@@ -651,13 +661,11 @@ class ByteBudgetedLRUDict(OrderedDict):
             self.move_to_end(key)
             self._bytes += self._sizeof(value)
             while self._bytes > self._budget and len(self):
-                oldest_key = next(iter(self))
-                self._bytes -= self._sizeof(super().pop(oldest_key))
+                self._take(next(iter(self)))
 
     def __delitem__(self, key):
         with self._cache_lock:
-            self._bytes -= self._sizeof(super().__getitem__(key))
-            super().__delitem__(key)
+            self._take(key)
 
     def __getitem__(self, key):
         with self._cache_lock:
@@ -668,14 +676,17 @@ class ByteBudgetedLRUDict(OrderedDict):
     def pop(self, key, *default):
         with self._cache_lock:
             if key in self:
-                self._bytes -= self._sizeof(super().__getitem__(key))
-            return super().pop(key, *default)
+                return self._take(key)
+            if default:
+                return default[0]
+            raise KeyError(key)
 
     def popitem(self, last=True):
         with self._cache_lock:
-            key, value = super().popitem(last=last)
-            self._bytes -= self._sizeof(value)
-            return key, value
+            if not len(self):
+                raise KeyError("popitem(): dictionary is empty")
+            key = next(reversed(self)) if last else next(iter(self))
+            return key, self._take(key)
 
     def clear(self):
         with self._cache_lock:
@@ -699,8 +710,7 @@ class ByteBudgetedLRUDict(OrderedDict):
         with self._cache_lock:
             self._budget = int(budget_bytes)
             while self._bytes > self._budget and len(self):
-                oldest_key = next(iter(self))
-                self._bytes -= self._sizeof(super().pop(oldest_key))
+                self._take(next(iter(self)))
 
     @property
     def nbytes(self):
