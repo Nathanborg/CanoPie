@@ -6370,11 +6370,30 @@ class ProjectTab(QtWidgets.QWidget):
         return [op for op in out if op in ("crop", "rotate", "resize")] or ["crop", "rotate", "resize"]
 
       
-    def _get_exif_data_with_optional_path(self, files):
+    #: the user cancelled "Locate exiftool.exe" this session: do not ask again
+    _exiftool_prompt_declined = False
+
+    def _exiftool_may_ask(self, ask):
+        """Ask for exiftool.exe only when the caller is an explicit EXIF action
+        (ask=True), only once per session, and only on the GUI thread -- never
+        while saving polygons or from a background export (a modal file dialog
+        in the middle of a save, or from a worker thread, which can hang)."""
+        if not ask or ProjectTab._exiftool_prompt_declined:
+            return False
+        try:
+            from PyQt5 import QtCore, QtWidgets
+            app = QtWidgets.QApplication.instance()
+            return app is not None and QtCore.QThread.currentThread() is app.thread()
+        except Exception:
+            return False
+
+    def _get_exif_data_with_optional_path(self, files, ask=False):
         """
         Return {abs_normcase_path: {tag: value}}.
-        Try helper w/ exiftool_path, then helper w/o, then subprocess with self.exiftool_path,
-        and finally prompt once for exiftool.exe if still missing.
+        Try helper w/ exiftool_path, then helper w/o, then subprocess with self.exiftool_path.
+        If exiftool is still missing: ask for exiftool.exe only when `ask` (an
+        explicit EXIF action -- see _exiftool_may_ask); otherwise, and if the
+        user cancels, return empty tags so the caller goes on without EXIF.
         """
         import os, logging
 
@@ -6412,11 +6431,17 @@ class ProjectTab(QtWidgets.QWidget):
             if d:
                 return {_normkey(k): v for k, v in d.items()}
         except FileNotFoundError:
-            # Ask once
+            if not self._exiftool_may_ask(ask):
+                logging.warning("exiftool not found: going on without EXIF for %d file(s) "
+                                "(File > Set exiftool Path to add it).", len(files))
+                return {_normkey(p): {} for p in files}
             from PyQt5 import QtWidgets
             path, _ = QtWidgets.QFileDialog.getOpenFileName(
-                self, "Locate exiftool.exe", "", "Executable (exiftool*.exe);;All Files (*)"
+                self, "Locate exiftool.exe (Cancel: continue without EXIF)", "",
+                "Executable (exiftool*.exe);;All Files (*)"
             )
+            if not path:
+                ProjectTab._exiftool_prompt_declined = True
             if path:
                 self.set_exiftool_path(path)
                 try:
@@ -16429,7 +16454,7 @@ class ProjectTab(QtWidgets.QWidget):
         # Build EXIF map / tags per option
         if include_exif_opt:
             with self._busy_dialog("Extracting EXIF…"):
-                raw_exif = self._get_exif_data_with_optional_path(filepaths_with_polygons)
+                raw_exif = self._get_exif_data_with_optional_path(filepaths_with_polygons, ask=True)
                 raw_exif = {_normkey(k): v for k, v in (raw_exif or {}).items()}
                 sanitized_exif, sanitized_tags = self._sanitize_exif_map_for_csv(
                     raw_exif, filepaths_with_polygons
@@ -17877,7 +17902,7 @@ class ProjectTab(QtWidgets.QWidget):
         
         # Fetch EXIF for all paths (reuses your same helpers)
         try:
-            raw_exif = self._get_exif_data_with_optional_path(normed_paths) or {}
+            raw_exif = self._get_exif_data_with_optional_path(normed_paths, ask=True) or {}
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "EXIF Error", f"Failed to read EXIF from files:\n{e}")
             try:

@@ -156,6 +156,14 @@ def _no_modal_dialogs(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _never_ask_for_exiftool(monkeypatch):
+    """The suite never waits on "Locate exiftool.exe": on a machine without a
+    configured exiftool (CI) that file dialog blocked forever. Whether exiftool
+    is installed must not decide whether a test can finish."""
+    monkeypatch.setattr(project_tab_module.ProjectTab, "_exiftool_prompt_declined", True, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _restore_global_app_state():
     """Snapshot and restore module/class-level state that tests can mutate.
 
