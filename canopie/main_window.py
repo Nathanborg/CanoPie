@@ -124,7 +124,8 @@ class MainWindow(QMainWindow):
         logging.info(f"Log file: {self.logfile}")
 
     def init_ui(self):
-        self.setWindowTitle("CanoPie V_1_0_0")
+        from ._version import __version__
+        self.setWindowTitle(f"CanoPie {__version__}")
         self.setGeometry(100, 100, 1200, 800)
 
         # Create the QTabWidget for managing tabs
