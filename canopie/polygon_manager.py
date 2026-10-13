@@ -1200,44 +1200,34 @@ class PolygonManager(QtWidgets.QDialog):
         except Exception:
             pass
             
+        # THE SAME MAPPING load_polygons DRAWS WITH: a record is stored relative to
+        # the post-.ax frame (fractions of its image_ref_size), and the displayed
+        # pixmap IS that frame, so a vertex is (x / ref_w, y / ref_h) of the pixmap.
+        # This used to push the vertex through the .ax geometry AGAIN
+        # (_ZoomBar._map_point_raw_to_scene) and then divide by the pixmap's size
+        # instead of the post-.ax frame's: on a decimated preview (the BCI mosaic's
+        # 4045 px pixmap of a 28315 px frame) every polygon was placed ~7x too far
+        # from the origin -- "zoom to polygon" landed thousands of pixels off,
+        # further the further from the top-left corner (a drift), and with a real
+        # crop / resize / rotation the .ax was applied twice.
         scene_pts = []
-        
-        # Import mapper
-        try:
-            from .image_viewer import _ZoomBar
-            
-            for (x, y) in pts:
-                if ref_w > 0 and ref_h > 0:
-                    # Normalize raw (0..1)
-                    nx = float(x) / float(ref_w)
-                    ny = float(y) / float(ref_h)
-                    
-                    # Map to Scene Normalized (0..1) handling Crop/Resize/Rot
-                    nsx, nsy = _ZoomBar._map_point_raw_to_scene(
-                        nx, ny, ref_w, ref_h, scene_w, scene_h, ax_config
-                    )
-                    
-                    # Map to Absolute Scene
-                    sx = nsx * scene_w
-                    sy = nsy * scene_h
-                    scene_pts.append(QtCore.QPointF(sx, sy))
-                else:
-                    # No ref dims? Just assume direct mapping?
-                    scene_pts.append(QtCore.QPointF(x, y))
+        pixitem = getattr(viewer, '_image', None)
+        norm_pixmap = (str(coord_space).lower() == "norm_pixmap")
+        for (x, y) in pts:
+            if norm_pixmap:
+                fx, fy = float(x), float(y)
+            elif ref_w > 0 and ref_h > 0:
+                fx, fy = float(x) / float(ref_w), float(y) / float(ref_h)
+            else:
+                # No ref dims: the vertex is taken to be in scene units already
+                scene_pts.append(QtCore.QPointF(float(x), float(y)))
+                continue
+            local = QtCore.QPointF(fx * scene_w, fy * scene_h)
+            try:
+                scene_pts.append(pixitem.mapToScene(local) if pixitem is not None else local)
+            except Exception:
+                scene_pts.append(local)
 
-        except ImportError:
-            # Fallback to simple scaling if _ZoomBar unavailable
-            logging.warning("Could not import _ZoomBar for polygon rect")
-            # Get pixmap dims
-            pixitem = getattr(viewer, '_image', None)
-            if pixitem and pixitem.pixmap() and not pixitem.pixmap().isNull():
-                vw, vh = pixitem.pixmap().width(), pixitem.pixmap().height()
-                if ref_w > 0 and ref_h > 0:
-                    sx = float(vw) / float(ref_w)
-                    sy = float(vh) / float(ref_h)
-                    for (x, y) in pts:
-                        scene_pts.append(QtCore.QPointF(x * sx, y * sy))
-        
         if scene_pts:
             poly = QtGui.QPolygonF(scene_pts)
             return poly.boundingRect()

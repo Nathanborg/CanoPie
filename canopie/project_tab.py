@@ -4792,9 +4792,9 @@ class ProjectTab(QtWidgets.QWidget):
                     fp = getattr(getattr(v, "image_data", None), "filepath", "")
                     effective_params = (
                         self._load_file_stretch(fp)
-                        or self._load_root_stretch(root_name)
-                        or self._load_project_stretch_default()
-                        or self._project_default_stretch
+                        or self._shared_stretch_for(self._load_root_stretch(root_name), fp)
+                        or self._shared_stretch_for(self._load_project_stretch_default(), fp)
+                        or self._shared_stretch_for(self._project_default_stretch, fp)
                         or _StretchParams()
                     )
                 # the bands this stretch shows must be in this viewer's preview
@@ -4839,11 +4839,27 @@ class ProjectTab(QtWidgets.QWidget):
         # until the duplicate-method fix made this the live code path). The rest of the class
         # enumerates open viewers via `self.viewer_widgets` (list of dicts with 'viewer' /
         # 'image_data'), same as `open_stretch_dialog`'s project/root targeting below.
+        def _fits(v):
+            # an image without the bands this shared stretch shows keeps its own display
+            _fp = getattr(getattr(v, "image_data", None), "filepath", None)
+            return v is viewer or self._shared_stretch_for(params, _fp) is not None
+
+        def _shared_or_own(v):
+            if _fits(v):
+                if v is not viewer:
+                    v._shows_shared_stretch = True
+                _apply_to_viewer(v, effective_params=params)
+            elif getattr(v, "_shows_shared_stretch", False):
+                # an earlier live state of the dialog (e.g. band 1, which this
+                # image has) was applied to it: back to its own display
+                v._shows_shared_stretch = False
+                _apply_to_viewer(v, effective_params=None)
+
         if scope == "project":
             for rec in (self.viewer_widgets or []):
                 v = rec.get("viewer")
                 if v is not None:
-                    _apply_to_viewer(v, effective_params=params)
+                    _shared_or_own(v)
             return
 
         if scope == "root" and root_name:
@@ -4854,7 +4870,7 @@ class ProjectTab(QtWidgets.QWidget):
                     continue
                 fp = getattr(v, "filepath", None) or getattr(getattr(v, "image_data", None), "filepath", None)
                 if fp and fp in target_files:
-                    _apply_to_viewer(v, effective_params=params)
+                    _shared_or_own(v)
             return
 
         # default: only this viewer
@@ -5637,6 +5653,21 @@ class ProjectTab(QtWidgets.QWidget):
                     elif tw > 0:            s = tw / float(w0); new_w, new_h = tw, max(1, int(round(h0 * s)))
                     elif th > 0:            s = th / float(h0); new_h, new_w = th, max(1, int(round(w0 * s)))
                     else: return
+                    # px_w / px_h are pixels of the FULL frame. On a decimated
+                    # preview (smaller than that frame) apply the same FACTOR the
+                    # export applies, or the preview is blown back up to the full
+                    # export size: New Folder213's 3.3 m mosaic preview (2438 px)
+                    # became 19499 x 17481 float -- 1.36 GB + a 341 Mpx pixmap per
+                    # band shown, defeating the 16 Mpx cap (BUG-060).
+                    try:
+                        from . import ax_geometry as _AG
+                        rh_, rw_ = ProjectTab._raw_hw_quick(image_filepath)
+                        if rh_ and rw_:
+                            _pv = _AG.preview_px_resize(ax, int(rw_), int(rh_), w0, h0)
+                            if _pv is not None:
+                                new_w, new_h = _pv
+                    except Exception as _e:
+                        logging.debug("px resize on a preview: full frame not resolved: %s", _e)
                 elif "scale" in resize:
                     s = float(resize.get("scale", 100.0)) / 100.0
                     new_w, new_h = max(1, int(round(w0 * s))), max(1, int(round(h0 * s)))
@@ -20229,6 +20260,22 @@ class ProjectTab(QtWidgets.QWidget):
             t0 = time.time()
             from .raster_reader import read_preview
             arr = read_preview(reader, filepath, bands, level=level, step=step)
+            # The viewer holds the .ax-PROCESSED preview (the loader applies the .ax
+            # to it, loaders._ImageLoadRunnable): a reload must too, or a cropped /
+            # rotated / resized image came back raw -- shown uncropped, its polygons
+            # off the image -- and the stretch dialog failed to stack it with the
+            # processed bands it already held.
+            try:
+                gm = getattr(self, "global_mods_checkbox", None)
+                _get_b = getattr(self, "_get_sklearn_bundle", None)
+                arr = self.__class__.apply_aux_modifications(
+                    filepath, arr, getattr(self, "project_folder", None),
+                    global_mode=bool(gm.isChecked()) if gm else False,
+                    src_channel_order="rgb",
+                    model_bundle=_get_b() if callable(_get_b) else None)
+            except Exception as e:
+                logging.warning("[stretch] .ax not applied to reloaded bands of %s: %s",
+                                os.path.basename(filepath), e)
             logging.info("[stretch] Loaded bands %s of %s in %.2fs -> %s",
                          bands, os.path.basename(filepath), time.time() - t0, arr.shape)
 
@@ -25118,7 +25165,7 @@ class ProjectTab(QtWidgets.QWidget):
                 root_name = self.get_root_by_filepath(fp) if hasattr(self, "get_root_by_filepath") else None
                 if root_name:
                     self._ensure_cached_stretch_defaults()
-                    sp = (self._root_stretch_map or {}).get(root_name)
+                    sp = self._shared_stretch_for((self._root_stretch_map or {}).get(root_name), fp)
             except Exception as e:
                 logging.debug(f"_render_with_viewer_stretch: root-stretch lookup failed: {e}")
 
@@ -25126,8 +25173,8 @@ class ProjectTab(QtWidgets.QWidget):
         # CRITICAL FIX: Skip project default if force_auto was set - this prevents
         # display_mode="single" from a previous session causing grayscale display
         if sp is None and not force_auto:
-             # Try project default if available
-             sp = self._project_default_stretch
+             # Try project default if available (and only if this image has its bands)
+             sp = self._shared_stretch_for(self._project_default_stretch, fp)
         
         # If still None, use generic default with display_mode="auto" explicitly
         if sp is None:
@@ -25343,10 +25390,12 @@ class ProjectTab(QtWidgets.QWidget):
         except Exception:
             pass
 
-    def _clear_all_file_stretches(self):
+    def _clear_all_file_stretches(self, keep_for=None):
         """
         Remove per-file viewer stretches from ALL images in the project.
         Called when applying project-scope stretch so the new default takes effect.
+        `keep_for`: that new stretch -- an image without the bands it shows keeps
+        its own stretch (it will not take the project one, see _shared_stretch_for).
         """
         try:
             # Collect all filepaths from all root groups
@@ -25360,6 +25409,8 @@ class ProjectTab(QtWidgets.QWidget):
                 all_fps.update(fps)
             # Clear viewer_stretch from each .ax file
             for fp in all_fps:
+                if keep_for is not None and self._shared_stretch_for(keep_for, fp) is None:
+                    continue
                 self._clear_file_stretch(fp)
             logging.debug(f"_clear_all_file_stretches: cleared {len(all_fps)} file stretches")
         except Exception as e:
@@ -25657,15 +25708,19 @@ class ProjectTab(QtWidgets.QWidget):
             self._save_project_stretch_default(params, viewer)
             targets = [rec.get('viewer') for rec in (self.viewer_widgets or [])]
             # FIX: Clear ALL per-file stretches so project default takes effect
-            # This ensures "Apply to All" actually applies to all images
-            self._clear_all_file_stretches()
+            # This ensures "Apply to All" actually applies to all images -- except
+            # an image without the bands it shows: that one keeps its own
+            self._clear_all_file_stretches(keep_for=self._project_default_stretch)
         elif params.scope == "root":
             self._root_stretch_map[root_name] = self._sp_with_refs(params, viewer)
             self._save_root_stretch(root_name, params, viewer)
             # apply to all open viewers (you might restrict to root viewers if you prefer)
             targets = [rec.get('viewer') for rec in (self.viewer_widgets or [])]
             # FIX: Clear per-file stretches for this root so root default takes effect
+            # (an image without the bands it shows keeps its own)
             for fp in self._filepaths_for_loaded_root(root_name):
+                if self._shared_stretch_for(self._root_stretch_map[root_name], fp) is None:
+                    continue
                 self._clear_file_stretch(fp)
         else:  # "viewer"
             fp = getattr(getattr(viewer, "image_data", None), "filepath", None)
@@ -25806,6 +25861,50 @@ class ProjectTab(QtWidgets.QWidget):
                     and (n_bands is None or b < int(n_bands)) and int(b) not in out:
                 out.append(int(b))
         return out
+
+    def _file_band_count(self, fp):
+        """Bands of the raster on disk, from its header (cached); None if unknown."""
+        if not fp:
+            return None
+        try:
+            key = (os.path.normcase(os.path.abspath(fp)), os.path.getmtime(fp))
+        except Exception:
+            key = (str(fp), None)
+        cache = self.__dict__.setdefault("_band_count_cache", {})
+        if key in cache:
+            return cache[key]
+        n = None
+        try:
+            from .raster_reader import probe
+            p = probe(fp)
+            if p is not None and getattr(p, "count", None):
+                n = int(p.count)
+        except Exception:
+            n = None
+        if n is None:
+            try:
+                from PIL import Image
+                with Image.open(fp) as im:
+                    n = len(im.getbands())
+            except Exception:
+                n = None
+        cache[key] = n
+        return n
+
+    def _shared_stretch_for(self, sp, fp):
+        """`sp` -- a ROOT or PROJECT stretch -- if this image has the file bands
+        it shows, else None. A stretch of thermal band 4 applied to all viewers
+        made a 3-band RGB image draw its band 1 with the thermal range (black):
+        an image without the band keeps its own display (Nathan, 2026-10-09)."""
+        if sp is None or not fp:
+            return sp
+        need = self._sp_needed_file_bands(sp)
+        if not need:
+            return sp
+        n = self._file_band_count(fp)
+        if n is None or max(need) < n:
+            return sp
+        return None
 
     def _ensure_preview_holds(self, viewer, sp):
         """A preview-loaded viewer holds only a few bands: load the FILE bands
@@ -26077,12 +26176,12 @@ class ProjectTab(QtWidgets.QWidget):
         # 1) per-file
         sp = self._load_file_stretch(filepath)
         if sp: return sp
-        # 2) root-level from cache/disk
+        # 2) root-level from cache/disk -- only if this image has its bands
         self._ensure_cached_stretch_defaults()
-        sp = self._root_stretch_map.get(root_name)
+        sp = self._shared_stretch_for(self._root_stretch_map.get(root_name), filepath)
         if sp: return sp
-        # 3) project default
-        return self._project_default_stretch
+        # 3) project default (same rule)
+        return self._shared_stretch_for(self._project_default_stretch, filepath)
 
     def display_image_group(self, image_data_list, root_name):
         # --- Global debounce (lazy init) ---
@@ -26266,10 +26365,11 @@ class ProjectTab(QtWidgets.QWidget):
             else:
                 # Inline _resolve_stretch_for_viewer using already-loaded ax
                 sp = self._stretch_from_dict(ax.get("viewer_stretch"))
+                _fp_res = getattr(image_data, "filepath", None)
                 if sp is None:
-                    sp = self._root_stretch_map.get(root_name)
+                    sp = self._shared_stretch_for(self._root_stretch_map.get(root_name), _fp_res)
                 if sp is None:
-                    sp = self._project_default_stretch
+                    sp = self._shared_stretch_for(self._project_default_stretch, _fp_res)
                 if sp:
                     viewer.stretch_params = sp
                     # A resolved/stored stretch is a deliberate choice, so it is

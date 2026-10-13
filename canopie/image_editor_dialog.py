@@ -597,6 +597,33 @@ class ImageEditorDialog(QDialog):
         logging.info(f"Histogram normalization {'enabled' if enabled else 'disabled'}")
         self.reapply_modifications()
 
+    def _preview_px_resize(self, w0, h0, mods):
+        """(new_w, new_h) for a pixel resize on the editor's DECIMATED preview
+        (px_w / px_h are full-frame pixels: the export's factor applies), or None
+        when the editor holds the full image -- see ax_geometry.preview_px_resize."""
+        full = getattr(self, "_editor_full_shape", None)
+        if not full or len(full) < 2:
+            return None
+        try:
+            from . import ax_geometry as _G
+            return _G.preview_px_resize(mods or {}, int(full[1]), int(full[0]), int(w0), int(h0))
+        except Exception:
+            return None
+
+    def _full_frame_wh(self, mods):
+        """(W, H) of the exported frame for `mods`, in FULL-raster pixels, when the
+        editor holds a decimated preview; None otherwise. The resize boxes show and
+        compare this size: px_w / px_h are full-frame pixels at export."""
+        full = getattr(self, "_editor_full_shape", None)
+        if not full or len(full) < 2:
+            return None
+        try:
+            from . import ax_geometry as _G
+            H, W = _G.frame_hw(mods or {}, int(full[1]), int(full[0]))
+            return (int(W), int(H)) if W and H else None
+        except Exception:
+            return None
+
     def _calculate_result_size_from_mods(self, mods):
         """
         Calculate the expected result image size from modifications WITHOUT processing the image.
@@ -1987,6 +2014,12 @@ class ImageEditorDialog(QDialog):
             # is kept as it was.
             mods_wo = dict(self.modifications)
             mods_wo.pop("resize", None)
+            # On a decimated preview: the FULL frame's size, the unit the resize
+            # boxes and px_w / px_h are in (the preview's size was compared with
+            # the full size the boxes show at open -> a bogus resize, BUG-060)
+            _ff = self._full_frame_wh(mods_wo)
+            if _ff is not None:
+                return _ff
             for _k in ("band_expression", "hist_match", "mask_polygon", "classification", "nodata_values"):
                 mods_wo.pop(_k, None)
             mods_wo.update(band_enabled=False, hist_enabled=False, nodata_enabled=False)
@@ -3139,6 +3172,9 @@ class ImageEditorDialog(QDialog):
                         s = th / float(h0)
                         new_h, new_w = th, max(1, int(round(w0 * s)))
                     # else: keep new_w, new_h = w0, h0
+                    _pv = self._preview_px_resize(w0, h0, modifications)
+                    if _pv is not None:
+                        new_w, new_h = _pv
                 elif "scale" in resize_info:
                     s = max(1, int(resize_info["scale"])) / 100.0
                     new_w = max(1, int(round(w0 * s)))
@@ -3181,6 +3217,11 @@ class ImageEditorDialog(QDialog):
                     elif th > 0:
                         s = th / float(h0)
                         new_h = th; new_w = max(1, int(round(w0 * s)))
+                    # px are FULL-frame pixels: on a decimated preview apply the
+                    # export's factor (it was blown back up to the full size, BUG-060)
+                    _pv = self._preview_px_resize(w0, h0, modifications)
+                    if _pv is not None:
+                        new_w, new_h = _pv
                 elif "scale" in resize_info:
                     scale = max(1, int(resize_info["scale"]))
                     new_w = max(1, int(round(w0 * (scale / 100.0))))
@@ -5485,6 +5526,21 @@ class ImageEditorDialog(QDialog):
             pre_h = ref_h or int(round(view_h * 1.0))
             sx_inv = (pre_w / float(tgt_w)) if tgt_w else 1.0
             sy_inv = (pre_h / float(tgt_h)) if tgt_h else 1.0
+            # On a decimated preview px / resize_ref_size are FULL-frame pixels
+            # while the view is the preview: invert the export's FACTOR and give
+            # the pre-resize size in the VIEW's units (BUG-060)
+            _full = getattr(self, "_editor_full_shape", None)
+            if _full and len(_full) >= 2:
+                try:
+                    from . import ax_geometry as _G
+                    _ops, _wh = _G.frame_plan(self.modifications, int(_full[1]), int(_full[0]))
+                    _op = next((o for o in _ops if o[0] == "resize"), None)
+                    if _op is not None and float(_op[1]) > 0 and float(_op[2]) > 0:
+                        sx_inv, sy_inv = 1.0 / float(_op[1]), 1.0 / float(_op[2])
+                        pre_w = int(round(view_w * sx_inv))
+                        pre_h = int(round(view_h * sy_inv))
+                except Exception as _e:
+                    logging.debug("inverse resize on a preview: %s", _e)
 
         elif "scale" in info:
             s = max(1, int(info["scale"])) / 100.0
@@ -6429,13 +6485,21 @@ class ImageEditorDialog(QDialog):
             return
 
         Ht, Wt = mod_image.shape[:2]
-        
+
         # FIX: Update size textboxes to reflect current modified image dimensions
-        # This ensures crop/rotate/resize operations update the displayed size
+        # This ensures crop/rotate/resize operations update the displayed size.
+        # On a decimated preview the boxes show the FULL frame (px_w / px_h are
+        # full-frame pixels at export): showing the preview's size made a typed
+        # resize 8x / 16x too small at export, and save took the full size shown
+        # at open for a resize (BUG-060).
+        _box_w, _box_h = Wt, Ht
+        _ff = self._full_frame_wh(self.modifications)
+        if _ff is not None:
+            _box_w, _box_h = _ff
         if hasattr(self, "resize_width_input"):
-            self.resize_width_input.setText(str(Wt))
+            self.resize_width_input.setText(str(_box_w))
         if hasattr(self, "resize_height_input"):
-            self.resize_height_input.setText(str(Ht))
+            self.resize_height_input.setText(str(_box_h))
         
         geom_now = {
             "shape": (Ht, Wt),

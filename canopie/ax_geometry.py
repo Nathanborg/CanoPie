@@ -132,6 +132,25 @@ def frame_hw(ax, raw_w, raw_h):
     return H, W
 
 
+def preview_px_resize(ax, raw_w, raw_h, w0, h0):
+    """A pixel resize (`px_w` / `px_h`: pixels of the FULL frame) applied to a
+    DECIMATED preview whose pre-resize frame is w0 x h0: the size the export's
+    resize FACTOR gives it, or None when there is no pixel resize or w0 x h0 is
+    the full frame itself (then the pixel size applies as is). Without this the
+    preview was blown back up to the full export size (BUG-060)."""
+    r = (ax or {}).get("resize") if isinstance(ax, dict) else None
+    if not (isinstance(r, dict) and ("px_w" in r or "px_h" in r)):
+        return None
+    ops, _ = frame_plan(ax, raw_w, raw_h)
+    op = next((o for o in ops if o[0] == "resize"), None)
+    if op is None:
+        return None
+    pre_w, pre_h = op[3] / float(op[1]), op[4] / float(op[2])
+    if w0 >= pre_w - 1 and h0 >= pre_h - 1:
+        return None
+    return max(1, int(round(w0 * float(op[1])))), max(1, int(round(h0 * float(op[2]))))
+
+
 def _rot_fwd(k, w, h, x, y):
     # np.rot90(img, k=3) for 90 (clockwise); k=2 for 180; k=1 for 270.
     if k == 90:

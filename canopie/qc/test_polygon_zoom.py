@@ -101,6 +101,7 @@ code-quality simplification (removes a formula that looks
 resolution-aware but never needed to be) rather than framed as an
 independent bug fix.
 """
+import numpy as np
 import pytest
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -687,3 +688,48 @@ def test_zoom_to_groups_keeps_an_off_center_real_scale_polygon_inside_the_image(
         f"final view (({tl.x():.0f},{tl.y():.0f}) to ({br.x():.0f},{br.y():.0f})) "
         f"does not overlap the 4000x3000 image at all -- reproduces the "
         f"reported 'zooming out of the image boundaries' bug")
+
+
+# ---------------------------------------------------------------------------
+# Nova pasta (5), 2026-10-09: "zoom to polygon ... on COGs the zoom is drifting"
+# ---------------------------------------------------------------------------
+_BCI_CROWN = [[9079.82, 10572.86], [9135.38, 10537.85], [9246.50, 10547.67],
+              [9241.32, 10658.29], [9225.24, 10672.93], [9105.06, 10684.81]]
+
+
+@pytest.mark.parametrize("ax_config", [
+    {"resize_enabled": True, "rotate_enabled": True, "crop_enabled": True, "band_expression": "b1>180",
+     "orig_size": {"h": 25548, "w": 28315, "c": 4}},
+    {"crop_enabled": True, "crop_rect": {"x": 4000, "y": 3000, "width": 20000, "height": 18000},
+     "crop_rect_ref_size": {"w": 28315, "h": 25548}, "rotate": 90, "resize": {"width": 50, "height": 50}},
+], ids=["ax_without_geometry", "ax_with_crop_rotate_resize"])
+def test_zoom_rect_is_where_the_polygon_is_drawn_on_a_decimated_preview(viewer_factory, monkeypatch, ax_config):
+    """A record is stored relative to the post-.ax frame (fractions of its
+    image_ref_size) and load_polygons draws it at that fraction of the pixmap.
+    The zoom rect pushed the vertices through the .ax AGAIN and divided by the
+    PIXMAP's size instead of the frame's: on the BCI mosaic's 4045 x 3650
+    preview of a 28315 x 25548 raster every crown landed ~7x further from the
+    origin (zoom thousands of pixels off, worse further from the top-left)."""
+    fp = "C:/Users/natha/Downloads/BCI_50ha_2024_11_12_orthomosaic_rgb_render.tif"
+    entry = {"points": _BCI_CROWN, "image_ref_size": {"w": 28315, "h": 25548}, "coord_space": "image"}
+    owner = _ZoomOwner({"crown": {fp: entry}}, native_hw=(25548, 28315))
+    v = _viewer_with_image(viewer_factory, img=(4045, 3650))
+    idata = type("D", (), {"filepath": fp, "ax_config": ax_config, "raw_shape": None})()
+    vw = {"viewer": v, "image_data": idata}
+    owner.viewer_widgets = [vw]
+    pm = PolygonManager.__new__(PolygonManager)
+    monkeypatch.setattr(type(pm), "parent", lambda self: owner, raising=False)
+
+    rect = pm._get_polygon_scene_rect(vw, v, "crown")
+    a = np.asarray(_BCI_CROWN, float) * (4045 / 28315.0, 3650 / 25548.0)     # load_polygons' mapping
+    want = QtCore.QRectF(a[:, 0].min(), a[:, 1].min(), np.ptp(a[:, 0]), np.ptp(a[:, 1]))
+    assert rect is not None
+    for got, exp in ((rect.left(), want.left()), (rect.top(), want.top()),
+                     (rect.right(), want.right()), (rect.bottom(), want.bottom())):
+        assert abs(got - exp) < 1e-6, (rect, want)
+
+    pm.zoom_to_groups(["crown"])
+    QtWidgets.QApplication.processEvents()
+    c = v.mapFromScene(want.center())
+    vc = v.viewport().rect().center()
+    assert abs(c.x() - vc.x()) <= 2 and abs(c.y() - vc.y()) <= 2, (c, vc)

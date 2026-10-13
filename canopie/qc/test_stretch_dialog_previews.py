@@ -196,3 +196,100 @@ def test_a_band_choice_from_the_view_menu_is_what_the_preview_loads(synthetic_pr
         if os.path.exists(axp):
             os.remove(axp)
         pt._display_bands = None
+
+
+# ---------------------------------------------------------------------------
+# Nathan, 2026-10-09: "should RGB_june keep its own display when an all-viewers
+# stretch names a band it doesn't have? Yes"
+# ---------------------------------------------------------------------------
+RGB3 = "rgb_16bit_tiled_bip_cog"            # 3 bands: has no file band 6
+
+
+def test_a_shared_stretch_naming_a_missing_band_is_not_used_for_that_image(synthetic_project, monkeypatch):
+    pt = synthetic_project
+    fp3, fp8 = fixture_image_path(RGB3), fixture_image_path(NAME)
+    monkeypatch.setattr(pt, "_project_default_stretch", _sp(), raising=False)
+    monkeypatch.setattr(pt, "_root_stretch_map", {"__none__": None}, raising=False)
+    assert pt._resolve_stretch_for_viewer(fp8, None) is not None, "an 8-band image takes the project stretch"
+    assert pt._resolve_stretch_for_viewer(fp3, None) is None, \
+        "a 3-band image took a project stretch of band 6 (drawn as its band 1 with that range)"
+
+
+def test_all_viewers_skips_an_image_without_the_band_and_restores_it(no_band_persist, monkeypatch):
+    from ..raster_reader import probe
+    pt = no_band_persist
+    va, shown_a, _ = _preview_viewer(pt)                       # 8 bands
+    fp3 = fixture_image_path(RGB3)
+    prof3 = probe(fp3)
+    arr3 = pt.reload_preview_bands(fp3, [0, 1, 2], prof3)
+    shown3 = {}
+    v3 = types.SimpleNamespace(
+        image_data=types.SimpleNamespace(filepath=fp3, image=arr3, profile=prof3, preview_bands=[0, 1, 2],
+                                         channel_order="rgb", full_shape=(prof3.height, prof3.width, prof3.count)),
+        stretch_params=None,
+        show_preview_array=lambda a, channel_order=None: shown3.update(arr=np.asarray(a).copy(), n=shown3.get("n", 0) + 1))
+    monkeypatch.setattr(pt, "viewer_widgets", [{"viewer": va}, {"viewer": v3}], raising=False)
+    monkeypatch.setattr(pt, "_project_default_stretch", None, raising=False)
+    monkeypatch.setattr(pt, "_root_stretch_map", {"__none__": None}, raising=False)
+    # 1) an earlier live state of the dialog -- band 1, which the 3-band image has
+    band1 = _sp(scope="project")
+    band1.band_refs = {"display_band": 0, "r_band": None, "g_band": None, "b_band": None}
+    pt._stretch_apply_preview(band1, va, None)
+    assert shown3.get("n") == 1 and v3.stretch_params.band_refs["display_band"] == 0
+    # 2) then band 6, which it has not: it goes back to its own (here: default) display
+    pt._stretch_apply_preview(_sp(scope="project"), va, None)
+    assert shown3.get("n") == 2, "the 3-band viewer was left on the earlier shared stretch"
+    assert str(v3.stretch_params.display_mode) != "single" or v3.stretch_params.band_refs is None, \
+        "the 3-band viewer took the band-6 stretch"
+    assert BAND in va.image_data.preview_bands, "the 8-band viewer did not take the stretch"
+
+
+def test_all_viewers_keeps_the_own_stretch_of_an_image_without_the_band(synthetic_project, monkeypatch):
+    import json, os
+    pt = synthetic_project
+    fp3, fp8 = fixture_image_path(RGB3), fixture_image_path(NAME)
+    written = []
+    try:
+        for fp in (fp3, fp8):
+            axp = pt._ax_path_for(fp)
+            assert not os.path.exists(axp), "precondition: fixture has no .ax"
+            json.dump({"viewer_stretch": {"mode": "absolute", "min_val": 1.0, "max_val": 2.0, "display_mode": "single",
+                                          "display_band": 1, "band_basis": "file"}}, open(axp, "w", encoding="utf-8"))
+            written.append(axp)
+        monkeypatch.setattr(pt, "multispectral_image_data_groups", {"r": [fp3, fp8]}, raising=False)
+        monkeypatch.setattr(pt, "thermal_rgb_image_data_groups", {}, raising=False)
+        monkeypatch.setattr(pt, "image_data_groups", {}, raising=False)
+        pt._clear_all_file_stretches(keep_for=_sp())
+        kept = {os.path.basename(p): "viewer_stretch" in json.load(open(p, encoding="utf-8")) for p in written}
+        assert kept[os.path.basename(written[0])] is True, "the 3-band image's own stretch was cleared"
+        assert kept[os.path.basename(written[1])] is False, "the 8-band image kept a stretch the project one replaces"
+    finally:
+        for p in written:
+            if os.path.exists(p):
+                os.remove(p)
+        pt._ax_cache.clear() if hasattr(getattr(pt, "_ax_cache", None), "clear") else None
+
+
+def test_reloaded_bands_keep_the_ax_crop(synthetic_project):
+    """reload_preview_bands returned RAW bands: a cropped image came back
+    uncropped in the viewer (and the dialog could not stack it with the
+    processed bands it held)."""
+    import json, os
+    from ..raster_reader import probe
+    pt = synthetic_project
+    fp = fixture_image_path(NAME)
+    axp = pt._ax_path_for(fp)
+    assert not os.path.exists(axp), "precondition: fixture has no .ax"
+    prof = probe(fp)
+    try:
+        json.dump({"crop_enabled": True, "crop_rect": {"x": 4, "y": 6, "width": 30, "height": 20},
+                   "crop_rect_ref_size": {"w": prof.width, "h": prof.height}}, open(axp, "w", encoding="utf-8"))
+        if hasattr(getattr(pt, "_ax_cache", None), "clear"):
+            pt._ax_cache.clear()
+        arr = pt.reload_preview_bands(fp, [BAND], prof)
+        assert arr is not None and arr.shape[:2] == (20, 30), f"reloaded band not cropped: {getattr(arr, 'shape', None)}"
+    finally:
+        if os.path.exists(axp):
+            os.remove(axp)
+        if hasattr(getattr(pt, "_ax_cache", None), "clear"):
+            pt._ax_cache.clear()

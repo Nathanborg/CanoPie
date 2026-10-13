@@ -77,9 +77,12 @@ The single place every known bug lives. Read this at the start of every session.
 | BUG-057 | `test_a_4326_source_needs_no_transformer` failed once in a full run: it built two CRS objects and relied on Python reusing the first one's address for the `id()` cache key (test defect; the import holds one CRS) | qc | low | fixed-unverified (2026-10-07; test holds one CRS) |
 | BUG-058 | Zoomed in after a boolean and back to RGB (stretch dialog), the image turns white / red / blue: every zoom tile mapped R, G, B with the boolean's 0..1 | viewer | high | fixed-unverified (2026-10-07; awaiting Nathan's check in the app) |
 | BUG-059 | A polygon drawn with sync on landed at the wrong place (and was SAVED there) on the other images of the root whenever the image drawn on is shown resized / cropped / as a decimated preview: scaled by displayed array sizes instead of each image's basis | polygons | high | fixed-unverified (2026-10-07; awaiting Nathan's check in the app) |
-| BUG-060 | The viewer replays a pixel resize (`px_w`/`px_h`) at its absolute size on a DECIMATED preview: New Folder213's 3.3 m mosaic preview (1/8, 2438 x 2186) is enlarged back to 19499 x 17481 float (1.36 GB + a 341 Mpx pixmap) -- defeats the 16 Mpx cap, a crash risk with more bands. The `.ax` itself (`px` = raw size, `resize_ref_size` = the preview) was written by the editor on the preview | viewer / editor | high | reproduced (2026-10-07; not fixed yet) |
+| BUG-060 | The viewer replays a pixel resize (`px_w`/`px_h`) at its absolute size on a DECIMATED preview: New Folder213's 3.3 m mosaic preview (1/8, 2438 x 2186) is enlarged back to 19499 x 17481 float (1.36 GB + a 341 Mpx pixmap) -- defeats the 16 Mpx cap, a crash risk with more bands. The `.ax` itself (`px` = raw size, `resize_ref_size` = the preview) was written by the editor on the preview | viewer / editor | high | fixed-unverified (2026-10-09; awaiting Nathan's check in the app) |
 | BUG-061 | Stretch dialog on Nova pasta (10): every viewer black, "all viewers" not applied, the band saved as band 1, and the saved Absolute range reset on every open | viewer / stretch | high | fixed-unverified (2026-10-07; awaiting Nathan's check in the app) |
 | BUG-062 | Single-band stretch drawn as a 0/1 boolean (all white) whenever the band's first column is all 0 -- an orthomosaic's black border: a band change in Percentile gave a binary picture, Percentile "stopped working" after Absolute | viewer / stretch | high | fixed-unverified (2026-10-07; my D3 code of 2026-10-06) |
+| BUG-063 | Polygon manager "Zoom to polygon" drifted off the crown on large rasters (Nova pasta (5)): the zoom rect pushed the vertices through the .ax again and divided by the PREVIEW's size -- ~7x too far from the origin | polygons / viewer | high | fixed-unverified (2026-10-09; awaiting Nathan's check in the app) |
+| BUG-064 | An all-viewers / root stretch naming a band an image does not have (thermal band 4 on a 3-band RGB) drew that image's band 1 with the thermal range; it now keeps its own display (Nathan, 2026-10-09) | viewer / stretch | medium | fixed-unverified (2026-10-09) |
+| BUG-065 | Bands reloaded for a preview (stretch dialog band pick, band bar, all-viewers band load) came back RAW: a cropped / rotated / resized image was shown uncropped, its polygons off the image | viewer / stretch | high | fixed-unverified (2026-10-09) |
 | ENV-001 | `canopie-env` has no Python interpreter | environment | — | open |
 
 ### COG boolean crash, windowed band math, Stage 3 speed (2026-10-07)
@@ -181,6 +184,31 @@ band math and boolean".
   NoData declared, so Percentile 0.5-99.5 of band 4 is 0..7559 (real data 7356..7585): with
   `nodata_values: [0]` in their `.ax` (copy) Percentile gives 7402..7705 and matches the reference.
   Full suite after BUG-062: 1,684 passed, 0 failed.
+- **2026-10-09** (Nathan: "RGB_june keep its own display ... yes; fix bug 060; fix my polygon
+  manager zoom to polygon on COGs, Nova pasta (5), the zoom is drifting"), all on copies:
+  - **BUG-063.** `_get_polygon_scene_rect` (polygon manager click and Zoom to polygon) mapped a
+    record through `_ZoomBar._map_point_raw_to_scene`: the .ax geometry applied AGAIN (records are
+    already relative to the post-.ax frame) and the result divided by the PIXMAP's size instead of
+    the frame's. Pasta (5) (28315 x 25548 mosaic, 4045 x 3650 preview, 2,802 crowns): six crowns
+    spread over the mosaic landed 2,456-13,883 px off the viewport centre; now 0-8 px, stable after
+    tiles settle. It now uses load_polygons' own mapping (fraction of image_ref_size x pixmap).
+    Test: `test_polygon_zoom` (+2, fail on the old code).
+  - **BUG-060.** px_w / px_h are full-frame pixels: on a decimated preview the viewer
+    (`apply_aux_modifications`) and the editor (its pipeline, its resize boxes, `_pre_resize_shape`,
+    the crop inverse) now apply the export's resize factor (`ax_geometry.preview_px_resize`); a full
+    image keeps the exact pixel size. New Folder213's 3.3 m mosaic: viewer 17481 x 19499 float
+    (1.36 GB, 341 Mpx pixmap) -> 2186 x 2438 (21 MB); editor the same. The `.ax` origin reproduced
+    on the old code: open the editor on the preview and save with no edit -> `px 19499 x 17481,
+    ref 2438 x 2186`; the new code writes nothing. Test: `test_preview_px_resize` (4).
+  - **BUG-064.** `_shared_stretch_for`: a root / project stretch naming a band the image lacks is
+    not used for it (resolution at load / refresh / Auto, the all-viewers apply, and the clearing of
+    own stretches on OK); a viewer that took an earlier live state of the dialog goes back to its own.
+    Pasta (10) copy, all-viewers thermal band 4 7400..7700: RGB_june unchanged (0 difference, with
+    and without an own stretch) in the session and after reopening; the five thermal mosaics show
+    band 4 (<= 0.06 / 255).
+  - **BUG-065.** `reload_preview_bands` now applies the .ax as the loader does (found when
+    RGB_june, cropped, came back 3746 x 2006 instead of 447 x 350).
+  Tests: `test_stretch_dialog_previews` (+4), all fail on the last commit's code.
 - **Final review before the commit (2026-10-07)**, the whole uncommitted tree read for bugs; fixed,
   each with a test that fails without it (revert-verified on a copy of the repo):
   - ML training on a windowed raster: a polygon whose window is over 1 GB raised MemoryError out of
