@@ -1213,6 +1213,7 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
         a_repl     = menu.addAction("Replicate to all viewers")
         a_edit     = menu.addAction("Edit this polygon")
         a_edit_all = menu.addAction("Edit all polygons in this group")
+        a_find = menu.addAction("Find canopy in other images…")
         menu.addSeparator()
         a_edit_vertices = menu.addAction("Edit vertices")
         menu.addSeparator()
@@ -1242,6 +1243,9 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
 
         elif chosen == a_edit_all and hasattr(v, "edit_all_polygons_in_group"):
             v.edit_all_polygons_in_group(self, start_redraw=True, respect_sync=True)
+
+        elif chosen == a_find and hasattr(v, "find_canopy_in_other_images"):
+            v.find_canopy_in_other_images(getattr(self, "name", None))
 
         elif chosen == a_edit_vertices and hasattr(v, "start_vertex_editing"):
             v.start_vertex_editing(self)
@@ -4022,8 +4026,9 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 # Left-click: check if clicking on background (for panning) or item (for selection)
                 # PERFORMANCE: Fast path - if we have few polygon items, use simpler detection
                 polygon_count = getattr(self, '_polygon_item_count', 0)
-                
-                if polygon_count == 0:
+
+                # (a canopy-finder outline not saved yet is draggable too)
+                if polygon_count == 0 and not getattr(self, "_has_canopy_temp", False):
                     # No polygons - always start panning (no need for items lookup)
                     self._is_panning = True
                     self.last_pan_point = event.pos()
@@ -6204,7 +6209,8 @@ class ImageViewer(QtWidgets.QGraphicsView):
 
     def contextMenuEvent(self, event):
         # Check if clicking on a polygon/point item - always allow their context menus
-        if any(isinstance(i, (EditablePolygonItem, EditablePointItem)) for i in self.items(event.pos())):
+        if any(isinstance(i, (EditablePolygonItem, EditablePointItem)) or getattr(i, "_canopy_temp", False)
+               for i in self.items(event.pos())):
             return super().contextMenuEvent(event)
         
         # Skip background context menu when in rectangle zoom mode
@@ -6214,10 +6220,61 @@ class ImageViewer(QtWidgets.QGraphicsView):
 
         menu = QtWidgets.QMenu(self)
         act_paste = menu.addAction("Paste geometry here")
+        # Polygons drawn in batched LOD tiles have no item (and so no menu) of
+        # their own: offer the crown finder for the record under the cursor.
+        act_find = None
+        group_here = None
+        try:
+            if any(isinstance(i, PolygonTileItem) for i in self.items(event.pos())):
+                group_here = self._record_group_at(self.mapToScene(event.pos()))
+        except Exception:
+            group_here = None
+        if group_here:
+            act_find = menu.addAction(f"Find canopy '{group_here}' in other images…")
         chosen = menu.exec_(event.globalPos())
 
         if chosen == act_paste:
             self.paste_geometry(self.mapToScene(event.pos()))
+        elif act_find is not None and chosen == act_find:
+            self.find_canopy_in_other_images(group_here)
+
+    def _record_group_at(self, scene_pt):
+        """Group of the stored polygon of this image under a scene point (the
+        smallest one, when crowns overlap), from the records themselves."""
+        owner = self._find_project_owner()
+        fp = getattr(getattr(self, "image_data", None), "filepath", None)
+        if owner is None or not fp:
+            return None
+        from .canopy_finder_dialog import existing_record, record_scene_polygon
+        best = None
+        try:
+            groups = {g for g, _k in owner._poly_index_lookup(fp)}
+        except Exception:
+            groups = set(owner.all_polygons.keys())
+        for g in groups:
+            _key, rec = existing_record(owner, g, fp)
+            if not isinstance(rec, dict):
+                continue
+            if str(dict.get(rec, "type", "polygon") or "polygon").lower() == "point":
+                continue
+            pts = dict.get(rec, "display_points") or rec.get("points") or []
+            if len(pts) < 3:
+                continue
+            poly = record_scene_polygon(self, pts, dict.get(rec, "image_ref_size") or {})
+            if poly is None or not poly.boundingRect().contains(scene_pt):
+                continue
+            if poly.containsPoint(scene_pt, QtCore.Qt.OddEvenFill):
+                area = poly.boundingRect().width() * poly.boundingRect().height()
+                if best is None or area < best[0]:
+                    best = (area, g)
+        return best[1] if best else None
+
+    def find_canopy_in_other_images(self, group):
+        owner = self._find_project_owner()
+        fp = getattr(getattr(self, "image_data", None), "filepath", None)
+        if owner is None or not fp or not group or not hasattr(owner, "open_canopy_finder"):
+            return
+        owner.open_canopy_finder(group, fp)
 
     def _save_pasted_polygon_for_this_file(self, poly_item):
         try:

@@ -2877,6 +2877,7 @@ class PolygonManager(QtWidgets.QDialog):
         zoom_action = menu.addAction("Zoom to Polygon Points")
         menu.addSeparator()
         edit_action = menu.addAction("Edit")
+        find_action = menu.addAction("Find canopy in other images…")
         delete_action = menu.addAction("Delete")
         copy_action = menu.addAction("Copy")
         move_action = menu.addAction("Move")
@@ -2895,6 +2896,8 @@ class PolygonManager(QtWidgets.QDialog):
         action = menu.exec_(self.list_widget.viewport().mapToGlobal(position))
         if action == edit_action:
             self.edit_selected_polygons(target_groups)
+        elif action == find_action:
+            self.find_canopy_for_group(clicked_group)
         elif action == delete_action:
             self.delete_selected_polygons(target_groups)
         elif action == copy_action:
@@ -3071,6 +3074,25 @@ class PolygonManager(QtWidgets.QDialog):
             lay.addWidget(btns)
 
             dlg.exec_()
+    def find_canopy_for_group(self, group):
+        """Open the crown finder for `group`, sourced from the first viewer of
+        this root that holds it (else any image holding it)."""
+        parent = self.parent()
+        if not group or not hasattr(parent, "open_canopy_finder"):
+            return
+        from .canopy_finder_dialog import existing_record
+        src = None
+        for w, viewer in self._iter_viewers():
+            fp = getattr(w.get("image_data"), "filepath", None)
+            if fp and existing_record(parent, group, fp)[1] is not None:
+                src = fp
+                break
+        if src is None:
+            src = next(iter((parent.all_polygons.get(group) or {}).keys()), None)
+        if src is None:
+            return
+        parent.open_canopy_finder(group, src)
+
     def _iter_viewers(self):
         """
         Yield (viewer_widget_dict, viewer) for all known viewers.
