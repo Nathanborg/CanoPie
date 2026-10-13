@@ -17,6 +17,9 @@ Orthomosaics are useful for mapping when you need , but they come at a cost:
 
 ## Getting Started
 
+**New to CanoPie?** The [tutorial](docs/tutorial.md) walks through every feature on a small example project
+you generate in one command (`python examples/make_example_project.py`).
+
 ### Prerequisites
 Before you begin, ensure you have the following installed:
 *   Python 3.10
@@ -24,7 +27,7 @@ Before you begin, ensure you have the following installed:
 *   ExifTool by Phil Harvey if you need exif data information from imagery
 ### Platform support
 CanoPie has been developed and tested on **Windows 10/11**.  
-It should run on other operating systems (Linux, macOS) as long as Python 3.10 and all dependencies are correctly installed, but cross-platform support has not been fully tested yet.  
+The test suite also runs on Linux (Ubuntu) in continuous integration; macOS should work but is not tested.  
 
 ### Installation and Usage (Conda)
 
@@ -53,6 +56,11 @@ pip install -r requirements.txt
 6. **Run CanoPie**
 ```sh
 python main.py
+```
+Or install it as a package, which adds a `canopie` command:
+```sh
+pip install .
+canopie
 ```
 
 ### Following a crown across images (Find canopy in other images)
