@@ -19,7 +19,7 @@ Orthomosaics are useful for mapping when you need , but they come at a cost:
 
 ### Prerequisites
 Before you begin, ensure you have the following installed:
-*   Python 3.1.0
+*   Python 3.10
 *   The required libraries listed in `requirements.txt`
 *   ExifTool by Phil Harvey if you need exif data information from imagery
 ### Platform support
@@ -54,6 +54,37 @@ pip install -r requirements.txt
 ```sh
 python main.py
 ```
+
+### Following a crown across images (Find canopy in other images)
+Right-click a polygon (in a viewer or in the Polygon Manager; several polygons can be selected) and choose
+**Find canopy in other images…**. CanoPie locates the same crown in:
+- orthomosaics of other dates, coordinate systems and resolutions (GeoTIFF georeference);
+- raw UAV frames, from their EXIF GPS and a camera model -- GPS-only cameras such as the FLIR Duo Pro R and
+  MicaSense are calibrated from the overlap of consecutive frames of their flight line -- and back from a raw
+  frame to an orthomosaic or to another flight's frames;
+- phenocam images, matched in image coordinates.
+
+Images can come from the current root, every root of the project, or other folders / projects (one or several,
+each folder treated as one flight). The crown is registered with StackReg (rigid body) or an exhaustive
+rotation and shift search, saved as the same polygon group on each image, and can be reviewed (moved, reshaped,
+rejected) in the canopy browser. **Export crowns** writes, per crown, the source crop and every image's crop
+aligned on it (GeoTIFF or JPEG), the crown polygon of each image (JSON), and a metadata CSV, by default into
+`canopy_exports` inside the project.
+
+### Running the tests
+```sh
+pip install -r requirements-dev.txt
+python -m pytest canopie/qc -q -p no:cacheprovider
+```
+A feature-level report is written to `canopie/qc/last_run_report.txt`. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+### Contributing and support
+Bug reports, questions and pull requests are welcome through the
+[issue tracker](https://github.com/Nathanborg/CanoPie/issues); see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+### Citing CanoPie
+Gonçalves, N. B., & Stark, S. C. CanoPie: A Graphical User Interface for Multitemporal Canopy Imagery Data
+Analysis. (In revision, Journal of Open Source Software.) <https://github.com/Nathanborg/CanoPie>
 
 ### Project status
 CanoPie is an early-stage collaborative project intirelly python-based developed by and for the research community. 
