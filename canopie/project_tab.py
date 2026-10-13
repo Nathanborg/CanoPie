@@ -22965,6 +22965,26 @@ class ProjectTab(QtWidgets.QWidget):
             self.polygon_manager.set_polygons(all_polygon_groups)
             self.polygon_manager.show()
 
+    def open_canopy_finder(self, group, source_fp):
+        """'Find canopy in other images…' (viewer polygon menu, polygon manager):
+        one non-modal finder per tab, re-aimed at the clicked crown."""
+        from .canopy_finder_dialog import CanopyFinderDialog
+        dlg = getattr(self, "_canopy_finder_dialog", None)
+        try:
+            if dlg is not None and dlg.worker is not None and dlg.worker.isRunning():
+                dlg.show(); dlg.raise_(); dlg.activateWindow()
+                return dlg
+            if dlg is None:
+                dlg = CanopyFinderDialog(self, group, source_fp)
+                self._canopy_finder_dialog = dlg
+            else:
+                dlg.set_source(group, source_fp)
+        except RuntimeError:            # the Qt side was deleted
+            dlg = CanopyFinderDialog(self, group, source_fp)
+            self._canopy_finder_dialog = dlg
+        dlg.show(); dlg.raise_(); dlg.activateWindow()
+        return dlg
+
     def show_export_manager(self):
         """Show the Export Manager dialog to monitor background exports."""
         mgr = ExportManagerDialog.get_instance(self)

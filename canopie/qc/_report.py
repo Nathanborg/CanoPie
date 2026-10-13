@@ -199,6 +199,28 @@ FEATURE_MAP = {
         "Polygon manager: click and Zoom to polygon",
         "a list click pans only, Zoom to polygon fits a real polygon with a native-resolution cap; the zoom rect is "
         "where the polygon is drawn -- also on a decimated COG / mosaic preview with an .ax (it drifted ~7x off)"),
+    "test_canopy_finder": (
+        "Find canopy in other images (GeoTIFF)",
+        "a crown goes through world coordinates (any CRS / resolution) and the .ax crop into other GeoTIFFs and the "
+        "exhaustive / StackReg engines find it within 1 px through a known shift + rotation; it is saved as the same "
+        "group (an existing one kept unless replaced, after a zip backup), viewers zoom onto it, other projects are "
+        "never written, the exported square is georeferenced, browser edits update the record; raw drone frames "
+        "located by EXIF (KD-tree picks the frames nearest the crown) ortho->raw, raw->ortho, raw->raw at their own "
+        "resolution with GPS / height / heading errors; phenocams in image coordinates; a COG read from the overview "
+        "at the working resolution; dragged outlines and Save all; the target scan never blocks the dialog; "
+        "images are matched in their post-.ax frame (crop / rotation / NoData from the .ax replay, rotated squares "
+        "exported with a ModelTransformation); a GPS-only flight (no height / heading) is calibrated from its own "
+        "overlap; GPS 0,0 is no GPS; several crowns in one run; the image editor's palette; GPS from the file "
+        "header in threads (same values as the whole file); the image list never measures frames; no typed "
+        "flight height / sensor width; a 20 % low or 25 % high ground size still found; the aligned crown "
+        "stack (every target on the source crown grid, georeferenced like the source square); the EXIF cache "
+        "kept per image folder and reused next session (nothing written beside the images, a changed file read "
+        "again, a plain TIFF not reopened for a georeference); several folders, each with its own nearest frames; "
+        "searches and flight-line measurements in worker processes (finder modules only, no Qt, below-normal "
+        "priority) give the result of one search after another, also for GPS-only frames; a replaced or "
+        "browser-edited crown replaces the outline drawn in the grid viewer; the dialog sections fold; a crown "
+        "dragged in a rotated browser tile lands where it was put on the (unrotated) image; a mosaic with no "
+        "data under the crown does not hold it"),
     "test_polygon_sync_scaling": (
         "A synced polygon keeps its place on every image of the root",
         "drawn with sync on, the copies sit at the same fraction of each frame (as copy-to-root) and are stamped "
