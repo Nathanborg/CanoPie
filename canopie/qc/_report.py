@@ -199,6 +199,10 @@ FEATURE_MAP = {
         "Polygon manager: click and Zoom to polygon",
         "a list click pans only, Zoom to polygon fits a real polygon with a native-resolution cap; the zoom rect is "
         "where the polygon is drawn -- also on a decimated COG / mosaic preview with an .ax (it drifted ~7x off)"),
+    "test_exiftool_prompt": (
+        "No exiftool: asked for only when it is needed",
+        "a polygon save or a background export never opens 'Locate exiftool.exe' (it blocked a save); an explicit "
+        "EXIF export asks once per session, never from a worker thread, and goes on without EXIF if cancelled"),
     "test_example_project": (
         "The tutorial's example project",
         "examples/make_example_project.py writes the roots, images, crowns and training classes docs/tutorial.md "
