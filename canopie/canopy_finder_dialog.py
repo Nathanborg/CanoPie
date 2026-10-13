@@ -54,8 +54,8 @@ IMAGE_EXTS = (".tif", ".tiff", ".jpg", ".jpeg", ".png")
 STYLE = """
     QWidget { font-size: 11px; }
     QLabel { font-size: 12px; }
-    QComboBox { padding: 0px 4px; min-height: 20px; font-size: 12px; }
-    QPushButton { padding: 2px 8px; min-height: 20px; }
+    QComboBox { padding: 0px 4px; min-height: 18px; font-size: 12px; }
+    QPushButton { padding: 1px 6px; min-height: 18px; }
     QPushButton#primary { font-weight: bold; background-color: #006400; color: white; }
     QPushButton#primary:disabled { background-color: #9bb59b; color: #eeeeee; }
     QCheckBox, QRadioButton { font-size: 12px; }
@@ -65,7 +65,7 @@ STYLE = """
         background-color: white; border: 1px solid gray; }
     QRadioButton::indicator:checked { background-color: #FFD700; border: 1px solid #006400; border-radius: 6px; }
     QRadioButton::indicator:unchecked { background-color: white; border: 1px solid gray; border-radius: 6px; }
-    QGroupBox { border: 1px solid #006400; border-radius: 4px; margin-top: 10px; padding-top: 4px; }
+    QGroupBox { border: 1px solid #006400; border-radius: 4px; margin-top: 8px; padding-top: 2px; }
     QGroupBox::indicator { width: 0px; height: 0px; }
     QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 3px; color: #006400;
                        font-weight: bold; font-size: 12px; }
@@ -519,8 +519,11 @@ class CanopyFindWorker(QtCore.QThread):
             if self._cancelled:
                 break
             g = job["group"]
+            sfp = job.get("source_fp") or self.source_fp
+            sax = job.get("source_ax") if job.get("source_fp") else self.source_ax
             try:
-                ctx = CF.prepare_source(self.source_fp, job["rec"], self.source_ax, self.cfg, g)
+                ctx = CF.prepare_source(sfp, job["rec"], sax, dict(self.cfg, bands=job.get("bands",
+                                                                                          self.cfg.get("bands"))), g)
             except Exception as e:
                 self.failed.emit(f"Crown '{g}': {e}")
                 continue
@@ -528,9 +531,18 @@ class CanopyFindWorker(QtCore.QThread):
             targets = job.get("targets")
             if targets is None and self.scan is not None:
                 self.progress.emit(0, 1, f"'{g}': choosing images")
+                scan = dict(self.scan)
+                if _norm(sfp) != _norm(self.source_fp):
+                    # a crown on another image: the dialog's images, plus the dialog's
+                    # source image, minus its own
+                    extra = [{"fp": self.source_fp, "root": scan.get("source_root", ""), "project": None,
+                              "external": False}]
+                    scan["targets"] = [t for t in list(scan.get("targets") or []) + extra
+                                       if _norm(t["fp"]) != _norm(sfp)]
+                scan.pop("source_root", None)
                 try:
                     items, _summary, _kind = classify_targets(
-                        self.source_fp, job["rec"], self.source_ax, cancel=lambda: self._cancelled, **self.scan)
+                        sfp, job["rec"], sax, cancel=lambda: self._cancelled, **scan)
                 except Exception as e:
                     self.failed.emit(f"Crown '{g}': {e}")
                     continue
@@ -707,6 +719,10 @@ class TempOutline(QtWidgets.QGraphicsPolygonItem):
 # ════════════════════════════════════════════════════════════════════════
 # Dialog
 # ════════════════════════════════════════════════════════════════════════
+#: where the folded state of the sections is kept (tests use their own)
+SETTINGS_ID = ("CanoPie", "CanoPie")
+
+
 class Section(QtWidgets.QGroupBox):
     """A dialog section that folds to its title: click "▾ Title" / "▸ Title".
     Its controls live in `body`; the folded state is remembered."""
@@ -721,7 +737,7 @@ class Section(QtWidgets.QGroupBox):
         lay.addWidget(self.body)
         self.setCheckable(True)
         try:
-            folded = QtCore.QSettings("CanoPie", "CanoPie").value(self._key, False, type=bool)
+            folded = QtCore.QSettings(*SETTINGS_ID).value(self._key, False, type=bool)
         except Exception:
             folded = False
         self.setChecked(not folded)
@@ -736,7 +752,7 @@ class Section(QtWidgets.QGroupBox):
                            QtWidgets.QSizePolicy.Preferred if open_ else QtWidgets.QSizePolicy.Maximum)
         if save:
             try:
-                QtCore.QSettings("CanoPie", "CanoPie").setValue(self._key, not open_)
+                QtCore.QSettings(*SETTINGS_ID).setValue(self._key, not open_)
             except Exception:
                 pass
 
@@ -759,7 +775,7 @@ class CanopyFinderDialog(QtWidgets.QDialog):
         self.setWindowTitle("Find canopy in other images")
         self.setWindowFlags(self.windowFlags() & ~QtCore.Qt.WindowContextHelpButtonHint)
         self.setModal(False)
-        self.resize(980, 720)
+        self.resize(920, 640)
         self.setStyleSheet(STYLE)
         self.worker = None
         self.ctx = None
@@ -767,6 +783,7 @@ class CanopyFinderDialog(QtWidgets.QDialog):
         self.results = []            # [(Result, target dict, saved_state)]
         self._temp_items = []        # (viewer, item) dashed outlines of unsaved results
         self.browser = None
+        self._crown_src = {}             # crowns on OTHER images than the source (polygon manager)
         self._ext_path = None            # (one folder; kept for callers -- see _ext_paths)
         self._ext_paths = []
         self._src_rec = None
@@ -784,6 +801,8 @@ class CanopyFinderDialog(QtWidgets.QDialog):
     # ---------------- UI ----------------
     def _build_ui(self):
         lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(6, 4, 6, 4)
+        lay.setSpacing(4)
         src_box = self.sec_crowns = Section("Crowns")
         sf = QtWidgets.QGridLayout(src_box.body)
         self.source_combo = QtWidgets.QComboBox()
@@ -797,7 +816,7 @@ class CanopyFinderDialog(QtWidgets.QDialog):
         b_gall.clicked.connect(lambda: self._tick_groups(True))
         b_gnone.clicked.connect(lambda: self._tick_groups(False))
         self.group_list = QtWidgets.QListWidget()
-        self.group_list.setMaximumHeight(110)
+        self.group_list.setMaximumHeight(84)
         self.group_list.setToolTip("Tick one or several crowns of the source image: each is searched for. "
                                    "The highlighted one drives the image list below.")
         self.group_list.itemChanged.connect(lambda _it: self._groups_changed())
@@ -827,7 +846,7 @@ class CanopyFinderDialog(QtWidgets.QDialog):
         row.addStretch(1)
         tl.addLayout(row)
         self.ext_list = QtWidgets.QListWidget()
-        self.ext_list.setMaximumHeight(64)
+        self.ext_list.setMaximumHeight(50)
         self.ext_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.ext_list.setVisible(False)
         tl.addWidget(self.ext_list)
@@ -838,7 +857,7 @@ class CanopyFinderDialog(QtWidgets.QDialog):
         self.ext_sub_btn.clicked.connect(self._browse_subfolders)
         self.ext_rm_btn.clicked.connect(self._remove_folders)
         self.target_list = QtWidgets.QListWidget()
-        self.target_list.setMaximumHeight(150)
+        self.target_list.setMaximumHeight(120)
         tl.addWidget(self.target_list)
         sel = QtWidgets.QHBoxLayout()
         b_all = QtWidgets.QPushButton("Tick all covering")
@@ -900,10 +919,21 @@ class CanopyFinderDialog(QtWidgets.QDialog):
                                 f"the app and the system; the searches run at below-normal priority.")
         f.addRow("Method:", self.method)
         f.addRow(grid)
-        f.addRow("Rotation step:", self.step)
-        f.addRow("Min score (NCC):", self.min_score)
-        f.addRow("Nearest raw frames (KD-tree):", kn)
-        f.addRow("Parallel searches:", self.workers)
+        for w in (self.step, self.min_score, self.workers):
+            w.setMaximumWidth(90)
+        self.k_near.setMaximumWidth(60)
+        for w in (self.radius, self.angle, self.radius_exif, self.angle_exif, self.radius_pct, self.angle_pixel):
+            w.setMaximumWidth(150)
+        g2 = QtWidgets.QGridLayout()
+        g2.setHorizontalSpacing(6); g2.setVerticalSpacing(2)
+        g2.addWidget(QtWidgets.QLabel("Rotation step:"), 0, 0); g2.addWidget(self.step, 0, 1)
+        g2.addWidget(QtWidgets.QLabel("Min score (NCC):"), 0, 2); g2.addWidget(self.min_score, 0, 3)
+        lk = QtWidgets.QLabel("Nearest raw frames:")
+        lk.setToolTip("KD-tree on the GPS of the frames: the k nearest the crown in each folder")
+        g2.addWidget(lk, 1, 0); g2.addLayout(kn, 1, 1)
+        g2.addWidget(QtWidgets.QLabel("Parallel searches:"), 1, 2); g2.addWidget(self.workers, 1, 3)
+        g2.setColumnStretch(4, 1)
+        f.addRow(g2)
         self.method.currentIndexChanged.connect(self._method_changed)
         self.k_near.valueChanged.connect(lambda _v: self._refresh_targets())
         opt.addWidget(set_box)
@@ -943,19 +973,27 @@ class CanopyFinderDialog(QtWidgets.QDialog):
         self.table.cellDoubleClicked.connect(lambda r, _c: self.show_result(r))
         self.table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._table_menu)
+        self.table.setMinimumHeight(140)
+        self.table.verticalHeader().setDefaultSectionSize(20)
         lay.addWidget(self.table, 1)
 
         bottom = QtWidgets.QHBoxLayout()
-        self.cb_ex_native = QtWidgets.QCheckBox("Registration square (GeoTIFF)")
-        self.cb_ex_native.setToolTip("Each image's own window around the crown, all bands, its own grid")
-        self.cb_ex_aligned = QtWidgets.QCheckBox("Aligned crown stack (GeoTIFF)")
-        self.cb_ex_aligned.setToolTip("Every image resampled onto the SOURCE crown window (same grid, all "
-                                      "bands): one GeoTIFF each + a multipage stack (page 0 = source) + CSV")
-        self.cb_ex_quick = QtWidgets.QCheckBox("Quicklook (PNG)")
-        self.cb_ex_native.setChecked(True)
-        self.cb_ex_aligned.setChecked(True)
-        self.btn_export = QtWidgets.QPushButton("Export registration squares…")
-        self.btn_export.clicked.connect(self.export)
+        self.ex_format = QtWidgets.QComboBox()
+        for key, label in CF.EXPORT_FORMATS.items():
+            self.ex_format.addItem(label, key)
+        self.ex_format.setToolTip("The crop of the crown in the source and in every image it was found in, "
+                                  "all aligned on the source crop (same grid: they stack), plus one metadata CSV")
+        self.ex_dir = QtWidgets.QLineEdit(self.default_export_dir())
+        self.ex_dir.setPlaceholderText("export folder")
+        self.ex_dir.setToolTip("Default: canopy_exports inside this project. One sub-folder per crown.")
+        self.ex_dir_btn = QtWidgets.QPushButton("…")
+        self.ex_dir_btn.setFixedWidth(28)
+        self.ex_dir_btn.setToolTip("Choose another folder")
+        self.ex_dir_btn.clicked.connect(self._browse_export_dir)
+        self.btn_export = QtWidgets.QPushButton("Export crowns")
+        self.btn_export.setToolTip("Aligned crops of the source and targets + metadata CSV; rejected results "
+                                   "are left out")
+        self.btn_export.clicked.connect(lambda: self.export())
         self.btn_save_all = QtWidgets.QPushButton("Save all")
         self.btn_save_all.setToolTip("Save every outline not saved yet (found, low score, geo) "
                                      "on this project's images")
@@ -964,11 +1002,24 @@ class CanopyFinderDialog(QtWidgets.QDialog):
         self.btn_browser.clicked.connect(self.open_browser)
         close = QtWidgets.QPushButton("Close")
         close.clicked.connect(self.close)
-        for w in (self.cb_ex_native, self.cb_ex_aligned, self.cb_ex_quick, self.btn_export):
-            bottom.addWidget(w)
+        bottom.addWidget(QtWidgets.QLabel("Export:"))
+        bottom.addWidget(self.ex_format)
+        bottom.addWidget(self.ex_dir, 1)
+        bottom.addWidget(self.ex_dir_btn)
+        bottom.addWidget(self.btn_export)
         bottom.addStretch(1)
         bottom.addWidget(self.btn_save_all); bottom.addWidget(self.btn_browser); bottom.addWidget(close)
         lay.addLayout(bottom)
+        for sec in (self.sec_crowns, self.sec_targets, self.sec_reg, self.sec_found):
+            bl = sec.body.layout()
+            bl.setContentsMargins(4, 2, 4, 2)
+            if isinstance(bl, QtWidgets.QFormLayout):
+                bl.setVerticalSpacing(2)
+            elif isinstance(bl, QtWidgets.QGridLayout):
+                bl.setVerticalSpacing(3)
+            else:
+                bl.setSpacing(3)
+        grid.setVerticalSpacing(2)
         self._set_result_buttons()
 
     def _method_changed(self):
@@ -979,11 +1030,49 @@ class CanopyFinderDialog(QtWidgets.QDialog):
         for w in (self.radius, self.radius_exif, self.radius_pct, self.scale_lo, self.scale_hi, self.min_score):
             w.setEnabled(not geo)
 
+    def default_export_dir(self):
+        pf = getattr(self.pt, "project_folder", None)
+        return os.path.join(pf, "canopy_exports") if pf else ""
+
+    def _browse_export_dir(self):
+        start = self.ex_dir.text().strip() or self.default_export_dir()
+        while start and not os.path.isdir(start):
+            start = os.path.dirname(start) if os.path.dirname(start) != start else ""
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Export the crowns into…", start)
+        if d:
+            self.ex_dir.setText(os.path.normpath(d))
+
+    # ---------------- reject ----------------
+    def is_rejected(self, row):
+        return bool(self.results[row][1].get("rejected"))
+
+    def set_rejected(self, row, on=True):
+        """Leave a result out of Save all, the export and the browser (or take it
+        back). A polygon already saved stays saved."""
+        self.results[row][1]["rejected"] = bool(on)
+        self._update_row(row)
+        if on:
+            self._drop_temp_outline(row)
+        if self.browser is not None and self.browser.isVisible():
+            self.browser.result_changed(row)
+
+    def _drop_temp_outline(self, row):
+        keep = []
+        for v, it in self._temp_items:
+            if getattr(it, "row", None) == row:
+                try:
+                    v.scene().removeItem(it)
+                except Exception:
+                    pass
+            else:
+                keep.append((v, it))
+        self._temp_items = keep
+
     def _set_result_buttons(self):
-        has = any(r.has_polygon for r, _t, _s in self.results)
+        has = any(r.has_polygon and not t.get("rejected") for r, t, _s in self.results)
         self.btn_export.setEnabled(has)
-        self.btn_save_all.setEnabled(any(r.has_polygon and not t.get("external") and s not in ("saved", "replaced")
-                                         for r, t, s in self.results))
+        self.btn_save_all.setEnabled(any(r.has_polygon and not t.get("external") and not t.get("rejected")
+                                         and s not in ("saved", "replaced") for r, t, s in self.results))
         self.btn_browser.setEnabled(bool(self.results) and self.ctx is not None)
 
     # ---------------- source / targets ----------------
@@ -992,6 +1081,7 @@ class CanopyFinderDialog(QtWidgets.QDialog):
         its group, the polygon list the crowns of the chosen image (this one ticked)."""
         self.group = group
         self._wanted_groups = {group}
+        self._crown_src = {}
         files = []
         gmap = (self.pt.all_polygons or {}).get(group) or {}
         seen = set()
@@ -1012,6 +1102,26 @@ class CanopyFinderDialog(QtWidgets.QDialog):
     def source_fp(self):
         return self.source_combo.currentData()
 
+    def set_crowns(self, crowns):
+        """Several crowns, each on its own image (any root): the first one's image
+        is the source; the others are listed as "crown  [image]" and each is
+        searched from its own image. The search covers every root."""
+        crowns = [(g, fp) for g, fp in crowns if g is not None and fp]
+        if not crowns:
+            return
+        self.set_source(crowns[0][0], crowns[0][1])
+        sfp = self.source_fp()
+        self._wanted_groups = {g for g, _fp in crowns}
+        self._crown_src = {g: fp for g, fp in crowns if _norm(fp) != _norm(sfp)}
+        self._fill_groups()
+        if self._crown_src and not self.rb_ext.isChecked():
+            self.rb_project.setChecked(True)
+        self._refresh_targets()
+
+    def crown_source(self, group):
+        """The image a crown is searched from."""
+        return self._crown_src.get(group) or self.source_fp()
+
     # ---------------- the polygon list ----------------
     def _groups_on(self, fp):
         try:
@@ -1026,11 +1136,15 @@ class CanopyFinderDialog(QtWidgets.QDialog):
         self.group_list.blockSignals(True)
         self.group_list.clear()
         cur = None
-        for g in (self._groups_on(sfp) if sfp else []):
-            it = QtWidgets.QListWidgetItem(str(g))
+        here = self._groups_on(sfp) if sfp else []
+        for g in here + [g for g in self._crown_src if g not in here]:
+            elsewhere = g in self._crown_src and g not in here
+            it = QtWidgets.QListWidgetItem(f"{g}  [{os.path.basename(self._crown_src[g])}]" if elsewhere else str(g))
             it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
             it.setCheckState(QtCore.Qt.Checked if g in self._wanted_groups else QtCore.Qt.Unchecked)
             it.setData(QtCore.Qt.UserRole, g)
+            if elsewhere:
+                it.setToolTip(f"On {self._crown_src[g]}: searched from that image")
             self.group_list.addItem(it)
             if g == self.group:
                 cur = it
@@ -1280,12 +1394,22 @@ class CanopyFinderDialog(QtWidgets.QDialog):
         for g in groups:
             if g == self.group:
                 continue
-            _k, r_ = existing_record(self.pt, g, sfp)
-            if r_ is not None:
-                jobs.append({"group": g, "rec": _plain(r_), "targets": None})
+            gfp = self.crown_source(g)
+            _k, r_ = existing_record(self.pt, g, gfp)
+            if r_ is None:
+                continue
+            job = {"group": g, "rec": _plain(r_), "targets": None}
+            if _norm(gfp) != _norm(sfp):
+                gax = ax_for(self.pt, gfp)
+                job.update(source_fp=gfp, source_ax=gax, bands=match_bands(gax, CF.file_band_count(gfp)))
+            jobs.append(job)
+        try:
+            src_root = self.pt.get_root_by_filepath(sfp) or ""
+        except Exception:
+            src_root = ""
         scan = {"targets": self._candidate_targets(), "opts": self._scan_opts(),
                 "project_folder": getattr(self.pt, "project_folder", None),
-                "gps_exif_cache": getattr(self.pt, "_gps_exif_cache", None)}
+                "gps_exif_cache": getattr(self.pt, "_gps_exif_cache", None), "source_root": src_root}
         self._clear_temp_items()
         if self.browser is not None:
             # its tiles index the rows about to be replaced
@@ -1369,7 +1493,22 @@ class CanopyFinderDialog(QtWidgets.QDialog):
         r, t, saved = self.results[i]
         it = self.table.item(i, 7)
         if it is not None:
-            it.setText(saved)
+            it.setText("rejected" if t.get("rejected") else saved)
+        grey = QtGui.QColor("#9e9e9e")
+        for c in range(self.table.columnCount()):
+            cell = self.table.item(i, c)
+            if cell is None:
+                continue
+            f = cell.font()
+            f.setStrikeOut(bool(t.get("rejected")))
+            cell.setFont(f)
+            if t.get("rejected"):
+                if cell.data(QtCore.Qt.UserRole + 7) is None:
+                    cell.setData(QtCore.Qt.UserRole + 7, cell.foreground())
+                cell.setForeground(grey)
+            elif cell.data(QtCore.Qt.UserRole + 7) is not None:
+                cell.setForeground(cell.data(QtCore.Qt.UserRole + 7))
+                cell.setData(QtCore.Qt.UserRole + 7, None)
         self._set_result_buttons()
 
     def _on_finished(self):
@@ -1398,7 +1537,7 @@ class CanopyFinderDialog(QtWidgets.QDialog):
         if v is not None and self._src_rec is not None:
             zoom_viewer_to(self.pt, v, self._src_rec.get("points") or [], self._src_rec.get("image_ref_size") or {})
         for i, (r, t, saved) in enumerate(self.results):
-            if not r.has_polygon or t.get("external"):
+            if not r.has_polygon or t.get("external") or t.get("rejected"):
                 continue
             v = live_viewer_for(self.pt, r.target_fp)
             if v is None:
@@ -1489,7 +1628,8 @@ class CanopyFinderDialog(QtWidgets.QDialog):
         (found, low score or geo). Images already holding the group are replaced
         only after one question (zip backup first). Returns the number saved."""
         rows = [i for i, (r, t, s) in enumerate(self.results)
-                if r.has_polygon and not t.get("external") and s not in ("saved", "replaced")]
+                if r.has_polygon and not t.get("external") and not t.get("rejected")
+                and s not in ("saved", "replaced")]
         if not rows:
             if ask:
                 QtWidgets.QMessageBox.information(self, "Save all", "Nothing left to save.")
@@ -1534,10 +1674,15 @@ class CanopyFinderDialog(QtWidgets.QDialog):
         a_show = m.addAction("Show / zoom")
         a_save = m.addAction("Save this polygon")
         a_repl = m.addAction("Save, replacing the existing one")
-        ok = r.has_polygon and not t.get("external") and saved not in ("saved", "replaced")
+        m.addSeparator()
+        a_rej = m.addAction("Restore (back into Save all and the export)" if t.get("rejected")
+                            else "Reject (leave out of Save all and the export)")
+        ok = r.has_polygon and not t.get("external") and not t.get("rejected") and saved not in ("saved", "replaced")
         a_save.setEnabled(ok); a_repl.setEnabled(ok)
         ch = m.exec_(self.table.viewport().mapToGlobal(pos))
-        if ch == a_show:
+        if ch == a_rej:
+            self.set_rejected(row, not t.get("rejected"))
+        elif ch == a_show:
             self.show_result(row)
         elif ch == a_save:
             if self.save_row(row) == "exists":
@@ -1547,41 +1692,45 @@ class CanopyFinderDialog(QtWidgets.QDialog):
             self.save_row(row, replace=True)
 
     # ---------------- export / browser ----------------
-    def export(self, groups=None, folder=None):
-        """Per crown, into <folder>/<crown>_<source>/: registration squares,
-        the aligned crown stack, quicklooks, summary."""
+    def export(self, groups=None, folder=None, fmt=None, quiet=False):
+        """Per crown, into <folder>/<crown>_<source>/: the source crop and the
+        crop of every target it was found in (rejected ones left out), aligned on
+        the source crop, as GeoTIFF or JPEG, + <crown>_metadata.csv. Default
+        folder: canopy_exports inside the project. Returns the crown folders."""
         if not self.results or not self.ctxs:
-            return
-        d = folder or QtWidgets.QFileDialog.getExistingDirectory(self, "Export registration squares to…")
+            return []
+        d = folder or self.ex_dir.text().strip()
         if not d:
-            return
-        n, outs = 0, []
+            self._browse_export_dir()
+            d = self.ex_dir.text().strip()
+            if not d:
+                return []
+        fmt = fmt or self.ex_format.currentData() or "tif"
+        outs, n_img = [], 0
         try:
             QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+            os.makedirs(d, exist_ok=True)
             for g, ctx in self.ctxs.items():
                 if groups is not None and g not in groups:
                     continue
-                out = os.path.join(d, f"{g}_{os.path.splitext(os.path.basename(ctx.fp))[0]}")
-                os.makedirs(out, exist_ok=True)
+                mine = [(r, t, s_) for r, t, s_ in self.results
+                        if t.get("group", self.group) == g and not t.get("rejected")]
+                out, files = CF.export_crowns(ctx, [r for r, _t, _s in mine], d, fmt=fmt, frames=self.frames,
+                                              saved={r.target_fp: s_ for r, _t, s_ in mine})
                 outs.append(out)
-                if self.cb_ex_native.isChecked():
-                    CF.export_source_square(ctx, out, frames=self.frames)
-                mine = [r for r, t, _s in self.results if t.get("group", self.group) == g]
-                for r in mine:
-                    if r.has_polygon:
-                        n += len(CF.export_result(ctx, r, out, native=self.cb_ex_native.isChecked(),
-                                                  aligned=False,
-                                                  quicklook=self.cb_ex_quick.isChecked(), frames=self.frames))
-                if self.cb_ex_aligned.isChecked():
-                    n += len(CF.export_aligned_stack(ctx, mine, out, frames=self.frames))
-                CF.write_summary(mine, out, ctx)
+                n_img += len(files) - 1
         except Exception as e:
             logging.exception("[canopy_finder] export failed")
-            QtWidgets.QMessageBox.warning(self, "Export", f"Export failed: {e}")
-            return
+            if not quiet:
+                QtWidgets.QMessageBox.warning(self, "Export", f"Export failed: {e}")
+            return outs
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
-        QtWidgets.QMessageBox.information(self, "Export", f"{n} file(s) + summaries written to\n" + "\n".join(outs))
+        if not quiet:
+            QtWidgets.QMessageBox.information(
+                self, "Export", f"{len(outs)} crown(s): {n_img} aligned crop(s) + metadata CSV in\n"
+                                + "\n".join(outs))
+        return outs
 
     def open_browser(self, focus_fp=None):
         if self.ctx is None:
