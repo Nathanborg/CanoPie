@@ -198,6 +198,34 @@ def test_band_math_after_an_ax_edit_is_computed_on_the_new_image(synthetic_proje
     assert rgb(rows_same) == rgb(rows_fresh)
 
 
+def test_two_ax_edits_with_the_same_mtime_still_refresh_the_band_math(synthetic_project, ax_on):
+    """Windows file times tick every ~15 ms: two .ax edits inside one tick share
+    an mtime. The band-math cache was keyed by (file, .ax mtime) and served the
+    image before the second edit. Forced here: both edits get the SAME mtime."""
+    pt = synthetic_project
+    name = "rgb_16bit_tiled_bip_cog"
+    group, fp, poly = _poly(pt, name)
+    _clear(pt)
+    ax_on(name, {"crop_enabled": True, "crop_rect": {"x": 0, "y": 0, "width": 90, "height": 90},
+                 "crop_rect_ref_size": {"w": 96, "h": 96}})
+    axp = pt._ax_path_for(fp)
+    st = os.stat(axp)
+    rows1, _ = pt.process_polygon(group, fp, poly, {}, [], False, opts=BM_OPTS)
+    for attr in ("_export_image_cache", "_export_cache", "_export_frame_hw_cache"):
+        c = getattr(pt, attr, None)
+        if hasattr(c, "clear"):
+            c.clear()
+    ax_on(name, {"crop_enabled": True, "crop_rect": {"x": 7, "y": 5, "width": 85, "height": 88},
+                 "crop_rect_ref_size": {"w": 96, "h": 96}})
+    os.utime(axp, ns=(st.st_atime_ns, st.st_mtime_ns))           # the very same mtime as the first edit
+    rows_same, _ = pt.process_polygon(group, fp, poly, {}, [], False, opts=BM_OPTS)
+    _clear(pt)
+    rows_fresh, _ = pt.process_polygon(group, fp, poly, {}, [], False, opts=BM_OPTS)
+    assert _bm_rows(rows_same) == _bm_rows(rows_fresh) != _bm_rows(rows1), (
+        "an .ax edit with an unchanged mtime kept the old band math",
+        _bm_rows(rows1), _bm_rows(rows_same), _bm_rows(rows_fresh))
+
+
 def test_background_export_drops_each_files_band_math(synthetic_project, tmp_path):
     from ..project_tab import ExportWorker
     pt = synthetic_project

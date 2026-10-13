@@ -179,11 +179,23 @@ def _restore_global_app_state():
     """
     from ..image_viewer import ImageViewer
 
+    from ..image_viewer import _ZoomBar
     saved = getattr(ImageViewer, "overlays_muted", False)
+    # Zoom sync is class-level too, and _ZoomBar caches the viewers it syncs to
+    # for 500 ms: a test that ended with viewers whose deletion was still
+    # pending left the next test syncing zoom INTO them -- a native access
+    # violation inside the wheel test's sync timer when several viewer test
+    # files ran in one process.
+    zb_keys = ("_zoom_sync_enabled", "_syncing", "_applying_fixed_zoom", "_fixed_zoom", "_fixed_center_norm")
+    zb_saved = {k: getattr(_ZoomBar, k, None) for k in zb_keys}
     try:
         yield
     finally:
         ImageViewer.overlays_muted = saved
+        for k, val in zb_saved.items():
+            setattr(_ZoomBar, k, val)
+        _ZoomBar._viewers_cache = None
+        _ZoomBar._viewers_cache_time = 0
 
 
 @pytest.fixture(scope="session", autouse=True)

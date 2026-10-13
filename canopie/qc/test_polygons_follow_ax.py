@@ -210,6 +210,8 @@ def test_a_resize_alone_moves_nothing_and_writes_nothing(iso, tmp_path, kind):
         _write_ax(pt, fp, None)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="two spellings of one path (forward and back slashes) "
+                                            "exist only on Windows")
 def test_two_spellings_of_one_image_are_moved_once(iso, tmp_path):
     """Records of one image keyed 'C:/x/a.tif' and 'C:\\x\\a.tif' (the BCI
     project has both): a snapshot keyed by spelling moved every crown twice --
