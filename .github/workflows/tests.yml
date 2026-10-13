@@ -44,6 +44,15 @@ jobs:
         run: |
           python -c "import canopie.app, canopie._version as v; print('CanoPie', v.__version__)"
 
+      - name: Qt starts (Linux, virtual display)
+        if: runner.os == 'Linux'
+        run: |
+          QT_DEBUG_PLUGINS=1 xvfb-run -a -s '-screen 0 1920x1080x24' python -c "
+          from PyQt5 import QtWidgets
+          app = QtWidgets.QApplication(['ci'])
+          print('Qt platform:', app.platformName())
+          " 2>&1 | tail -40
+
       # The suite runs in parts (as in CONTRIBUTING.md): one process for every
       # file keeps the Qt / raster caches of hundreds of tests from piling up.
       - name: QC suite
