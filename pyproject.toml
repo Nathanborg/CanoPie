@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "canopie"
+version = "1.1.0"
+description = "A graphical user interface for multitemporal canopy imagery analysis (UAV, phenocam, multispectral, thermal)"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Nathan B. Gonçalves", email = "nathanborges@gmail.com" },
+  { name = "Scott C. Stark" },
+]
+requires-python = ">=3.10"
+keywords = ["remote sensing", "UAV", "phenocam", "canopy", "multispectral", "thermal", "forest ecology"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Environment :: X11 Applications :: Qt",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: GIS",
+  "Topic :: Scientific/Engineering :: Image Processing",
+]
+# Lower bounds only; requirements.txt pins the versions CanoPie is developed with.
+dependencies = [
+  "numpy>=1.24",
+  "scipy",
+  "opencv-python>=4.8",
+  "tifffile",
+  "imagecodecs",
+  "Pillow",
+  "PyQt5>=5.15",
+  "ExifRead",
+  "pyproj",
+  "shapely",
+  "scikit-learn>=1.2",
+  "joblib",
+  "matplotlib",
+  "folium",
+  "geopy",
+  "pystackreg",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.urls]
+Homepage = "https://github.com/Nathanborg/CanoPie"
+Issues = "https://github.com/Nathanborg/CanoPie/issues"
+
+[project.gui-scripts]
+canopie = "canopie.app:main"
+
+[tool.setuptools]
+packages = ["canopie"]          # the QC suite (canopie/qc) runs from a checkout
