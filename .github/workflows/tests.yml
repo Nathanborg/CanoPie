@@ -54,6 +54,11 @@ jobs:
           print('Qt platform:', app.platformName())
           " 2>&1 | tail -40
 
+      - name: Test collection (diagnostic)
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then RUN="xvfb-run -a"; else RUN=""; fi
+          $RUN python -X faulthandler -m pytest canopie/qc --collect-only -q -p no:cacheprovider 2>&1 | tail -40 || true
+
       # The suite runs in parts (as in CONTRIBUTING.md): one process for every
       # file keeps the Qt / raster caches of hundreds of tests from piling up.
       - name: QC suite

@@ -636,7 +636,12 @@ class ByteBudgetedLRUDict(OrderedDict):
         self._budget = int(budget_bytes)
         self._bytes = 0
         self._sizeof = sizeof_fn or estimate_cache_entry_bytes
-        self._cache_lock = threading.Lock()
+        # REENTRANT: on Python 3.10 the C OrderedDict.pop() of a subclass calls
+        # the subclass's own __getitem__ -- which takes this lock again inside
+        # pop() / the eviction in __setitem__. A plain Lock deadlocked there
+        # (the image editor froze on Apply when an edit dropped a cached image;
+        # found by CI on Python 3.10, Python 3.12 does not make that call).
+        self._cache_lock = threading.RLock()
 
     def __setitem__(self, key, value):
         with self._cache_lock:
