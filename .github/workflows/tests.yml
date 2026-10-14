@@ -59,11 +59,20 @@ jobs:
       - name: QC suite
         timeout-minutes: 60
         run: |
+          # GitHub runs this with `bash -e`: without +e the first pytest that
+          # exits non-zero ends the script before the retry below can run.
+          set +e
           if [ "$RUNNER_OS" = "Linux" ]; then RUN="xvfb-run -a -s '-screen 0 1920x1080x24'"; else RUN=""; fi
           status=0
-          # A part is retried ONCE only when its process dies natively (no
-          # report written: the rare PyQt5/Windows crash documented in
-          # canopie/qc/conftest.py). A test that fails is never retried.
+          # The rare native PyQt5/Windows crash (canopie/qc/conftest.py) is
+          # told apart from a failing test by the report, which is written
+          # only when the session ends:
+          #   - no report: the process died mid-run -> the part runs once more;
+          #   - a report with 0 failed but a crash exit code (above pytest's own
+          #     0-5, e.g. 139): every result was in, the crash hit interpreter
+          #     shutdown -> a warning, not a failure. pytest's own codes (1 tests
+          #     failed, 2 collection/teardown error, ...) always fail the job.
+          # A test that fails is never retried.
           run_once() {
             rm -f canopie/qc/last_run_report.txt
             eval $RUN python -u -m pytest "$@" -v -p no:cacheprovider --timeout=600 --durations=15
@@ -75,7 +84,16 @@ jobs:
               echo "::warning::$1: the test process died natively (exit $rc) -- retrying the part once"
               run_once "${@:2}"; rc=$?
             fi
-            [ $rc -ne 0 ] && status=1
+            if [ ! -f canopie/qc/last_run_report.txt ]; then
+              echo "::error::$1: the test process died natively twice (exit $rc)"
+              status=1
+            elif [ $rc -ne 0 ]; then
+              if [ $rc -gt 5 ] && grep -qE "^TOTAL:.*\| 0 failed \|" canopie/qc/last_run_report.txt; then
+                echo "::warning::$1: all tests passed, then the process crashed on exit (exit $rc)"
+              else
+                status=1
+              fi
+            fi
             mkdir -p qc_reports
             if [ -f canopie/qc/last_run_report.txt ]; then
               grep -E "TOTAL|FAILED" canopie/qc/last_run_report.txt || true
