@@ -28,6 +28,8 @@ main.py
   └── canopie/main_window.py      MainWindow (QMainWindow) — menus, toolbar, tabs, global actions
         └── project_tab.py        ProjectTab (QWidget) — THE central controller (~26k lines)
               ├── image_viewer.py         ImageViewer (QGraphicsView) + EditablePolygonItem / EditablePointItem
+              │     ├── canopy_tracer.py  Smart Canopy brush: strokes on a crown -> its outline (graph cut, no Qt)
+              │     └── canopy_auto.py    Auto Canopy engine: offline only, not wired into the app (no Qt)
               ├── image_editor_dialog.py  ImageEditorDialog (QDialog) — per-image non-destructive edits (.ax files)
               ├── polygon_manager.py      PolygonManager (QDialog) — polygon-group tree, import/visibility
               ├── machine_learning_manager.py  MachineLearningManager + RootOffsetDialog + AnalysisOptionsDialog
@@ -141,6 +143,44 @@ Stored hierarchically: `all_polygons[group_name][image_filepath] = [ {points, im
   cropped/resized/rotated versions.
 - `group_name` = a label/category (e.g. "canopy_mask", a species); `class` = optional per-polygon label.
 On disk they are mirrored as `*_polygons.json` sidecars, and embedded in `project.json`.
+
+**Drawing modes** (`ProjectTab.toggle_drawing_mode`, Alt+D): polygon, point, rectangle, circle,
+smart_canopy, random_points. Every non-point mode MUST be listed in
+`ImageViewer._is_point_drawing_mode`, or it is silently treated as point mode. **Smart Canopy**
+is a brush (as in RoosterFly): Shift+click/drag starts a session, later clicks/drags add strokes,
+Ctrl+drag erases, `[`/`]` size the brush, `-`/`+` (or Alt+scroll) set how far the crown may grow
+past the paint (`CanopyParams.grow` x brush radius — the only reach, so it never runs away),
+Backspace undoes a stroke, Esc cancels. Defaults are optimised on BCI crowns for ~10 clicks inside
+a crown (brush ~1/6 of the crown radius, grow 4: F1 0.84 held out). Existing polygons and erased
+bands win over paint — crowns never overlap. Strokes are kept in scene
+coordinates (`_sc_strokes`) and after each one `_trace_smart_canopy` re-selects the crown from all
+of them: it reads the *displayed* pixels — the sharp COG viewport tile when it is shown, else the
+pixmap — and calls `canopy_tracer.select_canopy` (a GrabCut graph cut seeded by the paint; erased
+bands, polygons already in the viewer and everything beyond a reach around the paint are hard
+background). The yellow preview is `_sc_sel_item`. Only **Enter** (or right-click) commits: the
+outline goes through the ordinary `add_polygon_to_scene` / `polygon_drawn` path, so ProjectTab's
+name dialog opens then, and it is saved, undone and exported like a hand-drawn polygon.
+
+**Vertex editing** drags handles (at most 100 per outline, `start_vertex_editing`); a drag pulls every
+vertex within `VERTEX_SOFT_RADIUS_SCREEN_PX` (`[`/`]` while editing) along with a smooth falloff —
+`_vertex_drag_begin` fixes the weights at the press, `_apply_vertex_update` moves the vertices in
+place (`EditablePolygonItem._set_vertex_points`) and the handles with them; Shift+drag moves one
+vertex. **Grow/shrink** (`+`/`-`, `ProjectTab.resize_selected_polygons`) buffers the record's exact
+points in the FULL-raster basis, maps them with `image_to_scene_coords` (never via the preview size —
+on a COG that double-scaled the outline into the image corner) and records the change with
+`ModifyPolygonCommand`, so it is undoable and keeps the record's other fields;
+`ModifyPolygonCommand._apply_state` loads a lazy crown before writing its points and drops its stale
+`lod`/`display_points`.
+
+**Auto Canopy** (`canopy_auto.py`, every crown in a region found automatically) is **not wired into
+the app** — it was removed from the toolbar after testing (held-out BCI crown F1 ~0.57–0.60 against
+0.84 for Smart Canopy by hand). The engine, its tests (`canopie/qc/test_canopy_auto.py`) and the
+optimiser (`scripts/optimise_auto_canopy.py`: dense blocks from a project's polygons or a crown
+shapefile, `--auto-align` to shift a crown map drawn on another orthomosaic onto this one, random
+search with a held-out split) remain for offline work. Diagnostic on BCI (held-out crown F1): found
+centres 0.57, true centres 0.66, true centres and sizes 0.77; `SIZE_MODEL_BCI` (ridge on
+`size_features`) predicts each crown's size well (correlation 0.75), but finding the centres is the
+limit.
 
 **Point items carry SUB-PIXEL precision, and must keep it.** `EditablePolygonItem.polygon`
 holds genuine scene coordinates; `EditablePointItem.points` is pixmap-LOCAL instead, so a true

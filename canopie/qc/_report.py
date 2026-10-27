@@ -50,6 +50,18 @@ FEATURE_MAP = {
     "test_random_shapes": (
         "Random shape generation",
         "count, containment in valid area, spacing constraints, stratification"),
+    "test_polygon_resize": (
+        "Grow / shrink a polygon with + / -",
+        "stays in place on a decimated (COG) preview, keeps the record, drops stale overview, undoable"),
+    "test_vertex_smooth_drag": (
+        "Smooth vertex dragging",
+        "falloff around the dragged vertex, handles follow, Shift = one vertex, [ / ] reach, throttle"),
+    "test_canopy_auto": (
+        "Auto Canopy engine (offline; not in the app)",
+        "closed-canopy crown F1, no overlaps, region, cancel, size model, learning"),
+    "test_smart_canopy": (
+        "Smart Canopy brush (paint a crown, Enter saves)",
+        "crown selection IoU, erase, stop at neighbours, 16-bit/1-band input, viewer session keys"),
     "test_shapefile_export": (
         "Shapefile export",
         "geometry/attribute round-trip, pixel<->geo transforms, DBF field naming"),

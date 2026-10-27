@@ -7132,7 +7132,7 @@ class ProjectTab(QtWidgets.QWidget):
         self.toolbar.addAction(self.exportManagerAct)
         
 
-        # Drawing mode toggle (cycles: Polygon > Point > Rectangle > Circle > Random Points)
+        # Drawing mode toggle (cycles: Polygon > Point > Rectangle > Circle > Smart Canopy > Random Points)
         self.toggleDrawingModeAct = QtWidgets.QAction("Drawing Mode: Polygon", self, checkable=False)
         self.toggleDrawingModeAct.setShortcut(QtGui.QKeySequence("Alt+D"))  
         self.toggleDrawingModeAct.triggered.connect(self.toggle_drawing_mode)
@@ -7141,7 +7141,7 @@ class ProjectTab(QtWidgets.QWidget):
             self._shortcuts_only(self.toggleDrawingModeAct)
         except Exception:
             sc = self.toggleDrawingModeAct.shortcut().toString()
-            self.toggleDrawingModeAct.setToolTip(f"{sc} - Click to cycle: Polygon → Point → Rectangle → Circle → Random Points")
+            self.toggleDrawingModeAct.setToolTip(f"{sc} - Click to cycle: Polygon → Point → Rectangle → Circle → Smart Canopy → Random Points")
         self.toolbar.addSeparator()
         self.toolbar.addAction(self.saveQuickAct)
         
@@ -12181,14 +12181,15 @@ class ProjectTab(QtWidgets.QWidget):
             return
 
     def toggle_drawing_mode(self):
-        """Cycle through drawing modes: Polygon > Point > Rectangle > Circle > Random Points"""
+        """Cycle through drawing modes: Polygon > Point > Rectangle > Circle > Smart Canopy > Random Points"""
         # Define the mode cycle sequence
-        mode_sequence = ["polygon", "point", "rectangle", "circle", "random_points"]
+        mode_sequence = ["polygon", "point", "rectangle", "circle", "smart_canopy", "random_points"]
         mode_labels = {
             "polygon": "Drawing Mode: Polygon",
             "point": "Drawing Mode: Point",
             "rectangle": "Drawing Mode: Rectangle",
             "circle": "Drawing Mode: Circle",
+            "smart_canopy": "Drawing Mode: Smart Canopy",
             "random_points": "Drawing Mode: Random Points"
         }
         
@@ -12207,6 +12208,13 @@ class ProjectTab(QtWidgets.QWidget):
         
         # Update the central drawing mode property.
         self.current_drawing_mode = new_mode
+        if new_mode == "smart_canopy":
+            sb = getattr(self.window(), "statusBar", None)
+            if callable(sb):
+                self.window().statusBar().showMessage(
+                    "Smart Canopy: Shift+click inside a crown, then keep clicking (~10 clicks) or dragging; "
+                    "Ctrl+drag erases, - / + how far it grows, [ / ] brush size, Backspace undo, "
+                    "Enter save, Esc cancel", 15000)
 
         # Update all currently active viewers.
         for item in self.viewer_widgets:
@@ -33656,17 +33664,15 @@ class ProjectTab(QtWidgets.QWidget):
                 pass
             return names
 
-        def _scene_pts(viewer, img_pts):
-            if hasattr(self, "image_to_scene_coords"):
-                return [ self.image_to_scene_coords(viewer, QtCore.QPointF(x, y)) for (x, y) in img_pts ]
-            return [ QtCore.QPointF(x, y) for (x, y) in img_pts ]
-
-        def _viewer_basis_hw(viewer, fallback_hw):
-            try:
-                return self._viewer_basis_hw(viewer, fallback_hw=fallback_hw)
-            except Exception:
-                th, tw = fallback_hw
-                return (int(th or 0), int(tw or 0))
+        def _scene_poly(viewer, img_pts):
+            # FULL-raster pixels -> scene, the mapping image_to_scene_coords /
+            # scene_to_image_coords use (pixmap / polygon_basis_hw). This used to
+            # first rescale the points into the size of the PREVIEW the viewer
+            # holds and then call image_to_scene_coords, which scales from the
+            # full raster again: harmless on a plain image (both factors 1), but
+            # on a COG shown as a 1/16 preview the outline was redrawn ~1/256 its
+            # size in the image's corner -- "+ / - deletes polygons" in BCI.
+            return QtGui.QPolygonF([self.image_to_scene_coords(viewer, QtCore.QPointF(x, y)) for (x, y) in img_pts])
 
         # ---------- decide WHICH viewer to act on ----------
         viewer, filepath = _focused_viewer()
@@ -33698,83 +33704,83 @@ class ProjectTab(QtWidgets.QWidget):
 
         changed_any = False
 
-        for group_name in target_groups:
-            pdata = (self.all_polygons.get(group_name, {}) or {}).get(filepath)
-            if not pdata:
-                continue
-            # Respect 'type': skip points
-            if str(pdata.get("type", "polygon")).lower() == "point":
-                continue
-
-            pts_image = pdata.get("points") or []
-            if not pts_image:
-                continue
-
-            # ---- compute new points (image coords) using your Shapely method ----
-            new_pts_image = self.shrink_or_swell_shapely_polygon(pts_image, factor=step, swell=swell)
-            if not new_pts_image or new_pts_image == pts_image:
-                continue
-
-            # Persist back to canonical store (image coords + ref size preserved)
-            ref = pdata.get("image_ref_size") or {}
-            ref_w = int(ref.get("w", 0) or 0)
-            ref_h = int(ref.get("h", 0) or 0)
-            is_new_entry = (group_name not in self.all_polygons) or (filepath not in self.all_polygons.get(group_name, {}))
-            self.all_polygons.setdefault(group_name, {})
-            self.all_polygons[group_name][filepath] = {
-                'points': new_pts_image,
-                'coord_space': 'image',
-                'image_ref_size': {'w': ref_w, 'h': ref_h},
-                'name': pdata.get('name', group_name),
-                'root': pdata.get('root', ''),
-                'coordinates': pdata.get('coordinates', {}),
-                'type': pdata.get('type', 'polygon'),
-            }
-            
-            # CRITICAL: Update index if this is a new entry
-            if is_new_entry:
-                self._add_to_polygon_index(group_name, filepath)
-
-            # ---- redraw on THIS viewer only (remove old item with same name, add new) ----
+        # The basis scene_to_image_coords / image_to_scene_coords work in: the
+        # FULL raster (not the decimated preview a COG is shown as).
+        try:
+            basis_h, basis_w = self.polygon_basis_hw(viewer)
+        except Exception:
+            basis_h, basis_w = (0, 0)
+        if not (basis_h and basis_w):
             try:
-                # remove existing polygon(s) of same name
-                existing_items = []
-                if hasattr(viewer, "get_all_polygons"):
-                    for item in list(viewer.get_all_polygons()):
-                        if getattr(item, "name", None) == group_name:
-                            existing_items.append(item)
-                for it in existing_items:
-                    try:
-                        viewer._scene.removeItem(it)
-                    except Exception:
-                        pass
+                basis_h, basis_w = viewer.image_data.image.shape[:2]
+            except Exception:
+                return
 
-                # Convert image coords to viewer basis if needed, then to scene coords
-                vh, vw = _viewer_basis_hw(viewer, fallback_hw=(ref_h, ref_w))
-                pts_for_viewer = new_pts_image
-                if (ref_w and ref_h and vw and vh) and (ref_w != vw or ref_h != vh):
-                    sx_v, sy_v = float(vw) / float(ref_w), float(vh) / float(ref_h)
-                    pts_for_viewer = [(x * sx_v, y * sy_v) for (x, y) in new_pts_image]
+        items_by_name = {}
+        if hasattr(viewer, "get_all_polygons"):
+            for it in viewer.get_all_polygons():
+                if isinstance(it, EditablePolygonItem) and getattr(it, "name", None):
+                    items_by_name.setdefault(it.name, it)
 
-                scene_pts = _scene_pts(viewer, pts_for_viewer)
-                qpoly = QtGui.QPolygonF(scene_pts)
+        n_groups = len(target_groups)
+        if n_groups > 1:
+            self.undo_stack.beginMacro(f"{'Grow' if swell else 'Shrink'} {n_groups} polygons")
+        try:
+            for group_name in target_groups:
+                pdata = (self.all_polygons.get(group_name, {}) or {}).get(filepath)
+                item = items_by_name.get(group_name)
+                if not pdata or item is None:
+                    continue
+                # Respect 'type': skip points
+                if str(pdata.get("type", "polygon")).lower() == "point":
+                    continue
 
-                # ADD and RESTORE SELECTION if it was selected before
-                new_item = None
-                if hasattr(viewer, "add_polygon_to_scene"):
-                    new_item = viewer.add_polygon_to_scene(qpoly, group_name)
-                else:
-                    viewer.add_polygon(qpoly, group_name)
+                pts_image = pdata.get("points") or []       # (materialises a lazy crown: exact geometry)
+                if not pts_image:
+                    continue
+                # Into the full-raster basis if the record was saved on another one
+                ref = pdata.get("image_ref_size") or {}
+                ref_w, ref_h = int(ref.get("w", 0) or 0), int(ref.get("h", 0) or 0)
+                old_pts = [(float(x), float(y)) for (x, y) in pts_image]
+                if ref_w and ref_h and (ref_w != basis_w or ref_h != basis_h):
+                    sx, sy = basis_w / float(ref_w), basis_h / float(ref_h)
+                    old_pts = [(x * sx, y * sy) for (x, y) in old_pts]
 
-                if group_name in selected_names_in_viewer and new_item is not None:
-                    try:
-                        new_item.setSelected(True)
-                    except Exception:
-                        pass
+                new_pts = self.shrink_or_swell_shapely_polygon(old_pts, factor=step, swell=swell)
+                if not new_pts or new_pts == old_pts:
+                    continue
+                new_pts = [(float(x), float(y)) for (x, y) in new_pts]
+                if len(new_pts) > 3 and new_pts[0] == new_pts[-1]:
+                    new_pts = new_pts[:-1]                  # shapely closes the ring; polygons here are open
 
+                old_scene = _scene_poly(viewer, old_pts)
+                new_scene = _scene_poly(viewer, new_pts)
+                # Move the item itself (ModifyPolygonCommand's first redo leaves the
+                # visual alone, as after a drag), then record the change undoably --
+                # the same path a vertex edit or a move takes: the record keeps all
+                # its other fields, the file is saved, Ctrl+Z restores it exactly.
+                try:
+                    item.prepareGeometryChange()
+                    item.polygon = new_scene
+                    item.setPos(0, 0)
+                    item.is_lod_geometry = False
+                    item.update()
+                except Exception as e:
+                    logging.debug(f"resize: could not update '{group_name}' on screen: {e}")
+                    continue
+                cmd = ModifyPolygonCommand(self, group_name, filepath, group_name, old_scene, new_scene,
+                                           old_pts, new_pts, basis_w, basis_h)
+                cmd.setText(f"{'Grow' if swell else 'Shrink'} Polygon '{group_name}'")
+                self.undo_stack.push(cmd)
                 changed_any = True
-            except Exception as e:
-                logging.debug(f"Viewer redraw failed for '{group_name}': {e}")
+        finally:
+            if n_groups > 1:
+                self.undo_stack.endMacro()
+        if changed_any:
+            try:
+                viewer.invalidate_polygon_batch()          # the zoomed-out tiles hold the old outline
+            except Exception:
+                pass
 
         if changed_any:
             try:
@@ -34784,6 +34790,14 @@ class ModifyPolygonCommand(QUndoCommand):
         if self.group_name in self.tab.all_polygons:
              d = self.tab.all_polygons[self.group_name].get(self.filepath)
              if d:
+                 # A lazy crown (only its coarse overview read yet) must load its
+                 # full record BEFORE the new points go in: otherwise the save
+                 # below reads it -- and the sidecar's old points overwrite the
+                 # edit. Its coarse levels describe the old outline: drop them.
+                 if isinstance(d, polygon_lod.LazyPolygonRecord):
+                     d.get('points')
+                 d.pop('lod', None)
+                 d.pop('display_points', None)
                  d['points'] = img_pts
                  # Make sure to update the reference size since these coordinates are tied to the active scaled basis
                  if self.eff_w > 0 and self.eff_h > 0:

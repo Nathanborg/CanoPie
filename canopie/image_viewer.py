@@ -235,14 +235,16 @@ class VertexHandle(QtWidgets.QGraphicsObject):
     
     def itemChange(self, change, value):
         if change == QtWidgets.QGraphicsItem.ItemPositionHasChanged:
-            # Notify viewer of the move
+            # Notify viewer of the move -- unless the viewer itself is moving this
+            # handle along with a smooth drag of a neighbouring one
             try:
-                if self.viewer and hasattr(self.viewer, 'on_vertex_moved'):
+                if (self.viewer and hasattr(self.viewer, 'on_vertex_moved')
+                        and not self.viewer.__dict__.get('_vx_programmatic', False)):
                     self.viewer.on_vertex_moved(self.index, value)
             except Exception as e:
                 logging.debug(f"[VertexHandle] Error notifying viewer: {e}")
         return super().itemChange(change, value)
-    
+
     def mousePressEvent(self, event):
         # PERFORMANCE: Notify viewer that vertex is being dragged
         if event.button() == QtCore.Qt.LeftButton:
@@ -251,10 +253,13 @@ class VertexHandle(QtWidgets.QGraphicsObject):
                     self.viewer._begin_item_drag()
                 if self.viewer and hasattr(self.viewer, '_item_being_dragged'):
                     self.viewer._item_being_dragged = True
+                if self.viewer and hasattr(self.viewer, '_vertex_drag_begin'):
+                    self.viewer._vertex_drag_begin(
+                        self, single=bool(event.modifiers() & QtCore.Qt.ShiftModifier))
             except Exception:
                 pass
         super().mousePressEvent(event)
-    
+
     def mouseReleaseEvent(self, event):
         # PERFORMANCE: Notify viewer that drag ended
         if event.button() == QtCore.Qt.LeftButton:
@@ -263,6 +268,8 @@ class VertexHandle(QtWidgets.QGraphicsObject):
                     self.viewer._end_item_drag()
                 if self.viewer and hasattr(self.viewer, '_item_being_dragged'):
                     self.viewer._item_being_dragged = False
+                if self.viewer and hasattr(self.viewer, '_vertex_drag_end'):
+                    self.viewer._vertex_drag_end()
             except Exception:
                 pass
         super().mouseReleaseEvent(event)
@@ -294,6 +301,20 @@ HIGHRES_TILE_Z   = 0.5     # sharpened viewport tile -- above the image...
 POLYGON_Z        = 1.0     # ...and BELOW every annotation
 TEMP_DRAWING_Z   = 1e6     # in-progress rubber-band polygon
 LABEL_Z          = 1e7     # name labels, always on top
+
+# Smart Canopy brush: its default radius (screen px; [ / ] resize it), and how
+# far a crown may reach (x the viewport's longer side).
+SMART_CANOPY_BRUSH_SCREEN_PX = 25          # ~1/6 of a crown ~300 px across on screen (BCI-optimised)
+SMART_CANOPY_VIEW_REACH = 0.6
+# How far the crown may grow past the paint, x the brush radius (- / + step
+# through these; 0 = exactly what is painted).
+SMART_CANOPY_GROW_STEPS = (0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+SMART_CANOPY_GROW_DEFAULT = 8      # index: 4.0 (see CanopyParams.grow)
+
+# Vertex editing: dragging a handle pulls the outline within this radius (screen
+# px; [ / ] resize it while editing) along with a smooth falloff; Shift+drag
+# moves the one vertex only.
+VERTEX_SOFT_RADIUS_SCREEN_PX = 40
 
 
 # ---------------------------------------------------------------------------
@@ -705,6 +726,24 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
             pts_np[index, 0] = new_point.x()
             pts_np[index, 1] = new_point.y()
 
+        self._simplified_cache = None
+        self.update()
+
+    def _set_vertex_points(self, indices, xy):
+        """Move MANY vertices at once (a smooth vertex drag), on the same cheap
+        terms as _set_vertex_point: in place, no rebuild of the shape cache
+        until the edit session ends.  ``indices`` (k,) ints, ``xy`` (k, 2)."""
+        self.prepareGeometryChange()
+        poly = self._polygon
+        n = poly.count()
+        for i, (x, y) in zip(indices, xy):
+            if 0 <= i < n:
+                poly[int(i)] = QtCore.QPointF(float(x), float(y))
+        pts_np = self._pts_np
+        if pts_np is not None and len(pts_np) == n:
+            idx = np.asarray(indices, dtype=np.int64)
+            ok = (idx >= 0) & (idx < n)
+            pts_np[idx[ok]] = np.asarray(xy, dtype=np.float64)[ok]
         self._simplified_cache = None
         self.update()
 
@@ -2078,7 +2117,8 @@ class ImageViewer(QtWidgets.QGraphicsView):
         # Original Image Data Reference
         self._image_data = None
 
-        # Drawing mode: "polygon", "point", "rectangle", "circle", "random_points"
+        # Drawing mode: "polygon", "point", "rectangle", "circle", "random_points",
+        # "smart_canopy" (click / scribble a crown -> its outline, canopy_tracer.py)
         self.drawing_mode = "polygon"
         self.setMouseTracking(True)
         self._last_hover_pixel = None
@@ -3040,7 +3080,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
 
     def _is_point_drawing_mode(self):
         return getattr(self, "drawing_mode", "polygon") not in (
-            "polygon", "rectangle", "circle", "random_points")
+            "polygon", "rectangle", "circle", "random_points", "smart_canopy")
 
     def _snap_scene_to_export_pixel(self, scene_pt):
         """Scene position of the CENTRE of the exported-frame pixel under
@@ -3714,6 +3754,15 @@ class ImageViewer(QtWidgets.QGraphicsView):
             return
 
         delta = event.angleDelta().y()
+        # Smart canopy: Alt+scroll changes how far the crown may grow. Qt
+        # reports an Alt+wheel on the X axis, so read whichever axis moved.
+        if (self.drawing and getattr(self, "drawing_mode", "") == "smart_canopy"
+                and event.modifiers() & QtCore.Qt.AltModifier):
+            d = delta or event.angleDelta().x()
+            if d:
+                self._smart_canopy_change_grow(+1 if d > 0 else -1)
+            event.accept()
+            return
         if not delta:
             event.accept()
             return
@@ -3990,7 +4039,10 @@ class ImageViewer(QtWidgets.QGraphicsView):
                     self.currentPolygon = QtGui.QPolygonF()
                     self.currentPolygon.append(point)
                     self.lastPoint = point
-                    
+                    if self.drawing_mode == "smart_canopy":
+                        self._smart_canopy_begin()
+                        self._sc_erase = False
+
                     # Handle random points mode - prompt for count immediately
                     if self.drawing_mode == "random_points":
                         self._generate_random_points()
@@ -4037,7 +4089,12 @@ class ImageViewer(QtWidgets.QGraphicsView):
                         self.finish_polygon()
                         event.accept()
                         return
-                    if self._is_point_drawing_mode():
+                    if self.drawing_mode == "smart_canopy":
+                        # every press is a new brush stroke; Ctrl+drag erases
+                        self.currentPolygon = QtGui.QPolygonF([point])
+                        self.lastPoint = point
+                        self._sc_erase = bool(event.modifiers() & QtCore.Qt.ControlModifier)
+                    elif self._is_point_drawing_mode():
                         self._append_point_pixel(point)
                     else:
                         self.currentPolygon.append(point)
@@ -4174,6 +4231,13 @@ class ImageViewer(QtWidgets.QGraphicsView):
                     # dragging paints pixels: each new exported pixel once
                     if self._append_point_pixel(point) is not None:
                         self.update_temp_drawing()
+                elif self.drawing_mode == "smart_canopy":
+                    # a scribble: dense enough to say where the crown is
+                    min_distance = 3 / self.get_current_scale_factor()
+                    if self.lastPoint is None or QtCore.QLineF(self.lastPoint, point).length() > min_distance:
+                        self.currentPolygon.append(point)
+                        self.lastPoint = point
+                        self.update_temp_drawing()
                 else:
                     min_distance = 15 / self.get_current_scale_factor()
                     if self.lastPoint is None or QtCore.QLineF(self.lastPoint, point).length() > min_distance:
@@ -4191,6 +4255,10 @@ class ImageViewer(QtWidgets.QGraphicsView):
                     if self._shape_start_point is not None:
                         self._shape_end_point = point
                         self.update_temp_drawing()
+                elif self.drawing_mode == "smart_canopy":
+                    # before the stroke: the brush, so the user sees how far a click reaches
+                    if isinstance(self.temp_drawing_item, QtWidgets.QGraphicsPathItem):
+                        self.temp_drawing_item.setPath(self._smart_canopy_path([], hover_point=point))
                 else:
                     # Point mode hover preview. See _point_marker_path -- this
                     # used to be an independent, floor()ing copy of
@@ -4305,6 +4373,13 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 self._is_panning = False  # End panning
                 self.setCursor(QtCore.Qt.ArrowCursor)
             
+            # Smart canopy: a brush stroke is done -- re-select the crown from all
+            # strokes so far (Enter commits, Backspace undoes, Esc cancels)
+            if self.drawing and self.drawing_mode == "smart_canopy" and len(self.currentPolygon) >= 1:
+                self._smart_canopy_add_stroke()
+                event.accept()
+                return
+
             # Finish rectangle/circle on mouse release (drag-to-draw)
             if self.drawing and self.drawing_mode in ("rectangle", "circle"):
                 point = self.mapToScene(event.pos())
@@ -4331,6 +4406,10 @@ class ImageViewer(QtWidgets.QGraphicsView):
         super(ImageViewer, self).mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):
+        if self.drawing and self.drawing_mode == "smart_canopy":
+            # two quick brush clicks are two strokes, not "commit" (that is Enter)
+            event.accept()
+            return
         if self.drawing and self.has_image():
             self.finish_polygon()
             event.accept()
@@ -4360,6 +4439,13 @@ class ImageViewer(QtWidgets.QGraphicsView):
         k = event.key()
         t = event.text() or ""
 
+        # --- Vertex editing: [ / ] change how far a drag pulls the outline along ---
+        if getattr(self, "_vertex_editing_item", None) is not None and k in (QtCore.Qt.Key_BracketLeft,
+                                                                             QtCore.Qt.Key_BracketRight):
+            self._resize_vertex_radius(1.25 if k == QtCore.Qt.Key_BracketRight else 0.8)
+            event.accept()
+            return
+
         # --- Escape: Cancel drawing OR finish vertex editing ---
         if k == QtCore.Qt.Key_Escape:
             if self._vertex_editing_item:
@@ -4368,6 +4454,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 return
             elif self.drawing:
                 # Cancel current drawing
+                self._smart_canopy_reset()
                 self.drawing = False
                 self.left_button_pressed = False
                 self.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
@@ -4383,10 +4470,34 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 event.accept()
                 return
         
-        # --- Enter/Return: Finish vertex editing ---
+        # --- Enter/Return: Finish vertex editing / commit the smart-canopy crown ---
         if k in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
             if self._vertex_editing_item:
                 self.finish_vertex_editing()
+                event.accept()
+                return
+            if self.drawing and self.drawing_mode == "smart_canopy":
+                self.finish_polygon()                 # -> polygon_drawn -> the name dialog
+                event.accept()
+                return
+
+        # --- Smart canopy brush: Backspace undoes a stroke, [ / ] resize the brush ---
+        if self.drawing and self.drawing_mode == "smart_canopy":
+            if k == QtCore.Qt.Key_Backspace:
+                self._smart_canopy_undo()
+                event.accept()
+                return
+            if k in (QtCore.Qt.Key_BracketLeft, QtCore.Qt.Key_BracketRight):
+                self._smart_canopy_resize_brush(1.25 if k == QtCore.Qt.Key_BracketRight else 0.8)
+                event.accept()
+                return
+            # - / + : how far the crown may grow past the paint (re-selects at once)
+            if k in (QtCore.Qt.Key_Minus, QtCore.Qt.Key_Underscore) or t in ("-", "_"):
+                self._smart_canopy_change_grow(-1)
+                event.accept()
+                return
+            if k in (QtCore.Qt.Key_Plus, QtCore.Qt.Key_Equal) or t == "+":
+                self._smart_canopy_change_grow(+1)
                 event.accept()
                 return
 
@@ -4720,6 +4831,15 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 self._shape_start_point = None
                 self._shape_end_point = None
             
+            # Smart canopy - the crown the brush strokes selected (Enter / right-click)
+            elif self.drawing_mode == "smart_canopy":
+                crown = getattr(self, "_sc_selection", None)
+                self._smart_canopy_reset()
+                if crown is not None and len(crown) > 2:
+                    polygon_item = self.add_polygon_to_scene(crown, group_name)
+                    if not self.programmatically_adding_polygon:
+                        self.polygon_drawn.emit(polygon_item)
+
             # Polygon mode
             elif self.drawing_mode == "polygon":
                 if len(self.currentPolygon) > 2:
@@ -4832,8 +4952,269 @@ class ImageViewer(QtWidgets.QGraphicsView):
             self.temp_drawing_item.setPolygon(self.currentPolygon)
             return
 
+        # Smart canopy: the stroke so far
+        if self.drawing_mode == "smart_canopy":
+            if isinstance(self.temp_drawing_item, QtWidgets.QGraphicsPathItem):
+                self.temp_drawing_item.setPath(self._smart_canopy_path(self.currentPolygon))
+            return
+
         # Point mode. See _point_marker_path.
         self.temp_drawing_item.setPath(self._point_marker_path(self.currentPolygon))
+
+    # ------------------------------------------------------------------
+    # Smart Canopy brush (canopy_tracer.select_canopy)
+    #
+    # A session runs from the first Shift+stroke to Enter / right-click
+    # (commit: the name dialog) or Esc (cancel). Every stroke is kept in
+    # SCENE coordinates with its brush radius, and the crown is re-selected
+    # from all of them after each one -- so Backspace (undo a stroke) is
+    # exact, and the result does not depend on which pixmap happened to be
+    # shown when a stroke was made. Ctrl+drag erases; [ / ] size the brush.
+    # ------------------------------------------------------------------
+
+    def _smart_canopy_begin(self):
+        self._smart_canopy_reset()
+        self._sc_strokes = []
+        self._sc_erase = False
+
+    def _smart_canopy_reset(self):
+        """Drop the session: strokes, selection and its preview."""
+        item = getattr(self, "_sc_sel_item", None)
+        if item is not None:
+            try:
+                if not sip.isdeleted(item) and item.scene() is self._scene:
+                    self._scene.removeItem(item)
+            except Exception:
+                pass
+        self._sc_sel_item = None
+        self._sc_selection = None
+        self._sc_strokes = []
+
+    def _smart_canopy_brush_scene(self):
+        """Brush radius in scene units (a constant size on screen)."""
+        px = float(getattr(self, "_sc_brush_screen", SMART_CANOPY_BRUSH_SCREEN_PX))
+        return px / max(self.get_current_scale_factor(), 1e-9)
+
+    def _smart_canopy_resize_brush(self, factor):
+        px = float(getattr(self, "_sc_brush_screen", SMART_CANOPY_BRUSH_SCREEN_PX))
+        self._sc_brush_screen = float(min(400.0, max(3.0, px * factor)))
+        self._smart_canopy_status(self._smart_canopy_settings())
+        hover = self.mapToScene(self.mapFromGlobal(QtGui.QCursor.pos()))
+        if isinstance(self.temp_drawing_item, QtWidgets.QGraphicsPathItem):
+            self.temp_drawing_item.setPath(self._smart_canopy_path([], hover_point=hover))
+
+    def _smart_canopy_grow(self):
+        return float(getattr(self, "_sc_grow", SMART_CANOPY_GROW_STEPS[SMART_CANOPY_GROW_DEFAULT]))
+
+    def _smart_canopy_change_grow(self, step):
+        """One step along SMART_CANOPY_GROW_STEPS, then re-select from the same strokes."""
+        g = self._smart_canopy_grow()
+        i = int(np.argmin([abs(g - s) for s in SMART_CANOPY_GROW_STEPS]))
+        i = min(len(SMART_CANOPY_GROW_STEPS) - 1, max(0, i + int(step)))
+        self._sc_grow = SMART_CANOPY_GROW_STEPS[i]
+        if getattr(self, "_sc_strokes", None):
+            self._smart_canopy_update()
+        else:
+            self._smart_canopy_status(self._smart_canopy_settings())
+
+    def _smart_canopy_settings(self):
+        g = self._smart_canopy_grow()
+        grow = "exactly the paint" if g == 0 else f"up to {g:g}x the brush past the paint"
+        return (f"grow {grow} (- / + or Alt+scroll) · brush "
+                f"{float(getattr(self, '_sc_brush_screen', SMART_CANOPY_BRUSH_SCREEN_PX)):.0f} px ([ / ])")
+
+    def _smart_canopy_path(self, points, hover_point=None):
+        """Brush preview: the stroke so far as a band of the brush's width, and
+        the brush disc at the cursor."""
+        path = QtGui.QPainterPath()
+        pts = list(points)
+        r = self._smart_canopy_brush_scene()
+        if len(pts) >= 2:
+            line = QtGui.QPainterPath(pts[0])
+            for p in pts[1:]:
+                line.lineTo(p)
+            st = QtGui.QPainterPathStroker()
+            st.setWidth(2.0 * r)
+            st.setCapStyle(QtCore.Qt.RoundCap)
+            st.setJoinStyle(QtCore.Qt.RoundJoin)
+            path.addPath(st.createStroke(line))
+        elif len(pts) == 1:
+            path.addEllipse(pts[0], r, r)
+        if hover_point is not None:
+            path.addEllipse(hover_point, r, r)
+        return path
+
+    def _smart_canopy_add_stroke(self):
+        stroke = [QtCore.QPointF(p) for p in self.currentPolygon]
+        self.currentPolygon = QtGui.QPolygonF()
+        self.lastPoint = None
+        if not stroke:
+            return
+        if not hasattr(self, "_sc_strokes") or self._sc_strokes is None:
+            self._sc_strokes = []
+        self._sc_strokes.append({"pts": stroke, "r": self._smart_canopy_brush_scene(),
+                                 "erase": bool(getattr(self, "_sc_erase", False))})
+        self._sc_erase = False
+        self._smart_canopy_update()
+        if isinstance(self.temp_drawing_item, QtWidgets.QGraphicsPathItem):
+            self.temp_drawing_item.setPath(self._smart_canopy_path([], hover_point=stroke[-1]))
+
+    def _smart_canopy_undo(self):
+        if getattr(self, "_sc_strokes", None):
+            self._sc_strokes.pop()
+            self._smart_canopy_update()
+
+    def _smart_canopy_update(self):
+        """Re-select the crown from every stroke so far and show it."""
+        strokes = getattr(self, "_sc_strokes", None) or []
+        poly, note = (None, "")
+        if any(not s["erase"] for s in strokes):
+            poly, note = self._trace_smart_canopy(strokes)
+        self._sc_selection = poly
+        item = getattr(self, "_sc_sel_item", None)
+        if poly is None or len(poly) < 3:
+            if item is not None:
+                item.setPath(QtGui.QPainterPath())
+            self._smart_canopy_status(note or "paint over a crown (Shift+drag); Ctrl+drag erases")
+            return
+        if item is None or sip.isdeleted(item) or item.scene() is not self._scene:
+            item = QtWidgets.QGraphicsPathItem()
+            pen = QtGui.QPen(QtGui.QColor(255, 230, 0), 2)
+            pen.setCosmetic(True)
+            item.setPen(pen)
+            item.setBrush(QtGui.QBrush(QtGui.QColor(255, 230, 0, 55)))
+            item.setZValue(TEMP_DRAWING_Z - 1)       # under the brush, above the COG tile
+            self._scene.addItem(item)
+            self._sc_sel_item = item
+        path = QtGui.QPainterPath()
+        path.addPolygon(poly)
+        path.closeSubpath()
+        item.setPath(path)
+        self._smart_canopy_status(f"{note} · {self._smart_canopy_settings()} · "
+                                  "Enter: save · Backspace: undo stroke · Esc: cancel")
+
+    def _smart_canopy_status(self, text):
+        try:
+            owner = self._find_project_owner()
+            win = owner.window() if owner is not None else self.window()
+            if callable(getattr(win, "statusBar", None)):
+                win.statusBar().showMessage(f"Smart Canopy: {text}", 8000)
+        except Exception:
+            pass
+
+    def _smart_canopy_source(self, strokes):
+        """The pixmap item to read: the sharp COG viewport tile when it is shown
+        and holds every stroke, else the image's own pixmap (for a COG, its
+        decimated preview)."""
+        tile = getattr(self, "_highres_front_item", None)
+        try:
+            if tile is not None and not sip.isdeleted(tile) and tile.isVisible() and tile.scene() is self._scene:
+                pm = tile.pixmap()
+                if pm is not None and not pm.isNull():
+                    rect = tile.sceneBoundingRect()
+                    if all(rect.contains(p) for s in strokes for p in s["pts"]):
+                        return tile
+        except Exception:
+            pass
+        return self._image
+
+    @staticmethod
+    def _grab_pixels(pm, x0, y0, x1, y1):
+        """HxWx3 uint8 RGB of the pixmap box [x0, x1) x [y0, y1) -- what is displayed there."""
+        qimg = pm.copy(QtCore.QRect(x0, y0, x1 - x0, y1 - y0)).toImage().convertToFormat(QtGui.QImage.Format_RGB888)
+        w, h = qimg.width(), qimg.height()
+        ptr = qimg.constBits()
+        ptr.setsize(qimg.byteCount())
+        return np.frombuffer(ptr, np.uint8).reshape(h, qimg.bytesPerLine())[:, :w * 3].reshape(h, w, 3).copy()
+
+    def _polygons_in_box(self, src, x0, y0, w, h, skip=None):
+        """[(item, Nx2 array coords on ``src``'s box)] of this viewer's polygons that reach the box."""
+        out = []
+        for entry in list(getattr(self, "polygons", [])):
+            item = entry.get("item") if isinstance(entry, dict) else None
+            if not isinstance(item, EditablePolygonItem) or entry.get("is_mask_polygon") or item is skip:
+                continue
+            if item.scene() is not self._scene:
+                continue
+            try:
+                sp = item.mapToScene(item.polygon)
+                pts = np.array([[q.x(), q.y()] for q in (src.mapFromScene(p) for p in sp)], np.float64)
+            except Exception:
+                continue
+            if len(pts) < 3:
+                continue
+            pts -= (x0 + 0.5, y0 + 0.5)
+            if pts[:, 0].max() < 0 or pts[:, 1].max() < 0 or pts[:, 0].min() >= w or pts[:, 1].min() >= h:
+                continue
+            out.append((item, pts))
+        return out
+
+    def _smart_canopy_stop_mask(self, src, x0, y0, w, h, skip=None):
+        """Polygons already in this viewer (but ``skip``), rasterised on ``src``'s
+        pixel box (x0, y0, w, h): crowns never take them. None when none."""
+        polys = self._polygons_in_box(src, x0, y0, w, h, skip)
+        if not polys:
+            return None
+        m = np.zeros((h, w), np.uint8)
+        for _, pts in polys:
+            cv2.fillPoly(m, [np.round(pts * 16).astype(np.int32).reshape(-1, 1, 2)], 1, cv2.LINE_8, 4)
+        return m
+
+    def _trace_smart_canopy(self, strokes):
+        """(scene QPolygonF of the crown the strokes select, note), or (None, note).
+
+        Reads the DISPLAYED pixels (current band combination / stretch) -- on a
+        COG zoomed in, the sharp viewport tile -- around the strokes, and hands
+        them to canopy_tracer.select_canopy."""
+        src = self._smart_canopy_source(strokes)
+        if src is None:
+            return None, ""
+        pm = src.pixmap()
+        if pm is None or pm.isNull():
+            return None, ""
+        from .canopy_tracer import CanopyParams, select_canopy
+
+        pw, ph = pm.width(), pm.height()
+        tr = src.sceneTransform()
+        k = math.hypot(tr.m11(), tr.m12()) or 1.0          # scene units per source px
+        sc = max(self.get_current_scale_factor(), 1e-9) * k
+        vp = self.viewport().size()
+        r_max = min(0.5 * max(pw, ph), SMART_CANOPY_VIEW_REACH * max(vp.width(), vp.height()) / sc)
+
+        arr = []
+        for s in strokes:
+            loc = np.array([[q.x() - 0.5, q.y() - 0.5] for q in (src.mapFromScene(p) for p in s["pts"])], np.float64)
+            loc[:, 0] = np.clip(loc[:, 0], 0, pw - 1)
+            loc[:, 1] = np.clip(loc[:, 1], 0, ph - 1)
+            arr.append((loc, max(1.0, s["r"] / k), s["erase"]))
+        allp = np.vstack([a[0] for a in arr])
+        margin = 4.0 * max(a[1] for a in arr) + 0.5 * float(np.ptp(allp, axis=0).max()) + 8
+        margin = min(margin, r_max + max(a[1] for a in arr)) + 8
+        x0 = max(0, int(math.floor(allp[:, 0].min() - margin)))
+        y0 = max(0, int(math.floor(allp[:, 1].min() - margin)))
+        x1 = min(pw, int(math.ceil(allp[:, 0].max() + margin)) + 1)
+        y1 = min(ph, int(math.ceil(allp[:, 1].max() + margin)) + 1)
+        if x1 - x0 < 3 or y1 - y0 < 3:
+            return None, ""
+        rgb = self._grab_pixels(pm, x0, y0, x1, y1)
+        h, w = rgb.shape[:2]
+        stop = self._smart_canopy_stop_mask(src, x0, y0, w, h)
+        local = [(loc - (x0, y0), r, e) for loc, r, e in arr]
+
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            res = select_canopy(rgb, local, CanopyParams(grow=self._smart_canopy_grow(), max_radius_px=r_max),
+                                stop_mask=stop)
+        except Exception:
+            logging.exception("[ImageViewer] smart canopy selection failed")
+            return None, "selection failed (see log)"
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        if res is None or len(res.polygon) < 3:
+            return None, (res.note if res is not None else "")
+        poly = QtGui.QPolygonF([src.mapToScene(QtCore.QPointF(x + x0 + 0.5, y + y0 + 0.5)) for x, y in res.polygon])
+        logging.info("[ImageViewer] smart canopy: %s", res.note)
+        return poly, res.note
 
     def _generate_random_points(self):
         """
@@ -5773,6 +6154,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
         
     def stop_vertex_editing(self):
         """Remove all vertex handles and stop editing."""
+        self._vertex_drag_end()
         # CRITICAL: Stop the throttle timer FIRST to prevent race conditions,
         # but APPLY any update it was still holding before discarding it --
         # otherwise the very last drag position (the one the throttle was
@@ -5922,9 +6304,115 @@ class ImageViewer(QtWidgets.QGraphicsView):
         # deferring the full cache rebuild to stop_vertex_editing (once per
         # edit session, not once per frame). See its own docstring.
         poly_count = poly_item.polygon.count()
-        if 0 <= poly_index < poly_count:
+        if not (0 <= poly_index < poly_count):
+            return
+        drag = self.__dict__.get("_vx_drag")    # (getattr on a not-yet-initialised QObject raises)
+        if drag is None or drag["single"] or drag["radius"] <= 0 or drag["idx"] != poly_index:
             poly_item._set_vertex_point(poly_index, item_pos)
-            
+            return
+        # Smooth drag: every vertex within the radius of where the dragged one
+        # started moves by the drag times a smooth falloff -- (1 - (d/r)^2)^2,
+        # 1 at the vertex, 0 at the radius -- so a dense outline bends instead
+        # of growing a spike, and vertices without a handle follow too.
+        d = np.array([item_pos.x(), item_pos.y()]) - drag["origin"]
+        idx, w = drag["affected"], drag["weights"]
+        poly_item._set_vertex_points(idx, drag["pts0"][idx] + w[:, None] * d)
+        # handles sitting on moved vertices follow them (without re-entering here)
+        self._vx_programmatic = True
+        try:
+            for h, (hi, w_h) in drag["handles"].items():
+                p = drag["pts0"][hi] + w_h * d
+                h.setPos(poly_item.mapToScene(QtCore.QPointF(p[0], p[1])))
+        finally:
+            self._vx_programmatic = False
+
+    def _vertex_soft_radius_screen(self):
+        return float(self.__dict__.get("_vx_radius_screen", VERTEX_SOFT_RADIUS_SCREEN_PX))
+
+    def _vertex_drag_begin(self, handle, single=False):
+        """A handle was pressed: snapshot the outline and work out which vertices
+        follow it, and by how much (the falloff weights stay fixed for the drag)."""
+        item = getattr(self, "_vertex_editing_item", None)
+        if item is None:
+            self._vx_drag = None
+            return
+        try:
+            pts0 = xy_from_qpolygonf(item.polygon)
+        except Exception:
+            pts0 = np.array([[p.x(), p.y()] for p in item.polygon], dtype=np.float64)
+        idx = int(getattr(handle, "_poly_index", handle.index))
+        if not (0 <= idx < len(pts0)):
+            self._vx_drag = None
+            return
+        radius = self._vertex_soft_radius_screen() / max(self.get_current_scale_factor(), 1e-9)
+        origin = pts0[idx].copy()
+        dist = np.hypot(*(pts0 - origin).T)
+        w = np.clip(1.0 - (dist / radius) ** 2, 0.0, 1.0) ** 2 if radius > 0 else (dist == 0).astype(float)
+        w[idx] = 1.0
+        affected = np.flatnonzero(w > 0)
+        handles = {}
+        for h in getattr(self, "_vertex_handles", []):
+            hi = int(getattr(h, "_poly_index", h.index))
+            if h is not handle and 0 <= hi < len(w) and w[hi] > 0:
+                handles[h] = (hi, float(w[hi]))
+        self._vx_drag = dict(idx=idx, origin=origin, pts0=pts0, affected=affected, weights=w[affected],
+                             handles=handles, radius=float(radius), single=bool(single))
+        self._show_vertex_ring(item.mapToScene(QtCore.QPointF(origin[0], origin[1])), 0.0 if single else radius)
+
+    def _vertex_drag_end(self):
+        # The throttle may still hold the drag's last position: apply it while the
+        # smooth-drag state is there, or that last frame moves the one vertex alone.
+        try:
+            if getattr(self, "_vertex_update_timer", None):
+                self._vertex_update_timer.stop()
+            pending = getattr(self, "_pending_vertex_update", None)
+            self._pending_vertex_update = None
+            if pending is not None:
+                self._apply_vertex_update(*pending)
+        except Exception:
+            pass
+        self._vx_drag = None
+        self._show_vertex_ring(None, 0.0)
+
+    def _show_vertex_ring(self, centre_scene, radius_scene):
+        """The dashed circle of the smooth drag's reach (None / 0: hide it)."""
+        ring = self.__dict__.get("_vx_ring")
+        if centre_scene is None or radius_scene <= 0:
+            if ring is not None:
+                try:
+                    if not sip.isdeleted(ring) and ring.scene() is self._scene:
+                        self._scene.removeItem(ring)
+                except Exception:
+                    pass
+            self._vx_ring = None
+            return
+        if ring is None or sip.isdeleted(ring) or ring.scene() is not self._scene:
+            ring = QtWidgets.QGraphicsEllipseItem()
+            pen = QtGui.QPen(QtGui.QColor(255, 200, 0), 1.5, QtCore.Qt.DashLine)
+            pen.setCosmetic(True)
+            ring.setPen(pen)
+            ring.setBrush(QtGui.QBrush(QtGui.QColor(255, 200, 0, 25)))
+            ring.setZValue(1e7 - 1)                      # just under the handles
+            ring.setAcceptedMouseButtons(QtCore.Qt.NoButton)
+            self._scene.addItem(ring)
+            self._vx_ring = ring
+        ring.setRect(QtCore.QRectF(centre_scene.x() - radius_scene, centre_scene.y() - radius_scene,
+                                   2 * radius_scene, 2 * radius_scene))
+
+    def _resize_vertex_radius(self, factor):
+        r = self._vertex_soft_radius_screen()
+        self._vx_radius_screen = 0.0 if (factor < 1 and r <= 6) else float(min(600.0, max(6.0, (r or 6.0) * factor)))
+        msg = ("Vertex edit: a drag moves only one vertex (] for a smooth radius)" if self._vx_radius_screen <= 0
+               else f"Vertex edit: smooth drag radius {self._vx_radius_screen:.0f} px ([ / ] to change, "
+                    "Shift+drag: one vertex)")
+        try:
+            owner = self._find_project_owner()
+            win = owner.window() if owner is not None else self.window()
+            if callable(getattr(win, "statusBar", None)):
+                win.statusBar().showMessage(msg, 5000)
+        except Exception:
+            pass
+
     def finish_vertex_editing(self):
         """Finish vertex editing and emit modification signal."""
         # Store reference to the item before stopping
@@ -6024,6 +6512,8 @@ class ImageViewer(QtWidgets.QGraphicsView):
             return
 
         self.drawing = True
+        if getattr(self, "drawing_mode", "polygon") == "smart_canopy":
+            self._smart_canopy_begin()
 
         try:
             if getattr(self, "temp_drawing_item", None) is not None:
