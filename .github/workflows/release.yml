@@ -1,0 +1,58 @@
+# Push a tag v* -> build the standalone Windows app with Nuitka -> publish the
+# GitHub release WITH the zip attached. The release is created only after the
+# build, so Zenodo (which archives a release when it is published) gets the app.
+# Run it by hand (workflow_dispatch) to get the zip as a workflow artifact only.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-app:
+    runs-on: windows-latest
+    timeout-minutes: 240
+    env:
+      NUITKA_CACHE_DIR: C:\nc
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install CanoPie's dependencies and Nuitka
+        run: |
+          python -m pip install --upgrade pip
+          pip install . nuitka zstandard ordered-set
+
+      - name: Nuitka cache
+        uses: actions/cache@v4
+        with:
+          path: C:\nc
+          key: nuitka-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}-${{ github.sha }}
+          restore-keys: nuitka-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}-
+
+      - name: Build
+        run: python scripts/build_exe.py --out build --jobs 4
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CanoPie-windows
+          path: build/CanoPie-*-windows.zip
+
+      - name: Publish the release with the app attached
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          ver="${tag#v}"
+          # this version's section of CHANGELOG.md as the release notes
+          awk -v v="$ver" '$0 ~ "^## "v" " {on=1; next} /^## / {on=0} on' CHANGELOG.md > notes.md
+          gh release create "$tag" build/CanoPie-*-windows.zip --title "CanoPie $ver" --notes-file notes.md
