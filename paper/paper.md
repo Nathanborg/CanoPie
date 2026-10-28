@@ -11,11 +11,11 @@ tags:
   - time series
 authors:
   - name: Nathan B. Gonçalves
-    # orcid: 0000-0000-0000-0000   # TODO: add the ORCID
+    orcid: 0000-0001-9068-6904
     corresponding: true
     affiliation: "1, 2"
   - name: Scott C. Stark
-    # orcid: 0000-0000-0000-0000   # TODO: add the ORCID
+    orcid: 0000-0002-1579-1648
     affiliation: "1, 2"
 affiliations:
   - name: Department of Forestry, College of Agriculture and Natural Resources, Michigan State University, East Lansing, MI, USA
@@ -195,24 +195,28 @@ aspirations. -->
 
 CanoPie was developed for, and used in, a 14-month multitemporal survey of
 MicaSense multispectral and FLIR Duo Pro R thermal imagery over 100 ha of
-Amazon forest, where it is used to follow individual crowns across dates.
-<!-- TODO: add the studies / datasets / groups that use it (e.g., Panama / Barro
-Colorado Island work) with citations. -->
+Amazon forest, where it is used to follow individual crowns across dates. The
+resulting crown time series support the analysis of leaf demography, spectral
+variability and productivity across seasons in the first author's doctoral
+dissertation [@goncalves2025dissertation].
+<!-- TODO: add any other studies / datasets / groups that use it with citations. -->
 
 # AI usage disclosure
 
-<!-- TODO (authors): confirm and complete -- JOSS requires tools, versions,
-where they were used, and confirmation of human review. -->
-
-Generative AI (Anthropic Claude, model Claude Opus 5.5, through Claude Code)
-was used during development to write and refactor parts of the code --
-including the crown-registration module, performance work, and bug fixes --
-and the automated tests, and to help edit this manuscript. All AI-assisted
-code was reviewed by the authors, verified with the automated test suite and
-on real datasets, and the core design decisions were made by the authors.
+Generative AI (Anthropic Claude, through Claude Code; models Claude Opus 5,
+Claude Opus 5.5, Claude Sonnet 5 and Claude Sonnet 5.5) was used during
+development to write and refactor parts of the code -- including the
+crown-registration module, performance work, and bug fixes -- and the automated
+tests, and to help edit this manuscript. The authors confirm that all AI-assisted
+code was reviewed by them, verified with the automated test suite and on real
+datasets, and that the core design decisions were made by the authors. The
+authors take full responsibility for the software and this paper.
 
 # Acknowledgements
 
-<!-- TODO (authors): funding sources and grant numbers; collaborators. -->
+N.B. Gonçalves and S.C. Stark were supported by NSF DEB awards
+no. 1950080 and 1754357. N.B. Gonçalves was also financed by the Michigan State
+University Mericle Memorial Fund. We gratefully acknowledge the financial support
+of Simons Foundation award 429440, which supported N.B. Gonçalves.
 
 # References

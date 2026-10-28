@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use CanoPie in your research, please cite it as below."
+title: "CanoPie: A Graphical User Interface for Multitemporal Canopy Imagery Data Analysis"
+type: software
+version: 1.1.0
+date-released: "2026-10-28"
+license: MIT
+repository-code: "https://github.com/Nathanborg/CanoPie"
+url: "https://github.com/Nathanborg/CanoPie"
+keywords:
+  - remote sensing
+  - UAV
+  - phenocam
+  - thermal imagery
+  - multispectral imagery
+  - forest ecology
+authors:
+  - family-names: Gonçalves
+    given-names: Nathan B.
+    orcid: "https://orcid.org/0000-0001-9068-6904"
+    affiliation: "Michigan State University"
+  - family-names: Stark
+    given-names: Scott C.
+    orcid: "https://orcid.org/0000-0002-1579-1648"
+    affiliation: "Michigan State University"
