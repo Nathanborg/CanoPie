@@ -4,6 +4,14 @@ title: "CanoPie: A Graphical User Interface for Multitemporal Canopy Imagery Dat
 type: software
 version: 1.1.0
 date-released: "2026-10-29"
+doi: 10.5281/zenodo.23772111
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.23772111
+    description: "All versions (resolves to the latest)"
+  - type: doi
+    value: 10.5281/zenodo.23772112
+    description: "Version 1.1.0"
 license: MIT
 repository-code: "https://github.com/Nathanborg/CanoPie"
 url: "https://github.com/Nathanborg/CanoPie"

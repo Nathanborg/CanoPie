@@ -1,5 +1,8 @@
 <img width="456" height="135" alt="logo" src="https://github.com/user-attachments/assets/8cf3f529-817b-45cb-b9ce-0315d12cea37" />
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23772111.svg)](https://doi.org/10.5281/zenodo.23772111)
+[![Latest release](https://img.shields.io/github/v/release/Nathanborg/CanoPie)](https://github.com/Nathanborg/CanoPie/releases/latest)
+
 ## Project Description
 CanoPie is an image analysis tool for RGB, multispectral, and multitemporal data, designed for forest and agricultural canopy studies. With an intuitive PyQt5-based GUI, it enables researchers to process UAV and phenocam imagery (multispectral, thermal, and RGB), draw and manage polygons for data extraction, compute image statistics, and retrieve metadata directly via ExifTool,  all without relying on heavy photogrammetry pipelines.
 Canopie's core functionality relies on libraries such as OpenCV, tiffile, and PyQt5.
@@ -19,6 +22,11 @@ Orthomosaics are useful for mapping when you need , but they come at a cost:
 
 **New to CanoPie?** The [tutorial](docs/tutorial.md) walks through every feature on a small example project
 you generate in one command (`python examples/make_example_project.py`).
+
+### Download (Windows, no Python needed)
+Download `CanoPie-<version>-windows.zip` from the [latest release](https://github.com/Nathanborg/CanoPie/releases/latest),
+unzip it anywhere and run `CanoPie.exe`. The optional accelerators (numba) and the XGBoost / LightGBM
+classifiers are left out of this build; install from source (below) if you need them.
 
 ### Prerequisites
 Before you begin, ensure you have the following installed:
@@ -94,9 +102,15 @@ Bug reports, questions and pull requests are welcome through the
 ### License
 CanoPie is released under the [MIT License](LICENSE).
 
-### Citing CanoPie
-Gonçalves, N. B., & Stark, S. C. CanoPie: A Graphical User Interface for Multitemporal Canopy Imagery Data
-Analysis. (In revision, Journal of Open Source Software.) <https://github.com/Nathanborg/CanoPie>
+### How to cite
+If you use CanoPie in your research, please cite it:
+
+Gonçalves, N. B., & Stark, S. C. (2026). *CanoPie: A Graphical User Interface for Multitemporal Canopy Imagery
+Data Analysis* (Version 1.1.0) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.23772111
+
+This DOI always resolves to the latest version; each release also has its own DOI on
+[Zenodo](https://doi.org/10.5281/zenodo.23772111) (1.1.0: `10.5281/zenodo.23772112`). GitHub's
+"Cite this repository" button (from `CITATION.cff`) gives the same reference in APA and BibTeX.
 
 ### Project status
 CanoPie is an early-stage collaborative project intirelly python-based developed by and for the research community. 
