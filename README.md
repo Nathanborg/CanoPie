@@ -3,6 +3,15 @@
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23772111.svg)](https://doi.org/10.5281/zenodo.23772111)
 [![Latest release](https://img.shields.io/github/v/release/Nathanborg/CanoPie)](https://github.com/Nathanborg/CanoPie/releases/latest)
 
+**DOI:** [10.5281/zenodo.23772111](https://doi.org/10.5281/zenodo.23772111) ·
+**Zenodo:** [record](https://zenodo.org/records/23772112) ·
+**Download:** [latest release](https://github.com/Nathanborg/CanoPie/releases/latest) ·
+**Docs:** [tutorial](docs/tutorial.md), [white paper](docs/whitepaper.md)
+
+CanoPie was developed by Nathan B. Gonçalves during a PhD at Michigan State University,
+with Scott C. Stark, and continues to be developed at the Smithsonian Institution, where
+Nathan B. Gonçalves is now a postdoctoral researcher.
+
 ## Project Description
 CanoPie is an image analysis tool for RGB, multispectral, and multitemporal data, designed for forest and agricultural canopy studies. With an intuitive PyQt5-based GUI, it enables researchers to process UAV and phenocam imagery (multispectral, thermal, and RGB), draw and manage polygons for data extraction, compute image statistics, and retrieve metadata directly via ExifTool,  all without relying on heavy photogrammetry pipelines.
 Canopie's core functionality relies on libraries such as OpenCV, tiffile, and PyQt5.
