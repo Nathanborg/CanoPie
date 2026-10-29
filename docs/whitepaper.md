@@ -21,7 +21,9 @@ License: MIT
 ## 1. The problem
 
 Drones and fixed cameras now photograph forest canopies at centimetre resolution, every
-week if needed, in RGB, multispectral and thermal bands. For ecology, the interesting
+second if needed, in RGB, multispectral and thermal bands: phenocams on towers record
+the same canopy every few minutes for years, drones fly the same forest week after
+week, and both feed orthomosaics of whole landscapes. For ecology, the interesting
 unit in those images is usually not the landscape but the **individual tree crown**:
 when does this tree flush new leaves, how does its canopy temperature respond to
 drought, does it lose its leaves in the dry season while its neighbour does not?
@@ -42,6 +44,9 @@ flight, and crowns are then outlined on the mosaics. That path has real costs:
 - **Time series.** Mosaics of different dates rarely line up: GPS error and
   flight-to-flight differences shift them by metres, so every date has to be
   co-registered again before the same tree can be compared.
+- **Disconnected tools.** Phenocam series, raw drone frames and orthomosaics are
+  usually analysed in different software, so the same tree seen by a tower camera, a
+  drone and a mosaic is rarely measured in one place.
 
 CanoPie came out of exactly these problems. Over 14 months we flew repeated missions
 with a MicaSense dual camera (10 bands) and a FLIR Duo Pro R (thermal + RGB) over the
@@ -71,20 +76,26 @@ Its main pieces:
   per tree), synchronized across the images of a root, managed in a polygon manager,
   and imported from or exported to shapefiles. The **Smart Canopy brush** outlines a
   crown from one brush stroke (Section 4).
-- **Non-destructive editing.** Crop, rotation, resizing, histogram matching between
-  dates, NoData rules and masks, band math, vegetation indices and boolean masks, stored
-  as small `.ax` sidecar files and never written into the images.
+- **Image editor** (Section 5): non-destructive crop, rotation, resizing, histogram
+  matching between dates, NoData rules and polygon masks, band math, vegetation indices,
+  boolean masks and classification, stored as small `.ax` sidecar files and never
+  written into the images.
 - **Data extraction.** Per-polygon statistics of every band and index, written to CSV
   together with each image's EXIF metadata and timestamp.
-- **Machine learning.** Pixel classification with scikit-learn models trained from
-  labelled polygons; export of pixels, thumbnails and segmentation masks for
-  deep-learning datasets.
-- **Large rasters.** Orthomosaics and Cloud-Optimized GeoTIFFs of several gigabytes are
-  read window by window from their overviews.
-- **Phenocam series.** Frames taken in fog, rain or glare are filtered out by similarity
-  to reference frames.
+- **Machine Learning Manager** (Section 6): pixel classification with scikit-learn, and
+  export of pixels, thumbnails and segmentation masks for deep-learning training.
+- **Orthomosaics as Cloud-Optimized GeoTIFFs.** Mosaics of several gigabytes -- including
+  Cloud-Optimized GeoTIFFs (COGs) and hyperspectral cubes with hundreds of bands -- open
+  in seconds: CanoPie reads only the tiles on screen, from the overview level that
+  matches the zoom, instead of loading the whole raster into memory. Statistics, scene
+  means and exports on these rasters are computed window by window.
+- **Phenocams.** A phenocam series is a project like any other: each frame is a root,
+  a crown drawn once with *Sync* follows the whole series, and the CSV gives its
+  greenness (e.g. green chromatic coordinate) frame by frame. Frames taken in fog, rain
+  or with the sun in the lens are filtered out by their similarity to reference frames.
 - **Finding a crown in other images** (Section 3): a crown outlined once is located in
-  other orthomosaics, raw frames and phenocam images, and exported as aligned crops.
+  other orthomosaics, raw drone frames and phenocam images, and exported as aligned
+  crops.
 
 ## 3. Finding the same crown everywhere -- without photogrammetry
 
@@ -92,6 +103,20 @@ The central idea of CanoPie is that, to follow a tree, you do not need to rebuil
 whole scene. You need to know **where that one crown is in each image**. CanoPie finds
 it from information every drone image already carries, and then refines the position
 by matching the crown's own pixels.
+
+The same search works between any of the kinds of imagery a canopy study collects:
+
+| From → to | How the crown is first placed |
+|---|---|
+| **Orthomosaic → orthomosaic** (other dates, other coordinate systems, other pixel sizes, COGs) | the GeoTIFF georeference of both |
+| **Orthomosaic → raw drone frames** (RGB, multispectral, thermal) | the frames' EXIF GPS, altitude, camera and heading |
+| **Raw frame → orthomosaic** | the frame's camera model, projected into the mosaic |
+| **Raw frame → raw frames** of another flight or sensor | both frames' camera models |
+| **Phenocam → phenocam** frames | image coordinates (a fixed camera) |
+
+Images can come from the current project, from every root of it, or from any folders or
+other projects -- one folder per flight or date -- so a single crown can be followed
+through a whole archive of mosaics, flights and camera series.
 
 **Step 1 -- a first guess from the image's own metadata.**
 
@@ -153,7 +178,69 @@ between. The part connected to the paint is kept, holes are filled and the outli
 smoothed, never shrinking off the paint. The brush was tuned on annotated crowns from an
 orthomosaic COG, 1 m airborne RGB, phenocam frames and a MicaSense radiance band.
 
-## 5. Design principles
+## 5. The image editor
+
+Comparing a tree across dates and sensors usually needs some preparation of the images:
+cropping, correcting brightness between flights, masking clouds or gaps, computing an
+index. In most workflows each of these steps writes a new copy of the imagery. In
+CanoPie, the **image editor** records them instead: every edit is saved in a small
+`.ax` JSON file next to the image and replayed, in a fixed order, by the viewer, the
+CSV export, the machine-learning exports and the image export alike. The original
+file is never rewritten, so the original radiometry is always one click away, and
+every number exported is computed from exactly the pixels on screen.
+
+An edit can be applied to one image, to every image of a root, or to the whole project:
+
+- **Geometry**: crop, rotation and resizing.
+- **NoData**: values or expressions to ignore (e.g. `0, b1<123`), and **polygon masks**
+  that leave out the pixels of chosen groups -- a cloud, a gap, a tower.
+- **Histogram matching** (mean/std or full CDF) of every date to a reference image,
+  which removes much of the light difference between flights or phenocam frames before
+  they are compared.
+- **Band math**: any expression of the bands -- NDVI, GCC, ExG, a thermal threshold --
+  shown live; **boolean** expressions such as `(b4-b1)/(b4+b1) > 0.6` give masks.
+- **Classification** with a trained model (Section 6).
+- **Appended bands**: the result of an expression or a classification can be kept as an
+  extra band that every export then sees as data.
+
+## 6. The Machine Learning Manager: from labelled crowns to training data
+
+Polygons drawn in CanoPie are labelled data. The **Machine Learning Manager** turns them
+into models and into training sets for other tools.
+
+**Pixel classification.** Each polygon group is a class (e.g. `leaf`, `bare`,
+`understory`). The manager samples pixels from the polygons -- the bands in any order,
+vegetation-index expressions, and an optional 3×3 or 5×5 neighbourhood window -- trains
+scikit-learn models (RandomForest, ExtraTrees, GradientBoosting, LogisticRegression,
+SVM, GaussianNB, and XGBoost or LightGBM when installed, optionally tuned and stacked),
+and saves each model with a report: classes, features, holdout accuracy, confusion
+matrix and feature importances. The model then classifies whole images in the editor
+and adds class counts per polygon to the CSV.
+
+**Exporting for deep learning.** For models trained elsewhere (U-Net, Mask R-CNN,
+vision transformers), the manager exports:
+
+- **thumbnails** -- an image crop around every polygon, for classification datasets;
+- **segmentation masks** -- image and mask pairs, cut into fixed-size tiles (e.g. 256 or
+  512 px) for segmentation networks, with a CSV index of every pair;
+- **pixel tables** -- the values inside each polygon, as CSV;
+
+all with the image editor's edits applied, so the training data match what was seen
+and checked on screen. Training-time **augmentation** (brightness changes over the
+whole image or patch by patch, and synthetic shadows and uneven illumination) teaches
+models not to depend on the light of one flight -- a frequent failure in forest imagery
+under moving clouds.
+
+**Raw frames multiply the samples.** Because CanoPie works on raw frames, a crown is
+not one sample per flight, as on an orthomosaic, but one per frame that sees it --
+often 5 to 20 overlapping frames, each from a different view angle, sun geometry and
+position in the image. With *Find canopy in other images*, a crown labelled once is
+placed on all of them automatically. Every one of those views becomes a training
+example, so the same field effort yields many times more samples, with the natural
+variation in viewing geometry and illumination that a model meets in practice and that
+an orthomosaic averages away.
+
+## 7. Design principles
 
 **Edits never touch the images.** Each image's edits are stored in a small `.ax` JSON
 sidecar and replayed in a fixed order by every consumer -- the viewer, the CSV and
@@ -180,7 +267,7 @@ replays, exports, band math, classification, polygon handling and crown matching
 synthetic scenes with known answers, on Windows and Linux, on every change. A tutorial
 walks through every feature on an example project generated by one script.
 
-## 6. Use so far
+## 8. Use so far
 
 CanoPie was developed for, and used in, the 14-month MicaSense and FLIR survey over
 100 ha of Amazon forest described above, where it follows individual crowns across
@@ -188,7 +275,7 @@ dates. The resulting crown time series support the analysis of leaf demography,
 spectral variability and productivity across seasons in Nathan B. Gonçalves's doctoral
 dissertation at Michigan State University (Gonçalves, 2025).
 
-## 7. Limitations and next steps
+## 9. Limitations and next steps
 
 - Raw frames are modelled as nadir views of flat ground. Oblique frames or steep terrain
   rely more on the image-matching step to correct the first guess.
@@ -199,7 +286,7 @@ dissertation at Michigan State University (Gonçalves, 2025).
 - Planned: a published benchmark of the crown registration against photogrammetry-based
   and co-registration baselines, and more sensors calibrated out of the box.
 
-## 8. Getting and citing CanoPie
+## 10. Getting and citing CanoPie
 
 - Windows app: `CanoPie-<version>-windows.zip` from the
   [latest release](https://github.com/Nathanborg/CanoPie/releases/latest).
