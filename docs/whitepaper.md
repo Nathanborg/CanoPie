@@ -13,7 +13,7 @@ License: MIT
 > Department of Forestry and the Program in Ecology, Evolution, and Behavior at
 > **Michigan State University**, advised by Scott C. Stark, to analyse the drone and
 > phenocam imagery of the dissertation research in the Amazon. Nathan B. Gonçalves is now
-> a postdoctoral researcher at the **Smithsonian Institution**, where CanoPie continues to
+> a postdoctoral researcher at the **Smithsonian Tropical Research Institute (STRI)**, where CanoPie continues to
 > be developed.
 
 ---

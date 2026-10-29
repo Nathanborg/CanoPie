@@ -9,7 +9,7 @@
 **Docs:** [tutorial](docs/tutorial.md), [white paper](docs/whitepaper.md)
 
 CanoPie was developed by Nathan B. Gonçalves during a PhD at Michigan State University,
-with Scott C. Stark, and continues to be developed at the Smithsonian Institution, where
+with Scott C. Stark, and continues to be developed at the Smithsonian Tropical Research Institute (STRI), where
 Nathan B. Gonçalves is now a postdoctoral researcher.
 
 ## Project Description
