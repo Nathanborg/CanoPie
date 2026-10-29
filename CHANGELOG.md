@@ -2,7 +2,7 @@
 
 All notable changes to CanoPie. Versions follow `pyproject.toml`.
 
-## 1.1.0 - 2026-10-28
+## 1.1.0 - 2026-10-29
 
 First tagged release.
 

@@ -3,7 +3,7 @@ message: "If you use CanoPie in your research, please cite it as below."
 title: "CanoPie: A Graphical User Interface for Multitemporal Canopy Imagery Data Analysis"
 type: software
 version: 1.1.0
-date-released: "2026-10-28"
+date-released: "2026-10-29"
 license: MIT
 repository-code: "https://github.com/Nathanborg/CanoPie"
 url: "https://github.com/Nathanborg/CanoPie"
