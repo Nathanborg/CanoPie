@@ -784,13 +784,36 @@ def get_ax_transform_matrix(ax, raw_w, raw_h):
     return M, int(round(cur_w)), int(round(cur_h))
 
 
-@functools.lru_cache(maxsize=256)
 def _raw_image_dims(filepath):
     """
     Return (raw_h, raw_w) for an image on disk, or (None, None).
 
-    CACHED. A raster's dimensions cannot change while the app holds it open,
-    and this is called PER FEATURE during shapefile import whenever the target
+    CACHED per file VERSION -- (path, mtime, size) -- not per path. A file
+    can be replaced while the app runs (an exported crop copied over the
+    original keeps the name); a path-only cache then kept serving the old
+    size, and every reader of this one authority -- polygon basis, Inspect,
+    the crown finder, shapefile export -- worked in a frame the image no
+    longer has: crowns drawn on the new 1197x923 file were stored as if it
+    were 6080x3420 and landed outside it. One stat() per call is cheap next
+    to the decode the cache saves.
+    """
+    try:
+        st = os.stat(filepath)
+        version = (st.st_mtime_ns, st.st_size)
+    except (OSError, TypeError, ValueError):
+        version = None
+    return _raw_image_dims_cached(filepath, version)
+
+
+_raw_image_dims.cache_clear = lambda: _raw_image_dims_cached.cache_clear()
+
+
+@functools.lru_cache(maxsize=256)
+def _raw_image_dims_cached(filepath, _version):
+    """
+    _raw_image_dims for one version of the file (`_version` is only the key).
+
+    CACHED. This is called PER FEATURE during shapefile import whenever the target
     image has no recorded ``ref_size`` (polygon_manager's per-feature fallback).
     Uncached, that path opens the TIFF for every feature -- and for a non-TIFF,
     or on any tifffile error, falls through to ``cv2.imread``, i.e. a FULL
@@ -1602,7 +1625,7 @@ def clear_shapefile_io_caches():
     """Clear metadata and transformer caches."""
     _image_metadata_cache.clear()
     _transformer_cache.clear()
-    _raw_image_dims.cache_clear()
+    _raw_image_dims_cached.cache_clear()
 
 
 def _ax_cache_token(ax_data):

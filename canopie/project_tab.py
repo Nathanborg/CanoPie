@@ -8989,10 +8989,14 @@ class ProjectTab(QtWidgets.QWidget):
             key = ("eff4", fp)
             rec = size_cache.get(key)
             if rec is not None:
-                # For copy operations, trust the cache without re-validating mtimes
-                # Files don't change during a single copy operation
-                return rec[0], rec[1]
-            
+                # The cache outlives this copy operation, and a file can be
+                # replaced in between (same name, new size): check the image
+                # and .ax versions (one batched stat each per operation).
+                axp = self._ax_path_for(fp)
+                ax_id = (axp,) + (_get_stat(axp) if axp else (None, None))
+                if rec[2] == ax_id and rec[3] == _get_stat(fp):
+                    return rec[0], rec[1]
+
             # Cache miss - compute and store
             h, w = _size_after_ax_fast_from_file(fp)
             
