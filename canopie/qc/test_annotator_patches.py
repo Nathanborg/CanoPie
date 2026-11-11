@@ -240,11 +240,28 @@ def test_window_moves_off_the_viewer(project_tab, qapp):
         qapp.processEvents()
         assert dlg.frameGeometry().intersects(vg)
         poly = viewer.mapToScene(vp.rect().center())
-        dlg._keep_clear_of(viewer, QtCore.QRectF(poly.x() - 5, poly.y() - 5, 10, 10))
-        qapp.processEvents()
         r = viewer.mapFromScene(QtCore.QRectF(poly.x() - 5, poly.y() - 5, 10, 10)).boundingRect()
         pr = QtCore.QRect(vp.mapToGlobal(r.topLeft()), r.size())
-        assert not dlg.frameGeometry().intersects(pr), "the Annotator still covers the polygon"
+
+        def covered(g):
+            i = g.intersected(pr)
+            return max(0, i.width()) * max(0, i.height())
+        before = covered(dlg.frameGeometry())
+
+        dlg._keep_clear_of(viewer, QtCore.QRectF(poly.x() - 5, poly.y() - 5, 10, 10))
+        qapp.processEvents()
+        me = dlg.frameGeometry()
+        avail = (QtWidgets.QApplication.screenAt(vg.center())
+                 or QtWidgets.QApplication.primaryScreen()).availableGeometry()
+        # Is there any spot on this screen beside the polygon the window fits in?
+        # A CI runner's 1024x768 screen has none for an ~820x670 window over a
+        # centred polygon; a desktop screen does.
+        room = (pr.left() - avail.left() >= me.width() or avail.right() - pr.right() >= me.width()
+                or pr.top() - avail.top() >= me.height() or avail.bottom() - pr.bottom() >= me.height())
+        if room:
+            assert not me.intersects(pr), "the Annotator still covers the polygon although there is room"
+        else:
+            assert covered(me) <= before, "with no room, moving must not cover more of the polygon"
     finally:
         w["container"].hide()
         w["container"].deleteLater()
