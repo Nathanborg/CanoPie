@@ -50,6 +50,12 @@ def main():
         "--include-qt-plugins=sensible,styles",
         "--include-package=canopie",
         "--include-package-data=folium,branca,pyproj",
+        # imagecodecs loads each codec by name at runtime (imagecodecs._lzw
+        # for lzw_decode, ...), so Nuitka sees none of them and the exe could
+        # not read LZW/Deflate/ZSTD/JPEG-compressed TIFFs (e.g. GEE exports).
+        # AVIF (17 MB) is not a TIFF compression.
+        "--include-package=imagecodecs",
+        "--nofollow-import-to=imagecodecs._avif",
         "--include-data-files=%s=logo.PNG" % os.path.join(ROOT, "logo.PNG"),
         "--noinclude-pytest-mode=nofollow",
         "--noinclude-setuptools-mode=nofollow",

@@ -48,6 +48,13 @@ def use_pyqt_qt_plugins():
 
 
 def main():
+    if "--selftest" in sys.argv:
+        # CanoPie.exe --selftest [REPORT.txt]: check everything the app loads
+        # at runtime is present (see canopie/selftest.py).
+        from canopie import selftest
+        i = sys.argv.index("--selftest")
+        out = sys.argv[i + 1] if len(sys.argv) > i + 1 else None
+        sys.exit(selftest.run(out))
     if os.name == "nt":
         _windows_setup()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")

@@ -6175,6 +6175,7 @@ class ProjectTab(QtWidgets.QWidget):
             pass
 
         # --- 0) Oversized cube: display a 3-band preview instead of decoding it all ---
+        preview_err = None
         if ext in (".tif", ".tiff"):
             try:
                 from .raster_reader import probe as _probe, open_reader as _open_reader
@@ -6214,6 +6215,7 @@ class ProjectTab(QtWidgets.QWidget):
                         lite.reader = reader
                         return lite
             except Exception as e:
+                preview_err = e
                 logging.warning("Preview load failed for '%s', falling back: %s", filepath, e)
 
         # --- 1) TIFF preflight: if it's a real stack, go straight to tifffile ---
@@ -6233,6 +6235,20 @@ class ProjectTab(QtWidgets.QWidget):
                 # uncaught exception here into a per-file load-error signal,
                 # the same graceful "this one file failed" path used for any
                 # other load failure -- not a crash.
+                #
+                # When the windowed preview failed only because a codec could
+                # not be imported (e.g. imagecodecs' LZW missing from a
+                # frozen build), say so: the RAM message would send the user
+                # off converting a file that is perfectly readable.
+                if preview_err is not None and (
+                        isinstance(preview_err, ImportError)
+                        or "imagecodecs" in str(preview_err)):
+                    raise RuntimeError(
+                        f"{os.path.basename(filepath)}: cannot decode this "
+                        f"TIFF's compression -- {preview_err}. The imagecodecs "
+                        f"codec for it is missing from this installation "
+                        f"(reinstall imagecodecs, or use a CanoPie build that "
+                        f"bundles it).") from preview_err
                 raise
             except Exception as e:
                 logging.warning(f"tifffile stack load failed for '{filepath}', will try ImageData: {e}")

@@ -1132,10 +1132,9 @@ def get_optimal_chunk_size(total_size: int,
     Returns:
         Optimal chunk size
     """
-    import psutil
-
     if available_memory is None:
         try:
+            import psutil                       # optional: not a requirement
             available_memory = psutil.virtual_memory().available
         except Exception:
             available_memory = 2 * 1024 * 1024 * 1024  # Assume 2GB
