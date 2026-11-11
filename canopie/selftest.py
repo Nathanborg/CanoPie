@@ -24,7 +24,7 @@ import numpy as np
 # scripts that run code on import (and the exe has no folder to scan).
 # test_selftest.py keeps this list in step with the package.
 CANOPIE_MODULES = [
-    "analysis_replay", "app", "ax_geometry", "ax_registration", "band_layout",
+    "analysis_replay", "annotator", "app", "ax_geometry", "ax_registration", "band_layout",
     "canopy_auto", "canopy_browser", "canopy_finder", "canopy_finder_dialog",
     "canopy_finder_meta", "canopy_tracer", "export_images_options_dialog",
     "image_data", "image_editor_dialog", "image_viewer", "lazy_analysis",

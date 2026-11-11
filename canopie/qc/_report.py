@@ -207,6 +207,29 @@ FEATURE_MAP = {
         "band the viewer does not hold is saved as its file band (not band 1); the dialog opens on the saved band and "
         "keeps the saved Absolute range (it reset it to the band's data range on every open); an image without the "
         "band a root / project stretch shows keeps its own display (and its own stretch); reloaded bands keep the .ax crop"),
+    "test_annotator": (
+        "Annotator: custom polygon properties",
+        "project / root / image scope and label restriction; a new property covers existing and later polygons; N/A "
+        "saves null, counts as filled and disables the slider; per-label % filled, OK marks and the to-do list agree; "
+        "values live in the polygon's properties (Edit properties shows and edits them, null survives it), survive Ctrl+Q + "
+        "reopen; the current canopy is highlighted in the list, its viewer framed, arrows step its images, Next to fill; "
+        "a viewer click (locked too) opens the polygon, no prompt"),
+    "test_annotator_csv_export": (
+        "Annotator values in exports",
+        "prop_<name> columns in the main CSV (foreground and background writers) and the ML manager's CSVs; a "
+        "property with 'Include in exports' off is left out of the export copy but stays on the polygon"),
+    "test_annotator_patches": (
+        "Annotator brush patches + one Annotator window",
+        "strokes clipped to the crown, separate strokes stay separate polygons, erased holes survive reload; a real "
+        "drag on a viewer stores annotator_patches in the crown's basis and in the sidecar JSON; finishing offers the "
+        "% as the value (remembered Always / Never skip the question); the panel is in the Annotator window, which "
+        "moves off the polygon a list click zoomed to; the marked viewer strip is red while pending, green when OK; "
+        "→/D and ←/A walk the polygons to fill (borrowed from root stepping while open, given back on close); a "
+        "drawing is copied from the canopy's previous image, fitted to the new crown"),
+    "test_locked_polygon_pan_reset": (
+        "Locked polygon prompt leaves the canvas idle",
+        "after Cancel / Unlock on the lock prompt the pan is not stuck (hover no longer scrolls, open-hand cursor, "
+        "no mouse grabber), a background drag still pans, and an unlocked polygon drags on the next click"),
     "test_polygon_zoom": (
         "Polygon manager: click and Zoom to polygon",
         "a list click pans only, Zoom to polygon fits a real polygon with a native-resolution cap; the zoom rect is "

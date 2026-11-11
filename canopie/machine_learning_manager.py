@@ -5090,9 +5090,21 @@ class MachineLearningManager(QtWidgets.QDialog):
                     snap[g] = copy.deepcopy(src[g])
                 except Exception as e:
                     logging.warning(f"Snapshot failed for group '{g}': {e}; using shallow copy.")
-                    snap[g] = dict(src[g])
+                    # copy each record too: Annotator values are added below
+                    snap[g] = {fp: (dict(rec) if isinstance(rec, dict) else rec)
+                               for fp, rec in src[g].items()}
             else:
                 logging.debug(f"Group '{g}' not present at snapshot time.")
+        # Annotator values -> annot_* columns in every CSV built from this
+        # snapshot (the records here are copies; all_polygons is untouched).
+        if getattr(self.parent_tab, "annotator_store", None) is not None:
+            try:
+                from .annotator import attach_export_values
+                for g, fm in snap.items():
+                    for fp, rec in fm.items():
+                        attach_export_values(self.parent_tab, g, fp, rec)
+            except Exception:
+                logging.warning("Annotator values not added to the ML export", exc_info=True)
         return snap
         
     def export_csv_data(self):

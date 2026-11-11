@@ -3235,6 +3235,15 @@ class PolygonManager(QtWidgets.QDialog):
 
         # Filter to selected groups only
         selected_polys = {g: all_polygons[g] for g in groups if g in all_polygons}
+        # Annotator properties with "Include in exports" off stay out of the
+        # DBF: export copies, the live records are not touched.
+        store = getattr(parent, "annotator_store", None)
+        if store is not None and any(not p.get("export", True) for p in store.properties):
+            from .annotator import attach_export_values
+            selected_polys = {
+                g: {fp: (attach_export_values(parent, g, fp, dict(rec)) if isinstance(rec, dict) else rec)
+                    for fp, rec in fm.items()}
+                for g, fm in selected_polys.items()}
         if not selected_polys:
             QtWidgets.QMessageBox.warning(self, "No Polygons", "Selected groups have no polygon data.")
             return
