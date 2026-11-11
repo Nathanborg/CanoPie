@@ -368,7 +368,7 @@ class LazyPolygonRecord(dict):
     """
 
     #: Keys that must never be answered from the coarse overview.
-    _EXACT_KEYS = frozenset({'points', 'coordinates', 'properties', 'lod'})
+    _EXACT_KEYS = frozenset({'points', 'coordinates', 'properties', 'lod', 'annotator_patches'})
 
     def __init__(self, meta, source_path):
         super().__init__(meta)

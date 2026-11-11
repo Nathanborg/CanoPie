@@ -6811,6 +6811,13 @@ class ProjectTab(QtWidgets.QWidget):
         self.polygonManagerAct.setShortcut(QKeySequence("P"))       
         self.polygonManagerAct.triggered.connect(self.show_polygon_manager)
 
+        self.annotatorAct = QtWidgets.QAction("Annotator", self)
+        self.annotatorAct.setShortcut(QKeySequence("Ctrl+Shift+P"))
+        self.annotatorAct.triggered.connect(self.show_annotator)
+        # Lives in the Modules dropdown; added to the tab too so the shortcut
+        # works while that menu is closed.
+        self.addAction(self.annotatorAct)
+
         self.exportManagerAct = QtWidgets.QAction("Export Manager", self)
         self.exportManagerAct.setShortcut(QKeySequence("Ctrl+E"))
         self.exportManagerAct.triggered.connect(self.show_export_manager)
@@ -6932,7 +6939,7 @@ class ProjectTab(QtWidgets.QWidget):
         for a in [
             self.openAct, self.openRGBAct, self.exitAct, self.saveAct, self.saveAllAct,
             self.nextAct, self.prevAct, self.syncAct, self.cleanAllAct, self.goToRootAct,
-            self.polygonManagerAct, self.copyMetadataAct, self.openImageFoldersAct,
+            self.polygonManagerAct, self.annotatorAct, self.copyMetadataAct, self.openImageFoldersAct,
             self.saveProjectAct, self.loadProjectAct, self.saveQuickAct,
             self.copyPolygonsNextAct, self.copyPolygonsPrevAct,
             self.copyPolygonsAllRootsAct, self.copyPolygonsNextTabAct,
@@ -7197,6 +7204,7 @@ class ProjectTab(QtWidgets.QWidget):
         modules_menu = QtWidgets.QMenu(self)
         modules_menu.addAction(self.showMapAct)
         modules_menu.addAction(self.machineLearningManagerAct)
+        modules_menu.addAction(self.annotatorAct)
         modules_menu.addAction(self.randomShapesAct)
         modules_menu.addSeparator()
         modules_menu.addAction(self.setRootOffsetAct)
@@ -16833,6 +16841,7 @@ class ProjectTab(QtWidgets.QWidget):
             except Exception:
                 pass
 
+            from .annotator import attach_export_values as _attach_annot
             snapshot_dir = tempfile.mkdtemp(prefix="canopie_csv_export_")
             snapshot_json_path = os.path.join(snapshot_dir, "polygons_snapshot.json")
 
@@ -16854,6 +16863,8 @@ class ProjectTab(QtWidgets.QWidget):
                     pd_disk = _jsonify(polygon_dict if isinstance(polygon_dict, dict) else {})
                     if isinstance(pd_disk, dict) and "name" not in pd_disk:
                         pd_disk["name"] = group_name
+                # Annotator values -> annot_* columns (pd_disk is this export's copy)
+                _attach_annot(self, group_name, filepath, pd_disk)
                 snap_jobs.append([group_name, filepath, pd_disk])
 
             if _snap_cancelled:
@@ -16882,6 +16893,13 @@ class ProjectTab(QtWidgets.QWidget):
             logging.warning(f"[CSV export] Failed to create disk snapshot (continuing with in-memory polygons): {e}")
             snapshot_dir = None
             snapshot_json_path = None
+            # Annotator values still go out: on shallow COPIES, never on the
+            # live all_polygons records.
+            if getattr(self, "annotator_store", None) is not None:
+                from .annotator import attach_export_values
+                polygons_to_process = [
+                    (g, fp, attach_export_values(self, g, fp, dict(pd)) if isinstance(pd, dict) else pd)
+                    for (g, fp, pd) in polygons_to_process]
         finally:
             try:
                 snap_progress.close()
@@ -23028,6 +23046,69 @@ class ProjectTab(QtWidgets.QWidget):
             self.polygon_manager.set_polygons(all_polygon_groups)
             self.polygon_manager.show()
 
+    def show_annotator(self):
+        """Open the Annotator (custom per-polygon properties, annotator.py)."""
+        from .annotator import Annotator
+        dlg = getattr(self, "annotator", None)
+        try:
+            if dlg is None:
+                dlg = self.annotator = Annotator(self)
+            dlg.show()
+        except RuntimeError:            # the Qt side was deleted
+            dlg = self.annotator = Annotator(self)
+            dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        return dlg
+
+    def _annotator_polygon_click(self, item, viewer):
+        """ImageViewer.polygon_click_listener: a polygon or point was pressed.
+        True means the open Annotator took the click."""
+        dlg = getattr(self, "annotator", None)
+        if dlg is None:
+            return False
+        try:
+            return bool(dlg.on_viewer_polygon_clicked(item, viewer))
+        except RuntimeError:
+            return False
+
+    def _annotator_record_changed(self, group, filepath):
+        """A polygon's properties were edited outside the Annotator."""
+        dlg = getattr(self, "annotator", None)
+        if dlg is not None:
+            try:
+                dlg.record_changed(group, filepath)
+                return
+            except RuntimeError:
+                pass
+        store = getattr(self, "annotator_store", None)
+        if store is not None:
+            from .annotator import find_record
+            key, rec = find_record(self.all_polygons, group, filepath)
+            if rec is not None:
+                store.sync_record(group, key, rec, force=True)
+
+    def _restore_annotator(self, data):
+        """Load project.json's "annotator" key (definitions + values)."""
+        from .annotator import AnnotationStore
+        self.annotator_store = AnnotationStore(data) if data else None
+        dlg = getattr(self, "annotator", None)
+        if dlg is not None:
+            from .annotator import store_for
+            try:
+                dlg.store = dlg.panel.store = store_for(self)
+                dlg.panel.show_polygon(None, None, None, None)
+                if dlg.isVisible():
+                    dlg.refresh()
+            except RuntimeError:
+                pass
+
+    def _annotator_payload(self):
+        # An emptied store is still written, so removing the last property
+        # does not leave the old definitions behind in project.json.
+        store = getattr(self, "annotator_store", None)
+        return None if store is None else store.to_dict()
+
     def open_canopy_finder(self, group, source_fp, crowns=None):
         """'Find canopy in other images…' (viewer polygon menu, polygon manager):
         one non-modal finder per tab, re-aimed at the clicked crown. `crowns`:
@@ -23315,6 +23396,13 @@ class ProjectTab(QtWidgets.QWidget):
         # from C++. An unhandled Python exception there does not propagate --
         # PyQt aborts the process. So a missing/not-yet-built manager must be a
         # quiet no-op rather than an AttributeError.
+        ann = getattr(self, "annotator", None)
+        if ann is not None:
+            try:
+                if ann.isVisible():
+                    ann.schedule_refresh()
+            except Exception:
+                pass
         pm = getattr(self, "polygon_manager", None)
         if pm is None or not pm.isVisible():
             return
@@ -27337,6 +27425,10 @@ class ProjectTab(QtWidgets.QWidget):
                         'properties': (polygon_data.get('properties') or {})
                                       if isinstance(polygon_data, dict) else {},
                     }
+                    # Annotator brush patches -- see _sidecar_payload.
+                    _patches = polygon_data.get('annotator_patches') if isinstance(polygon_data, dict) else None
+                    if _patches:
+                        data_to_save['annotator_patches'] = _patches
 
                     base_filename     = os.path.splitext(os.path.basename(filepath))[0]
                     polygon_filename  = f"{group_name}_{base_filename}_polygons.json"
@@ -29006,6 +29098,9 @@ class ProjectTab(QtWidgets.QWidget):
             "root_coordinates": self.root_coordinates,
             "root_mapping": getattr(self, "root_mapping_dict", {})  # Include root_mapping if present
         }
+        _annot = self._annotator_payload()
+        if _annot is not None:
+            project_data["annotator"] = _annot
 
         # Save folder paths and batch options based on mode.
         if self.mode == 'dual_folder':
@@ -29124,6 +29219,7 @@ class ProjectTab(QtWidgets.QWidget):
         project_name = os.path.basename(os.path.normpath(project_folder))
         self.update_project_name(project_name)
         self.project_folder = project_folder
+        self._restore_annotator(project_data.get("annotator"))
 
         # Determine mode (do not prompt)
         if "mode" in project_data:
@@ -30384,6 +30480,11 @@ class ProjectTab(QtWidgets.QWidget):
         }
         if polygon_data.get('is_mask_polygon'):
             data_to_save['is_mask_polygon'] = True
+        # Annotator brush patches (annotator.py): polygons drawn inside the
+        # crown per property, in the same coordinate basis as 'points'.
+        patches = polygon_data.get('annotator_patches')
+        if patches:
+            data_to_save['annotator_patches'] = patches
         # No `lod` pyramid in the sidecar any more. It was 41% of every file
         # (55 of 134 MB for the 2,801 BCI crowns) and 2.5 s of every import,
         # and nothing needs it stored: the overview takes its one level from
@@ -30539,6 +30640,9 @@ class ProjectTab(QtWidgets.QWidget):
                     existing_data["polygons_external"] = False
                 existing_data["current_root_index"] = self.current_root_index
                 existing_data["root_coordinates"] = getattr(self, "root_coordinates", {}) or {}
+                _annot = self._annotator_payload()
+                if _annot is not None:
+                    existing_data["annotator"] = _annot
 
                 # Write back
                 with open(project_json_path, 'w', encoding='utf-8') as f:
@@ -31929,6 +32033,8 @@ class ProjectTab(QtWidgets.QWidget):
     def _wire_viewer_for_inspection(self, viewer):
         checked = getattr(self, "inspectAct", None).isChecked() if hasattr(self, "inspectAct") else False
         viewer.set_inspection_mode(checked)
+        # Polygon clicks reach the Annotator's Polygon Properties panel.
+        viewer.polygon_click_listener = self._annotator_polygon_click
 
         # idempotent pixel read hook
         try:

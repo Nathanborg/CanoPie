@@ -32,6 +32,7 @@ main.py
               │     └── canopy_auto.py    Auto Canopy engine: offline only, not wired into the app (no Qt)
               ├── image_editor_dialog.py  ImageEditorDialog (QDialog) — per-image non-destructive edits (.ax files)
               ├── polygon_manager.py      PolygonManager (QDialog) — polygon-group tree, import/visibility
+              │     └── annotator.py      Annotator (PolygonManager subclass) — custom per-polygon properties
               ├── machine_learning_manager.py  MachineLearningManager + RootOffsetDialog + AnalysisOptionsDialog
               ├── loaders.py              async image loading (QThreadPool/QRunnable), EXIF batch, ImageProcessor
               ├── image_data.py           ImageData — reads one image file, classifies rgb/thermal/multispectral
@@ -58,6 +59,26 @@ fast functions (wrapped in try/except — the app runs without NumExpr/Numba ins
    current root into one or more **ImageViewer** panes, and lets the user draw polygons.
 3. Drawing/editing happens in **ImageViewer**; polygons live in `ProjectTab.all_polygons`
    and are mirrored to disk. **PolygonManager** is the management UI over that dict.
+   The **Annotator** (`annotator.py`, Modules > Annotator, Ctrl+Shift+P) adds user-defined
+   numeric/categorical properties scoped to the project, a root or an image (optionally one
+   label). VALUES live in each polygon's own `properties` under the property's name (number,
+   choice, tags 'a;b', null = N/A), so the viewer's Edit properties dialog, the sidecar JSON,
+   shapefile DBF and `prop_<name>` CSV columns all carry them. `project.json["annotator"]`
+   holds the definitions plus a value INDEX (a cache) so completion stats never page in a
+   LazyPolygonRecord; any read of a record refreshes it. Applicability is computed on demand,
+   so a property covers existing and later polygons. "Include in exports" off takes the
+   property out of each export's copy (attach_export_values), never off the polygon.
+   The Polygon Properties panel is the left half of the Annotator window, which moves off the
+   polygon a list click zooms to. Per property, "Draw" turns on a plain brush (PatchBrush, an
+   event filter on that viewer's viewport): painted areas are clipped to the crown
+   (PatchCanvas, OpenCV mask) and saved as polygons in record["annotator_patches"][name] --
+   written to the sidecar by _sidecar_payload / save_polygons_to_json and lazy-loaded like
+   `properties` (polygon_lod._EXACT_KEYS). Finishing can set a numeric value to the % drawn.
+   While the Annotator is open, ←/→/A/D mean previous/next polygon to fill (the project
+   window's root-stepping shortcuts are borrowed and restored on close), the marked viewer's
+   strip is red while anything is pending and green when complete, and "From previous image"
+   copies a property's patches from the same group's latest earlier image (transfer_patches:
+   source crown bbox -> target crown bbox).
 4. **ImageEditorDialog** applies non-destructive per-image edits saved as **.ax** sidecars.
 5. **MachineLearningManager** trains sklearn models from polygon labels and/or applies a
    model during CSV export. Heavy pixel math is offloaded to **performance.py** when available.

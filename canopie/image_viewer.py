@@ -422,7 +422,7 @@ class PolygonPropertiesDialog(QtWidgets.QDialog):
         layout.addWidget(self.table)
 
         for k, v in (properties or {}).items():
-            self._append_row(str(k), "" if v is None else str(v))
+            self._append_row(str(k), "" if v is None else str(v), is_null=v is None)
 
         btn_row = QtWidgets.QHBoxLayout()
         self.add_btn = QtWidgets.QPushButton("Add Property")
@@ -441,11 +441,20 @@ class PolygonPropertiesDialog(QtWidgets.QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def _append_row(self, key, value):
+    #: Marks a value cell that held null (None) when the dialog opened.
+    _NULL_ROLE = QtCore.Qt.UserRole + 7
+
+    def _append_row(self, key, value, is_null=False):
         row = self.table.rowCount()
         self.table.insertRow(row)
         self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(key))
-        self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(value))
+        val = QtWidgets.QTableWidgetItem(value)
+        if is_null:
+            # null (e.g. an Annotator N/A, an empty DBF field) shows blank
+            # and stays null unless something is typed in.
+            val.setData(self._NULL_ROLE, True)
+            val.setToolTip("null (no value)")
+        self.table.setItem(row, 1, val)
 
     def _remove_selected(self):
         rows = sorted({idx.row() for idx in self.table.selectedIndexes()}, reverse=True)
@@ -481,6 +490,9 @@ class PolygonPropertiesDialog(QtWidgets.QDialog):
             if not key:
                 continue
             val = (val_item.text() if val_item else "")
+            if val.strip() == "" and val_item is not None and val_item.data(self._NULL_ROLE):
+                out[key] = None
+                continue
             out[key] = self._coerce(val)
         return out
 
@@ -1110,7 +1122,12 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
             # very top, before selection/undo bookkeeping -- rather than
             # inside a running drag, because interrupting an ALREADY-active
             # Qt drag is what causes the item to glitch/snap.
-            if getattr(self, "is_locked", False) and not _prompt_unlock_click(self):
+            annotator_took_it = _notify_polygon_click(self)
+            if getattr(self, "is_locked", False):
+                # With the Annotator open a locked polygon is just picked for
+                # its properties: no prompt, and it stays locked.
+                if not annotator_took_it:
+                    _prompt_unlock_click(self)
                 event.ignore()
                 return
 
@@ -1305,11 +1322,36 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
             v.delete_all_polygons_in_group(self)
 
 
+def _notify_polygon_click(item):
+    """Tell the owning viewer's polygon_click_listener (ProjectTab wires it to
+    the Annotator) that `item` was pressed. True if the listener took it."""
+    try:
+        scn = item.scene()
+        views = scn.views() if scn is not None else []
+        v = views[0] if views else None
+        listener = getattr(v, "polygon_click_listener", None) if v is not None else None
+        return bool(listener(item, v)) if listener is not None else False
+    except Exception:
+        logging.debug("[annotator] polygon click listener failed", exc_info=True)
+        return False
+
+
 def _prompt_unlock_click(item):
     """Shared lock-click handler for EditablePolygonItem / EditablePointItem.
 
-    Returns True if the click should proceed as a normal press (item is now
-    unlocked one way or another), False if it must be swallowed.
+    Asks whether to unlock, applies the answer, and ALWAYS returns False: the
+    press that opened the dialog is swallowed whatever the user chose, and the
+    user clicks again to drag a polygon they just unlocked.
+
+    Why never let the press continue: the box is modal and opens in the middle
+    of a mouse press, so it eats the matching release. A press that carried on
+    into a drag would have no release left to end it. Swallowing it has the
+    same problem one level up: the item ignores the press, so QGraphicsView's
+    ScrollHandDrag takes it as a background click and starts hand-scrolling,
+    and with no release on the way the pan stayed on. The closed-hand cursor
+    stuck and every later hover moved the image. The view is flagged here and
+    ImageViewer.mousePressEvent ends that pan once the press has gone through
+    (see ImageViewer.reset_pointer_interaction).
     """
     box = QtWidgets.QMessageBox(QtWidgets.QMessageBox.Question, "Polygon Locked",
                                  f"'{getattr(item, 'name', '') or 'This polygon'}' is locked.",
@@ -1320,18 +1362,23 @@ def _prompt_unlock_click(item):
     box.exec_()
     clicked = box.clickedButton()
 
+    v = None
+    try:
+        scn = item.scene()
+        v = scn.views()[0] if scn and scn.views() else None
+    except Exception:
+        v = None
+    if v is not None:
+        v._press_interrupted_by_modal = True
+
     if clicked is btn_this:
         item.is_locked = False
-        return True
-    if clicked is btn_group:
+    elif clicked is btn_group:
         try:
-            scn = item.scene()
-            v = scn.views()[0] if scn and scn.views() else None
             if v is not None and hasattr(v, "unlock_group"):
                 v.unlock_group(getattr(item, "name", None))
         except Exception:
             logging.debug("[lock] unlock_group failed", exc_info=True)
-        return not getattr(item, "is_locked", False)
     return False
 
 
@@ -1868,7 +1915,10 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
 
     def mousePressEvent(self, event):
         if event.button() == QtCore.Qt.LeftButton:
-            if getattr(self, "is_locked", False) and not _prompt_unlock_click(self):
+            annotator_took_it = _notify_polygon_click(self)
+            if getattr(self, "is_locked", False):
+                if not annotator_took_it:
+                    _prompt_unlock_click(self)
                 event.ignore()
                 return
 
@@ -4124,7 +4174,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
                     
                     if clickable_items:
                         # Clicked on an item - let Qt handle selection/dragging normally
-                        super(ImageViewer, self).mousePressEvent(event)
+                        self._press_to_scene(event)
                     else:
                         # Clicked on background - use fast manual panning
                         self._is_panning = True
@@ -4175,7 +4225,17 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 super(ImageViewer, self).mousePressEvent(event)
 
         else:
-            super(ImageViewer, self).mousePressEvent(event)
+            self._press_to_scene(event)
+
+    def _press_to_scene(self, event):
+        """Hand a press to QGraphicsView/the scene, then undo the pan it may
+        have started if a locked item opened its unlock prompt meanwhile (the
+        modal prompt ate the release; see _prompt_unlock_click)."""
+        self._press_interrupted_by_modal = False
+        super(ImageViewer, self).mousePressEvent(event)
+        if self._press_interrupted_by_modal:
+            self._press_interrupted_by_modal = False
+            self.reset_pointer_interaction()
 
     def get_pixel_value(self, x, y):
         try:
@@ -5398,6 +5458,38 @@ class ImageViewer(QtWidgets.QGraphicsView):
             if getattr(item, "name", None) == group_name:
                 item.is_locked = False
 
+    #: Set by _prompt_unlock_click when a modal prompt opened during a press.
+    _press_interrupted_by_modal = False
+
+    #: callable(item, viewer) -> bool, called on every left press of a
+    #: polygon/point (see _notify_polygon_click). ProjectTab sets it.
+    polygon_click_listener = None
+
+    def reset_pointer_interaction(self):
+        """Return the canvas to its idle state after a press whose release
+        never arrived, e.g. one eaten by a modal dialog.
+
+        Ends both pans: CanoPie's manual one (_is_panning) and Qt's own
+        ScrollHandDrag hand-scroll, whose flag is private. A left release
+        through the QGraphicsView base class is the only public way to clear
+        that flag, and with no mouse grabber the scene ignores the release.
+        """
+        self._is_panning = False
+        self.left_button_pressed = False
+        self.middle_button_pressed = False
+        self._item_being_dragged = False
+        try:
+            pos = QtCore.QPointF(self.viewport().mapFromGlobal(QtGui.QCursor.pos()))
+            rel = QtGui.QMouseEvent(QtCore.QEvent.MouseButtonRelease, pos,
+                                    QtCore.Qt.LeftButton, QtCore.Qt.NoButton,
+                                    QtCore.Qt.NoModifier)
+            QtWidgets.QGraphicsView.mouseReleaseEvent(self, rel)
+        except Exception:
+            logging.debug("[pan] base-class release failed", exc_info=True)
+        if self.dragMode() == QtWidgets.QGraphicsView.ScrollHandDrag:
+            self.viewport().setCursor(QtCore.Qt.OpenHandCursor)
+        self.setCursor(QtCore.Qt.ArrowCursor)
+
     # ------------------------------------------------------------------
     # Filter & Color (PolygonManager "Filter & Color Polygons")
     # ------------------------------------------------------------------
@@ -5530,6 +5622,14 @@ class ImageViewer(QtWidgets.QGraphicsView):
         new_props = dlg.get_properties()
         entry['properties'] = new_props
         item.properties = new_props
+
+        # The Annotator reads these same properties; keep its panel and
+        # completion marks in step with what was just typed here.
+        try:
+            if hasattr(owner, "_annotator_record_changed"):
+                owner._annotator_record_changed(group, storage_key)
+        except Exception:
+            logging.debug("[properties] annotator sync failed", exc_info=True)
 
         try:
             if hasattr(owner, "_mark_polygon_dirty"):
