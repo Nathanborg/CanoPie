@@ -8,6 +8,8 @@ to single-band grayscale on click, restores the composite stretch via its
 leading Auto/RGB button, hides immediately when drawing starts, and stays
 docked to the bottom of the viewport below the zoom bar at any size.
 """
+import os
+
 import numpy as np
 import pytest
 from PyQt5 import QtCore, QtGui
@@ -20,6 +22,22 @@ pytestmark = [pytest.mark.viewer]
 # One fixture per interesting band count: single-band, 3-band, 8-band, 200-band.
 BAR_FIXTURES = ["gray_8bit_png", "rgb_8bit_untiled",
                 "multiband_8band_ancillary", "hyperspectral_200band"]
+
+
+@pytest.fixture(autouse=True)
+def _remove_ax_written_by_band_clicks(synthetic_project):
+    """A band click saves the image's stretch to its .ax (real behaviour).
+    The project is shared by the whole session, so remove any .ax this test
+    created -- later tests expect these fixtures to have none."""
+    paths = {n: synthetic_project._ax_path_for(fixture_image_path(n)) for n in (f["name"] for f in FIXTURES)}
+    existed = {n for n, p in paths.items() if os.path.exists(p)}
+    yield
+    for n, p in paths.items():
+        if n not in existed and os.path.exists(p):
+            os.remove(p)
+            cache = getattr(synthetic_project, "_ax_cache", None)
+            if cache:
+                cache.pop(os.path.normcase(os.path.abspath(fixture_image_path(n))), None)
 
 
 def _viewer_with_image(synthetic_project, viewer_factory, name):
