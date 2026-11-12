@@ -1,9 +1,14 @@
 # CanoPie: following individual tree crowns through raw drone, orthomosaic and phenocam imagery
 
-**White paper -- version 1.1.0, October 2026**
+**White paper -- version 1.2.0, November 2026**
 
-**Nathan B. Gonçalves** ([ORCID 0000-0001-9068-6904](https://orcid.org/0000-0001-9068-6904))
-and **Scott C. Stark** ([ORCID 0000-0002-1579-1648](https://orcid.org/0000-0002-1579-1648))
+**Nathan B. Gonçalves**<sup>1,2</sup> ([ORCID 0000-0001-9068-6904](https://orcid.org/0000-0001-9068-6904))
+and **Scott C. Stark**<sup>2</sup> ([ORCID 0000-0002-1579-1648](https://orcid.org/0000-0002-1579-1648))
+
+<sup>1</sup> Smithsonian Tropical Research Institute, 0843-03092, Balboa, Republic of Panama<br>
+<sup>2</sup> Department of Forestry, Michigan State University, East Lansing, Michigan, USA
+
+Corresponding author: Nathan B. Gonçalves, <nathanborges@gmail.com>
 
 Software: <https://github.com/Nathanborg/CanoPie> ·
 DOI: [10.5281/zenodo.23772111](https://doi.org/10.5281/zenodo.23772111) ·
@@ -82,6 +87,16 @@ Its main pieces:
   written into the images.
 - **Data extraction.** Per-polygon statistics of every band and index, written to CSV
   together with each image's EXIF metadata and timestamp.
+- **Annotator.** Custom per-crown properties -- numbers, categories or tags such as
+  `leaf_cover` or `phenophase` -- defined for the whole project, one root or one image,
+  optionally only for certain labels. Values are stored in the polygon's own properties
+  (so they reach the CSV and shapefile exports), a strip on each viewer turns green when
+  every crown is filled in, and the keyboard steps to the next crown to fill. Patches
+  drawn inside a crown with a brush (e.g. the flowering or leafless part) give a
+  percentage cover and are saved with the polygon.
+- **Polygon filters and statistics.** Rules on any property (and on hidden attributes:
+  area, perimeter, last-modified date) colour or hide crowns and narrow the polygon
+  lists to the matching ones; *Polygon Stats* summarises the selected crowns.
 - **Machine Learning Manager** (Section 6): pixel classification with scikit-learn, and
   export of pixels, thumbnails and segmentation masks for deep-learning training.
 - **Orthomosaics as Cloud-Optimized GeoTIFFs.** Mosaics of several gigabytes -- including
@@ -296,7 +311,7 @@ dissertation at Michigan State University (Gonçalves, 2025).
 Please cite:
 
 > Gonçalves, N. B., & Stark, S. C. (2026). *CanoPie: A Graphical User Interface for
-> Multitemporal Canopy Imagery Data Analysis* (Version 1.1.0) [Computer software].
+> Multitemporal Canopy Imagery Data Analysis* (Version 1.2.0) [Computer software].
 > Zenodo. <https://doi.org/10.5281/zenodo.23772111>
 
 ## AI usage
@@ -309,10 +324,11 @@ real datasets; the design decisions are the authors'.
 
 ## Acknowledgements
 
-N.B. Gonçalves and S.C. Stark were supported by NSF DEB awards no. 1950080 and 1754357.
-N.B. Gonçalves was also financed by the Michigan State University Mericle Memorial Fund.
-We gratefully acknowledge the financial support of Simons Foundation award 429440, which
-supported N.B. Gonçalves.
+This research was supported by Simons Foundation award 429440, which funds N.B.
+Gonçalves's postdoctoral position at the Smithsonian Tropical Research Institute. At
+Michigan State University, N.B. Gonçalves and S.C. Stark were supported by NSF DEB awards
+no. 1950080 and 1754357, and N.B. Gonçalves was also financed by the Michigan State
+University Mericle Memorial Fund.
 
 ## References
 

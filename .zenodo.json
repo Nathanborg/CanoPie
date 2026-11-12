@@ -1,0 +1,34 @@
+{
+  "title": "CanoPie: A Graphical User Interface for Multitemporal Canopy Imagery Data Analysis",
+  "upload_type": "software",
+  "description": "<p>CanoPie is a free, open-source desktop application (Python, PyQt5) for loading, annotating, editing and measuring multitemporal canopy imagery -- raw drone frames, orthomosaics (including Cloud-Optimized GeoTIFFs) and phenocam images -- following individual tree crowns through time without photogrammetry. It ships as a standalone Windows app.</p>",
+  "creators": [
+    {
+      "name": "Gonçalves, Nathan B.",
+      "orcid": "0000-0001-9068-6904",
+      "affiliation": "Smithsonian Tropical Research Institute, 0843-03092, Balboa, Republic of Panama; Michigan State University"
+    },
+    {
+      "name": "Stark, Scott C.",
+      "orcid": "0000-0002-1579-1648",
+      "affiliation": "Michigan State University"
+    }
+  ],
+  "license": "MIT",
+  "keywords": [
+    "remote sensing",
+    "UAV",
+    "phenocam",
+    "thermal imagery",
+    "multispectral imagery",
+    "forest ecology"
+  ],
+  "notes": "Funding: This research was supported by Simons Foundation award 429440 (postdoctoral position of N.B. Gonçalves at the Smithsonian Tropical Research Institute). At Michigan State University, N.B. Gonçalves and S.C. Stark were supported by NSF DEB awards no. 1950080 and 1754357, and N.B. Gonçalves was also financed by the Michigan State University Mericle Memorial Fund. Contact: nathanborges@gmail.com",
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/Nathanborg/CanoPie",
+      "relation": "isSupplementTo",
+      "scheme": "url"
+    }
+  ]
+}
