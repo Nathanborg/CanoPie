@@ -55,6 +55,20 @@ FEATURE_MAP = {
         "Export Manager under Modules; viewer and Polygon Manager menus share their entries (Edit vertices / "
         "properties, Find canopy, Lock, Polygon Stats, Polygon Info); Polygon Stats = process_polygon rows for "
         "the selected polygons (several, viewer or manager, either path spelling); old counts = Polygon Info"),
+    "test_filter_rules_and_selection": (
+        "Filter rules: suggestions, hidden attributes, speed; zoomed-out selection; last_modified; filtered lists",
+        "property list (hidden area / perimeter / last_modified first) and value suggestions (commonest labels, "
+        "number quartiles); rule rows build / parse expressions; lazy crowns read without paging them in, reused "
+        "until changed, cached on disk across sessions; 5000 polygons re-filter < 1 s; Apply no longer rewrites "
+        "properties or saves; selecting while zoomed out works (lists, canvas click, Ctrl+drag) and survives "
+        "zooming; a deleted crown never stays in the zoomed-out tiles; edits stamp last_modified; after Apply the "
+        "Polygon Manager and ML lists show only the kept polygons, Clear Filters shows all"),
+    "test_polygon_appearance_and_lists": (
+        "Polygon & label appearance; lists follow viewer clicks; non-blocking ML manager",
+        "labels keep their on-screen size at any zoom (also on a COG preview); style reaches pens, label space and "
+        "zoomed-out tiles, previews live, Cancel restores, saved in QSettings; Configuration menu + gear beside "
+        "Lock Polygons; a viewer click selects the row in the Polygon Manager and ML manager (Ctrl adds); the ML "
+        "manager opens non-modal, one per tab, and picks up new groups"),
     "test_cog_pixel_zoom": (
         "A COG zooms in to its real pixels",
         "wheel and zoom bar limits are per REAL pixel (50x / 20x of the raster, not of the 1/16 preview a COG is "

@@ -302,6 +302,179 @@ POLYGON_Z        = 1.0     # ...and BELOW every annotation
 TEMP_DRAWING_Z   = 1e6     # in-progress rubber-band polygon
 LABEL_Z          = 1e7     # name labels, always on top
 
+# ---------------------------------------------------------------------------
+# Polygon & label appearance (Configuration > Polygon & Label Appearance…,
+# and the gear button in the Polygon Manager). App-wide, kept in QSettings.
+# ---------------------------------------------------------------------------
+#: label_mode "screen": labels keep label_px SCREEN pixels at every zoom.
+#: label_mode "zoom":   the old behaviour -- the size is set in scene units, so
+#:   it grows as you zoom in; on a COG (scene unit = a 1/16 preview pixel) that
+#:   made labels hundreds of pixels tall when zoomed in.
+#: outline_color None = automatic (red on RGB images, blue otherwise).
+POLYGON_STYLE_DEFAULTS = {
+    "label_px": 14, "label_mode": "screen", "label_color": "#ff0000",
+    "label_bold": False, "label_halo": True,
+    "outline_color": None, "outline_width": 1.0, "selected_color": "#ff00ff",
+}
+POLYGON_STYLE = dict(POLYGON_STYLE_DEFAULTS)
+_POLYGON_STYLE_KEY = "polygon_style"
+_POLYGON_STYLE_SETTINGS = ("CanoPie", "CanoPie")      # the same store canopy_finder_dialog uses
+_style_version = [0]          # bumped on every change: items rebuild cached pens / fonts
+
+
+def _clean_style(st):
+    out = dict(POLYGON_STYLE_DEFAULTS)
+    for k, v in (st or {}).items():
+        if k not in out:
+            continue
+        try:
+            if k == "label_px":
+                v = int(min(96, max(6, int(float(v)))))
+            elif k == "outline_width":
+                v = float(min(10.0, max(0.5, float(v))))
+            elif k in ("label_bold", "label_halo"):
+                v = v if isinstance(v, bool) else str(v).lower() in ("1", "true", "yes")
+            elif k == "label_mode":
+                v = v if v in ("screen", "zoom") else "screen"
+            elif k == "outline_color":
+                v = None if v in (None, "", "auto", "None") or not QtGui.QColor(str(v)).isValid() else str(v)
+            elif k in ("label_color", "selected_color"):
+                v = str(v) if QtGui.QColor(str(v)).isValid() else out[k]
+        except (TypeError, ValueError):
+            continue
+        out[k] = v
+    return out
+
+
+def load_polygon_style():
+    """Read the saved style (QSettings) into POLYGON_STYLE."""
+    import json as _json
+    try:
+        raw = QtCore.QSettings(*_POLYGON_STYLE_SETTINGS).value(_POLYGON_STYLE_KEY, "", type=str)
+        st = _json.loads(raw) if raw else {}
+    except Exception:
+        st = {}
+    POLYGON_STYLE.clear()
+    POLYGON_STYLE.update(_clean_style(st))
+    _style_version[0] += 1
+    return dict(POLYGON_STYLE)
+
+
+def apply_polygon_style(style, save=True):
+    """Set the style, save it, and redraw every polygon in every open viewer
+    (outline pens, labels, and the zoomed-out tiles)."""
+    import json as _json
+    POLYGON_STYLE.clear()
+    POLYGON_STYLE.update(_clean_style(style))
+    _style_version[0] += 1
+    if save:
+        try:
+            QtCore.QSettings(*_POLYGON_STYLE_SETTINGS).setValue(_POLYGON_STYLE_KEY, _json.dumps(POLYGON_STYLE))
+        except Exception:
+            logging.debug("[style] could not save the polygon style", exc_info=True)
+    app = QtWidgets.QApplication.instance()
+    for w in (app.allWidgets() if app is not None else []):
+        if isinstance(w, ImageViewer):
+            try:
+                w.refresh_polygon_style()
+            except RuntimeError:
+                pass
+    return dict(POLYGON_STYLE)
+
+
+def _style_color(key, fallback):
+    v = POLYGON_STYLE.get(key)
+    c = QtGui.QColor(v) if v else QtGui.QColor(fallback)
+    return c if c.isValid() else QtGui.QColor(fallback)
+
+
+def outline_color_for(is_rgb):
+    """The default outline colour: the style's, else red (RGB) / blue."""
+    return _style_color("outline_color", QtCore.Qt.red if is_rgb else QtCore.Qt.blue)
+
+
+_label_font_cache = {}
+
+
+def _screen_label_font():
+    key = (POLYGON_STYLE["label_px"], POLYGON_STYLE["label_bold"], _style_version[0])
+    f = _label_font_cache.get(key)
+    if f is None:
+        _label_font_cache.clear()
+        f = QtGui.QFont()
+        f.setPixelSize(int(POLYGON_STYLE["label_px"]))
+        f.setBold(bool(POLYGON_STYLE["label_bold"]))
+        _label_font_cache[key] = f
+    return f
+
+
+def label_reserve(item, text):
+    """(width, height) in SCENE units to reserve in an item's bounding rect
+    for its label. In "screen" mode the label is drawn at most at the
+    scale where labels start showing (_LABEL_SCALE_THRESHOLD), so this is its
+    largest scene size; in "zoom" mode the old fixed reserve."""
+    if POLYGON_STYLE["label_mode"] != "screen":
+        return len(text) * 50 + 100, 250
+    t = float(getattr(item, "_LABEL_SCALE_THRESHOLD", 0.35)) or 0.35
+    px = float(POLYGON_STYLE["label_px"])
+    return (len(text) * px * 0.7 + 2 * px) / t, (1.6 * px) / t
+
+
+def label_scene_rect(item, anchor, text):
+    """Scene rect a label can cover, for the item's bounding rect. Text is
+    drawn UP from its baseline, so in "screen" mode the rect sits above the
+    anchor (the old reserve hung below the offset point)."""
+    w, h = label_reserve(item, text)
+    if POLYGON_STYLE["label_mode"] != "screen":
+        return QtCore.QRectF(anchor + getattr(item, "label_offset", QtCore.QPointF(10, -10)),
+                             QtCore.QSizeF(w, h))
+    return QtCore.QRectF(anchor.x(), anchor.y() - h, w, h + h * 0.4)
+
+
+def draw_item_label(item, painter, anchor, scale):
+    """Draw an item's name label next to scene point `anchor` (the polygon's
+    top-right / the point set's top-left) in the current style."""
+    text = item.label_text
+    off = getattr(item, "label_offset", QtCore.QPointF(10, -10))
+    color = _style_color("label_color", QtCore.Qt.red)
+    if POLYGON_STYLE["label_mode"] != "screen":
+        # the old scene-unit size (grows with zoom)
+        base_px = 40 if getattr(item, "is_rgb", True) else 32
+        boost = item._get_res_boost() if hasattr(item, "_get_res_boost") else getattr(item, "_cached_res_boost", 1.0)
+        px = (base_px * boost) / scale
+        px = int(max(14, min(220, round(px))))
+        if px != getattr(item, "_cached_font_px", None):
+            font = QtGui.QFont()
+            font.setPixelSize(px)
+            item._cached_font = font
+            item._cached_font_px = px
+        font = QtGui.QFont(item._cached_font)
+        font.setBold(bool(POLYGON_STYLE["label_bold"]))
+        painter.setFont(font)
+        painter.setPen(QtGui.QPen(color))
+        painter.drawText(anchor + off, text)
+        return
+    # "screen": a fixed number of SCREEN pixels. Scale the painter by 1/zoom
+    # at the label's anchor so the font is set in device pixels (a scene-unit
+    # font cannot be smaller than 1 unit, and on a COG at 800x one unit is 800
+    # screen pixels). Below the show-threshold (a hovered / selected label
+    # when zoomed far out) it is drawn no larger than its reserved rect.
+    s = max(float(scale), float(getattr(item, "_LABEL_SCALE_THRESHOLD", 0.35)))
+    painter.save()
+    try:
+        painter.translate(anchor)
+        painter.scale(1.0 / s, 1.0 / s)
+        painter.translate(6, -4)             # offset in SCREEN pixels
+        painter.setFont(_screen_label_font())
+        if POLYGON_STYLE["label_halo"]:
+            painter.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 200)))
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                painter.drawText(QtCore.QPointF(dx, dy), text)
+        painter.setPen(QtGui.QPen(color))
+        painter.drawText(QtCore.QPointF(0, 0), text)
+    finally:
+        painter.restore()
+
 # Smart Canopy brush: its default radius (screen px; [ / ] resize it), and how
 # far a crown may reach (x the viewport's longer side).
 SMART_CANOPY_BRUSH_SCREEN_PX = 25          # ~1/6 of a crown ~300 px across on screen (BCI-optimised)
@@ -397,6 +570,150 @@ POINT_GRAB_RADIUS   = 3.0   # legacy hit-test footprint (was a 6x6 box, this
                             # is its radius) -- grows with raw_to_pixmap_scale
                             # but never shrinks below this, so a point stays
                             # clickable at both 1:1 and extreme decimation.
+
+
+class PolygonAppearanceDialog(QtWidgets.QDialog):
+    """Configuration > Polygon & Label Appearance… (also the gear button next
+    to Lock Polygons in the Polygon Manager). Label size / sizing mode /
+    colour / bold / halo, outline colour / width, selection colour. Changes
+    show live in every viewer; Cancel puts the previous style back; OK saves
+    it (app-wide, QSettings)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Polygon & Label Appearance")
+        self.setWindowFlags(self.windowFlags() & ~QtCore.Qt.WindowContextHelpButtonHint)
+        self._original = dict(POLYGON_STYLE)
+        self._style = dict(POLYGON_STYLE)
+        lay = QtWidgets.QVBoxLayout(self)
+
+        lab = QtWidgets.QGroupBox("Labels")
+        lf = QtWidgets.QFormLayout(lab)
+        self.label_px = QtWidgets.QSpinBox()
+        self.label_px.setRange(6, 96)
+        self.label_px.setSuffix(" px")
+        lf.addRow("Size", self.label_px)
+        self.label_mode = QtWidgets.QComboBox()
+        self.label_mode.addItem("Fixed size on screen (adaptive)", "screen")
+        self.label_mode.addItem("Grows with zoom (scales with the image)", "zoom")
+        lf.addRow("Sizing", self.label_mode)
+        self.label_color = self._color_button("label_color")
+        lf.addRow("Colour", self.label_color)
+        self.label_bold = QtWidgets.QCheckBox("Bold")
+        self.label_halo = QtWidgets.QCheckBox("Dark outline (readable on imagery)")
+        lf.addRow("", self.label_bold)
+        lf.addRow("", self.label_halo)
+        lay.addWidget(lab)
+
+        out = QtWidgets.QGroupBox("Polygon outline")
+        of = QtWidgets.QFormLayout(out)
+        self.auto_color = QtWidgets.QCheckBox("Automatic (red on RGB images, blue otherwise)")
+        of.addRow("Colour", self.auto_color)
+        self.outline_color = self._color_button("outline_color")
+        of.addRow("", self.outline_color)
+        self.outline_width = QtWidgets.QDoubleSpinBox()
+        self.outline_width.setRange(0.5, 10.0)
+        self.outline_width.setSingleStep(0.5)
+        self.outline_width.setSuffix(" px")
+        of.addRow("Width", self.outline_width)
+        note = QtWidgets.QLabel("Above 1 px, thousands of polygons draw noticeably slower.")
+        note.setStyleSheet("color:#777;")
+        note.setWordWrap(True)
+        of.addRow("", note)
+        self.selected_color = self._color_button("selected_color")
+        of.addRow("Selected", self.selected_color)
+        lay.addWidget(out)
+
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+                                        | QtWidgets.QDialogButtonBox.RestoreDefaults)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        bb.button(QtWidgets.QDialogButtonBox.RestoreDefaults).clicked.connect(self.restore_defaults)
+        lay.addWidget(bb)
+
+        self._load(self._style)
+        self.label_px.valueChanged.connect(self._changed)
+        self.label_mode.currentIndexChanged.connect(self._changed)
+        self.label_bold.toggled.connect(self._changed)
+        self.label_halo.toggled.connect(self._changed)
+        self.auto_color.toggled.connect(self._changed)
+        self.outline_width.valueChanged.connect(self._changed)
+
+    # ---------------------------------------------------------------- widgets
+    def _color_button(self, key):
+        b = QtWidgets.QPushButton()
+        b.setFixedWidth(90)
+        b.clicked.connect(lambda _=False, k=key: self._pick(k))
+        return b
+
+    def _paint_button(self, b, color):
+        c = QtGui.QColor(color) if color else QtGui.QColor("#888")
+        b.setText(c.name())
+        fg = "black" if c.lightness() > 140 else "white"
+        b.setStyleSheet(f"background:{c.name()}; color:{fg};")
+
+    def _pick(self, key):
+        cur = self._style.get(key) or (outline_color_for(True).name() if key == "outline_color" else "#ff0000")
+        c = QtWidgets.QColorDialog.getColor(QtGui.QColor(cur), self, "Choose a colour")
+        if not c.isValid():
+            return
+        self._style[key] = c.name()
+        if key == "outline_color":
+            self.auto_color.setChecked(False)
+        self._load(self._style)
+        self._changed()
+
+    def _load(self, st):
+        blockers = [QtCore.QSignalBlocker(w) for w in (self.label_px, self.label_mode, self.label_bold,
+                                                       self.label_halo, self.auto_color, self.outline_width)]
+        self.label_px.setValue(int(st["label_px"]))
+        self.label_mode.setCurrentIndex(max(0, self.label_mode.findData(st["label_mode"])))
+        self.label_bold.setChecked(bool(st["label_bold"]))
+        self.label_halo.setChecked(bool(st["label_halo"]))
+        self.auto_color.setChecked(st["outline_color"] is None)
+        self.outline_color.setEnabled(st["outline_color"] is not None)
+        self.outline_width.setValue(float(st["outline_width"]))
+        self._paint_button(self.label_color, st["label_color"])
+        self._paint_button(self.outline_color, st["outline_color"] or outline_color_for(True).name())
+        self._paint_button(self.selected_color, st["selected_color"])
+        del blockers
+
+    def style(self):
+        st = dict(self._style)
+        st["label_px"] = self.label_px.value()
+        st["label_mode"] = self.label_mode.currentData()
+        st["label_bold"] = self.label_bold.isChecked()
+        st["label_halo"] = self.label_halo.isChecked()
+        st["outline_width"] = self.outline_width.value()
+        if self.auto_color.isChecked():
+            st["outline_color"] = None
+        elif not st.get("outline_color"):
+            st["outline_color"] = outline_color_for(True).name()
+        return st
+
+    def _changed(self, *_a):
+        self._style = self.style()
+        self.outline_color.setEnabled(self._style["outline_color"] is not None)
+        apply_polygon_style(self._style, save=False)     # live preview
+
+    def restore_defaults(self):
+        self._style = dict(POLYGON_STYLE_DEFAULTS)
+        self._load(self._style)
+        self._changed()
+
+    def accept(self):
+        apply_polygon_style(self.style(), save=True)
+        super().accept()
+
+    def reject(self):
+        apply_polygon_style(self._original, save=False)
+        super().reject()
+
+
+def open_polygon_appearance(parent=None):
+    """Open the appearance dialog (modal; it previews live)."""
+    dlg = PolygonAppearanceDialog(parent)
+    return dlg.exec_()
 
 
 class PolygonPropertiesDialog(QtWidgets.QDialog):
@@ -885,12 +1202,7 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
 
         full = QtCore.QRectF(raw)
         if self.label_text and (self._show_label or self._hover_showing_label):
-            label_width = len(self.label_text) * 50 + 100
-            label_height = 250
-            label_rect = QtCore.QRectF(
-                full.topRight() + self.label_offset,
-                QtCore.QSizeF(label_width, label_height)
-            )
+            label_rect = label_scene_rect(self, full.topRight(), self.label_text)
             full = full.united(label_rect)
         margin = 50
         self._cached_brect = full.adjusted(-margin, -margin, margin, margin)
@@ -967,8 +1279,10 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
 
     def _ensure_pens(self):
         """Lazily build cached QPen objects.  Called once or after geometry invalidation."""
-        if self._pen_base is not None:
+        if self._pen_base is not None and getattr(self, "_pens_style_version", None) == _style_version[0]:
             return
+        self._pens_style_version = _style_version[0]
+        sel = _style_color("selected_color", QtCore.Qt.magenta)
         if self.current_color is not None:
             # A filter rule assigned an explicit color -- it wins over both
             # the mask-polygon orange and the default red/blue, so the user's
@@ -977,19 +1291,18 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
             self._fill_base = (QtGui.QColor(self.current_color.red(), self.current_color.green(),
                                              self.current_color.blue(), 80)
                                 if self.is_mask_polygon else QtCore.Qt.transparent)
-            self._pen_highlight = QtGui.QPen(QtCore.Qt.magenta)
+            self._pen_highlight = QtGui.QPen(sel)
             self._fill_highlight = (QtGui.QColor(255, 0, 255, 100) if self.is_mask_polygon
                                      else QtCore.Qt.transparent)
         elif self.is_mask_polygon:
             self._pen_base = QtGui.QPen(QtGui.QColor(255, 165, 0))
             self._fill_base = QtGui.QColor(255, 165, 0, 80)
-            self._pen_highlight = QtGui.QPen(QtCore.Qt.magenta)
+            self._pen_highlight = QtGui.QPen(sel)
             self._fill_highlight = QtGui.QColor(255, 0, 255, 100)
         else:
-            base_color = QtCore.Qt.red if self.is_rgb else QtCore.Qt.blue
-            self._pen_base = QtGui.QPen(base_color)
+            self._pen_base = QtGui.QPen(outline_color_for(self.is_rgb))
             self._fill_base = QtCore.Qt.transparent
-            self._pen_highlight = QtGui.QPen(QtCore.Qt.magenta)
+            self._pen_highlight = QtGui.QPen(sel)
             self._fill_highlight = QtCore.Qt.transparent
 
     def set_filter_style(self, visible, color=None):
@@ -1051,14 +1364,15 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
         # cursor position on EVERY paint of EVERY crown (56,774 calls in one
         # COG navigation).
         highlighted = getattr(self, "_hovered", False) or self.isSelected()
+        base_w = float(POLYGON_STYLE.get("outline_width", 1.0))
         if highlighted:
             pen = self._pen_highlight
             fill_color = self._fill_highlight if self.is_mask_polygon else self._fill_base
-            width_px = 2.0
+            width_px = max(2.0, base_w)
         else:
             pen = self._pen_base
             fill_color = self._fill_base
-            width_px = 1.0
+            width_px = base_w
         pen.setCosmetic(True)
         pen.setWidthF(width_px)
 
@@ -1079,28 +1393,8 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
             if scale < self._LABEL_SCALE_THRESHOLD and not highlighted:
                 return
 
-            # Use cached image size
-            img_w, img_h = self._get_image_size()
-            res_boost = self._cached_res_boost
-
-            base_px = 40 if self.is_rgb else 32
-            px = (base_px * res_boost) / scale
-            px = int(max(14, min(220, round(px))))
-
-            # Reuse cached QFont when pixel size hasn't changed
-            if px != self._cached_font_px:
-                font = QtGui.QFont()
-                font.setPixelSize(px)
-                self._cached_font = font
-                self._cached_font_px = px
-            painter.setFont(self._cached_font)
-            painter.setPen(self._pen_label)
-
-            # Simple positioning without extra boundingRect call
-            bbox = self._polygon.boundingRect()
-            pos = bbox.topRight() + self.label_offset
-
-            painter.drawText(pos, self.label_text)
+            self._get_image_size()             # caches _cached_res_boost ("zoom" mode)
+            draw_item_label(self, painter, self._polygon.boundingRect().topRight(), scale)
 
     def hoverEnterEvent(self, event):
         self.setCursor(QtCore.Qt.PointingHandCursor)
@@ -1509,7 +1803,7 @@ class PolygonTileItem(QtWidgets.QGraphicsItem):
         self._polygons = polygons
         self._cache = {}                   # level -> {color_key: (QPainterPath, QColor)}
         self._is_rgb = is_rgb
-        self._default_color = QtGui.QColor(QtCore.Qt.red if is_rgb else QtCore.Qt.blue)
+        self._default_color = outline_color_for(is_rgb)
         self.setZValue(POLYGON_Z)
         # Purely decorative: hit-testing and editing go through the real
         # EditablePolygonItem that gets promoted on click.
@@ -1566,7 +1860,7 @@ class PolygonTileItem(QtWidgets.QGraphicsItem):
             # invokes the full stroker and costs ~14x more -- see
             # EditablePolygonItem.paint.
             pen.setCosmetic(True)
-            pen.setWidthF(1.0)
+            pen.setWidthF(float(POLYGON_STYLE.get("outline_width", 1.0)))
             painter.setPen(pen)
             painter.drawPath(path)
 
@@ -1788,12 +2082,7 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
 
         full = QtCore.QRectF(rect)
         if self.label_text and (self._show_label or self._hover_showing_label):
-            label_width = len(self.label_text) * 50 + 100
-            label_height = 250
-            label_rect = QtCore.QRectF(
-                full.topLeft() + self.label_offset,
-                QtCore.QSizeF(label_width, label_height)
-            )
+            label_rect = label_scene_rect(self, full.topLeft(), self.label_text)
             full = full.united(label_rect)
         # Generous fixed padding: paint() adds a COSMETIC outline (constant
         # device pixels), which in scene units grows as the view zooms out.
@@ -1910,30 +2199,11 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
             if scale < self._LABEL_SCALE_THRESHOLD and not highlighted:
                 return
 
-            res_boost = self._get_res_boost()
-
-            base_px = 40 if self.is_rgb else 32
-            px = (base_px * res_boost) / scale
-            px = int(max(14, min(220, round(px))))
-
-            # Reuse cached QFont when pixel size hasn't changed
-            if px != self._cached_font_px:
-                font = QtGui.QFont()
-                font.setPixelSize(px)
-                self._cached_font = font
-                self._cached_font_px = px
-            painter.setFont(self._cached_font)
-            painter.setPen(self._pen_label)
-
-            # Simple positioning - get bounds once
             xs, ys = [], []
             for p in self.points:
                 sx, sy = self._scene_xy(p)
                 xs.append(sx); ys.append(sy)
-            rx, ry = min(xs), min(ys)
-            text_position = QtCore.QPointF(rx, ry) + self.label_offset
-
-            painter.drawText(text_position, self.label_text)
+            draw_item_label(self, painter, QtCore.QPointF(min(xs), min(ys)), scale)
 
     def hoverEnterEvent(self, event):
         self.setCursor(QtCore.Qt.PointingHandCursor)
@@ -2092,6 +2362,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
         self._scene.setItemIndexMethod(QtWidgets.QGraphicsScene.BspTreeIndex)
         self._scene.setBspTreeDepth(4)  # Prevent excessive subdivisions for large coords
         self.setScene(self._scene)
+        self._scene.selectionChanged.connect(self._on_scene_selection_changed)
         self._image = None
 
         # === PERFORMANCE OPTIMIZATIONS FOR LARGE IMAGES ===
@@ -3391,6 +3662,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
             self._scene = QtWidgets.QGraphicsScene(self)
             self._scene.setItemIndexMethod(QtWidgets.QGraphicsScene.BspTreeIndex)
             self.setScene(self._scene)
+            self._scene.selectionChanged.connect(self._on_scene_selection_changed)
 
         self._zoom = 0
         self._empty = False
@@ -4072,6 +4344,11 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 and not self.inspection_mode
                 and (event.modifiers() & QtCore.Qt.ControlModifier)):
             self._rb_dragging = True
+            self._rb_scene_rect = None
+            self._rb_press_scene = self.mapToScene(event.pos())
+            if not getattr(self, "_rb_signal_connected", False):
+                self.rubberBandChanged.connect(self._remember_rubber_band)
+                self._rb_signal_connected = True
             self.setDragMode(QtWidgets.QGraphicsView.RubberBandDrag)
             super(ImageViewer, self).mousePressEvent(event)
             return
@@ -4175,6 +4452,8 @@ class ImageViewer(QtWidgets.QGraphicsView):
                     self.update_temp_drawing()
                     event.accept()
                 self.left_button_pressed = True
+            elif self._zoomed_out_click(event):
+                pass                       # selected (or not) a tiled crown; a drag pans
             else:
                 # Left-click: check if clicking on background (for panning) or item (for selection)
                 # PERFORMANCE: Fast path - if we have few polygon items, use simpler detection
@@ -4422,8 +4701,24 @@ class ImageViewer(QtWidgets.QGraphicsView):
     def mouseReleaseEvent(self, event):
         if event.button() == QtCore.Qt.LeftButton:
             self._locked_drag = None          # a plain click: no prompt
+        if event.button() == QtCore.Qt.LeftButton and getattr(self, "_zoomed_out_press", False):
+            # The press selected a tiled crown (_zoomed_out_click) and never
+            # reached QGraphicsView. Its own release handler would take this
+            # for a click on the BACKGROUND (ScrollHandDrag, few motions) and
+            # clearSelection() -- undoing the selection just made.
+            self._zoomed_out_press = False
+            self.left_button_pressed = False
+            self._is_panning = False
+            self.setCursor(QtCore.Qt.ArrowCursor)
+            if _ZoomBar._zoom_sync_enabled and not _ZoomBar._applying_fixed_zoom:
+                _ZoomBar._store_scroll_position(self)
+                _ZoomBar.update_fixed_center(self)
+            event.accept()
+            return
         if self._rb_dragging and event.button() == QtCore.Qt.LeftButton:
             self._rb_dragging = False
+            if getattr(self, "_batch_active", False):
+                self._zoomed_out_rubber_band(self.mapToScene(event.pos()))
             self.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
             event.accept()
             return
@@ -5483,6 +5778,26 @@ class ImageViewer(QtWidgets.QGraphicsView):
         """Return current polygon visibility state (default True)."""
         return getattr(self, "_polygons_visible", True)
 
+    def refresh_polygon_style(self):
+        """Redraw after the polygon & label appearance changed: rebuild each
+        item's pens and label space, and drop the zoomed-out tiles so they are
+        rebuilt in the new outline colour / width."""
+        for item in self.get_all_polygons():
+            try:
+                item.prepareGeometryChange()
+                if hasattr(item, "_pen_base"):
+                    item._pen_base = None
+                if hasattr(item, "_update_bounding_rect"):
+                    item._update_bounding_rect()
+                item.update()
+            except RuntimeError:
+                pass
+        try:
+            self.invalidate_polygon_batch()
+        except Exception:
+            pass
+        self.viewport().update()
+
     # ------------------------------------------------------------------
     # Polygon locking ("Lock Polygons" in PolygonManager)
     # ------------------------------------------------------------------
@@ -5946,13 +6261,23 @@ class ImageViewer(QtWidgets.QGraphicsView):
         return dropped
 
     def _batch_source_items(self):
+        """Polygon items the zoomed-out tiles are built from. An item that is
+        no longer in this scene (deleted by a path that left its entry in
+        self.polygons) is never tiled -- it would be drawn as a remnant."""
         out = []
+        sc = self._scene
         for rec in getattr(self, "polygons", []):
             if rec.get('type') != 'polygon':
                 continue
             it = rec.get('item')
-            if it is not None:
-                out.append(it)
+            if it is None:
+                continue
+            try:
+                if it.scene() is not sc:
+                    continue
+            except RuntimeError:          # the C++ item is gone
+                continue
+            out.append(it)
         return out
 
     def clear_polygon_batch(self):
@@ -6134,8 +6459,119 @@ class ImageViewer(QtWidgets.QGraphicsView):
             # (see rebuild_polygon_batch), so it must also stay hidden in the
             # per-item representation -- otherwise it would flicker back into
             # view every time zoom crosses the batch threshold.
-            it.setVisible((not active) and visible and not getattr(it, "_filtered_hidden", False))
+            #
+            # A SELECTED polygon stays drawn on its own over the tiles: Qt
+            # deselects an item it hides, so zooming out used to wipe the
+            # selection (e.g. what a filter + list click had just picked).
+            keep = (not active) or it.isSelected()
+            it.setVisible(keep and visible and not getattr(it, "_filtered_hidden", False))
         self._batch_active = bool(active)
+
+    def select_polygon_item(self, item, selected=True):
+        """Select / deselect a polygon item, also while zoomed out: Qt cannot
+        select an item that is hidden, and the tiles hide every item, so
+        selecting from a list (Polygon Manager, ML manager, Annotator) did
+        nothing until zooming back in. The item is shown on its own first."""
+        try:
+            if selected and getattr(self, "_batch_active", False)                     and not getattr(item, "_filtered_hidden", False) and self.are_polygons_visible():
+                item.setVisible(True)
+            item.setSelected(bool(selected))
+        except RuntimeError:
+            pass
+
+    # ---- selecting while zoomed out (the tiles hide every crown) ------------
+    def _tiled_polygons(self):
+        """Polygon items currently drawn by the tiles (hidden, not filtered out)."""
+        return [it for it in self._batch_source_items()
+                if not getattr(it, "_filtered_hidden", False)]
+
+    @staticmethod
+    def _poly_scene(it):
+        return it.mapToScene(it.polygon)
+
+    def _hidden_polygon_at(self, scene_pt):
+        """The smallest tiled crown containing scene_pt, or None. Qt's own hit
+        testing only finds VISIBLE items, so it never sees a tiled crown."""
+        best, best_area = None, None
+        for it in self._tiled_polygons():
+            try:
+                poly = self._poly_scene(it)
+                br = poly.boundingRect()
+                if not br.contains(scene_pt):
+                    continue
+                if not poly.containsPoint(scene_pt, QtCore.Qt.OddEvenFill):
+                    continue
+                a = br.width() * br.height()
+                if best is None or a < best_area:
+                    best, best_area = it, a
+            except RuntimeError:
+                continue
+        return best
+
+    def _zoomed_out_click(self, event):
+        """Plain left click while the tiles are drawn: select the crown under
+        the cursor (and tell the lists / Annotator, as a click on a drawn crown
+        does), then pan as on background so a drag still moves the view.
+        False when zoomed in or the click is on a crown drawn on its own."""
+        if not getattr(self, "_batch_active", False) or not self.has_image():
+            return False
+        scene_pos = self.mapToScene(event.pos())
+        for it in self._scene.items(scene_pos):
+            if isinstance(it, (EditablePolygonItem, EditablePointItem)) and it.isVisible():
+                return False               # already drawn on its own: the normal path
+        hit = self._hidden_polygon_at(scene_pos)
+        if hit is not None:
+            for it in self._scene.selectedItems():
+                if it is not hit:
+                    it.setSelected(False)
+            self.select_polygon_item(hit, True)
+            try:
+                _notify_polygon_click(hit)
+            except Exception:
+                logging.debug("[select] click listener failed", exc_info=True)
+        self._is_panning = True
+        self.last_pan_point = event.pos()
+        self.setCursor(QtCore.Qt.ClosedHandCursor)
+        self._zoomed_out_press = True          # see mouseReleaseEvent
+        event.accept()
+        return True
+
+    def _remember_rubber_band(self, rect, from_scene, to_scene):
+        if not rect.isNull():
+            self._rb_scene_rect = QtCore.QRectF(from_scene, to_scene).normalized()
+
+    def _zoomed_out_rubber_band(self, release_scene):
+        """Ctrl+drag (or Ctrl+click) while zoomed out: add the tiled crowns the
+        band touches (or the one clicked) to the selection."""
+        rect = getattr(self, "_rb_scene_rect", None)
+        press = getattr(self, "_rb_press_scene", None)
+        tiny = rect is None or (
+            self.mapFromScene(rect.topLeft()) - self.mapFromScene(rect.bottomRight())).manhattanLength() < 4
+        if tiny:
+            hit = self._hidden_polygon_at(press if press is not None else release_scene)
+            if hit is not None:
+                self.select_polygon_item(hit, not hit.isSelected())
+            return
+        band = QtGui.QPolygonF(rect)
+        for it in self._tiled_polygons():
+            try:
+                poly = self._poly_scene(it)
+                if poly.boundingRect().intersects(rect) and poly.intersects(band):
+                    self.select_polygon_item(it, True)
+            except RuntimeError:
+                continue
+
+    def _on_scene_selection_changed(self):
+        """While zoomed out (tiles active), a crown drawn on its own only
+        because it was selected goes back to the tile once deselected."""
+        if not getattr(self, "_batch_active", False):
+            return
+        try:
+            for it in self._batch_source_items():
+                if it.isVisible() and not it.isSelected():
+                    it.setVisible(False)
+        except RuntimeError:
+            pass
 
     def paintEvent(self, event):
         # The universal zoom hook. setTransform() is not virtual in Qt, so
@@ -6252,6 +6688,11 @@ class ImageViewer(QtWidgets.QGraphicsView):
             # item that is about to be detached from the scene).
             if item.scene() is self._scene:
                 self._scene.removeItem(item)
+            # the zoomed-out tiles may still hold its outline (they skip items
+            # no longer in the scene; in a bulk loop the caller rebuilds once)
+            if not defer_repaint:
+                self.polygons = [p for p in getattr(self, "polygons", []) if p.get("item") is not item]
+            self.invalidate_polygon_batch()
             
             if not defer_repaint:
                 # Force full scene invalidation to clear any ghost labels

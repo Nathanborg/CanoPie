@@ -164,6 +164,22 @@ def _never_ask_for_exiftool(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _default_polygon_style():
+    """Every test starts from the default polygon & label appearance, never
+    from a style the user saved in the app (Configuration menu), and leaves
+    nothing behind. Nothing here touches the saved QSettings."""
+    from ..image_viewer import POLYGON_STYLE, POLYGON_STYLE_DEFAULTS, _style_version
+    saved = dict(POLYGON_STYLE)
+    POLYGON_STYLE.clear()
+    POLYGON_STYLE.update(POLYGON_STYLE_DEFAULTS)
+    _style_version[0] += 1
+    yield
+    POLYGON_STYLE.clear()
+    POLYGON_STYLE.update(saved)
+    _style_version[0] += 1
+
+
+@pytest.fixture(autouse=True)
 def _restore_global_app_state():
     """Snapshot and restore module/class-level state that tests can mutate.
 

@@ -422,6 +422,359 @@ def _polygon_shoelace_area(points):
     return abs(area) / 2.0
 
 
+# ---------------------------------------------------------------------------
+# Filter attributes: properties + hidden geometry / time, indexed once
+# ---------------------------------------------------------------------------
+#: Attributes every polygon has in a filter rule, besides its own properties.
+#: area / perimeter: the polygon's `properties` value if it has one (e.g. a
+#: shapefile's area), else computed in the polygon's own pixels; area_px /
+#: perimeter_px are always the computed ones. last_modified: 'YYYY-MM-DD
+#: HH:MM:SS' (ProjectTab._stamp_polygon_modified; older polygons: their file's
+#: time) -- compare as text, e.g. last_modified > "2026-11-01".
+HIDDEN_FILTER_ATTRIBUTES = ("area", "perimeter", "last_modified", "area_px", "perimeter_px",
+                            "name", "group", "type")
+
+#: Callables a rule may use (no other builtins -- the text comes from a form).
+_SAFE_RULE_FUNCS = {"str": str, "int": int, "float": float, "len": len, "abs": abs,
+                    "min": min, "max": max, "round": round, "bool": bool}
+
+
+def _area_perimeter(pts):
+    """(area, perimeter) of a ring, vectorised; (0, 0) when degenerate."""
+    try:
+        a = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
+    except (TypeError, ValueError):
+        return 0.0, 0.0
+    if len(a) < 2:
+        return 0.0, 0.0
+    b = np.roll(a, -1, axis=0)
+    per = float(np.hypot(*(b - a).T).sum()) if len(a) > 2 else float(np.hypot(*(a[1] - a[0])))
+    area = 0.5 * abs(float(np.dot(a[:, 0], b[:, 1]) - np.dot(a[:, 1], b[:, 0]))) if len(a) >= 3 else 0.0
+    return area, per
+
+
+def _record_stamp(rec):
+    """Changes whenever the record's geometry, properties or modification
+    time does (edits replace those objects / restamp), so a cached entry can
+    be reused until then. Reads no file."""
+    return (id(rec), getattr(rec, "is_materialised", None),
+            id(dict.get(rec, "properties")), id(dict.get(rec, "points")),
+            dict.get(rec, "last_modified"))
+
+
+def _iso_mtime(path):
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(path)))
+    except (OSError, TypeError, ValueError):
+        return ""
+
+
+class PolygonAttributeIndex:
+    """{(group, filepath): eval namespace} for the Filter & Color rules and
+    their suggestions, kept between filter runs.
+
+    THE SLOWNESS THIS REMOVES: each Apply read every polygon's properties and
+    full outline -- for a lazily loaded crown that is a file read, ~3,500 of
+    them on BCI per Apply -- and wrote computed areas back into every
+    polygon's properties, which then saved the whole project. Now each
+    polygon is read once (unread ones straight from their file, 16 at a time,
+    without touching the live record) and its entry is reused until the
+    polygon changes (_record_stamp)."""
+
+    #: Next to the polygon sidecars (the loader only reads *_polygons.json):
+    #: each unread crown's namespace, keyed by its sidecar's name + mtime + size,
+    #: so a project's FIRST filter of a session does not parse every sidecar
+    #: again (BCI: 3,515 files, ~4.8 s -> a stat each).
+    CACHE_NAME = "_filter_index.json"
+
+    def __init__(self):
+        self.entries = {}            # (group, fp) -> (stamp, namespace)
+        self._disk = None            # sidecar name -> [mtime, size, namespace]
+        self._disk_dir = None
+
+    def _load_disk_cache(self, polygons_dir):
+        if self._disk is not None and self._disk_dir == polygons_dir:
+            return
+        self._disk, self._disk_dir = {}, polygons_dir
+        if not polygons_dir:
+            return
+        try:
+            with open(os.path.join(polygons_dir, self.CACHE_NAME), "r", encoding="utf-8") as f:
+                blob = json.load(f)
+            if isinstance(blob, dict) and blob.get("version") == 1:
+                self._disk = dict(blob.get("entries") or {})
+        except (OSError, ValueError):
+            pass
+
+    def _save_disk_cache(self):
+        if not self._disk_dir or self._disk is None:
+            return
+        path = os.path.join(self._disk_dir, self.CACHE_NAME)
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"version": 1, "entries": self._disk}, f, separators=(",", ":"), default=str)
+            os.replace(tmp, path)
+        except (OSError, TypeError, ValueError):
+            logging.debug("[PolygonFilter] could not write %s", path, exc_info=True)
+
+    def refresh(self, snapshot, polygons_dir=None, max_workers=16):
+        """Bring the entries up to date with `snapshot` ({group: {fp: rec}});
+        returns (entries, computed_areas). Safe on a worker thread: it never
+        mutates a record."""
+        old = self.entries
+        new, todo, computed = {}, [], {}
+        for group, files in snapshot.items():
+            for fp, rec in (files or {}).items():
+                if not isinstance(rec, dict):
+                    continue
+                st = _record_stamp(rec)
+                hit = old.get((group, fp))
+                if hit is not None and hit[0] == st:
+                    new[(group, fp)] = hit
+                else:
+                    todo.append((group, fp, rec, st))
+
+        self._load_disk_cache(polygons_dir)
+        disk = self._disk if self._disk is not None else {}
+        disk_new = {}
+
+        def _load(job):
+            group, fp, rec, st = job
+            src = getattr(rec, "source_path", None)
+            cache_key = None
+            if getattr(rec, "is_materialised", True) is False and src:
+                key = os.path.basename(src)
+                try:
+                    fst = os.stat(src)
+                    sig = [fst.st_mtime, fst.st_size]
+                except OSError:
+                    sig = None
+                hit = disk.get(key)
+                if sig is not None and hit and hit[0] == sig[0] and hit[1] == sig[1]:
+                    return (group, fp), (st, dict(hit[2]))
+                from .polygon_lod import read_sidecar
+                data = read_sidecar(src) or {}
+                cache_key = (key, sig)
+                props, pts, lm = data.get("properties"), data.get("points"), data.get("last_modified")
+                lm = lm or _iso_mtime(src)
+            else:
+                props, pts = dict.get(rec, "properties"), dict.get(rec, "points")
+                lm = dict.get(rec, "last_modified")
+                if not lm and polygons_dir:
+                    base = os.path.splitext(os.path.basename(str(fp)))[0]
+                    lm = _iso_mtime(os.path.join(polygons_dir, f"{group}_{base}_polygons.json"))
+            props = props if isinstance(props, dict) else {}
+            area_px, per_px = _area_perimeter(pts or [])
+            ns = _coerce_numeric_strings(props)
+            if props.get("area") in (None, ""):
+                ns["area"] = area_px
+                computed[(group, fp)] = area_px
+            if props.get("perimeter") in (None, ""):
+                ns["perimeter"] = per_px
+            ns["area_px"], ns["perimeter_px"] = area_px, per_px
+            ns["last_modified"] = lm or ""
+            ns.setdefault("name", dict.get(rec, "name") or group)
+            ns.setdefault("group", group)
+            ns.setdefault("type", dict.get(rec, "type") or "polygon")
+            ns["props"] = dict(props)        # props["flower cover"]: names that are not identifiers
+            if cache_key is not None and cache_key[1] is not None:
+                disk_new[cache_key[0]] = [cache_key[1][0], cache_key[1][1], ns]
+            return (group, fp), (st, ns)
+
+        if todo:
+            if len(todo) > 64:
+                with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    for k, v in ex.map(_load, todo):
+                        new[k] = v
+            else:
+                for job in todo:
+                    k, v = _load(job)
+                    new[k] = v
+        self.entries = new
+        if disk_new and self._disk is not None:
+            self._disk.update(disk_new)
+            self._save_disk_cache()
+        return new, computed
+
+    def catalog(self, limit_values=60):
+        """{attribute: [suggested values]} from the indexed polygons: the
+        commonest text values (labels such as species), or min / quartiles /
+        max for numbers. Hidden attributes first."""
+        from collections import Counter
+        seen = {}
+        for _st, ns in self.entries.values():
+            for k, v in ns.items():
+                if k == "props" or v is None or v == "":
+                    continue
+                seen.setdefault(k, []).append(v)
+        out = {}
+        for k in list(HIDDEN_FILTER_ATTRIBUTES) + sorted(k for k in seen if k not in HIDDEN_FILTER_ATTRIBUTES):
+            vals = seen.get(k)
+            if not vals:
+                if k in ("area", "perimeter", "last_modified"):
+                    out[k] = []
+                continue
+            nums = [v for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool)]
+            if len(nums) == len(vals) and k != "last_modified":
+                q = np.quantile(np.asarray(nums, dtype=np.float64), [0, 0.25, 0.5, 0.75, 1.0])
+                out[k] = [float(f"{x:.6g}") for x in q]
+            else:
+                out[k] = [str(v) for v, _n in Counter(str(x) for x in vals).most_common(limit_values)]
+        return out
+
+
+def sample_catalog(all_polygons, n=300):
+    """A QUICK catalog from up to `n` polygons already in memory (plus the
+    hidden attributes), for a rule row before the full index is built."""
+    idx = PolygonAttributeIndex()
+    snap = {}
+    count = 0
+    for g, files in (all_polygons or {}).items():
+        for fp, rec in (files or {}).items():
+            if not isinstance(rec, dict) or getattr(rec, "is_materialised", True) is False:
+                continue
+            snap.setdefault(g, {})[fp] = rec
+            count += 1
+            if count >= n:
+                break
+        if count >= n:
+            break
+    if count < n // 3:                    # mostly unread crowns: read a few files
+        for g, files in (all_polygons or {}).items():
+            for fp, rec in (files or {}).items():
+                if g in snap and fp in snap[g]:
+                    continue
+                snap.setdefault(g, {})[fp] = rec
+                count += 1
+                if count >= n // 2:
+                    break
+            if count >= n // 2:
+                break
+    idx.refresh(snap)
+    return idx.catalog()
+
+
+_RULE_OPS = ["==", "!=", ">", ">=", "<", "<=", "contains", "expr"]
+# "prop op value" with ONE literal value; anything longer ("a > 5 and b == 'x'")
+# opens as a whole expression.
+_RULE_RE = re.compile(r"""^\s*([A-Za-z_]\w*)\s*(==|!=|>=|<=|>|<)\s*("[^"]*"|'[^']*'|[^\s"'=<>!()]+)\s*$""")
+_QUOTES = "\"'"
+
+
+class RuleRow(QtWidgets.QWidget):
+    """One Filter & Color rule as  [property v] [op v] [value v].
+
+    The property list holds the hidden attributes (area, perimeter,
+    last_modified ...) and every property found on the polygons; the value
+    list suggests that property's values -- the commonest labels (species ...)
+    or, for numbers, min / quartiles / max. Both stay editable. Operator
+    "expr" takes the property box as a whole Python expression instead."""
+
+    def __init__(self, catalog=None, parent=None):
+        super().__init__(parent)
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        self.prop = QtWidgets.QComboBox()
+        self.prop.setEditable(True)
+        self.prop.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self.prop.setMinimumContentsLength(8)
+        self.prop.setToolTip("Property (type, or pick). Hidden ones: area, perimeter, last_modified")
+        self.op = QtWidgets.QComboBox()
+        self.op.addItems(_RULE_OPS)
+        self.op.setToolTip('"contains": text match; "expr": the left box is a full expression')
+        self.value = QtWidgets.QComboBox()
+        self.value.setEditable(True)
+        self.value.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self.value.setMinimumContentsLength(8)
+        self.value.setToolTip("Value (type, or pick a value found on the polygons)")
+        for w in (self.prop, self.value):
+            w.completer().setCompletionMode(QtWidgets.QCompleter.PopupCompletion)
+            w.completer().setFilterMode(QtCore.Qt.MatchContains)
+            w.completer().setCaseSensitivity(QtCore.Qt.CaseInsensitive)
+        lay.addWidget(self.prop, 3)
+        lay.addWidget(self.op, 0)
+        lay.addWidget(self.value, 3)
+        self._catalog = {}
+        self.prop.currentTextChanged.connect(self._fill_values)
+        self.op.currentTextChanged.connect(lambda t: self.value.setEnabled(t != "expr"))
+        self.set_catalog(catalog or {})
+
+    def set_catalog(self, catalog):
+        self._catalog = dict(catalog or {})
+        text = self.prop.currentText()
+        blocker = QtCore.QSignalBlocker(self.prop)
+        self.prop.clear()
+        self.prop.addItems(list(self._catalog.keys()))
+        self.prop.setEditText(text)
+        del blocker
+        self._fill_values(text)
+
+    def _fill_values(self, prop):
+        text = self.value.currentText()
+        blocker = QtCore.QSignalBlocker(self.value)
+        self.value.clear()
+        self.value.addItems([str(v) for v in self._catalog.get(prop.strip(), [])])
+        self.value.setEditText(text)
+        del blocker
+
+    def expression(self):
+        p = self.prop.currentText().strip()
+        op = self.op.currentText()
+        if op == "expr" or not p:
+            return p
+        import keyword
+        ref = p if (p.isidentifier() and not keyword.iskeyword(p)) else f"props[{p!r}]"
+        v = self.value.currentText().strip()
+        if op == "contains":
+            return f"{v!r} in str({ref})"
+        if v in ("True", "False", "None"):
+            lit = v
+        else:
+            try:
+                float(v)
+                lit = v
+            except ValueError:
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in _QUOTES:
+                    lit = v
+                else:
+                    lit = repr(v)
+        return f"{ref} {op} {lit}"
+
+    def set_expression(self, text):
+        text = (text or "").strip()
+        m = _RULE_RE.match(text)
+        if m:
+            prop, op, val = m.groups()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in _QUOTES:
+                val = val[1:-1]
+            self.prop.setEditText(prop)
+            self.op.setCurrentText(op)
+            self._fill_values(prop)
+            self.value.setEditText(val)
+        else:
+            self.prop.setEditText(text)
+            self.op.setCurrentText("expr")
+
+
+class _IndexWorker(QtCore.QObject):
+    """Builds / refreshes the PolygonAttributeIndex off the GUI thread."""
+    finished = QtCore.pyqtSignal()
+
+    def __init__(self, index, snapshot, polygons_dir):
+        super().__init__()
+        self._index, self._snapshot, self._dir = index, snapshot, polygons_dir
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            self._index.refresh(self._snapshot, self._dir)
+        except Exception:
+            logging.warning("[PolygonFilter] attribute index failed", exc_info=True)
+        self.finished.emit()
+
+
 class PolygonFilterWorker(QtCore.QObject):
     """Background evaluator for PolygonManager's Filter & Color rules.
 
@@ -452,7 +805,7 @@ class PolygonFilterWorker(QtCore.QObject):
     finished = QtCore.pyqtSignal(dict, dict, list)
     error = QtCore.pyqtSignal(str)
 
-    def __init__(self, all_polygons_snapshot, rules, hide_unmatched=False):
+    def __init__(self, all_polygons_snapshot, rules, hide_unmatched=False, index=None, polygons_dir=None):
         """
         all_polygons_snapshot: {group: {filepath: polygon_dict}} — a snapshot
             (not the live dict) so a save/edit on the GUI thread mid-evaluation
@@ -469,13 +822,17 @@ class PolygonFilterWorker(QtCore.QObject):
         self._snapshot = all_polygons_snapshot
         self._rules = rules or []
         self._hide_unmatched = bool(hide_unmatched)
+        # PolygonAttributeIndex kept by the Polygon Manager between runs: a
+        # polygon is read once and reused until it changes.
+        self._index = index if index is not None else PolygonAttributeIndex()
+        self._polygons_dir = polygons_dir
 
     @QtCore.pyqtSlot()
     def run(self):
         try:
             style_map = {}
-            computed_areas = {}
-            total = sum(len(files) for files in self._snapshot.values())
+            entries, computed_areas = self._index.refresh(self._snapshot, self._polygons_dir)
+            total = len(entries)
             done = 0
             step = max(1, total // 100)
 
@@ -499,65 +856,35 @@ class PolygonFilterWorker(QtCore.QObject):
             # back instead of just producing a filter result that looks like
             # it did nothing.
             match_counts = {expr: 0 for code, _c, _h, expr in compiled if code is not None}
+            # NO builtins but a few harmless helpers: the text comes from a form.
+            safe_globals = {'__builtins__': {}}
+            safe_globals.update(_SAFE_RULE_FUNCS)
 
-            for group, files in self._snapshot.items():
-                for fp, poly in files.items():
-                    done += 1
-                    if done % step == 0 or done == total:
-                        self.progress.emit(done, total)
-
-                    props = dict(poly.get('properties') or {})
-                    if 'area' not in props or props.get('area') in (None, ''):
-                        pts = poly.get('points') or []
-                        area = _polygon_shoelace_area(pts)
-                        props['area'] = area
-                        computed_areas[(group, fp)] = area
-
-                    # Sanitized eval locals: only the polygon's own
-                    # properties plus a couple of always-present aliases, and
-                    # NO builtins -- this is user-authored text from a form
-                    # field, evaluated per-polygon, so it must not be able to
-                    # reach the filesystem/interpreter.
-                    #
-                    # Coerced so numeric-looking values that survived
-                    # shapefile import as strings (DBF column typing, not
-                    # content -- see _coerce_numeric_strings) support
-                    # </>/<=/>=; a rule like `dbh_mm > 300` would otherwise
-                    # TypeError on every single polygon and be silently
-                    # swallowed below as "no match".
-                    local_ns = _coerce_numeric_strings(props)
-                    local_ns.setdefault('name', poly.get('name') or group)
-                    local_ns.setdefault('group', group)
-                    safe_globals = {'__builtins__': {}}
-
-                    # Default when NO rule matches: visible unless the user
-                    # opted into "Hide non-matching polygons", in which case
-                    # this polygon is filtered OUT rather than merely left
-                    # with the default color.
-                    visible, color = not self._hide_unmatched, None
-                    for code, rule_color, rule_hide, expr_text in compiled:
-                        if code is None:
-                            continue
-                        try:
-                            if eval(code, safe_globals, local_ns):
-                                visible, color = (not rule_hide), (None if rule_hide else rule_color)
-                                match_counts[expr_text] += 1
-                                break
-                        except Exception as e:
-                            # A rule referencing a property this polygon
-                            # doesn't have (e.g. `species == "oak"` on a
-                            # polygon with no `species`) is expected and
-                            # common -- treat as "rule doesn't match", not
-                            # an error to surface per-polygon.
-                            logging.debug("[PolygonFilter] rule %r failed on %s/%s: %s",
-                                          expr_text, group, fp, e)
-                            continue
-
-                    key = (group, fp)
-                    style_map[key] = {
-                        'visible': visible,
-                        'color': QtGui.QColor(*color) if color else None,
-                    }
+            for (group, fp), (_stamp, local_ns) in entries.items():
+                done += 1
+                if done % step == 0 or done == total:
+                    self.progress.emit(done, total)
+                # Default when NO rule matches: visible unless the user opted
+                # into "Hide non-matching polygons".
+                visible, color = not self._hide_unmatched, None
+                for code, rule_color, rule_hide, expr_text in compiled:
+                    if code is None:
+                        continue
+                    try:
+                        if eval(code, safe_globals, local_ns):
+                            visible, color = (not rule_hide), (None if rule_hide else rule_color)
+                            match_counts[expr_text] += 1
+                            break
+                    except Exception as e:
+                        # A property this polygon lacks (routine in a mixed
+                        # project) is "no match", not an error.
+                        logging.debug("[PolygonFilter] rule %r failed on %s/%s: %s",
+                                      expr_text, group, fp, e)
+                        continue
+                style_map[(group, fp)] = {
+                    'visible': visible,
+                    'color': QtGui.QColor(*color) if color else None,
+                }
 
             # Rules that matched NOTHING across the entire project -- the
             # signature of a wrong/truncated property name or a comparison
@@ -571,6 +898,70 @@ class PolygonFilterWorker(QtCore.QObject):
             import traceback
             logging.error("[PolygonFilterWorker] Exception: %s\n%s", e, traceback.format_exc())
             self.error.emit(str(e))
+
+
+class _MouseDownTracker(QtCore.QObject):
+    """Event filter on a list's viewport: is a mouse button down right now?
+    A click moves the list's current row on PRESS, before itemClicked fires;
+    the row-changed handler uses this to leave clicks to itemClicked and act
+    only on keyboard moves (Up / Down / Page / Home / End).
+    QApplication.mouseButtons() is not reliable for that."""
+
+    def __init__(self, list_widget):
+        super().__init__(list_widget)
+        self.down = False
+        list_widget.viewport().installEventFilter(self)
+
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+        if t in (QtCore.QEvent.MouseButtonPress, QtCore.QEvent.MouseButtonDblClick):
+            self.down = True
+        elif t == QtCore.QEvent.MouseButtonRelease:
+            self.down = False
+        return False
+
+
+def follow_keyboard_rows(list_widget, on_row):
+    """Call on_row(item) when the current row of `list_widget` is moved by
+    the KEYBOARD -- the same thing a click on that row does."""
+    tracker = _MouseDownTracker(list_widget)
+
+    def _changed(current, _previous):
+        if current is not None and not tracker.down:
+            on_row(current)
+    list_widget.currentItemChanged.connect(_changed)
+    return tracker
+
+
+def highlight_list_row(list_widget, key, key_of, additive=False):
+    """Select the row of `list_widget` whose key_of(item) == key, make it
+    current and scroll it to the middle -- without emitting the list's
+    signals (a programmatic highlight must not trigger the row's own click
+    behaviour). Used by the Polygon Manager and the ML manager when a
+    polygon is clicked in a viewer. Returns the row item, or None."""
+    lw = list_widget
+    target = None
+    for i in range(lw.count()):
+        it = lw.item(i)
+        if key_of(it) == key:
+            target = it
+            break
+    if target is None:
+        return None
+    blocker = QtCore.QSignalBlocker(lw)
+    sm_blocker = QtCore.QSignalBlocker(lw.selectionModel()) if lw.selectionModel() else None
+    try:
+        if not additive:
+            lw.clearSelection()
+        target.setSelected(True)
+        lw.setCurrentItem(target, QtCore.QItemSelectionModel.NoUpdate)
+        lw.scrollToItem(target, QtWidgets.QAbstractItemView.PositionAtCenter)
+    finally:
+        del blocker
+        if sm_blocker is not None:
+            del sm_blocker
+    lw.viewport().update()
+    return target
 
 
 class PolygonManager(QtWidgets.QDialog):
@@ -645,9 +1036,21 @@ class PolygonManager(QtWidgets.QDialog):
         )
         self.lock_polys_checkbox.stateChanged.connect(self._on_lock_polys_changed)
         self.top_controls_layout.addWidget(self.lock_polys_checkbox)
+        # Small gear: the same Polygon & Label Appearance dialog as the main
+        # window's Configuration menu.
+        self.appearance_button = QtWidgets.QToolButton()
+        self.appearance_button.setText("⚙")
+        self.appearance_button.setAutoRaise(True)
+        self.appearance_button.setToolTip("Polygon & label appearance (label size, colours, outline width)")
+        self.appearance_button.clicked.connect(self.open_appearance)
+        self.top_controls_layout.addWidget(self.appearance_button)
         self.top_controls_layout.addStretch()
 
         # === List ===
+        self.list_filter_label = QtWidgets.QLabel("")
+        self.list_filter_label.setStyleSheet("color:#1565c0; font-size:11px;")
+        self.list_filter_label.hide()
+        self.layout.addWidget(self.list_filter_label)
         self.list_widget = QtWidgets.QListWidget()
         self.list_widget.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.list_widget.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
@@ -752,7 +1155,9 @@ class PolygonManager(QtWidgets.QDialog):
         self.layout.addWidget(self.delete_all_polygons_button)
         self.delete_all_polygons_button.clicked.connect(self.on_delete_all_polygons)
         self.list_widget.itemClicked.connect(self.on_item_clicked_select_in_viewers)
-        
+        # Up / Down arrows behave like a click: move the viewers to the row's polygon
+        self._row_keys = follow_keyboard_rows(self.list_widget, self.on_item_clicked_select_in_viewers)
+
     def _on_show_labels_changed(self):
         """
         Called when 'Show Labels' checkbox is toggled.
@@ -762,6 +1167,10 @@ class PolygonManager(QtWidgets.QDialog):
         for vw_widget, viewer in self._iter_viewers():
             if hasattr(viewer, "set_labels_visible"):
                 viewer.set_labels_visible(checked)
+
+    def open_appearance(self):
+        from .image_viewer import open_polygon_appearance
+        return open_polygon_appearance(self)
 
     def _on_lock_polys_changed(self):
         """Called when 'Lock Polygons' checkbox is toggled.
@@ -821,7 +1230,8 @@ class PolygonManager(QtWidgets.QDialog):
         flay.addWidget(hint)
 
         self.filter_rules_table = QtWidgets.QTableWidget(0, 4)
-        self.filter_rules_table.setHorizontalHeaderLabels(["Expression", "Hide", "Color", ""])
+        self.filter_rules_table.setHorizontalHeaderLabels(["Rule", "Hide", "Color", ""])
+        self.filter_rules_table.verticalHeader().setDefaultSectionSize(28)
         self.filter_rules_table.horizontalHeader().setStretchLastSection(False)
         self.filter_rules_table.horizontalHeader().setSectionResizeMode(
             0, QtWidgets.QHeaderView.Stretch)
@@ -833,7 +1243,7 @@ class PolygonManager(QtWidgets.QDialog):
 
         rule_btn_row = QtWidgets.QHBoxLayout()
         self.add_rule_button = QtWidgets.QPushButton("Add Rule")
-        self.add_rule_button.clicked.connect(lambda: self._add_filter_rule_row("area > 100", QtGui.QColor(0, 170, 0)))
+        self.add_rule_button.clicked.connect(lambda: self._add_filter_rule_row("", QtGui.QColor(0, 170, 0)))
         rule_btn_row.addWidget(self.add_rule_button)
         rule_btn_row.addStretch()
         flay.addLayout(rule_btn_row)
@@ -861,6 +1271,12 @@ class PolygonManager(QtWidgets.QDialog):
         flay.addWidget(self.filter_status_label)
 
         self._active_filter_threads = set()
+        # Properties + hidden attributes of every polygon, kept between runs
+        # (PolygonAttributeIndex) -- what makes Apply fast and fills the
+        # rule rows' suggestions.
+        self._attr_index = PolygonAttributeIndex()
+        self._index_running = False
+        self._catalog = None
 
         # The last successfully-applied filter/color result, so it can be
         # reapplied to a viewer that gets rebuilt after this dialog already
@@ -874,12 +1290,66 @@ class PolygonManager(QtWidgets.QDialog):
         self.filter_content.setVisible(expanded)
         self.filter_toggle_button.setArrowType(
             QtCore.Qt.DownArrow if expanded else QtCore.Qt.RightArrow)
+        if expanded:
+            self._refresh_attribute_index()
+
+    def _polygons_dir(self):
+        pf = getattr(self.parent(), "project_folder", None)
+        return os.path.join(pf, "polygons") if pf else None
+
+    def _refresh_attribute_index(self):
+        """Index every polygon in the background (once; later only what
+        changed), then give the rule rows the full suggestions."""
+        parent = self.parent()
+        if self._index_running or parent is None or not getattr(parent, "all_polygons", None):
+            return
+        snapshot = {g: dict(files) for g, files in parent.all_polygons.items()}
+        self._index_running = True
+        thread = QtCore.QThread(self)
+        worker = _IndexWorker(self._attr_index, snapshot, self._polygons_dir())
+        worker.moveToThread(thread)
+        self._active_filter_threads.add(thread)
+
+        def _done():
+            self._index_running = False
+            self._catalog = self._attr_index.catalog()
+            self._push_catalog()
+
+        def _cleanup():
+            self._active_filter_threads.discard(thread)
+            worker.deleteLater()
+            thread.deleteLater()
+
+        thread.started.connect(worker.run)
+        worker.finished.connect(_done)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(_cleanup)
+        thread.start()
+
+    def _push_catalog(self):
+        for row in range(self.filter_rules_table.rowCount()):
+            w = self.filter_rules_table.cellWidget(row, 0)
+            if isinstance(w, RuleRow):
+                w.set_catalog(self._catalog)
+
+    def _current_catalog(self):
+        """The full catalog once indexed, else a quick sample."""
+        if self._catalog:
+            return self._catalog
+        return sample_catalog(getattr(self.parent(), "all_polygons", {}) or {})
 
     def _add_filter_rule_row(self, expression="", color=None):
         color = color or QtGui.QColor(0, 170, 0)
         row = self.filter_rules_table.rowCount()
         self.filter_rules_table.insertRow(row)
-        self.filter_rules_table.setItem(row, 0, QtWidgets.QTableWidgetItem(expression))
+        editor = RuleRow(self._current_catalog())
+        if expression:
+            editor.set_expression(expression)
+        else:
+            editor.prop.setEditText("area")
+            editor.op.setCurrentText(">")
+        self.filter_rules_table.setCellWidget(row, 0, editor)
+        self._refresh_attribute_index()
 
         hide_item = QtWidgets.QTableWidgetItem()
         hide_item.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled)
@@ -915,8 +1385,12 @@ class PolygonManager(QtWidgets.QDialog):
     def _collect_filter_rules(self):
         rules = []
         for row in range(self.filter_rules_table.rowCount()):
-            expr_item = self.filter_rules_table.item(row, 0)
-            expr = (expr_item.text().strip() if expr_item else "")
+            editor = self.filter_rules_table.cellWidget(row, 0)
+            if isinstance(editor, RuleRow):
+                expr = editor.expression()
+            else:
+                expr_item = self.filter_rules_table.item(row, 0)
+                expr = (expr_item.text().strip() if expr_item else "")
             if not expr:
                 continue
             hide_item = self.filter_rules_table.item(row, 1)
@@ -965,7 +1439,8 @@ class PolygonManager(QtWidgets.QDialog):
         self.filter_status_label.setText("Evaluating filters...")
 
         thread = QtCore.QThread(self)
-        worker = PolygonFilterWorker(snapshot, rules, hide_unmatched=hide_unmatched)
+        worker = PolygonFilterWorker(snapshot, rules, hide_unmatched=hide_unmatched,
+                                     index=self._attr_index, polygons_dir=self._polygons_dir())
         worker.moveToThread(thread)
         self._active_filter_threads.add(thread)
 
@@ -992,20 +1467,10 @@ class PolygonManager(QtWidgets.QDialog):
         to every open viewer, and persist any area it had to compute."""
         parent = self.parent()
 
-        # Persist areas the worker computed (properties were missing them),
-        # so re-filtering — or a shapefile export — doesn't recompute every
-        # time and DOES export the value the user just filtered on.
-        if parent is not None and computed_areas:
-            for (group, fp), area in computed_areas.items():
-                entry = (parent.all_polygons.get(group, {}) or {}).get(fp)
-                if entry is not None:
-                    entry.setdefault('properties', {})['area'] = area
-                    if hasattr(parent, '_mark_polygon_dirty'):
-                        try:
-                            parent._mark_polygon_dirty(group, fp)
-                        except Exception:
-                            pass
-
+        # Computed areas are NOT written into the polygons' properties any
+        # more: area / perimeter are hidden attributes (PolygonAttributeIndex),
+        # available to every rule without touching -- and re-saving -- every
+        # polygon of the project after each Apply.
         n_visible = sum(1 for s in style_map.values() if s.get('visible'))
         n_hidden = len(style_map) - n_visible
         status = (f"Applied to {len(style_map)} polygon(s): "
@@ -1032,12 +1497,20 @@ class PolygonManager(QtWidgets.QDialog):
         # the filter rules anywhere.
         self._last_filter_style_map = style_map
 
-        if parent is not None:
-            try:
-                if hasattr(parent, "save_incremental"):
-                    parent.save_incremental(show_status=False)
-            except Exception:
-                logging.debug("[PolygonFilter] incremental save after filter failed", exc_info=True)
+        # The lists now show only what the filter kept: the coloured (matching)
+        # polygons that are still visible -- or, when the rules only hide, the
+        # visible ones. A group is kept if any of its images kept it.
+        any_colored = any(st.get("color") is not None for st in style_map.values())
+        kept, seen = set(), set()
+        for (group, _fp), st in style_map.items():
+            seen.add(group)
+            if st.get("visible", True) and (st.get("color") is not None or not any_colored):
+                kept.add(group)
+        try:
+            self.set_list_filter(seen - kept)
+        except Exception:
+            logging.debug("[PolygonFilter] list filter failed", exc_info=True)
+
 
     def _on_filter_error(self, err):
         self.filter_status_label.setText("")
@@ -1049,6 +1522,7 @@ class PolygonManager(QtWidgets.QDialog):
             if hasattr(viewer, "clear_polygon_style"):
                 viewer.clear_polygon_style()
         self._last_filter_style_map = None
+        self.set_list_filter(None)
         self.filter_status_label.setText("Filters cleared.")
 
     def _select_group_in_viewers(self, group_name: str, additive: bool = False, center: bool = True):
@@ -1079,7 +1553,11 @@ class PolygonManager(QtWidgets.QDialog):
                 for it in viewer.get_all_polygons():
                     if getattr(it, "name", None) == group_name:
                         try:
-                            it.setSelected(True)
+                            # works zoomed out too (tiles hide the items)
+                            if hasattr(viewer, "select_polygon_item"):
+                                viewer.select_polygon_item(it, True)
+                            else:
+                                it.setSelected(True)
                         except Exception:
                             pass
         
@@ -2731,9 +3209,13 @@ class PolygonManager(QtWidgets.QDialog):
         # Build set of current group names
         new_groups = set(polygon_groups.keys()) if polygon_groups else set()
         old_groups = getattr(self, '_cached_group_names', None)
+        # An applied Filter & Color leaves only the polygons it kept in the
+        # list (set_list_filter); the list is rebuilt when that changes too.
+        dropped = getattr(self, "_list_dropped", None) or set()
+        list_key = (getattr(self, "_list_filter_version", 0),)
         
         # Only rebuild list widget if groups changed
-        if old_groups is None or new_groups != old_groups:
+        if old_groups is None or new_groups != old_groups or list_key != getattr(self, "_cached_list_key", None):
             # Repainting/re-laying-out per inserted row is what made this cost
             # seconds: measured on a REALISED (shown) dialog with 2333 groups,
             # a rebuild + select took 1.63 s. Suppressing updates and signals
@@ -2745,6 +3227,8 @@ class PolygonManager(QtWidgets.QDialog):
             try:
                 self.list_widget.clear()
                 for group_name in sorted(polygon_groups.keys(), key=self.natural_sort_key):
+                    if group_name in dropped:
+                        continue
                     display_name = group_name or "Unnamed Group"
                     item = QtWidgets.QListWidgetItem(display_name)
                     item.setData(QtCore.Qt.UserRole, group_name)
@@ -2753,11 +3237,45 @@ class PolygonManager(QtWidgets.QDialog):
                 self.list_widget.blockSignals(False)
                 self.list_widget.setUpdatesEnabled(True)
             self._cached_group_names = new_groups
+            self._cached_list_key = list_key
             # Invalidate the reverse index since groups changed
             self._groups_by_filepath = None
+            self._update_list_filter_label(len(new_groups))
 
         # After setting polygons, update the selection based on current_root
         self.update_selection_based_on_root()
+
+    def set_list_filter(self, dropped_groups):
+        """Show only the polygons an applied filter KEPT: `dropped_groups` are
+        left out of this list and the ML manager's (None = show all).
+        Recording what was dropped -- not what was kept -- means a polygon
+        drawn after the filter still shows up."""
+        self._list_dropped = set(dropped_groups) if dropped_groups else None
+        self._list_filter_version = getattr(self, "_list_filter_version", 0) + 1
+        parent = self.parent()
+        self.set_polygons(getattr(parent, "all_polygons", {}) or {})
+        mlm = getattr(parent, "ml_manager", None)
+        if mlm is not None:
+            try:
+                mlm.refresh_polygon_groups()
+            except RuntimeError:
+                pass
+
+    def list_filter_dropped(self):
+        """Groups an applied filter removed from the lists (empty: none)."""
+        return getattr(self, "_list_dropped", None) or set()
+
+    def _update_list_filter_label(self, n_total):
+        lab = getattr(self, "list_filter_label", None)
+        if lab is None:
+            return
+        dropped = self.list_filter_dropped()
+        if not dropped:
+            lab.hide()
+            return
+        lab.setText(f"Showing {self.list_widget.count()} of {n_total} polygons "
+                    f"(filtered — Clear Filters shows all)")
+        lab.show()
 
     def set_current_root(self, current_root, image_data_groups):
         """
@@ -2862,6 +3380,13 @@ class PolygonManager(QtWidgets.QDialog):
     def get_selected_polygon_groups(self):
             selected_items = self.list_widget.selectedItems()
             return [item.data(QtCore.Qt.UserRole) for item in selected_items]
+
+    def highlight_group(self, group, additive=False):
+        """A polygon was clicked in a viewer: select its row here and scroll
+        to it. Signals are blocked, so this does not zoom the viewers the way a
+        click in this list does. Ctrl (additive) keeps the other rows."""
+        return highlight_list_row(self.list_widget, group,
+                                  lambda it: it.data(QtCore.Qt.UserRole), additive)
 
     def show_context_menu(self, position):
         item = self.list_widget.itemAt(position)

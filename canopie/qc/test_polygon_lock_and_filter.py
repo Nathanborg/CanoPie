@@ -475,7 +475,11 @@ def test_successful_shapefile_import_closes_the_progress_dialog(qapp, monkeypatc
     PolygonManager._on_shapefile_import_finished(pm, {}, [], dlg)
     qapp.processEvents()
 
-    assert not dlg.isVisible(), (
+    # The handler also deleteLater()s the dialog; whether that deletion has
+    # already run depends on what earlier tests left in the event queue. A
+    # deleted dialog is closed too.
+    from PyQt5 import sip
+    assert sip.isdeleted(dlg) or not dlg.isVisible(), (
         "the shapefile import progress dialog is still on screen after the "
         "finished-handler ran -- something in its cleanup raised before "
         "close() (this is exactly what reset() did)")

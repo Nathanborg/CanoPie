@@ -3739,9 +3739,18 @@ class DeletePolygonCommand(QUndoCommand):
                                      items_to_remove.append(it)
                              for it in items_to_remove:
                                  viewer._scene.removeItem(it)
-                             # Also clean viewer's internal list
+                             # Also clean viewer's internal list -- by the
+                             # removed items too: an imported crown's record
+                             # name is its label, not its group key, so the
+                             # name test alone left its entry, and the
+                             # zoomed-out tiles kept drawing the deleted crown.
                              if hasattr(viewer, 'polygons'):
-                                 viewer.polygons = [p for p in viewer.polygons if (p.get('name') or '').strip() != self.group_name]
+                                 gone = {id(it) for it in items_to_remove}
+                                 viewer.polygons = [p for p in viewer.polygons
+                                                    if id(p.get('item')) not in gone
+                                                    and (p.get('name') or '').strip() != self.group_name]
+                             if hasattr(viewer, 'invalidate_polygon_batch'):
+                                 viewer.invalidate_polygon_batch()
                              if hasattr(viewer, '_polygon_item_count'):
                                  viewer._polygon_item_count = len(viewer.polygons) if hasattr(viewer, 'polygons') else 0
                              viewer.viewport().update()
@@ -22488,8 +22497,22 @@ class ProjectTab(QtWidgets.QWidget):
         return pixitem.mapToScene(QtCore.QPointF(x_pix, y_pix))
 
     def show_machine_learning_manager(self):
-        ml_manager = MachineLearningManager(self)
-        ml_manager.exec_()
+        """Open the ML manager WITHOUT blocking the main window, like the
+        Polygon Manager: one window per tab, raised if already open. It used
+        exec_(), which froze the canvas for as long as it was open."""
+        mgr = getattr(self, "ml_manager", None)
+        try:
+            if mgr is None:
+                raise RuntimeError
+            mgr.refresh_polygon_groups()       # also raises if Qt deleted it
+        except RuntimeError:
+            mgr = self.ml_manager = MachineLearningManager(self)
+        mgr.setModal(False)
+        mgr.setWindowModality(QtCore.Qt.NonModal)
+        mgr.show()
+        mgr.raise_()
+        mgr.activateWindow()
+        return mgr
 
     def _ensure_polygon_index(self):
         """
@@ -23064,8 +23087,7 @@ class ProjectTab(QtWidgets.QWidget):
         return dlg
 
     def _annotator_polygon_click(self, item, viewer):
-        """ImageViewer.polygon_click_listener: a polygon or point was pressed.
-        True means the open Annotator took the click."""
+        """True if the open Annotator took this click (see _on_viewer_polygon_pressed)."""
         dlg = getattr(self, "annotator", None)
         if dlg is None:
             return False
@@ -23073,6 +23095,28 @@ class ProjectTab(QtWidgets.QWidget):
             return bool(dlg.on_viewer_polygon_clicked(item, viewer))
         except RuntimeError:
             return False
+
+    def _on_viewer_polygon_pressed(self, item, viewer):
+        """ImageViewer.polygon_click_listener: a polygon or point was pressed.
+
+        The open Polygon Manager and ML manager select that polygon's row and
+        scroll to it (Ctrl adds to their selection, as it does in the viewer);
+        then the Annotator may take the click. True means the Annotator took it."""
+        group = getattr(item, "name", None)
+        if group:
+            additive = bool(QtWidgets.QApplication.keyboardModifiers() & QtCore.Qt.ControlModifier)
+            for attr in ("polygon_manager", "ml_manager"):
+                w = getattr(self, attr, None)
+                if w is None:
+                    continue
+                try:
+                    if w.isVisible() and hasattr(w, "highlight_group"):
+                        w.highlight_group(group, additive=additive)
+                except RuntimeError:            # the window was deleted
+                    pass
+                except Exception:
+                    logging.debug("[lists] highlight in %s failed", attr, exc_info=True)
+        return self._annotator_polygon_click(item, viewer)
 
     def _annotator_record_changed(self, group, filepath):
         """A polygon's properties were edited outside the Annotator."""
@@ -23336,10 +23380,19 @@ class ProjectTab(QtWidgets.QWidget):
                         sc.setItemIndexMethod(old_idx)
 
                 if hasattr(viewer, 'polygons'):
+                    # By the removed ITEMS, not only by p['name']: a record's
+                    # name is its label ("37147.0") while items are keyed by
+                    # group ("excelsum_37147.0"), so the name test kept every
+                    # imported crown's entry -- and the zoomed-out tiles,
+                    # built from these entries, kept drawing deleted crowns.
+                    gone = {id(it) for it in items_to_remove}
                     viewer.polygons = [p for p in viewer.polygons
-                                       if (p.get('name') or '').strip() not in labels]
+                                       if id(p.get('item')) not in gone
+                                       and (p.get('name') or '').strip() not in labels]
                 if hasattr(viewer, '_polygon_item_count'):
                     viewer._polygon_item_count = len(viewer.polygons) if hasattr(viewer, 'polygons') else 0
+                if hasattr(viewer, 'invalidate_polygon_batch'):
+                    viewer.invalidate_polygon_batch()
                 if hasattr(viewer, 'viewport'):
                     viewer.viewport().update()
             except Exception as e:
@@ -23405,6 +23458,13 @@ class ProjectTab(QtWidgets.QWidget):
                     ann.schedule_refresh()
             except Exception:
                 pass
+        mlm = getattr(self, "ml_manager", None)
+        if mlm is not None:
+            try:
+                if mlm.isVisible():
+                    mlm.refresh_polygon_groups()
+            except Exception:
+                pass
         pm = getattr(self, "polygon_manager", None)
         if pm is None or not pm.isVisible():
             return
@@ -23422,18 +23482,28 @@ class ProjectTab(QtWidgets.QWidget):
             self.polygon_manager.set_current_root(current_root, self.image_data_groups)
 
     def select_polygon_from_manager(self, list_item):
+        """Second handler of a Polygon Manager list click (the manager's own
+        on_item_clicked_select_in_viewers runs first and pans every viewer to
+        the polygon at the current zoom). This one only makes sure the items
+        are selected.
+
+        It used to also call viewer.centerOn(item), which centres on the
+        item's BOUNDING RECT -- and that rect includes the space reserved for
+        the item's label, above and beside the crown (on a COG hundreds of
+        scene units). Running after the manager's correct pan, it moved the
+        view off the polygon: "one click used to centre it, now it moves
+        somewhere else"."""
         group_name = list_item.data(QtCore.Qt.UserRole)
-        if group_name:
-            # Iterate through all polygons to find and select them
-            for widget in self.viewer_widgets:
-                viewer = widget['viewer']
-                for item in viewer.get_all_polygons():
-                    if item.name == group_name:
+        if not group_name:
+            return
+        for widget in self.viewer_widgets:
+            viewer = widget['viewer']
+            for item in viewer.get_all_polygons():
+                if item.name == group_name:
+                    if hasattr(viewer, "select_polygon_item"):
+                        viewer.select_polygon_item(item, True)
+                    else:
                         item.setSelected(True)
-                        viewer.centerOn(item)
-            # Removed pop-up
-        else:
-            pass  # Handle cases where group_name is invalid if necessary
 
 
     def _debounced_jump(self, target_idx: int):
@@ -27431,6 +27501,9 @@ class ProjectTab(QtWidgets.QWidget):
                     _patches = polygon_data.get('annotator_patches') if isinstance(polygon_data, dict) else None
                     if _patches:
                         data_to_save['annotator_patches'] = _patches
+                    _lm = polygon_data.get('last_modified') if isinstance(polygon_data, dict) else None
+                    if _lm:
+                        data_to_save['last_modified'] = _lm
 
                     base_filename     = os.path.splitext(os.path.basename(filepath))[0]
                     polygon_filename  = f"{group_name}_{base_filename}_polygons.json"
@@ -28208,8 +28281,26 @@ class ProjectTab(QtWidgets.QWidget):
 
     # ========== helpers for per-file save (tiny, local) ==========
 
+    def _stamp_polygon_modified(self, group_name, filepath):
+        """Record WHEN a polygon last changed: record['last_modified'] =
+        'YYYY-MM-DD HH:MM:SS' (local time). Every edit path marks the polygon
+        dirty, which calls this; the drag command calls it too. A hidden
+        attribute -- not in 'properties', so it does not clutter Edit
+        properties or the CSV -- that the Polygon Manager's filter can use
+        (last_modified > "2026-11-01")."""
+        rec = (self.all_polygons.get(group_name) or {}).get(filepath) if hasattr(self, "all_polygons") else None
+        if not isinstance(rec, dict):
+            return
+        try:
+            if getattr(rec, "is_materialised", True) is False:
+                rec.get("points")          # read the file FIRST: its merge would overwrite the stamp
+        except Exception:
+            pass
+        dict.__setitem__(rec, "last_modified", time.strftime("%Y-%m-%d %H:%M:%S"))
+
     def _mark_polygon_dirty(self, group_name, filepath):
         """Mark a polygon as dirty for both debounced auto-save and incremental save (Ctrl+Q)."""
+        self._stamp_polygon_modified(group_name, filepath)
         # Track for debounced auto-save (writes individual polygon files)
         if not hasattr(self, "_dirty_polys"):
             self._dirty_polys = set()
@@ -30487,6 +30578,9 @@ class ProjectTab(QtWidgets.QWidget):
         patches = polygon_data.get('annotator_patches')
         if patches:
             data_to_save['annotator_patches'] = patches
+        lm = polygon_data.get('last_modified')
+        if lm:
+            data_to_save['last_modified'] = lm
         # No `lod` pyramid in the sidecar any more. It was 41% of every file
         # (55 of 134 MB for the 2,801 BCI crowns) and 2.5 s of every import,
         # and nothing needs it stored: the overview takes its one level from
@@ -32036,7 +32130,7 @@ class ProjectTab(QtWidgets.QWidget):
         checked = getattr(self, "inspectAct", None).isChecked() if hasattr(self, "inspectAct") else False
         viewer.set_inspection_mode(checked)
         # Polygon clicks reach the Annotator's Polygon Properties panel.
-        viewer.polygon_click_listener = self._annotator_polygon_click
+        viewer.polygon_click_listener = self._on_viewer_polygon_pressed
 
         # idempotent pixel read hook
         try:
@@ -35080,6 +35174,7 @@ class ModifyPolygonCommand(QUndoCommand):
                  d.pop('lod', None)
                  d.pop('display_points', None)
                  d['points'] = img_pts
+                 d['last_modified'] = time.strftime("%Y-%m-%d %H:%M:%S")
                  # Make sure to update the reference size since these coordinates are tied to the active scaled basis
                  if self.eff_w > 0 and self.eff_h > 0:
                      d['image_ref_size'] = {'w': int(self.eff_w), 'h': int(self.eff_h)}

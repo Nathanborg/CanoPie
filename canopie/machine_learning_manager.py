@@ -1203,6 +1203,11 @@ class MachineLearningManager(QtWidgets.QDialog):
         self.list_widget = QListWidget()
         self.list_widget.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.main_layout.addWidget(self.list_widget)
+        # Like the Polygon Manager: a click, or Up / Down, moves the viewers to
+        # the polygon (same zoom); Ctrl / Shift add to the selection.
+        self.list_widget.itemClicked.connect(self._move_viewers_to_row)
+        from .polygon_manager import follow_keyboard_rows
+        self._row_keys = follow_keyboard_rows(self.list_widget, self._move_viewers_to_row)
 
         self.populate_polygon_groups()
 
@@ -5071,11 +5076,68 @@ class MachineLearningManager(QtWidgets.QDialog):
         if not hasattr(self.parent(), 'all_polygons'):
             logging.warning("Parent does not have 'all_polygons'. Cannot populate polygon groups.")
             return
-        for group_name in sorted(self.parent().all_polygons.keys()):
+        for group_name in self._listed_groups():
             self.list_widget.addItem(QtWidgets.QListWidgetItem(group_name))
+
+    def _listed_groups(self):
+        """All polygon groups, minus those an applied Polygon Manager filter
+        left out (the two lists show the same polygons)."""
+        groups = sorted(getattr(self.parent(), "all_polygons", {}) or {})
+        pm = getattr(self.parent(), "polygon_manager", None)
+        dropped = pm.list_filter_dropped() if pm is not None and hasattr(pm, "list_filter_dropped") else set()
+        return [g for g in groups if g not in dropped] if dropped else groups
 
     def get_selected_groups(self):
         return [item.text() for item in self.list_widget.selectedItems()]
+
+    def _move_viewers_to_row(self, item):
+        """Select the row's polygon in the viewers and pan to it at the
+        current zoom -- the Polygon Manager's own list-click code."""
+        if item is None:
+            return
+        pm = getattr(self.parent(), "polygon_manager", None)
+        if pm is None or not hasattr(pm, "_select_group_in_viewers"):
+            return
+        mods = QtWidgets.QApplication.keyboardModifiers()
+        additive = bool(mods & (QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier))
+        try:
+            pm._select_group_in_viewers(item.text(), additive=additive)
+        except Exception:
+            logging.debug("[ML manager] move to %s failed", item.text(), exc_info=True)
+
+    def highlight_group(self, group, additive=False):
+        """A polygon was clicked in a viewer: select its row and scroll to it."""
+        from .polygon_manager import highlight_list_row
+        return highlight_list_row(self.list_widget, group, lambda it: it.text(), additive)
+
+    def refresh_polygon_groups(self):
+        """Re-list the groups (the window stays open now, so polygons can be
+        added or deleted meanwhile), keeping the current selection."""
+        keep = set(self.get_selected_groups())
+        cur = self.list_widget.currentItem()
+        cur_text = cur.text() if cur is not None else None
+        groups = self._listed_groups()
+        if [self.list_widget.item(i).text() for i in range(self.list_widget.count())] == groups:
+            return
+        blocker = QtCore.QSignalBlocker(self.list_widget)
+        try:
+            self.populate_polygon_groups()
+            for i in range(self.list_widget.count()):
+                it = self.list_widget.item(i)
+                if it.text() in keep:
+                    it.setSelected(True)
+                if it.text() == cur_text:
+                    self.list_widget.setCurrentItem(it, QtCore.QItemSelectionModel.NoUpdate)
+        finally:
+            del blocker
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QtCore.QEvent.ActivationChange and self.isActiveWindow():
+            try:
+                self.refresh_polygon_groups()
+            except Exception:
+                logging.debug("[ML manager] group refresh failed", exc_info=True)
  
     def _snapshot_polygons_by_group(self, groups):
         """

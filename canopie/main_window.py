@@ -82,6 +82,13 @@ def setup_logging_light(app_name="CanoPie", level=logging.INFO):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        # the saved polygon & label appearance (Configuration menu), before
+        # any viewer draws
+        try:
+            from .image_viewer import load_polygon_style
+            load_polygon_style()
+        except Exception:
+            pass
         self.init_ui()
         self.status = self.statusBar()
 
@@ -352,6 +359,18 @@ class MainWindow(QMainWindow):
             "Choose which bands of a large multi-band raster are rendered (display only)")
         display_bands_action.triggered.connect(self.choose_display_bands)
         view_menu.addAction(display_bands_action)
+
+        # Configuration: app-wide look of polygons and their labels
+        config_menu = menu_bar.addMenu("Configuration")
+        self.polygonAppearanceAct = QAction("Polygon && Label Appearance…", self)
+        self.polygonAppearanceAct.setStatusTip(
+            "Label size (fixed on screen or growing with zoom), colours, outline width")
+        self.polygonAppearanceAct.triggered.connect(self.open_polygon_appearance)
+        config_menu.addAction(self.polygonAppearanceAct)
+
+    def open_polygon_appearance(self):
+        from .image_viewer import open_polygon_appearance
+        return open_polygon_appearance(self)
 
     def choose_display_bands(self):
         current_tab = self.get_current_tab()
