@@ -2872,30 +2872,50 @@ class PolygonManager(QtWidgets.QDialog):
         selected_groups = self.get_selected_polygon_groups()
         target_groups = selected_groups if clicked_group in selected_groups else [clicked_group]
 
+        many = f" ({len(target_groups)} selected)" if len(target_groups) > 1 else ""
+        single = len(target_groups) == 1
+
+        # The SAME entries, in the same order, as a polygon's right-click menu
+        # in a viewer (image_viewer._polygon_context_menu), plus this list's
+        # own (Move, exports).
         menu = QtWidgets.QMenu(self)
-       
         zoom_action = menu.addAction("Zoom to Polygon Points")
         menu.addSeparator()
         edit_action = menu.addAction("Edit")
+        vertices_action = menu.addAction("Edit vertices")
+        props_action = menu.addAction("Edit properties")
         find_action = menu.addAction("Find canopy in other images…")
-        delete_action = menu.addAction("Delete")
-        copy_action = menu.addAction("Copy")
-        move_action = menu.addAction("Move")
+        for a_ in (vertices_action, props_action):
+            a_.setEnabled(single)
+            if not single:
+                a_.setToolTip("Select one polygon")
+        menu.addSeparator()
+        copy_action = menu.addAction("Copy" + many)
+        move_action = menu.addAction("Move" + many)
         copy_to_viewers_action = menu.addAction("Copy to Viewers (This Root)")
-        delete_all_action = menu.addAction("Delete All Polygons")
+        locked_now = self._groups_locked(target_groups)
+        lock_action = menu.addAction(("Unlock" if locked_now else "Lock") + many)
+        menu.addSeparator()
+        stats_action = menu.addAction("Polygon Stats…" + many)
+        stats_action.setToolTip("The CSV export's statistics for the selected polygon(s), on every image they are on")
+        info_action = menu.addAction("Polygon Info…" + many)
         menu.addSeparator()
         export_csv_action = menu.addAction("Export CSV (ML)")
         export_shp_action = menu.addAction("Export Shapefile (.shp)")
         import_shp_action = menu.addAction("Import Shapefile (.shp)")
         thumbs_action     = menu.addAction("Generate Thumbnails (ML)")
         masks_action      = menu.addAction("Generate Segmentation Masks (ML)")
-            # NEW: stats
         menu.addSeparator()
-        stats_action = menu.addAction("Polygon Stats…")  # NEW
+        delete_action = menu.addAction("Delete")
+        delete_all_action = menu.addAction("Delete All Polygons")
 
         action = menu.exec_(self.list_widget.viewport().mapToGlobal(position))
         if action == edit_action:
             self.edit_selected_polygons(target_groups)
+        elif action == vertices_action:
+            self._with_group_item(clicked_group, lambda v, it: v.start_vertex_editing(it))
+        elif action == props_action:
+            self._with_group_item(clicked_group, lambda v, it: v.edit_polygon_properties(it))
         elif action == find_action:
             if len(target_groups) > 1:
                 self.find_canopy_for_groups(target_groups)
@@ -2909,6 +2929,8 @@ class PolygonManager(QtWidgets.QDialog):
             self.move_selected_polygons(target_groups)
         elif action == copy_to_viewers_action:
             self.copy_selected_polygons_to_current_root_viewers(target_groups)
+        elif action == lock_action:
+            self._set_groups_locked(target_groups, not locked_now)
         elif action == delete_all_action:
             self.delete_all_polygons_for_groups(target_groups)
         elif action == zoom_action:
@@ -2923,12 +2945,69 @@ class PolygonManager(QtWidgets.QDialog):
             self._mlm_invoke(target_groups, kind="thumbs")
         elif action == masks_action:
             self._mlm_invoke(target_groups, kind="masks")
-        elif action == stats_action: 
-            # If multiple items are selected, use them; otherwise use the clicked item.
-            groups = self.get_selected_polygon_groups() or target_groups
-            self.show_polygon_stats(groups)
-            
-    def show_polygon_stats(self, groups=None):
+        elif action == stats_action:
+            self.polygon_stats_for_groups(target_groups)
+        elif action == info_action:
+            self.show_polygon_info(target_groups)
+
+    # ---------------------------------------------- menu helpers
+    def _group_items(self, group):
+        """(viewer, item) for every on-screen polygon / point of `group`."""
+        out = []
+        for _w, viewer in self._iter_viewers():
+            if not hasattr(viewer, "get_all_polygons"):
+                continue
+            for it in viewer.get_all_polygons():
+                if getattr(it, "name", None) == group:
+                    out.append((viewer, it))
+        return out
+
+    def _with_group_item(self, group, fn, _retry=True):
+        """Run fn(viewer, item) on the group's polygon in a viewer: on screen
+        now, else after bringing its root up (Edit vertices / properties
+        need the polygon drawn)."""
+        found = self._group_items(group)
+        if found:
+            viewer, it = found[0]
+            fn(viewer, it)
+            return True
+        parent = self.parent()
+        if _retry and parent is not None and hasattr(parent, "switch_to_group"):
+            parent.switch_to_group(group)
+            QtCore.QTimer.singleShot(700, lambda: self._with_group_item(group, fn, _retry=False))
+            return False
+        QtWidgets.QMessageBox.information(self, "Polygon", f"'{group}' is not shown in any viewer.")
+        return False
+
+    def _groups_locked(self, groups):
+        items = [it for g in groups for _v, it in self._group_items(g)]
+        return bool(items) and all(getattr(it, "is_locked", False) for it in items)
+
+    def _set_groups_locked(self, groups, locked):
+        for g in groups:
+            for _v, it in self._group_items(g):
+                it.is_locked = bool(locked)
+
+    def polygon_stats_for_groups(self, groups):
+        """"Polygon Stats…": the CSV export's statistics (process_polygon)
+        for the selected polygon groups, on every image each one is on."""
+        parent = self.parent()
+        if parent is None or not hasattr(parent, "show_stats_for_polygons"):
+            return None
+        allp = getattr(parent, "all_polygons", {}) or {}
+        pairs, seen = [], set()
+        import os as _os
+        for g in groups:
+            for fp, rec in (allp.get(g) or {}).items():
+                if isinstance(rec, dict) and dict.get(rec, "is_mask_polygon", False):
+                    continue
+                k = (g, _os.path.normcase(_os.path.normpath(str(fp))))
+                if k not in seen:          # one image under two path spellings
+                    seen.add(k)
+                    pairs.append((g, fp))
+        return parent.show_stats_for_polygons(pairs)
+
+    def show_polygon_info(self, groups=None):
             """
             Show counts based on the loaded project data (all_polygons) in memory.
             Calculates:
@@ -2943,7 +3022,7 @@ class PolygonManager(QtWidgets.QDialog):
             # Access the in-memory dictionary loaded from project.json
             all_polygons = getattr(parent, "all_polygons", {})
             if not all_polygons:
-                 QtWidgets.QMessageBox.information(self, "Polygon Stats", "No polygons found in project data.")
+                 QtWidgets.QMessageBox.information(self, "Polygon Info", "No polygons found in project data.")
                  return
 
             # Resolve root id -> name map if available
@@ -3062,7 +3141,7 @@ class PolygonManager(QtWidgets.QDialog):
 
             # --- Display Dialog ---
             dlg = QtWidgets.QDialog(self)
-            dlg.setWindowTitle("Project Polygon Stats")
+            dlg.setWindowTitle("Polygon Info")
             dlg.resize(700, 500)
             lay = QtWidgets.QVBoxLayout(dlg)
 
@@ -3077,6 +3156,9 @@ class PolygonManager(QtWidgets.QDialog):
             lay.addWidget(btns)
 
             dlg.exec_()
+    #: old name of show_polygon_info ("Polygon Stats" became "Polygon Info")
+    show_polygon_stats = show_polygon_info
+
     def _canopy_source_of(self, group):
         """The image a crown is searched from: the first viewer of this root
         holding it, else any image holding it (any root)."""

@@ -1124,9 +1124,12 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
             # Qt drag is what causes the item to glitch/snap.
             annotator_took_it = _notify_polygon_click(self)
             if getattr(self, "is_locked", False):
-                # With the Annotator open a locked polygon is just picked for
-                # its properties: no prompt, and it stays locked.
-                if not annotator_took_it:
+                # With the Annotator open a click on a locked polygon just
+                # picks it for its properties; the unlock prompt waits until
+                # the user actually tries to DRAG it (ImageViewer._arm_locked_drag).
+                if annotator_took_it:
+                    _arm_locked_drag(self, event)
+                else:
                     _prompt_unlock_click(self)
                 event.ignore()
                 return
@@ -1264,62 +1267,80 @@ class EditablePolygonItem(QtWidgets.QGraphicsObject):
         logging.warning(f"Attempted to switch to non-existent tab: {tab_name}")
 
     def contextMenuEvent(self, event):
-        menu = QtWidgets.QMenu()
-        a_copy     = menu.addAction("Copy polygon")
-        a_repl     = menu.addAction("Replicate to all viewers")
-        a_edit     = menu.addAction("Edit this polygon")
+        _polygon_context_menu(self, is_point=False)
+
+
+def _polygon_context_menu(item, is_point=False):
+    """Right-click menu of a polygon / point in a viewer. The SAME entries, in
+    the same order, as the Polygon Manager's menu (PolygonManager.show_context_menu).
+    Stats, info, copy and replicate act on every selected polygon / point
+    (Ctrl+click or Ctrl+drag to select several), or on this one if it is
+    not selected."""
+    scene = item.scene()
+    v = scene.views()[0] if scene is not None and scene.views() else None
+    if v is None:
+        return
+    selected = [it for it in scene.selectedItems()
+                if isinstance(it, (EditablePolygonItem, EditablePointItem))]
+    targets = selected if item in selected else [item]
+    n = len(targets)
+    many = f" ({n} selected)" if n > 1 else ""
+
+    menu = QtWidgets.QMenu()
+    a_zoom = menu.addAction("Zoom to polygon")
+    menu.addSeparator()
+    a_edit = a_edit_all = a_vertices = a_find = None
+    if not is_point:
+        a_edit = menu.addAction("Edit this polygon")
         a_edit_all = menu.addAction("Edit all polygons in this group")
+        a_vertices = menu.addAction("Edit vertices")
+    a_props = menu.addAction("Edit properties")
+    if not is_point:
         a_find = menu.addAction("Find canopy in other images…")
-        menu.addSeparator()
-        a_edit_vertices = menu.addAction("Edit vertices")
-        menu.addSeparator()
-        a_props = menu.addAction("Edit properties")
-        a_lock = menu.addAction("Unlock this polygon" if getattr(self, "is_locked", False)
-                                 else "Lock this polygon")
-        menu.addSeparator()
-        a_delete   = menu.addAction("Delete this polygon")
-        a_delete_all = menu.addAction("Delete all polygons in this group")
+    menu.addSeparator()
+    a_copy = menu.addAction(("Copy points" if is_point else "Copy polygon") + many)
+    a_repl = menu.addAction("Replicate to all viewers" + many)
+    a_lock = menu.addAction("Unlock this polygon" if getattr(item, "is_locked", False)
+                            else "Lock this polygon")
+    menu.addSeparator()
+    a_stats = menu.addAction("Polygon Stats…" + many)
+    a_stats.setToolTip("The CSV export's statistics for the selected polygon(s) on this image")
+    a_info = menu.addAction("Polygon Info…" + many)
+    menu.addSeparator()
+    a_delete = menu.addAction("Delete this polygon")
+    a_delete_all = menu.addAction("Delete all polygons in this group")
 
-        chosen = menu.exec_(QtGui.QCursor.pos())
-
-        v = self.scene().views()[0] if self.scene().views() else None
-        if not v:
-            return
-
-        if chosen == a_copy and hasattr(v, "copy_specific_items"):
-            v.copy_specific_items([self])
-
-        elif chosen == a_repl and hasattr(v, "replicate_toviewer"):
-            selected = [it for it in self.scene().selectedItems()
-                        if isinstance(it, (EditablePolygonItem, EditablePointItem))]
-            v.replicate_toviewer(selected or [self])
-
-        elif chosen == a_edit and hasattr(v, "edit_single_polygon"):
-            v.edit_single_polygon(self, start_redraw=True)
-
-        elif chosen == a_edit_all and hasattr(v, "edit_all_polygons_in_group"):
-            v.edit_all_polygons_in_group(self, start_redraw=True, respect_sync=True)
-
-        elif chosen == a_find and hasattr(v, "find_canopy_in_other_images"):
-            v.find_canopy_in_other_images(getattr(self, "name", None))
-
-        elif chosen == a_edit_vertices and hasattr(v, "start_vertex_editing"):
-            v.start_vertex_editing(self)
-
-        elif chosen == a_props and hasattr(v, "edit_polygon_properties"):
-            v.edit_polygon_properties(self)
-
-        elif chosen == a_lock:
-            # Per-polygon toggle -- independent of PolygonManager's global
-            # "Lock Polygons" checkbox, which sets every polygon at once.
-            # This is the individual counterpart: lock/unlock just this one.
-            self.is_locked = not getattr(self, "is_locked", False)
-
-        elif chosen == a_delete and hasattr(v, "delete_polygon_for_this_file"):
-            v.delete_polygon_for_this_file(self)
-
-        elif chosen == a_delete_all and hasattr(v, "delete_all_polygons_in_group"):
-            v.delete_all_polygons_in_group(self)
+    chosen = menu.exec_(QtGui.QCursor.pos())
+    if chosen is None:
+        return
+    if chosen == a_zoom and hasattr(v, "zoom_to_items"):
+        v.zoom_to_items(targets)
+    elif a_edit is not None and chosen == a_edit and hasattr(v, "edit_single_polygon"):
+        v.edit_single_polygon(item, start_redraw=True)
+    elif a_edit_all is not None and chosen == a_edit_all and hasattr(v, "edit_all_polygons_in_group"):
+        v.edit_all_polygons_in_group(item, start_redraw=True, respect_sync=True)
+    elif a_vertices is not None and chosen == a_vertices and hasattr(v, "start_vertex_editing"):
+        v.start_vertex_editing(item)
+    elif chosen == a_props and hasattr(v, "edit_polygon_properties"):
+        v.edit_polygon_properties(item)
+    elif a_find is not None and chosen == a_find and hasattr(v, "find_canopy_in_other_images"):
+        v.find_canopy_in_other_images(getattr(item, "name", None))
+    elif chosen == a_copy and hasattr(v, "copy_specific_items"):
+        v.copy_specific_items(targets)
+    elif chosen == a_repl and hasattr(v, "replicate_toviewer"):
+        v.replicate_toviewer(targets)
+    elif chosen == a_lock:
+        # Per-polygon toggle -- independent of PolygonManager's global
+        # "Lock Polygons" checkbox, which sets every polygon at once.
+        item.is_locked = not getattr(item, "is_locked", False)
+    elif chosen == a_stats and hasattr(v, "polygon_stats_for_items"):
+        v.polygon_stats_for_items(targets)
+    elif chosen == a_info and hasattr(v, "polygon_info_for_items"):
+        v.polygon_info_for_items(targets)
+    elif chosen == a_delete and hasattr(v, "delete_polygon_for_this_file"):
+        v.delete_polygon_for_this_file(item)
+    elif chosen == a_delete_all and hasattr(v, "delete_all_polygons_in_group"):
+        v.delete_all_polygons_in_group(item)
 
 
 def _notify_polygon_click(item):
@@ -1334,6 +1355,21 @@ def _notify_polygon_click(item):
     except Exception:
         logging.debug("[annotator] polygon click listener failed", exc_info=True)
         return False
+
+
+def _arm_locked_drag(item, event):
+    """A locked item was pressed while the Annotator took the click: remember
+    it, so that a DRAG (not a plain click) still asks to unlock."""
+    try:
+        scn = item.scene()
+        views = scn.views() if scn is not None else []
+        v = views[0] if views else None
+        if v is not None:
+            # scene position, compared in viewport pixels on move: a mouse
+            # event's global position may be the cursor's, not the event's
+            v._locked_drag = (item, QtCore.QPointF(event.scenePos()))
+    except Exception:
+        logging.debug("[lock] could not arm the drag prompt", exc_info=True)
 
 
 def _prompt_unlock_click(item):
@@ -1917,7 +1953,9 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
         if event.button() == QtCore.Qt.LeftButton:
             annotator_took_it = _notify_polygon_click(self)
             if getattr(self, "is_locked", False):
-                if not annotator_took_it:
+                if annotator_took_it:
+                    _arm_locked_drag(self, event)
+                else:
                     _prompt_unlock_click(self)
                 event.ignore()
                 return
@@ -1988,42 +2026,7 @@ class EditablePointItem(QtWidgets.QGraphicsObject):
 
 
     def contextMenuEvent(self, event):
-        menu = QtWidgets.QMenu()
-        a_copy = menu.addAction("Copy points")
-        a_repl = menu.addAction("Replicate to all viewers")
-        menu.addSeparator()
-        a_props = menu.addAction("Edit properties")
-        a_lock = menu.addAction("Unlock this polygon" if getattr(self, "is_locked", False)
-                                 else "Lock this polygon")
-        menu.addSeparator()
-        a_delete   = menu.addAction("Delete this polygon")
-        a_delete_all = menu.addAction("Delete all polygons in this group")
-
-        chosen = menu.exec_(QtGui.QCursor.pos())
-
-        v = self.scene().views()[0] if self.scene().views() else None
-        if not v:
-            return
-
-        if chosen == a_copy and hasattr(v, "copy_specific_items"):
-            v.copy_specific_items([self])
-
-        elif chosen == a_repl and hasattr(v, "replicate_toviewer"):
-            selected = [it for it in self.scene().selectedItems()
-                        if isinstance(it, (EditablePolygonItem, EditablePointItem))]
-            v.replicate_toviewer(selected or [self])
-
-        elif chosen == a_props and hasattr(v, "edit_polygon_properties"):
-            v.edit_polygon_properties(self)
-
-        elif chosen == a_lock:
-            self.is_locked = not getattr(self, "is_locked", False)
-
-        elif chosen == a_delete and hasattr(v, "delete_polygon_for_this_file"):
-            v.delete_polygon_for_this_file(self)
-
-        elif chosen == a_delete_all and hasattr(v, "delete_all_polygons_in_group"):
-            v.delete_all_polygons_in_group(self)
+        _polygon_context_menu(self, is_point=True)
 
 
 def _norm_style_key_fp(fp):
@@ -3601,6 +3604,25 @@ class ImageViewer(QtWidgets.QGraphicsView):
     #: per preview pixel (see _on_highres_timer_timeout).
     _HIGHRES_MIN_DEVICE_PX_PER_PREVIEW_PX = 1.1
 
+    def native_per_preview(self):
+        """Real raster pixels per displayed (preview) pixel: ~16 for a COG
+        shown from its 1/16 overview (image_data.display_scale), 1 for an
+        image loaded whole."""
+        try:
+            return max(1.0, float(getattr(getattr(self, "image_data", None), "display_scale", 1.0) or 1.0))
+        except (TypeError, ValueError):
+            return 1.0
+
+    def max_zoom_factor(self, base=50.0):
+        """Largest view zoom: `base` screen pixels per REAL pixel.
+
+        Zoom is measured against the displayed pixmap, which for a COG is a
+        decimated preview (BCI: 1/16). A flat 50x cap therefore stopped at ~3
+        screen px per real pixel there -- "it won't let me zoom in onto the
+        pixels" -- while a plain image went to 50. The sharp viewport tile
+        reads full resolution once zoomed in, so the pixels are there to see."""
+        return float(base) * self.native_per_preview()
+
     def _trigger_highres_update(self):
         if not getattr(self, "_highres_enabled", False):
             return
@@ -3915,8 +3937,9 @@ class ImageViewer(QtWidgets.QGraphicsView):
             steps = accum / 120.0
             new_zoom = current_zoom * (1.25 ** steps)
 
-            # Clamp zoom: min is fit_zoom, max is 50x
-            new_zoom = max(fit_zoom, min(50.0, new_zoom))
+            # Clamp zoom: min is fit_zoom, max 50 screen px per REAL pixel
+            # (see max_zoom_factor: a COG's preview is decimated)
+            new_zoom = max(fit_zoom, min(self.max_zoom_factor(), new_zoom))
             
             # Calculate relative scale required
             scale_factor = new_zoom / current_zoom
@@ -4253,6 +4276,29 @@ class ImageViewer(QtWidgets.QGraphicsView):
             return None
 
     def mouseMoveEvent(self, event):
+        # --- A locked polygon pressed while the Annotator is open: a click
+        # only picked it; once the mouse moves past the drag distance the user
+        # is trying to drag it, so ask to unlock (and do not pan meanwhile).
+        armed = getattr(self, "_locked_drag", None)
+        if armed is not None:
+            if not (event.buttons() & QtCore.Qt.LeftButton):
+                self._locked_drag = None
+            else:
+                item, scene0 = armed
+                moved = (event.pos() - self.mapFromScene(scene0)).manhattanLength()
+                if moved >= QtWidgets.QApplication.startDragDistance():
+                    self._locked_drag = None
+                    self.reset_pointer_interaction()
+                    try:
+                        _prompt_unlock_click(item)
+                    except RuntimeError:          # the item was deleted meanwhile
+                        pass
+                    # the modal prompt ate the release: back to idle
+                    self._press_interrupted_by_modal = False
+                    self.reset_pointer_interaction()
+                event.accept()
+                return
+
         # --- FAST PATH: Skip all expensive operations during active panning ---
         if self._is_panning:
             # Use fast manual scrollbar updates for both left and middle button panning
@@ -4374,6 +4420,8 @@ class ImageViewer(QtWidgets.QGraphicsView):
         super(ImageViewer, self).mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton:
+            self._locked_drag = None          # a plain click: no prompt
         if self._rb_dragging and event.button() == QtCore.Qt.LeftButton:
             self._rb_dragging = False
             self.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
@@ -5460,6 +5508,63 @@ class ImageViewer(QtWidgets.QGraphicsView):
 
     #: Set by _prompt_unlock_click when a modal prompt opened during a press.
     _press_interrupted_by_modal = False
+
+    #: (locked item, press screen pos) while the Annotator took a press on a
+    #: locked polygon; a drag past startDragDistance then asks to unlock.
+    _locked_drag = None
+
+    # ---------------------------------------------- polygon menu actions
+    def _owner_and_fp(self):
+        owner = self._find_project_owner()
+        fp = getattr(getattr(self, "image_data", None), "filepath", None)
+        return owner, fp
+
+    def polygon_stats_for_items(self, items):
+        """"Polygon Stats…": the CSV export's statistics (process_polygon)
+        for these polygons / points on this viewer's image."""
+        owner, fp = self._owner_and_fp()
+        if owner is None or not fp or not hasattr(owner, "show_stats_for_polygons"):
+            return None
+        names = []
+        for it in items:
+            n = getattr(it, "name", None)
+            if n and n not in names:
+                names.append(n)
+        return owner.show_stats_for_polygons([(n, fp) for n in names])
+
+    def polygon_info_for_items(self, items):
+        """"Polygon Info…": the Polygon Manager's counts (polygons / points
+        per root and group) for these polygons' groups."""
+        owner, _fp = self._owner_and_fp()
+        pm = getattr(owner, "polygon_manager", None) if owner is not None else None
+        groups = sorted({getattr(it, "name", None) for it in items} - {None})
+        if pm is not None and groups and hasattr(pm, "show_polygon_info"):
+            pm.show_polygon_info(groups)
+
+    def zoom_to_items(self, items):
+        """"Zoom to polygon": frame these items in this viewer."""
+        rect = None
+        for it in items:
+            try:
+                if hasattr(it, "polygon"):
+                    r = it.mapToScene(it.polygon).boundingRect()
+                else:
+                    r = it.mapToScene(it.boundingRect()).boundingRect()
+            except Exception:
+                continue
+            rect = r if rect is None else rect.united(r)
+        if rect is None:
+            return
+        owner, _fp = self._owner_and_fp()
+        native_hw = None
+        try:
+            native_hw = owner.polygon_basis_hw(self) if owner is not None else None
+        except Exception:
+            native_hw = None
+        if rect.width() < 1.0 and rect.height() < 1.0:
+            self.smart_zoom_to_scene_rect(rect)
+        else:
+            self.smart_fit_to_scene_rect(rect, native_hw)
 
     #: callable(item, viewer) -> bool, called on every left press of a
     #: polygon/point (see _notify_polygon_click). ProjectTab sets it.
@@ -7967,6 +8072,7 @@ class _ZoomBar(QtWidgets.QFrame):
         self._view = parent_view
         self._min_zoom = float(min_zoom)
         self._max_zoom = float(max_zoom)
+        self._base_max_zoom = float(max_zoom)    # per REAL pixel; see _refresh_range
         self._block = False
 
         self.setFrameShape(QtWidgets.QFrame.StyledPanel)
@@ -8549,7 +8655,18 @@ class _ZoomBar(QtWidgets.QFrame):
         t = pos / 1000.0
         return math.exp((1.0 - t) * math.log(zmin) + t * math.log(zmax))
 
+    def _refresh_range(self):
+        """Slider maximum: 20x of a plain image, and the same 20 screen px per
+        REAL pixel on a decimated (COG) preview. Re-read on every use, so a
+        viewer whose image changes always has the right range."""
+        try:
+            k = self._view.native_per_preview()
+        except Exception:
+            k = 1.0
+        self._max_zoom = max(self._base_max_zoom, self._base_max_zoom * k)
+
     def _set_slider_from_zoom(self, z):
+        self._refresh_range()
         self._block = True
         self._slider.setValue(self._zoom_to_slider(z, self._min_zoom, self._max_zoom))
         self._block = False
@@ -8557,6 +8674,7 @@ class _ZoomBar(QtWidgets.QFrame):
     def _on_slider_changed(self, v):
         if self._block:
             return
+        self._refresh_range()
         z = self._slider_to_zoom(v, self._min_zoom, self._max_zoom)
         self._update_label(z)
         self.zoomChanged.emit(z)
@@ -8584,6 +8702,7 @@ class _ZoomBar(QtWidgets.QFrame):
 
     # ---------- external API ----------
     def set_zoom(self, z, *, emit=False, sync=True):
+        self._refresh_range()
         z = max(self._min_zoom, min(self._max_zoom, float(z)))
         self._set_slider_from_zoom(z)
         self._update_label(z)
@@ -8878,7 +8997,8 @@ def attach_zoom_bar(viewer):
     viewer.current_zoom_factor = current_zoom_factor
 
     def set_zoom_factor(z, anchor=QtWidgets.QGraphicsView.AnchorUnderMouse):
-        z = max(0.01, min(50.0, float(z)))
+        cap = viewer.max_zoom_factor() if hasattr(viewer, "max_zoom_factor") else 50.0
+        z = max(0.01, min(cap, float(z)))
         prev_anchor = viewer.transformationAnchor()
         viewer.setTransformationAnchor(anchor)
         viewer.resetTransform()

@@ -570,3 +570,87 @@ def test_viewer_click_opens_polygon_in_panel_even_when_locked(project_tab, qapp,
     assert iv._notify_polygon_click(item) is False, "a closed Annotator must not take clicks"
     viewer._scene.clear()
     viewer.deleteLater()
+
+
+def test_locked_crown_asks_to_unlock_only_when_dragged(project_tab, qapp, monkeypatch):
+    """With the Annotator open: a click on a locked crown only opens it in the
+    panel; pressing and DRAGGING it asks to unlock -- and afterwards the
+    canvas is idle (no stuck pan), since the prompt swallows the release."""
+    from canopie import image_viewer as iv
+    from canopie.image_viewer import _ZoomBar
+    from PyQt5 import QtGui
+    from PyQt5.QtTest import QTest
+    monkeypatch.setattr(_ZoomBar, "_zoom_sync_enabled", False)
+    pt = project_tab
+    dlg = pt.show_annotator()
+    dlg.store.add_property("cover", KIND_NUMERIC)
+    g, f, _lb, _r = _first_polygon(pt)
+
+    viewer = iv.ImageViewer()
+    viewer.resize(300, 300)
+    viewer.image_data = type("D", (), {"filepath": f, "image": None})()
+    viewer._scene.clear()
+    pm = QtGui.QPixmap(2000, 2000)
+    pm.fill(QtCore.Qt.gray)
+    viewer._image = viewer._scene.addPixmap(pm)
+    viewer._scene.setSceneRect(0, 0, 2000, 2000)
+    viewer._empty = False
+    viewer.polygons = []
+    pt._wire_viewer_for_inspection(viewer)
+    viewer.add_polygon_to_scene(QtGui.QPolygonF([
+        QtCore.QPointF(900, 900), QtCore.QPointF(1100, 900),
+        QtCore.QPointF(1100, 1100), QtCore.QPointF(900, 1100)]), name=g)
+    viewer.set_polygons_locked(True)
+    viewer.show()
+    qapp.processEvents()
+    viewer.centerOn(1000, 1000)
+    qapp.processEvents()
+
+    prompts = []
+
+    def fake_exec(box):
+        prompts.append(box.text())
+        for b in box.buttons():
+            if b.text() == "Cancel":
+                b.click()
+        return 0
+    monkeypatch.setattr(QtWidgets.QMessageBox, "exec_", fake_exec)
+
+    vp = viewer.viewport()
+    pt0 = viewer.mapFromScene(QtCore.QPointF(1000, 1000))
+
+    def move(p, buttons=QtCore.Qt.LeftButton):
+        QtWidgets.QApplication.sendEvent(vp, QtGui.QMouseEvent(
+            QtCore.QEvent.MouseMove, QtCore.QPointF(p), QtCore.Qt.NoButton, buttons, QtCore.Qt.NoModifier))
+
+    try:
+        # 1) a plain click: opens it, no prompt
+        QTest.mouseClick(vp, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, pt0)
+        qapp.processEvents()
+        assert prompts == [], "a plain click on a locked crown asked to unlock"
+        assert dlg.panel.group == g
+
+        # 2) press + a tiny jitter (below the drag distance): still no prompt
+        QTest.mousePress(vp, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, pt0)
+        move(pt0 + QtCore.QPoint(1, 0))
+        assert prompts == []
+        QTest.mouseRelease(vp, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, pt0 + QtCore.QPoint(1, 0))
+
+        # 3) press + a real drag: asks once
+        h0 = viewer.horizontalScrollBar().value()
+        QTest.mousePress(vp, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, pt0)
+        d = QtWidgets.QApplication.startDragDistance() + 5
+        move(pt0 + QtCore.QPoint(d, 0))
+        qapp.processEvents()
+        assert len(prompts) == 1 and "locked" in prompts[0], "dragging a locked crown did not ask to unlock"
+        # the modal ate the release; the canvas must be idle, not panning
+        move(pt0 + QtCore.QPoint(d + 40, 0), buttons=QtCore.Qt.NoButton)
+        qapp.processEvents()
+        assert viewer.horizontalScrollBar().value() == h0, "the view kept panning after the prompt"
+        assert viewer._locked_drag is None and not viewer._is_panning
+        it = viewer.get_all_polygons()[0]
+        assert it.is_locked, "Cancel must leave it locked"
+    finally:
+        viewer.hide()
+        viewer._scene.clear()
+        viewer.deleteLater()

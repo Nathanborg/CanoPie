@@ -50,9 +50,21 @@ FEATURE_MAP = {
     "test_random_shapes": (
         "Random shape generation",
         "count, containment in valid area, spacing constraints, stratification"),
+    "test_polygon_menus_and_stats": (
+        "Polygon menus + Polygon Stats for selected polygons",
+        "Export Manager under Modules; viewer and Polygon Manager menus share their entries (Edit vertices / "
+        "properties, Find canopy, Lock, Polygon Stats, Polygon Info); Polygon Stats = process_polygon rows for "
+        "the selected polygons (several, viewer or manager, either path spelling); old counts = Polygon Info"),
+    "test_cog_pixel_zoom": (
+        "A COG zooms in to its real pixels",
+        "wheel and zoom bar limits are per REAL pixel (50x / 20x of the raster, not of the 1/16 preview a COG is "
+        "shown from); a plain image keeps its 50x / 20x"),
     "test_polygon_resize": (
         "Grow / shrink a polygon with + / -",
-        "stays in place on a decimated (COG) preview, keeps the record, drops stale overview, undoable"),
+        "stays in place on a decimated (COG) preview, keeps the record, drops stale overview, undoable; a "
+        "shapefile-imported crown (other path spelling) resizes in place; one shortcut per key (duplicates "
+        "made Qt swallow + / -); a moved imported crown is stored and stays put on the next + / -; a resize "
+        "saves only that crown, not the whole root (the ~1 s lag per key pause on BCI)"),
     "test_vertex_smooth_drag": (
         "Smooth vertex dragging",
         "falloff around the dragged vertex, handles follow, Shift = one vertex, [ / ] reach, throttle"),
@@ -213,7 +225,8 @@ FEATURE_MAP = {
         "saves null, counts as filled and disables the slider; per-label % filled, OK marks and the to-do list agree; "
         "values live in the polygon's properties (Edit properties shows and edits them, null survives it), survive Ctrl+Q + "
         "reopen; the current canopy is highlighted in the list, its viewer framed, arrows step its images, Next to fill; "
-        "a viewer click (locked too) opens the polygon, no prompt"),
+        "a viewer click (locked too) opens the polygon, no prompt; dragging a locked crown asks to unlock, then "
+        "the canvas is idle"),
     "test_annotator_csv_export": (
         "Annotator values in exports",
         "prop_<name> columns in the main CSV (foreground and background writers) and the ML manager's CSVs; a "
@@ -225,7 +238,8 @@ FEATURE_MAP = {
         "% as the value (remembered Always / Never skip the question); the panel is in the Annotator window, which "
         "moves off the polygon a list click zoomed to; the marked viewer strip is red while pending, green when OK; "
         "→/D and ←/A walk the polygons to fill (borrowed from root stepping while open, given back on close); a "
-        "drawing is copied from the canopy's previous image, fitted to the new crown"),
+        "drawing is copied from the canopy's previous image, fitted to the new crown; two properties' patches "
+        "never overlap (strokes and copies stay off the other property's paint)"),
     "test_locked_polygon_pan_reset": (
         "Locked polygon prompt leaves the canvas idle",
         "after Cancel / Unlock on the lock prompt the pan is not stuck (hover no longer scrolls, open-hand cursor, "

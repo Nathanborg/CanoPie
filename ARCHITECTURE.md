@@ -79,6 +79,9 @@ fast functions (wrapped in try/except — the app runs without NumExpr/Numba ins
    strip is red while anything is pending and green when complete, and "From previous image"
    copies a property's patches from the same group's latest earlier image (transfer_patches:
    source crown bbox -> target crown bbox).
+   Patches of different properties never overlap (PatchCanvas.set_blocked: the crown's other
+   properties' paint is off limits). With the Annotator open a click on a locked crown only
+   opens it; a drag past startDragDistance asks to unlock (ImageViewer._locked_drag).
 4. **ImageEditorDialog** applies non-destructive per-image edits saved as **.ax** sidecars.
 5. **MachineLearningManager** trains sklearn models from polygon labels and/or applies a
    model during CSV export. Heavy pixel math is offloaded to **performance.py** when available.

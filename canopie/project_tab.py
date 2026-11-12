@@ -6821,6 +6821,8 @@ class ProjectTab(QtWidgets.QWidget):
         self.exportManagerAct = QtWidgets.QAction("Export Manager", self)
         self.exportManagerAct.setShortcut(QKeySequence("Ctrl+E"))
         self.exportManagerAct.triggered.connect(self.show_export_manager)
+        # In the Modules dropdown; on the tab too so Ctrl+E works with it closed.
+        self.addAction(self.exportManagerAct)
 
         self.copyMetadataAct = QtWidgets.QAction("Copy Metadata", self)
         self.copyMetadataAct.triggered.connect(self.copy_metadata_action)
@@ -7152,7 +7154,6 @@ class ProjectTab(QtWidgets.QWidget):
 
         # Polygon manager + tools
         self.toolbar.addAction(self.polygonManagerAct)
-        self.toolbar.addAction(self.exportManagerAct)
         
 
         # Drawing mode toggle (cycles: Polygon > Point > Rectangle > Circle > Smart Canopy > Random Points)
@@ -7205,6 +7206,7 @@ class ProjectTab(QtWidgets.QWidget):
         modules_menu.addAction(self.showMapAct)
         modules_menu.addAction(self.machineLearningManagerAct)
         modules_menu.addAction(self.annotatorAct)
+        modules_menu.addAction(self.exportManagerAct)
         modules_menu.addAction(self.randomShapesAct)
         modules_menu.addSeparator()
         modules_menu.addAction(self.setRootOffsetAct)
@@ -33649,12 +33651,32 @@ class ProjectTab(QtWidgets.QWidget):
             else:
                 logging.debug("resize_selected_polygons not yet available; ignoring +/- key.")
 
+        # ONE shortcut per key. "-" and Qt.Key_Minus (and "+" / Qt.Key_Plus)
+        # are the SAME key sequence, so the lists below used to register each
+        # twice -- and Qt treats two shortcuts on one key as ambiguous: it
+        # fires neither (activatedAmbiguously) and swallows the key, so the
+        # viewer's own +/- handler never saw it either. Pressing + / - did
+        # nothing at all. Also guarded against a second install.
+        for old in getattr(self, "_polygon_resize_shortcuts", []) or []:
+            try:
+                old.setEnabled(False)
+                old.deleteLater()
+            except RuntimeError:
+                pass
+        self._polygon_resize_shortcuts = []
+        _seen = set()
+
         def _mk_shortcut(keys, handler):
             for k in keys:
-                sc = QtWidgets.QShortcut(QKeySequence(k), self)
+                seq = QKeySequence(k)
+                if seq.isEmpty() or seq.toString() in _seen:
+                    continue
+                _seen.add(seq.toString())
+                sc = QtWidgets.QShortcut(seq, self)
                 # FIX: use Qt.WidgetWithChildrenShortcut (QtCore), not QShortcut.WidgetWithChildrenShortcut
                 sc.setContext(Qt.WidgetWithChildrenShortcut)
                 sc.activated.connect(handler)
+                self._polygon_resize_shortcuts.append(sc)
 
         # Grow: '+', '=', numpad '+'
         _mk_shortcut(["+", "=", Qt.Key_Plus], lambda: _safe_resize(+self.polygon_resize_step))
@@ -33849,11 +33871,29 @@ class ProjectTab(QtWidgets.QWidget):
                     items_by_name.setdefault(it.name, it)
 
         n_groups = len(target_groups)
+        changed_keys = []
         if n_groups > 1:
             self.undo_stack.beginMacro(f"{'Grow' if swell else 'Shrink'} {n_groups} polygons")
         try:
             for group_name in target_groups:
-                pdata = (self.all_polygons.get(group_name, {}) or {}).get(filepath)
+                # The record may be filed under the OTHER spelling of this
+                # image's path: a shapefile import stores os.path.normpath
+                # ('C:\\Users\\x\\y.tif') while the viewer holds the
+                # project.json form ('C:/Users/x\\y.tif'). An exact .get()
+                # missed every imported crown, so +/- silently did nothing on
+                # them (the BCI project: all 3515 crowns). _poly_index_lookup
+                # is the union of both spellings -- see its docstring.
+                group_map = self.all_polygons.get(group_name, {}) or {}
+                store_key = filepath
+                pdata = group_map.get(filepath)
+                if pdata is None:
+                    try:
+                        for gn, key in self._poly_index_lookup(filepath):
+                            if gn == group_name and key in group_map:
+                                store_key, pdata = key, group_map[key]
+                                break
+                    except Exception:
+                        logging.debug("resize: index lookup failed", exc_info=True)
                 item = items_by_name.get(group_name)
                 if not pdata or item is None:
                     continue
@@ -33894,11 +33934,14 @@ class ProjectTab(QtWidgets.QWidget):
                 except Exception as e:
                     logging.debug(f"resize: could not update '{group_name}' on screen: {e}")
                     continue
-                cmd = ModifyPolygonCommand(self, group_name, filepath, group_name, old_scene, new_scene,
+                # store_key: the record (and its sidecar) must be updated under
+                # the key it lives under, not the viewer's spelling.
+                cmd = ModifyPolygonCommand(self, group_name, store_key, group_name, old_scene, new_scene,
                                            old_pts, new_pts, basis_w, basis_h)
                 cmd.setText(f"{'Grow' if swell else 'Shrink'} Polygon '{group_name}'")
                 self.undo_stack.push(cmd)
                 changed_any = True
+                changed_keys.append((group_name, store_key))
         finally:
             if n_groups > 1:
                 self.undo_stack.endMacro()
@@ -33914,8 +33957,21 @@ class ProjectTab(QtWidgets.QWidget):
                     self.update_polygon_manager()
             except Exception:
                 pass
-            if hasattr(self, "_poly_resize_save_timer"):
-                self._poly_resize_save_timer.start(400)  # debounce
+            # Save only what changed. This used to restart a debounced
+            # save_polygons_to_json(<whole root>): every pause between key
+            # presses rewrote each crown file of the root and rebuilt the
+            # overview of the whole project ON THE GUI THREAD -- ~1 s per pause
+            # on the BCI project (3515 crowns), the lag felt while resizing.
+            # ModifyPolygonCommand already wrote this crown's file; marking it
+            # dirty keeps it in the incremental save (Ctrl+Q / autosave), which
+            # also refreshes the overview, like any other edit.
+            mark = getattr(self, "_mark_polygon_dirty", None)
+            for g_key in changed_keys:
+                try:
+                    if mark is not None:
+                        mark(*g_key)
+                except Exception:
+                    logging.debug("resize: could not mark %s dirty", g_key, exc_info=True)
 
 
     # Add this tiny helper somewhere in ProjectTab (near image_to_scene_coords is fine)
@@ -34121,6 +34177,133 @@ class ProjectTab(QtWidgets.QWidget):
                 self, "Loading Error",
                 "Failed to load selected images. Ensure they are valid and accessible."
             )
+    def _stats_inputs(self, filepaths):
+        """What process_polygon needs besides the polygon, shared by the
+        viewer's Stats button and Polygon Stats: the analysis options (reused,
+        else asked once), EXIF of `filepaths` (or a placeholder), and the
+        Random Forest model when the options ask for one. None when the
+        options dialog is cancelled."""
+        from PyQt5 import QtWidgets
+        import os, logging
+
+        opts = getattr(self, "analysis_options", None)
+        if not isinstance(opts, dict):
+            dlg = AnalysisOptionsDialog(self)
+            if dlg.exec_() != QtWidgets.QDialog.Accepted:
+                return None
+            opts = dlg.get_options()
+            self.analysis_options = opts  # persist for next time
+
+        include_exif_opt = bool(opts.get("include_exif", True))
+        use_rf = bool(opts.get("use_random_forest", False))
+
+        def _normkey(p):
+            return os.path.normcase(os.path.abspath(p))
+
+        keys = [_normkey(f) for f in filepaths]
+        fake = ({k: {'FakePath': "FAKE:/ONE"} for k in keys}, ['FakePath'])
+        try:
+            if include_exif_opt:
+                with self._busy_dialog("Extracting EXIF…"):
+                    raw_exif = self._get_exif_data_with_optional_path(list(filepaths))
+                raw_exif = {_normkey(k): v for k, v in (raw_exif or {}).items()}
+                sanitized_exif, sanitized_tags = self._sanitize_exif_map_for_csv(raw_exif, keys)
+                if sanitized_tags:
+                    exif_data_dict, exif_tags = sanitized_exif, [str(t) for t in sanitized_tags]
+                else:
+                    exif_data_dict, exif_tags = fake
+            else:
+                exif_data_dict, exif_tags = fake
+        except Exception as e:
+            logging.warning(f"EXIF read failed for stats: {e}")
+            exif_data_dict, exif_tags = fake
+
+        model_loaded = False
+        if use_rf:
+            try:
+                if hasattr(ProjectTab, 'shared_random_forest_model') and ProjectTab.shared_random_forest_model is not None:
+                    self.random_forest_model = ProjectTab.shared_random_forest_model
+                    model_loaded = True
+                else:
+                    model_loaded = bool(self.load_random_forest_model())
+            except Exception as e:
+                logging.warning(f"RF model load failed for stats: {e}")
+                model_loaded = False
+        return opts, exif_data_dict, exif_tags, model_loaded
+
+    def stats_rows_for_polygons(self, pairs, inputs=None):
+        """process_polygon rows -- the CSV export's statistics -- for the given
+        (group, filepath) pairs. `filepath` may be either spelling of the
+        image path; the record is found under the key it is stored under.
+        Points and polygons alike; lists of records under one key too."""
+        import logging
+        if inputs is None:
+            inputs = self._stats_inputs(sorted({fp for _g, fp in pairs}))
+            if inputs is None:
+                return None
+        opts, exif_data_dict, exif_tags, model_loaded = inputs
+        rows_all = []
+        for group_name, filepath in pairs:
+            group_map = self.all_polygons.get(group_name, {}) or {}
+            key, entry = filepath, group_map.get(filepath)
+            if entry is None:
+                try:
+                    for gn, k in self._poly_index_lookup(filepath):
+                        if gn == group_name and k in group_map:
+                            key, entry = k, group_map[k]
+                            break
+                except Exception:
+                    pass
+            if not entry:
+                continue
+            if isinstance(entry, dict) and 'points' in entry:
+                polys = [entry]
+            else:
+                polys = [p for p in (entry.values() if isinstance(entry, dict) else entry)
+                         if isinstance(p, dict) and 'points' in p]
+            for poly in polys:
+                try:
+                    rows, _mods = self.process_polygon(
+                        group_name=group_name, filepath=key, polygon_dict=poly,
+                        exif_data_dict=exif_data_dict, exif_tags=exif_tags,
+                        model_loaded=model_loaded, opts=opts)
+                except Exception as e:
+                    logging.warning("Polygon stats failed for %s @ %s: %s", group_name, key, e)
+                    continue
+                if rows:
+                    rows_all.extend(rows)
+        return rows_all
+
+    def show_stats_for_polygons(self, pairs, title=None):
+        """"Polygon Stats" from the viewer's or the Polygon Manager's right-click
+        menu: the CSV export's statistics (process_polygon) for the selected
+        polygons only -- one or many, on one image or several."""
+        from PyQt5 import QtWidgets
+        import os
+        pairs = [(g, fp) for g, fp in pairs if g and fp]
+        if not pairs:
+            QtWidgets.QMessageBox.information(self, "Polygon Stats", "Select one or more polygons first.")
+            return None
+        inputs = self._stats_inputs(sorted({fp for _g, fp in pairs}))
+        if inputs is None:
+            return None
+        try:
+            with self._busy_dialog(f"Computing stats for {len(pairs)} polygon(s)…"):
+                rows = self.stats_rows_for_polygons(pairs, inputs=inputs)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Polygon Stats", "Failed to compute stats:\n" + str(e))
+            return None
+        if not rows:
+            QtWidgets.QMessageBox.information(self, "Polygon Stats", "No stats available for these polygons.")
+            return rows
+        if title is None:
+            groups = sorted({g for g, _fp in pairs})
+            files = sorted({os.path.basename(fp) for _g, fp in pairs})
+            title = ("Polygon Stats: " + (groups[0] if len(groups) == 1 else f"{len(groups)} polygons")
+                     + (f" @ {files[0]}" if len(files) == 1 else f" on {len(files)} images"))
+        self._show_stats_rows_dialog(rows, title=title)
+        return rows
+
     def _stats_image(self, viewer):
         """
         Compute & show stats for the image in `viewer` using the same pipeline as CSV export,
@@ -34139,57 +34322,10 @@ class ProjectTab(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "Stats", "This image path is invalid or missing.")
             return
 
-        # --------- options (reuse last, else prompt) ----------
-        opts = getattr(self, "analysis_options", None)
-        if not isinstance(opts, dict):
-            dlg = AnalysisOptionsDialog(self)
-            if dlg.exec_() != QtWidgets.QDialog.Accepted:
-                return  # cancelled
-            opts = dlg.get_options()
-            self.analysis_options = opts  # persist for next time
-
-        include_exif_opt = bool(opts.get("include_exif", True))
-        use_rf = bool(opts.get("use_random_forest", False))
-
-        # --------- EXIF for just this file ----------
-        def _normkey(p): 
-            import os
-            return os.path.normcase(os.path.abspath(p))
-
-        try:
-            if include_exif_opt:
-                with self._busy_dialog("Extracting EXIF…"):
-                    raw_exif = self._get_exif_data_with_optional_path([filepath])
-                raw_exif = {_normkey(k): v for k, v in (raw_exif or {}).items()}
-                sanitized_exif, sanitized_tags = self._sanitize_exif_map_for_csv(
-                    raw_exif, [_normkey(filepath)]
-                )
-                if sanitized_tags:
-                    exif_tags = [str(t) for t in sanitized_tags]
-                    exif_data_dict = sanitized_exif
-                else:
-                    exif_tags = ['FakePath']
-                    exif_data_dict = {_normkey(filepath): {'FakePath': "FAKE:/ONE"}}
-            else:
-                exif_tags = ['FakePath']
-                exif_data_dict = {_normkey(filepath): {'FakePath': "FAKE:/ONE"}}
-        except Exception as e:
-            logging.warning(f"EXIF read failed for stats: {e}")
-            exif_tags = ['FakePath']
-            exif_data_dict = {_normkey(filepath): {'FakePath': "FAKE:/ONE"}}
-
-        # --------- RF model (optional) ----------
-        model_loaded = False
-        if use_rf:
-            try:
-                if hasattr(ProjectTab, 'shared_random_forest_model') and ProjectTab.shared_random_forest_model is not None:
-                    self.random_forest_model = ProjectTab.shared_random_forest_model
-                    model_loaded = True
-                else:
-                    model_loaded = bool(self.load_random_forest_model())
-            except Exception as e:
-                logging.warning(f"RF model load failed for stats: {e}")
-                model_loaded = False
+        inputs = self._stats_inputs([filepath])
+        if inputs is None:
+            return  # options dialog cancelled
+        opts, exif_data_dict, exif_tags, model_loaded = inputs
 
         # --------- gather polygons for this file ----------
         polys = []  # list of (group_name, polygon_dict)
@@ -34889,8 +35025,14 @@ class ModifyPolygonCommand(QUndoCommand):
         super().__init__(f"Move Polygon '{label}'")
         self.tab = project_tab
         self.label = label
-        self.filepath = filepath
         self.group_name = group_name
+        # The key the record is STORED under, which is not always the viewer's
+        # spelling of the path: a shapefile import stores os.path.normpath
+        # ('C:\\Users\\x\\y.tif'), the viewer holds 'C:/Users/x\\y.tif'. With
+        # the viewer's spelling the exact lookup in _apply_state missed every
+        # imported crown: a drag was never stored or saved, and the next + / -
+        # (which reads the record) put the crown back where it had been.
+        self.filepath = self._storage_key(project_tab, group_name, filepath)
         self.old_points = old_points  # QPolygonF (scene coords) for UI
         self.new_points = new_points  # QPolygonF (scene coords) for UI
         self.old_img_pts = old_img_pts # [(x,y)] list for JSON
@@ -34898,6 +35040,19 @@ class ModifyPolygonCommand(QUndoCommand):
         self.eff_w = eff_w
         self.eff_h = eff_h
         self._first_run = True
+
+    @staticmethod
+    def _storage_key(tab, group_name, filepath):
+        group_map = (getattr(tab, "all_polygons", None) or {}).get(group_name) or {}
+        if filepath in group_map:
+            return filepath
+        try:
+            for gn, key in tab._poly_index_lookup(filepath):
+                if gn == group_name and key in group_map:
+                    return key
+        except Exception:
+            logging.debug("[ModifyPolygonCommand] index lookup failed", exc_info=True)
+        return filepath
 
     def redo(self):
         # On first run (initial drag end), we do NOT update visual because it is already consistent.

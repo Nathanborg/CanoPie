@@ -589,6 +589,9 @@ class PatchCanvas:
         for poly in polygons or []:
             self._fill_rings(poly, 1)
         self.mask &= self.crown
+        #: area painted for OTHER properties of this crown: never painted
+        #: here, so two properties' patches never overlap (set_blocked)
+        self.blocked = np.zeros_like(self.crown)
 
     def _to_mask(self, pts):
         import numpy as np
@@ -616,7 +619,7 @@ class PatchCanvas:
             cv2.circle(self.mask, (int(x), int(y)), r, val, -1)
             if i:
                 cv2.line(self.mask, tuple(map(int, p[i - 1])), (int(x), int(y)), val, 2 * r)
-        self.mask &= self.crown
+        self._clip()
 
     def clear(self):
         self.mask[:] = 0
@@ -625,7 +628,24 @@ class PatchCanvas:
         """Add saved patches (rings in the basis), clipped to the crown."""
         for rings in polygons or []:
             self._fill_rings(rings, 1)
+        self._clip()
+
+    def set_blocked(self, polygons):
+        """Mark the patches of the crown's OTHER properties as off limits:
+        a stroke or a copy never paints there. What this property already had
+        is left alone until it is edited."""
+        import cv2
+        self.blocked[:] = 0
+        for rings in polygons or []:
+            if not rings:
+                continue
+            cv2.fillPoly(self.blocked, [self._to_mask(rings[0])], 1)
+            for hole in rings[1:]:
+                cv2.fillPoly(self.blocked, [self._to_mask(hole)], 0)
+
+    def _clip(self):
         self.mask &= self.crown
+        self.mask &= (1 - self.blocked)
 
     @property
     def fraction(self):
@@ -742,7 +762,7 @@ class PatchBrush(QtCore.QObject):
 
     changed = QtCore.pyqtSignal(float)      # painted fraction of the crown
 
-    def __init__(self, viewer, record, prop, color, radius_screen=20.0, parent=None):
+    def __init__(self, viewer, record, prop, color, radius_screen=20.0, parent=None, blocked=None):
         super().__init__(parent)
         self.viewer = viewer
         self.record = record
@@ -756,6 +776,8 @@ class PatchBrush(QtCore.QObject):
             self.basis = (float(hw[1]), float(hw[0])) if hw and hw[0] else _pixmap_wh(viewer)
         existing = ((record.get(PATCHES_KEY) or {}).get(prop["name"]) or {}).get("polygons")
         self.canvas = PatchCanvas(record.get("points") or [], existing)
+        # other properties' patches on this crown: never painted over
+        self.canvas.set_blocked(blocked)
         self._stroke = None
         self._erase = False
         col = QtGui.QColor(color)
@@ -2062,6 +2084,17 @@ class Annotator(PolygonManager):
             viewer.scene().addItem(item)
             self._patch_items.append(item)
 
+    def _other_patches(self, rec, name):
+        """Polygons painted on this crown for the OTHER current properties:
+        a drawing never overlaps them. Leftovers of removed properties are
+        not counted."""
+        live = {p["name"] for p in self.store.properties} - {name}
+        out = []
+        for n, entry in ((rec or {}).get(PATCHES_KEY) or {}).items():
+            if n in live and entry:
+                out.extend(entry.get("polygons") or [])
+        return out
+
     def _on_brush_size(self, px):
         self._brush_size = int(px)
         if self._brush is not None:
@@ -2136,7 +2169,8 @@ class Annotator(PolygonManager):
             return False
         try:
             self._brush = PatchBrush(viewer, rec, prop, self._patch_color(pid),
-                                     radius_screen=self._brush_size, parent=self)
+                                     radius_screen=self._brush_size, parent=self,
+                                     blocked=self._other_patches(rec, prop["name"]))
         except ValueError as e:
             self.panel.set_drawing(None)
             self.hint.setText(f"Cannot draw on this polygon: {e}")

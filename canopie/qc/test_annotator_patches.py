@@ -369,3 +369,44 @@ def test_arrow_and_a_d_keys_walk_the_polygons_to_fill(project_tab, qapp):
     assert pt.rightKeyAct.shortcut().toString() == "D"
     assert pt.nextAct.shortcut().toString() == "Right"
     assert pt.prevAct.shortcut().toString() == "Left"
+
+
+def test_other_properties_patches_are_never_painted_over():
+    c = PatchCanvas(SQUARE)
+    fruit = PatchCanvas(SQUARE)
+    fruit.add_stroke([(50, 50)], radius=20)
+    c.set_blocked(fruit.polygons())
+    c.add_stroke([(10, 50), (90, 50)], radius=10)        # a band right through the fruit patch
+    overlap = (c.mask & fruit.mask).sum() / max(1, fruit.mask.sum())
+    assert overlap < 0.02, f"the drawing covers {overlap:.0%} of another property's patch"
+    assert c.mask.any(), "outside the other patch, painting must still work"
+    c.add_polygons([[[[0, 0], [100, 0], [100, 100], [0, 100]]]])   # a copy over everything
+    assert (c.mask & fruit.mask).sum() / max(1, fruit.mask.sum()) < 0.02, "a copy painted over it"
+
+
+def test_brush_keeps_two_properties_apart(project_tab, qapp):
+    pt = project_tab
+    g, fp, rec, viewer, w = _crown(pt)
+    saved_widgets = pt.viewer_widgets
+    pt.viewer_widgets = [w]
+    try:
+        dlg = pt.show_annotator()
+        flower = dlg.store.add_property("flower", KIND_NUMERIC, patch_sets_value=False)
+        fruit = dlg.store.add_property("fruit", KIND_NUMERIC, patch_sets_value=False)
+        dlg.open_polygon(g, fp, navigate=False)
+        cx, cy = np.asarray(rec["points"], dtype=float).mean(axis=0)
+        dlg.panel.brush_slider.setValue(8)
+        dlg.start_drawing(flower)
+        _drag(viewer, [(cx, cy)])
+        dlg.finish_drawing()
+        dlg.start_drawing(fruit)
+        _drag(viewer, [(cx - 6, cy), (cx + 6, cy)])           # across the flower patch
+        dlg.finish_drawing()
+        a = PatchCanvas(rec["points"], rec[PATCHES_KEY]["flower"]["polygons"])
+        b = PatchCanvas(rec["points"], rec[PATCHES_KEY]["fruit"]["polygons"])
+        assert a.mask.any() and b.mask.any()
+        assert (a.mask & b.mask).sum() / max(1, a.mask.sum()) < 0.05, "flower and fruit patches overlap"
+    finally:
+        pt.viewer_widgets = saved_widgets
+        w["container"].hide()
+        w["container"].deleteLater()

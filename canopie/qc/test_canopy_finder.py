@@ -437,13 +437,16 @@ def test_both_menus_offer_the_finder(geo_project, monkeypatch, qapp):
     item = next(p["item"] for p in v.polygons if getattr(p.get("item"), "name", "") == "crown")
     item.contextMenuEvent(None)
     acts = seen[-1]
-    assert acts.index("Find canopy in other images…") == acts.index("Edit all polygons in this group") + 1
+    # The viewer and Polygon Manager menus share one order for their edit
+    # entries: ... Edit vertices, Edit properties, Find canopy (see
+    # test_polygon_menus_and_stats.py).
+    assert acts.index("Find canopy in other images…") == acts.index("Edit properties") + 1
     pm = pt.polygon_manager
     pt.show_polygon_manager()
     lw = pm.list_widget
     row = next(i for i in range(lw.count()) if lw.item(i).data(0x0100) == "crown")
     pm.show_context_menu(lw.visualItemRect(lw.item(row)).center())
-    assert seen[-1].index("Find canopy in other images…") == seen[-1].index("Edit") + 1
+    assert seen[-1].index("Find canopy in other images…") == seen[-1].index("Edit properties") + 1
     pm.hide()
 
 
