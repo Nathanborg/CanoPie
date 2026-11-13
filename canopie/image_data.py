@@ -62,6 +62,13 @@ from .utils import *
 class ImageData:
     def __init__(self, filepath, mode='dual_folder'):
         self.filepath = filepath
+        # A .cogref is a JSON pointer to a remote COG, not pixels: only the
+        # windowed reader (ProjectTab._imagedata_or_fallback -> raster_reader)
+        # can open it. Say so instead of "could not read image file".
+        if str(filepath).lower().endswith(".cogref"):
+            raise ValueError(
+                f"{os.path.basename(filepath)} is a pointer to a remote image (.cogref); "
+                f"it opens through the tiled reader, not as a whole image file")
         # PERF FIX: cv2.imread is faster (uses libtiff directly for TIFFs).
         # Only use np.fromfile+imdecode for paths with non-ASCII chars (Windows Unicode fix).
         try:

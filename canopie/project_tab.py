@@ -2985,9 +2985,31 @@ def _preview_budget_bytes(profile, n_bands):
     return int(min(_PREVIEW_LOAD_THRESHOLD_BYTES, _PREVIEW_MAX_PIXELS * max(1, int(n_bands)) * itemsize))
 
 
+def _drop_remote_for_exif(paths):
+    """``paths`` without remote images (.cogref): exiftool needs a local file,
+    and handed the pointer it would report the JSON file's own metadata. Each
+    call that drops any says so in the log, naming the files."""
+    from .remote_raster import is_cogref, not_supported_message
+    paths = list(paths or [])
+    remote = [p for p in paths if is_cogref(p)]
+    if remote:
+        logging.warning("[exif] %s (%d remote file(s) skipped: %s%s)",
+                        not_supported_message("EXIF", remote[0]), len(remote),
+                        ", ".join(os.path.basename(p) for p in remote[:5]),
+                        " ..." if len(remote) > 5 else "")
+        paths = [p for p in paths if not is_cogref(p)]
+    return paths
+
+
 def _wants_preview(profile):
-    """Load a preview (not the whole raster) for this windowable TIFF?"""
+    """Load a preview (not the whole raster) for this windowable TIFF?
+
+    Always for a remote (.cogref) file: the whole-file loaders (tifffile,
+    cv2) need a local file, and the preview path reads only the tiles of one
+    pyramid level -- the full-resolution detail comes from the zoom tiles."""
     try:
+        if getattr(profile, "remote", False):
+            return True
         return bool(profile.bytes_if_fully_loaded > _PREVIEW_LOAD_THRESHOLD_BYTES
                     or int(profile.width) * int(profile.height) > _PREVIEW_MAX_PIXELS)
     except Exception:
@@ -6018,7 +6040,7 @@ class ProjectTab(QtWidgets.QWidget):
         md = event.mimeData()
         if not md.hasUrls():
             event.ignore(); return
-        exts = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}
+        exts = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.cogref'}
         for u in md.urls():
             p = u.toLocalFile()
             if os.path.isdir(p) or os.path.splitext(p.lower())[1] in exts:
@@ -6185,7 +6207,7 @@ class ProjectTab(QtWidgets.QWidget):
 
         # --- 0) Oversized cube: display a 3-band preview instead of decoding it all ---
         preview_err = None
-        if ext in (".tif", ".tiff"):
+        if ext in (".tif", ".tiff", ".cogref"):
             try:
                 from .raster_reader import probe as _probe, open_reader as _open_reader
                 profile = _probe(filepath)
@@ -6226,6 +6248,14 @@ class ProjectTab(QtWidgets.QWidget):
             except Exception as e:
                 preview_err = e
                 logging.warning("Preview load failed for '%s', falling back: %s", filepath, e)
+
+        # A remote image (.cogref pointer) has no whole-file fallback: tifffile
+        # and cv2 below would only read the small JSON pointer. Say why it failed.
+        if ext == ".cogref":
+            from .raster_reader import last_probe_error as _last_probe_error
+            why = preview_err or _last_probe_error(filepath) or (
+                "not a tiled TIFF that can be read window by window")
+            raise RuntimeError(f"{os.path.basename(filepath)}: cannot open the remote image: {why}")
 
         # --- 1) TIFF preflight: if it's a real stack, go straight to tifffile ---
         if ext in (".tif", ".tiff") and _tifffile_is_stack(filepath):
@@ -6422,6 +6452,7 @@ class ProjectTab(QtWidgets.QWidget):
         """
         import os, logging
 
+        files = _drop_remote_for_exif(files)
         if not files:
             return {}
 
@@ -12404,7 +12435,7 @@ class ProjectTab(QtWidgets.QWidget):
         self.current_folder_path = rgb_folder
 
         # Load RGB image file paths
-        image_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')  # Add more if needed
+        image_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.cogref')  # .cogref: remote COG pointer
         all_images = [
             os.path.join(rgb_folder, f) for f in os.listdir(rgb_folder)
             if f.lower().endswith(image_extensions)
@@ -12497,7 +12528,7 @@ class ProjectTab(QtWidgets.QWidget):
         self.current_folder_path = rgb_folder
 
         # Scan images
-        image_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')
+        image_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.cogref')
         all_images = [os.path.join(rgb_folder, f) for f in os.listdir(rgb_folder)
                       if f.lower().endswith(image_extensions)]
         all_images.sort()
@@ -12573,9 +12604,10 @@ class ProjectTab(QtWidgets.QWidget):
         import os, json, time, shutil, subprocess, logging
         from PyQt5 import QtWidgets, QtCore
 
-        def _normkey(p):  
+        def _normkey(p):
             return os.path.normcase(os.path.abspath(p))
 
+        paths = _drop_remote_for_exif(paths)
         total = len(paths)
         exe = getattr(self, "exiftool_path", None) or "exiftool"
         have = bool(shutil.which(exe))
@@ -12771,6 +12803,8 @@ class ProjectTab(QtWidgets.QWidget):
             dlg.close()   
     def _extract_exif_for_file(self, filepath, exif_tags):
         """Uses your existing EXIF method if present; falls back to exiftool JSON."""
+        if not _drop_remote_for_exif([filepath]):
+            return {}
         # If you already have a reader, use it
         if hasattr(self, "_read_exif_tags"):
             try:
@@ -19881,10 +19915,19 @@ class ProjectTab(QtWidgets.QWidget):
         # ---------- export pass ----------
         source_files, target_files = [], []
         ok = fail = 0
+        from .remote_raster import is_cogref as _is_cogref, not_supported_message as _remote_msg
+        remote_skipped = []
 
         with self._busy_dialog("Exporting images…"):
             for fp in filepaths:
                 QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents)
+                if _is_cogref(fp):
+                    # Remote images are not exported (this would read the
+                    # whole remote file); counted and named in the report.
+                    logging.error("[export_project_images] %s", _remote_msg("Export Project Images", fp))
+                    remote_skipped.append(os.path.basename(fp))
+                    fail += 1
+                    continue
                 raw, src_order = _read_raw_any(fp)
                 if raw is None:
                     fail += 1
@@ -20024,6 +20067,10 @@ class ProjectTab(QtWidgets.QWidget):
             msg += "\nEXIF copy skipped by user."
         if fail:
             msg += f"\nFailed: {fail}"
+        if remote_skipped:
+            msg += (f"\nNot exported: {len(remote_skipped)} remote image(s) (.cogref) -- exporting "
+                    f"is not available for remote images in this version: "
+                    + ", ".join(remote_skipped[:5]) + (" ..." if len(remote_skipped) > 5 else ""))
         # Surface appended-band failures that _apply_ax_to_raw swallows
         # internally (see _record_appended_band_error) -- a classification/
         # boolean/band-expression band appended in the editor silently
@@ -20062,6 +20109,19 @@ class ProjectTab(QtWidgets.QWidget):
             import cv2
 
             filepath = os.fspath(filepath)
+
+            # Remote images (.cogref) are view-only in this version: CSV/ML
+            # export and Inspect read through here, and are refused with the
+            # reason rather than handed a JSON pointer to decode.
+            from .remote_raster import is_cogref as _is_cogref
+            if _is_cogref(filepath):
+                from .remote_raster import not_supported_message as _remote_msg
+                msg = _remote_msg("Analysis and export (CSV, ML, Inspect)", filepath)
+                logging.error("[_get_export_image] %s", msg)
+                if not hasattr(self, "_export_errors"):
+                    self._export_errors = {}
+                self._export_errors[os.path.normcase(os.path.abspath(filepath))] = msg
+                return None, {"error": msg}
 
             # ---------- cache keyed by image & .ax mtimes ----------
             # RAM FIX: byte-budgeted (was an uncapped plain dict, and its own
@@ -32630,7 +32690,7 @@ class ProjectTab(QtWidgets.QWidget):
 
         # Fallback: scan disk only if memory was empty (e.g. first-time open)
         if not all_images:
-            image_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')
+            image_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.cogref')
             all_images = [
                 os.path.join(folder_path, f)
                 for f in os.listdir(folder_path)
@@ -32753,7 +32813,7 @@ class ProjectTab(QtWidgets.QWidget):
 
         # 6) Fallback to disk scan ONLY if memory was empty (e.g. different folder)
         if not all_images:
-            image_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.PNG', '.JPG', '.JPEG', '.BMP', '.TIF', '.TIFF')
+            image_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.cogref', '.PNG', '.JPG', '.JPEG', '.BMP', '.TIF', '.TIFF', '.COGREF')
             all_images = [
                 os.path.join(folder_path, f)
                 for f in sorted(os.listdir(folder_path))
@@ -33019,8 +33079,8 @@ class ProjectTab(QtWidgets.QWidget):
             
             # Fallback to disk scan
             if not all_images:
-                image_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', 
-                                   '.PNG', '.JPG', '.JPEG', '.BMP', '.TIF', '.TIFF')
+                image_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.cogref',
+                                   '.PNG', '.JPG', '.JPEG', '.BMP', '.TIF', '.TIFF', '.COGREF')
                 try:
                     all_images = [
                         os.path.join(self.current_folder_path, f)
@@ -34176,7 +34236,7 @@ class ProjectTab(QtWidgets.QWidget):
         last_batch_size = settings.value("last_batch_size", 10, type=int)  # default 10
 
         # --- Fast multi-file dialog (native) ---
-        filters = "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff);;All Files (*)"
+        filters = "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.cogref);;All Files (*)"
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self, "Select Images", initial_dir or os.path.expanduser("~"), filters
         )
@@ -34808,7 +34868,7 @@ class ImagePickerDialog(QtWidgets.QDialog):
         self.model = QtWidgets.QFileSystemModel(self)
         self.model.setRootPath(start_dir)
         # Only show images
-        self.model.setNameFilters(["*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tif", "*.tiff"])
+        self.model.setNameFilters(["*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tif", "*.tiff", "*.cogref"])
         self.model.setNameFilterDisables(False)
         self.model.setFilter(QtCore.QDir.Files | QtCore.QDir.NoDotAndDotDot)
 

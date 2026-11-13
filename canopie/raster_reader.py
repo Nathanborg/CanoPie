@@ -51,12 +51,36 @@ except Exception:  # pragma: no cover - tifffile is a hard requirement in practi
     tifffile = None
     _TIFFFILE_AVAILABLE = False
 
+from .remote_raster import is_cogref, open_pointer
+
+#: Extensions probe() plans for. ``.cogref`` is a pointer to a remote COG
+#: (see remote_raster): the header and tiles come over HTTP Range requests.
+_TIFF_EXTS = (".tif", ".tiff", ".cogref")
+
+# The last reason probe() could not open a remote file, by path, so the
+# loader can say why instead of falling through to a reader that cannot work.
+_REMOTE_ERRORS = OrderedDict()
+
+
+def last_probe_error(path):
+    """Why the last probe() of this remote (.cogref) path failed, or None."""
+    return _REMOTE_ERRORS.get(os.path.normcase(os.path.abspath(str(path))))
+
+
+def _tiff_source(path):
+    """What to hand tifffile.TiffFile: the path itself, or for a ``.cogref``
+    a RangeFile on the remote COG (a fresh handle on the shared source)."""
+    if is_cogref(path):
+        return open_pointer(path)
+    return path
+
 
 __all__ = [
     "RasterProfile",
     "TiledRasterReader",
     "LazyChannels",
     "probe",
+    "last_probe_error",
     "open_reader",
     "clear_reader_cache",
     "read_preview",
@@ -78,9 +102,9 @@ def axes_for(path):
     if not _TIFFFILE_AVAILABLE:
         return None
     try:
-        if os.path.splitext(str(path))[1].lower() not in (".tif", ".tiff"):
+        if os.path.splitext(str(path))[1].lower() not in _TIFF_EXTS:
             return None
-        with tifffile.TiffFile(path) as tf:
+        with tifffile.TiffFile(_tiff_source(path)) as tf:
             return (tf.series[0].axes or "").upper() or None
     except Exception:
         return None
@@ -174,6 +198,10 @@ def _cpu_workers(default=12):
 # those was slower than 1 (8.4 s). Concurrency therefore follows tile size.
 _INFLIGHT_TILE_BYTES = 192 * 1024 * 1024
 
+# read_bands_full on a remote file fetches the whole level in one batch (one
+# set of parallel requests) when its decoded tiles fit in this much memory.
+_REMOTE_PREFETCH_BYTES = 128 * 1024 * 1024
+
 
 def workers_for_tile_bytes(tile_bytes, cap=None):
     """Thread count for decoding tiles of the given decoded size."""
@@ -199,6 +227,9 @@ class RasterProfile:
         "tiled", "tile_w", "tile_h", "planar", "compression", "predictor",
         "n_levels", "level_shapes", "band_names", "wavelengths", "nodata",
         "epsg", "transform", "strategy", "channel_origin",
+        # remote: True for a .cogref (pixels come over HTTP); source: the
+        # remote file's display name (never carries an API key).
+        "remote", "source",
     )
 
     def __init__(self, **kw):
@@ -379,9 +410,10 @@ def _parse_geo(page):
     return epsg, transform
 
 
-def _choose_strategy(page, tiled, planar):
+def _choose_strategy(page, tiled, planar, remote=False):
     try:
-        if page.is_memmappable:
+        # A remote file has nothing to map; its tiles/strips are read instead.
+        if not remote and page.is_memmappable:
             return STRATEGY_MEMMAP
     except Exception:
         pass
@@ -404,11 +436,14 @@ def probe(path):
     if not _TIFFFILE_AVAILABLE:
         return None
     ext = os.path.splitext(str(path))[1].lower()
-    if ext not in (".tif", ".tiff"):
+    if ext not in _TIFF_EXTS:
         return None
 
+    remote = is_cogref(path)
+    err_key = os.path.normcase(os.path.abspath(str(path)))
     try:
-        with tifffile.TiffFile(path) as tf:
+        source = _tiff_source(path)
+        with tifffile.TiffFile(source) as tf:
             series = tf.series[0]
             page = tf.pages[0]
 
@@ -451,11 +486,13 @@ def probe(path):
             nodata = _parse_nodata(page)
             epsg, transform = _parse_geo(page)
 
-            strategy = _choose_strategy(page, tiled, planar)
+            strategy = _choose_strategy(page, tiled, planar, remote=remote)
             # Multi-page band stacks do not fit the single-page segment math below.
             if len(tf.pages) > 1 and count == len(tf.pages) and strategy != STRATEGY_MEMMAP:
                 strategy = STRATEGY_FULL
 
+            if remote:
+                _REMOTE_ERRORS.pop(err_key, None)
             return RasterProfile(
                 path=os.path.abspath(str(path)),
                 width=width, height=height, count=count,
@@ -470,9 +507,19 @@ def probe(path):
                 strategy=strategy,
                 # tifffile hands back native band order; cv2 would hand back BGR.
                 channel_origin="tifffile",
+                remote=remote,
+                source=getattr(source, "url", None) if remote else None,
             )
     except Exception as exc:
-        logging.debug("probe failed for %s: %s", path, exc)
+        if remote:
+            # A network or pointer problem is the user's to fix: keep the
+            # reason for the loader's error message, and log it.
+            _REMOTE_ERRORS[err_key] = str(exc)
+            while len(_REMOTE_ERRORS) > 64:
+                _REMOTE_ERRORS.popitem(last=False)
+            logging.warning("remote probe failed for %s: %s", os.path.basename(str(path)), exc)
+        else:
+            logging.debug("probe failed for %s: %s", path, exc)
         return None
 
 
@@ -738,7 +785,12 @@ class TiledRasterReader:
             raise RuntimeError("tifffile is required for TiledRasterReader")
         self.profile = profile
         self.path = profile.path
-        self._tf = tifffile.TiffFile(self.path)
+        # A .cogref is a pointer to a remote COG: the header parse and every
+        # tile read go through one RangeFile (HTTP Range requests) instead of
+        # open(path). self.path stays the pointer's path -- it is the image's
+        # identity everywhere else in CanoPie (caches, sidecars, .ax files).
+        self._remote = open_pointer(self.path) if is_cogref(self.path) else None
+        self._tf = tifffile.TiffFile(self._remote.clone() if self._remote is not None else self.path)
         self._series = self._tf.series[0]
         self._local = threading.local()
         self._lock = threading.Lock()
@@ -760,7 +812,7 @@ class TiledRasterReader:
             _ = lv["page"].decode
 
         self._memmap = None
-        if profile.strategy == STRATEGY_MEMMAP:
+        if profile.strategy == STRATEGY_MEMMAP and self._remote is None:
             try:
                 self._memmap = tifffile.memmap(self.path)
             except Exception as exc:
@@ -922,10 +974,14 @@ class TiledRasterReader:
         return pool
 
     def _handle(self):
-        """One file handle per thread; reused across tiles."""
+        """One file handle per thread; reused across tiles. For a remote file
+        each thread gets its own RangeFile clone (own position, shared cache)."""
         fh = getattr(self._local, "fh", None)
         if fh is None or fh.closed:
-            fh = open(self.path, "rb", buffering=0)
+            if self._remote is not None:
+                fh = self._remote.clone()
+            else:
+                fh = open(self.path, "rb", buffering=0)
             self._local.fh = fh
             with self._lock:
                 self._handles.append(fh)
@@ -941,7 +997,9 @@ class TiledRasterReader:
         _TILE_CACHE.put(key, arr)
         return arr
 
-    def _decode_uncached(self, level, seg_index):
+    def _decode_uncached(self, level, seg_index, raw=None):
+        """Decode one segment. ``raw`` is its compressed bytes when the caller
+        already has them (a remote batch fetched by _decode_many)."""
         lv = self._levels[level]
         offset = lv["offsets"][seg_index]
         nbytes = lv["counts"][seg_index]
@@ -949,9 +1007,16 @@ class TiledRasterReader:
             shape = (lv["th"], lv["tw"]) if lv["planar"] == 2 else (lv["th"], lv["tw"], lv["count"])
             arr = np.zeros(shape, dtype=self.profile.dtype)
         else:
-            fh = self._handle()
-            fh.seek(offset)
-            raw = fh.read(nbytes)
+            if raw is None:
+                if self._remote is not None:
+                    raw = self._remote.pread(offset, nbytes, cached=False)
+                else:
+                    fh = self._handle()
+                    fh.seek(offset)
+                    raw = fh.read(nbytes)
+            if self._remote is not None and len(raw) != nbytes:
+                raise IOError("{}: tile {} at level {}: got {} of {} bytes".format(
+                    os.path.basename(self.path), seg_index, level, len(raw), nbytes))
             data = lv["page"].decode(raw, seg_index, **lv.get("decode_kwargs", {}))[0]
             arr = self._normalise_segment(np.asarray(data), lv)
         return arr
@@ -1020,8 +1085,19 @@ class TiledRasterReader:
         todo.sort(key=lambda i: lv["offsets"][i])
         lock = threading.Lock()
 
+        # Remote: fetch every compressed tile of this batch first, with
+        # adjacent tiles merged into one Range request and separate requests
+        # in parallel. One request per tile would pay a network round trip
+        # each -- a 6x6-tile preview row by row is 36 of them.
+        raws = {}
+        if self._remote is not None and len(todo) > 1:
+            fetch = [i for i in todo if lv["counts"][i]]
+            got = self._remote.read_ranges(
+                [(int(lv["offsets"][i]), int(lv["counts"][i])) for i in fetch])
+            raws = dict(zip(fetch, got))
+
         def run(chunk):
-            local = [(i, self._decode_uncached(level, i)) for i in chunk]
+            local = [(i, self._decode_uncached(level, i, raws.get(i))) for i in chunk]
             with lock:
                 result.update(local)
 
@@ -1219,6 +1295,22 @@ class TiledRasterReader:
         out = np.empty((len(bands), out_h, out_w), dtype=self.profile.dtype)
         workers = lv["workers"]
 
+        def _row_segs(tr):
+            if lv["planar"] == 2:
+                return [self._segment_index(lv, b, tr, tc)
+                        for b in bands for tc in range(lv["across"])]
+            return [self._segment_index(lv, 0, tr, tc) for tc in range(lv["across"])]
+
+        # Remote: one batch for the whole level when it is small (a preview
+        # level usually is), so every tile row is requested at once instead of
+        # one round trip per row.
+        prefetched = None
+        if self._remote is not None:
+            n_planes = len(bands) if lv["planar"] == 2 else 1
+            if lv["tile_bytes"] * lv["across"] * lv["down"] * n_planes <= _REMOTE_PREFETCH_BYTES:
+                prefetched = self._decode_many(
+                    level, [s for tr in range(lv["down"]) for s in _row_segs(tr)], workers)
+
         # Walk tile rows so only one row of tiles is resident at a time.
         for tr in range(lv["down"]):
             ty0 = tr * lv["th"]
@@ -1230,12 +1322,8 @@ class TiledRasterReader:
             # every step-th row and column from (sy0, sx0): a strided view, not
             # an np.ix_ gather (that copied every patch, per band, per tile)
             rsl = slice(sy0 - ty0, ty1 - ty0, step)
-            if lv["planar"] == 2:
-                seg = [self._segment_index(lv, b, tr, tc)
-                       for b in bands for tc in range(lv["across"])]
-            else:
-                seg = [self._segment_index(lv, 0, tr, tc) for tc in range(lv["across"])]
-            decoded = self._decode_many(level, seg, workers)
+            decoded = prefetched if prefetched is not None \
+                else self._decode_many(level, _row_segs(tr), workers)
             for tc in range(lv["across"]):
                 tx0 = tc * lv["tw"]
                 tx1 = min(lv["width"], tx0 + lv["tw"])
@@ -1285,8 +1373,18 @@ class TiledRasterReader:
             self._tf.close()
         except Exception:
             pass
+        if self._remote is not None:
+            self._remote.close()       # this handle only; the shared source stays
         self._memmap = None
         _TILE_CACHE.drop_path(self.path)
+
+    @property
+    def is_remote(self):
+        return self._remote is not None
+
+    def remote_stats(self):
+        """HTTP counters for a remote file (requests, bytes_fetched, ...), else None."""
+        return self._remote.stats() if self._remote is not None else None
 
     def __enter__(self):
         return self
