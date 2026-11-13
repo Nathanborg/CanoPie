@@ -525,9 +525,9 @@ def test_project_tab_opens_a_cogref_as_a_windowed_preview(served, synthetic_proj
     want = served["pyr"][..., list(lite.preview_bands)]
     assert np.array_equal(lite.image, want)
 
-    # analysis/export and EXIF say no, with the reason
+    # analysis reads it window by window; EXIF still says no
     img, info = pt._get_export_image(ref)
-    assert img is None and "not available for remote images" in info["error"]
+    assert img is not None and info.get("lazy"), info
     from ..project_tab import _drop_remote_for_exif
     assert _drop_remote_for_exif([ref, local]) == [local]
 
@@ -843,3 +843,220 @@ def test_a_superseded_zoom_request_never_reads(served, synthetic_project, monkey
     _, ref = served["refs"]["pyr"]
     assert _zoom_request(synthetic_project, ref, monkeypatch, request_id=1, current_id=2) == []
     assert _zoom_request(synthetic_project, ref, monkeypatch, request_id=3, current_id=3) == [1]
+
+
+
+# --------------------------------------------------------------------------
+# Analysis on remote images: CSV, Inspect, ML -- the same numbers as local
+# --------------------------------------------------------------------------
+
+ANALYSIS_FIXTURES = ["hyperspectral_200band", "ax_crop_nodata_source", "rgb_16bit_tiled_bip_cog"]
+STATS_COLS = ("Mean", "Median", "Standard Deviation", "Q25", "Q75", "Pixel Count")
+
+
+@pytest.fixture(scope="module")
+def fixture_server(fixtures_ready):
+    from .fixtures_manifest import FIXTURE_IMAGES_DIR
+    srv = _start_server(FIXTURE_IMAGES_DIR)
+    yield srv
+    srv.shutdown()
+    srv.server_close()
+
+
+def _remote_twin(fixture_server, name, tmp_path):
+    """A .cogref for a QC fixture, served over HTTP, with its .ax beside it."""
+    import shutil
+    from .fixtures_manifest import fixture_image_path
+    fp = fixture_image_path(name)
+    stem = os.path.splitext(os.path.basename(fp))[0]
+    ref = str(tmp_path / (stem + ".cogref"))
+    rm.write_pointer(ref, fixture_server.base + os.path.basename(fp), size=os.path.getsize(fp))
+    ax = os.path.join(os.path.dirname(fp), stem + ".ax")
+    if os.path.exists(ax):
+        shutil.copy(ax, str(tmp_path / (stem + ".ax")))
+    return fp, ref
+
+
+def _clear_analysis_caches(pt):
+    for attr in ("_export_image_cache", "_export_cache", "_per_band_nd_cache", "_master_nd_cache",
+                 "_scene_stats_cache"):
+        c = getattr(pt, attr, None)
+        if hasattr(c, "clear"):
+            c.clear()
+
+
+def _csv_rows(pt, name, fp):
+    from .fixtures_manifest import get_fixture
+    from .project_builder import polygon_group_name
+    spec = get_fixture(name)
+    group = polygon_group_name(name, spec["polygon"]["name"])
+    poly = pt.all_polygons[group][fixture_image_path_of(name)]
+    rows, _ = pt.process_polygon(group, fp, poly, {}, [], False,
+                                 opts={"stats": {"mean": True, "median": True, "std": True,
+                                                 "quantiles": [25, 75]}})
+    return {r.get("Channel"): r for r in rows if isinstance(r, dict)}
+
+
+def fixture_image_path_of(name):
+    from .fixtures_manifest import fixture_image_path
+    return fixture_image_path(name)
+
+
+@pytest.mark.extraction
+@pytest.mark.parametrize("name", ANALYSIS_FIXTURES)
+def test_csv_statistics_of_a_remote_image_equal_the_local_ones(
+        name, synthetic_project, fixture_server, tmp_path, monkeypatch):
+    """Same polygon, same file: read from disk and streamed over HTTP. The
+    remote file always takes the windowed path; it must give the numbers the
+    local file gives on its own path (whole read for these small files)."""
+    pt = synthetic_project
+    fp, ref = _remote_twin(fixture_server, name, tmp_path)
+    _clear_analysis_caches(pt)
+    local = _csv_rows(pt, name, fp)
+    _clear_analysis_caches(pt)
+    remote = _csv_rows(pt, name, ref)
+    assert local and set(local) == set(remote), (set(local), set(remote))
+    for ch in local:
+        for col in STATS_COLS:
+            if col in local[ch]:
+                assert remote[ch].get(col) == pytest.approx(local[ch][col], rel=1e-6, abs=1e-6), \
+                    f"{name}/{ch} {col}: local {local[ch][col]} remote {remote[ch].get(col)}"
+    img, info = pt._get_export_image(ref)
+    assert info.get("lazy") and hasattr(img, "prefetch"), "a remote image must be read window by window"
+
+
+@pytest.mark.extraction
+def test_the_analysis_image_inspect_reads_is_the_same(synthetic_project, fixture_server, tmp_path, monkeypatch):
+    """Inspect, CSV and ML read _get_export_image: a remote image's windows
+    equal the local file's windowed analysis image, band for band."""
+    from .. import project_tab as ptm
+    pt = synthetic_project
+    fp, ref = _remote_twin(fixture_server, "ax_crop_nodata_source", tmp_path)
+    monkeypatch.setattr(ptm, "_EXPORT_LAZY_THRESHOLD_BYTES", 1)        # local lazy too
+    _clear_analysis_caches(pt)
+    a, ia = pt._get_export_image(fp)
+    _clear_analysis_caches(pt)
+    b, ib = pt._get_export_image(ref)
+    assert ia["layout"].names() == ib["layout"].names() and (ia["H"], ia["W"]) == (ib["H"], ib["W"])
+    for win in ((0, 0, ia["W"], ia["H"]), (3, 5, 17, 21)):
+        wa, wb = a.read_window(*win), b.read_window(*win)
+        for k, (x, y) in enumerate(zip(wa, wb)):
+            assert np.array_equal(x, y, equal_nan=True), f"band {k} differs in window {win}"
+
+
+@pytest.mark.ml
+def test_ml_training_rows_from_a_remote_image_equal_the_local_ones(
+        synthetic_project, ml_manager_factory, fixture_server, tmp_path):
+    from .fixtures_manifest import get_fixture
+    from .project_builder import polygon_group_name
+    name = "rgb_16bit_tiled_bip_cog"
+    pt = synthetic_project
+    fp, ref = _remote_twin(fixture_server, name, tmp_path)
+    spec = get_fixture(name)
+    group = polygon_group_name(name, spec["polygon"]["name"])
+    mgr = ml_manager_factory(pt)
+    pbg = mgr._snapshot_polygons_by_group([group])
+    pbg_remote = {group: {ref: pbg[group][fp]}}
+
+    def sample(path, polys):
+        _clear_analysis_caches(pt)
+        img, _c = mgr._get_export_image(path)
+        assert img is not None, path
+        xr, yr, *_rest = mgr._sample_training_file(
+            group, path, img, polys, selected_band_indices=[0, 1, 2], selected_expressions=[],
+            window_size=1, samples_per_poly=10 ** 9, num_features=3,
+            augmentation_cfg={"enabled": False}, augmentation_enabled=False,
+            n_variants=1, rng=np.random.default_rng(0))
+        return np.asarray(xr, dtype=np.float64).reshape(-1, 3), list(yr)
+
+    xl, yl = sample(fp, pbg)
+    xr_, yr_ = sample(ref, pbg_remote)
+    assert len(xl) > 0 and xl.shape == xr_.shape and yl == yr_
+    assert np.array_equal(xl, xr_)
+    # the manager's entry loop goes through the prefetcher, unchanged in order
+    entries = [(group, ref), (group, fp), (group, ref)]
+    assert list(mgr._remote_prefetched(entries, {group: {ref: pbg[group][fp], fp: pbg[group][fp]}})) == entries
+
+
+def test_csv_export_prefetches_a_files_polygons_in_one_round(
+        served, synthetic_project, tmp_path, monkeypatch):
+    """Polygons across a remote image: iter_with_remote_prefetch downloads
+    every tile under them before the first is processed, so processing them
+    costs no further requests -- and yields them in their original order."""
+    pt = synthetic_project
+    _, ref = served["refs"]["pyr"]
+    polys = []
+    for k, (x, y) in enumerate([(100, 100), (900, 150), (300, 800), (1100, 900), (600, 500)]):
+        polys.append(("g{}".format(k), {
+            "points": [[x, y], [x + 60, y], [x + 60, y + 40], [x, y + 40]],
+            "coord_space": "image", "image_ref_size": {"w": 1300, "h": 1000},
+            "name": "g{}".format(k), "type": "polygon"}))
+    _clear_analysis_caches(pt)
+    img, info = pt._get_export_image(ref)
+    assert info.get("lazy")
+    reader = img._reader
+    reader._remote.reset_stats()
+    out = list(pt.iter_with_remote_prefetch(polys, lambda it: (ref, it[1])))
+    assert out == polys
+    after_prefetch = reader.remote_stats()["requests"]
+    assert after_prefetch >= 1
+    for _g, pd in polys:
+        pts = pt._points_to_export_frame(ref, pd["points"], pd, img.shape)
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        img.read_window(int(min(xs)), int(min(ys)), int(max(xs)) + 1, int(max(ys)) + 1)
+    assert reader.remote_stats()["requests"] == after_prefetch, \
+        "reading the polygons after the prefetch went to the network again"
+
+
+def test_a_remote_image_whose_ax_needs_the_whole_image_is_refused_with_the_reason(
+        served, synthetic_project, tmp_path):
+    import json
+    import shutil
+    pt = synthetic_project
+    _, ref = served["refs"]["pyr"]
+    ref2 = str(tmp_path / "pyr.cogref")
+    shutil.copy(ref, ref2)
+    with open(str(tmp_path / "pyr.ax"), "w") as fh:
+        json.dump({"hist_enabled": True, "hist_match": {"enabled": True, "reference": "x.tif"}}, fh)
+    _clear_analysis_caches(pt)
+    img, info = pt._get_export_image(ref2)
+    assert img is None and "needs the whole image" in info.get("error", "")
+
+
+def test_download_progress_reaches_100_percent_per_batch(served):
+    seen = []
+
+    def listener(bid, label, done, total):
+        seen.append((bid, label, done, total))
+
+    rm.add_progress_listener(listener)
+    try:
+        rf = rm.RangeFile(served["srv"].base + "pyr.tif", name="pyr")
+        rf.read_ranges([(300_000, 400_000), (2_000_000, 300_000)])
+    finally:
+        rm.remove_progress_listener(listener)
+    assert seen, "no progress was reported"
+    ids = {b for b, *_ in seen}
+    assert len(ids) == 1
+    dones = [d for _b, _l, d, _t in seen]
+    assert dones[0] == 0 and dones == sorted(dones)
+    assert seen[-1][2] == seen[-1][3] == 700_000 and seen[-1][1] == "pyr"
+
+
+def test_status_bar_shows_streaming_percent_until_the_tiles_land(qapp):
+    from PyQt5 import QtWidgets
+    from ..remote_images_dialog import install_stream_progress
+    win = QtWidgets.QMainWindow()
+    w = install_stream_progress(win.statusBar())
+    try:
+        w._on_changed(1, "ortho.cogref", 0, 4_000_000)
+        assert not w.isHidden() and w.bar.value() == 0 and "Streaming ortho.cogref" in w.label.text()
+        w._on_changed(2, "ortho.cogref", 1_000_000, 4_000_000)       # a second viewer
+        w._on_changed(1, "ortho.cogref", 3_000_000, 4_000_000)
+        assert w.bar.value() == 50 and "4.0 MB of 8.0 MB" in w.label.text()
+        w._on_changed(1, "ortho.cogref", 4_000_000, 4_000_000)
+        w._on_changed(2, "ortho.cogref", 4_000_000, 4_000_000)
+        assert w.bar.value() == 100 and "streamed" in w.label.text() and w._hide.isActive()
+    finally:
+        rm.remove_progress_listener(w.report)
+        win.deleteLater()

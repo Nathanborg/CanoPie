@@ -459,8 +459,17 @@ written into a pointer. **File > Add Remote Images (URLs)…** (`remote_images_d
 `remote_raster.make_pointer` per link and opens the pointers through
 `ProjectTab.open_image_paths` -- the grouping into roots that File > Open Image files also uses.
 CLI: `python -m canopie.remote_raster make <url> ortho.cogref`; measure with
-`scripts/bench_remote_cog.py`; examples and user steps in `examples/remote_cogs/`. View-only for now: `_get_export_image` (CSV/ML/Inspect),
-Export Project Images and the exiftool paths refuse `.cogref` with the reason.
+`scripts/bench_remote_cog.py`; examples and user steps in `examples/remote_cogs/`.
+Analysis: `_get_export_image` always gives a remote image the windowed `LazyAnalysis` (never a
+whole read); an `.ax` step that needs the whole image (hist match, registration, classification,
+up-size) is refused with that reason. `ProjectTab.iter_with_remote_prefetch` wraps the polygon
+loops (`_process_file_batch`, ML `train_models` and `_CsvExportWorker` via
+`MachineLearningManager._remote_prefetched`): items keep their order, and before an item whose
+tiles are not in memory the tiles of it and the following items (`_REMOTE_PREFETCH_BATCH_BYTES`)
+come down in one parallel round (`LazyChannels.prefetch` -> `TiledRasterReader.prefetch_rects`,
+compressed bytes held in the reader's raw cache). Downloads report progress
+(`remote_raster.add_progress_listener`) to the status bar's `StreamProgress`; each batch logs one
+INFO line. Still refused: Export Project Images and exiftool.
 
 ## Where to start for common tasks
 

@@ -214,6 +214,11 @@ _REMOTE_PREVIEW_FETCH_BYTES = 48 * 1024 * 1024
 # a remote file is the wait before anything appears.
 _REMOTE_PREVIEW_TARGET_DIM = 1500
 
+# Compressed tiles fetched ahead of use (prefetch_rects), per remote reader.
+# Compressed bytes, so a 0.9 MB DEFLATE tile costs 0.9 MB here instead of the
+# 2 MB it decodes to; a tile is dropped from here once it is decoded.
+_REMOTE_RAW_CACHE_BYTES = 512 * 1024 * 1024
+
 
 def workers_for_tile_bytes(tile_bytes, cap=None):
     """Thread count for decoding tiles of the given decoded size."""
@@ -802,6 +807,9 @@ class TiledRasterReader:
         # open(path). self.path stays the pointer's path -- it is the image's
         # identity everywhere else in CanoPie (caches, sidecars, .ax files).
         self._remote = open_pointer(self.path) if is_cogref(self.path) else None
+        self._raw = OrderedDict()            # (level, segment) -> compressed bytes
+        self._raw_bytes = 0
+        self._raw_lock = threading.Lock()
         self._tf = tifffile.TiffFile(self._remote.clone() if self._remote is not None else self.path)
         self._series = self._tf.series[0]
         self._local = threading.local()
@@ -1046,6 +1054,8 @@ class TiledRasterReader:
             shape = (lv["th"], lv["tw"]) if lv["planar"] == 2 else (lv["th"], lv["tw"], lv["count"])
             arr = np.zeros(shape, dtype=self.profile.dtype)
         else:
+            if raw is None and self._remote is not None:
+                raw = self._raw_take(level, seg_index)
             if raw is None:
                 if self._remote is not None:
                     raw = self._remote.pread(offset, nbytes, cached=False)
@@ -1129,11 +1139,20 @@ class TiledRasterReader:
         # in parallel. One request per tile would pay a network round trip
         # each -- a 6x6-tile preview row by row is 36 of them.
         raws = {}
-        if self._remote is not None and len(todo) > 1:
-            fetch = [i for i in todo if lv["counts"][i]]
-            got = self._remote.read_ranges(
-                [(int(lv["offsets"][i]), int(lv["counts"][i])) for i in fetch])
-            raws = dict(zip(fetch, got))
+        if self._remote is not None:
+            fetch = []
+            for i in todo:
+                if not lv["counts"][i]:
+                    continue
+                pre = self._raw_take(level, i)
+                if pre is not None:
+                    raws[i] = pre
+                else:
+                    fetch.append(i)
+            if fetch:
+                got = self._remote.read_ranges(
+                    [(int(lv["offsets"][i]), int(lv["counts"][i])) for i in fetch])
+                raws.update(zip(fetch, got))
 
         def run(chunk):
             local = [(i, self._decode_uncached(level, i, raws.get(i))) for i in chunk]
@@ -1158,6 +1177,78 @@ class TiledRasterReader:
             for i in todo:
                 _TILE_CACHE.put((self.path, level, i), result[i])
         return result
+
+    # -- remote prefetch --------------------------------------------------
+
+    def _raw_take(self, level, seg):
+        with self._raw_lock:
+            data = self._raw.pop((level, seg), None)
+            if data is not None:
+                self._raw_bytes -= len(data)
+            return data
+
+    def _raw_put(self, level, seg, data):
+        with self._raw_lock:
+            old = self._raw.pop((level, seg), None)
+            if old is not None:
+                self._raw_bytes -= len(old)
+            self._raw[(level, seg)] = data
+            self._raw_bytes += len(data)
+            while self._raw_bytes > _REMOTE_RAW_CACHE_BYTES and len(self._raw) > 1:
+                _, old = self._raw.popitem(last=False)
+                self._raw_bytes -= len(old)
+
+    def segments_for_rects(self, rects, level=0, bands=None):
+        """Segment indices under ``rects`` ((x0, y0, x1, y1) at ``level``),
+        each once, for ``bands`` (all bands when None; planar=1 ignores it)."""
+        lv = self._levels[level]
+        if lv["planar"] == 2:
+            bands = list(range(lv["count"])) if bands is None else [int(b) for b in bands]
+        out = []
+        for (x0, y0, x1, y1) in rects:
+            x0 = max(0, int(x0)); y0 = max(0, int(y0))
+            x1 = min(lv["width"], int(math.ceil(x1))); y1 = min(lv["height"], int(math.ceil(y1)))
+            if x1 <= x0 or y1 <= y0:
+                continue
+            for (tr, tc) in self._spatial_tiles(lv, x0, y0, x1, y1):
+                if lv["planar"] == 2:
+                    out.extend(self._segment_index(lv, b, tr, tc) for b in bands)
+                else:
+                    out.append(self._segment_index(lv, 0, tr, tc))
+        return list(dict.fromkeys(out))
+
+    def fetch_bytes_for_rects(self, rects, level=0, bands=None):
+        """Compressed bytes still to download for ``rects`` (0 when local)."""
+        if self._remote is None:
+            return 0
+        lv = self._levels[level]
+        with self._raw_lock:
+            held = set(self._raw)
+        return int(sum(int(lv["counts"][s]) for s in self.segments_for_rects(rects, level, bands)
+                       if (level, s) not in held and _TILE_CACHE.get((self.path, level, s)) is None))
+
+    def prefetch_rects(self, rects, level=0, bands=None):
+        """Remote file: download, in one parallel round, every tile under
+        ``rects`` that is not already decoded or fetched, so the reads that
+        follow come from memory. This is what turns a CSV export of 2,000
+        crowns from 2,000 network round trips into a few batches. Returns the
+        bytes fetched; a local file returns 0 and reads as before."""
+        if self._remote is None:
+            return 0
+        lv = self._levels[level]
+        with self._raw_lock:
+            held = set(self._raw)
+        todo = [s for s in self.segments_for_rects(rects, level, bands)
+                if lv["counts"][s] and (level, s) not in held
+                and _TILE_CACHE.get((self.path, level, s)) is None]
+        if not todo:
+            return 0
+        todo.sort(key=lambda s: lv["offsets"][s])
+        got = self._remote.read_ranges(
+            [(int(lv["offsets"][s]), int(lv["counts"][s])) for s in todo])
+        for s, data in zip(todo, got):
+            self._raw_put(level, s, data)
+        return int(sum(len(d) for d in got))
 
     # -- public reads -----------------------------------------------------
 
@@ -1414,6 +1505,9 @@ class TiledRasterReader:
             pass
         if self._remote is not None:
             self._remote.close()       # this handle only; the shared source stays
+        with self._raw_lock:
+            self._raw.clear()
+            self._raw_bytes = 0
         self._memmap = None
         _TILE_CACHE.drop_path(self.path)
 
@@ -1740,6 +1834,30 @@ class LazyChannels:
                 fx0, fy0, fx1, fy1, bands=self._order, level=self._level)
             return [cube[:, :, i] for i in range(cube.shape[2])]
         return _LazyWindowList(self._reader, self._order, fx0, fy0, fx1, fy1, self._level)
+
+    # -- remote prefetch (no-ops on a local file) -------------------------
+
+    def _prefetch_plan(self, boxes):
+        """(raw rects, level, bands) the reader would read for these windows."""
+        rects = [(int(x0) + self._ox, int(y0) + self._oy, int(x1) + self._ox, int(y1) + self._oy)
+                 for (x0, y0, x1, y1) in boxes]
+        return rects, self._level, list(self._order)
+
+    def prefetch(self, boxes):
+        """Download, in one parallel round, the remote tiles under these
+        windows (this object's frame), so reading them next costs no network
+        round trip. Returns the bytes fetched (0 for a local file)."""
+        if not getattr(self._reader, "is_remote", False) or not boxes:
+            return 0
+        rects, level, bands = self._prefetch_plan(boxes)
+        return self._reader.prefetch_rects(rects, level=level, bands=bands)
+
+    def fetch_bytes(self, boxes):
+        """Compressed bytes that reading these windows would still download."""
+        if not getattr(self._reader, "is_remote", False) or not boxes:
+            return 0
+        rects, level, bands = self._prefetch_plan(boxes)
+        return self._reader.fetch_bytes_for_rects(rects, level=level, bands=bands)
 
     def read_window_offset(self, x0, y0, x1, y1):
         """Like :meth:`read_window`, but each band keeps full-image indexing.

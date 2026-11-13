@@ -134,6 +134,14 @@ class MainWindow(QMainWindow):
         self._status_handler = _StatusBarHandler(self)
         logging.getLogger().addHandler(self._status_handler)
 
+        # remote images: "Streaming <image> 45 % (5.0 of 11.2 MB)" in the
+        # status bar while tiles download, until they have landed
+        try:
+            from .remote_images_dialog import install_stream_progress
+            self._stream_progress = install_stream_progress(self.status)
+        except Exception as e:
+            logging.debug("stream progress widget not installed: %s", e)
+
         logging.info("CanoPie started")
         logging.info(f"Log file: {self.logfile}")
 

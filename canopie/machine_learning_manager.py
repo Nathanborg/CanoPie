@@ -853,7 +853,8 @@ class _CsvExportWorker(QtCore.QThread):
                 writer = csv.writer(f)
                 writer.writerow(self.header)
 
-                for idx, (group_name, filepath) in enumerate(self.all_entries, start=1):
+                entries = self.mgr._remote_prefetched(self.all_entries, self.polygons_by_group)
+                for idx, (group_name, filepath) in enumerate(entries, start=1):
                     if self._cancelled:
                         break
                     self.progress.emit(idx, total, os.path.basename(filepath))
@@ -1435,6 +1436,17 @@ class MachineLearningManager(QtWidgets.QDialog):
                 break
 
         return row, ok_row, n_dropped_nan, n_dropped_missing_band
+
+    def _remote_prefetched(self, entries, polygons_by_group):
+        """``entries`` ((group, filepath) pairs) unchanged and in order, with the
+        tiles under the coming shapes on remote images downloaded in batches
+        ahead of use (ProjectTab.iter_with_remote_prefetch). Without a parent
+        tab, or for local images, the plain sequence."""
+        pt = getattr(self, "parent_tab", None)
+        it = getattr(pt, "iter_with_remote_prefetch", None)
+        if not callable(it):
+            return iter(entries)
+        return it(entries, lambda e: (e[1], (polygons_by_group or {}).get(e[0], {}).get(e[1])))
 
     def _sample_training_file(self, group_name, filepath, img, polygons_by_group, *,
                               selected_band_indices, selected_expressions, window_size,
@@ -2507,7 +2519,8 @@ class MachineLearningManager(QtWidgets.QDialog):
 
         rng = np.random.default_rng(12345)
 
-        for idx, (group_name, filepath) in enumerate(entries, start=1):
+        for idx, (group_name, filepath) in enumerate(
+                self._remote_prefetched(entries, polygons_by_group), start=1):
             if progress.wasCanceled():
                 progress.close()
                 return

@@ -66,6 +66,8 @@ __all__ = [
     "open_pointer",
     "clear_sources",
     "set_default_api_key",
+    "add_progress_listener",
+    "remove_progress_listener",
     "default_api_key",
     "gdrive_metadata",
     "inspect_url",
@@ -92,7 +94,7 @@ MERGE_GAP = 64 * 1024
 #: ...and never builds one request larger than this.
 MAX_SPAN = 16 * 1024 * 1024
 #: Concurrent HTTP requests for read_ranges, across all remote files.
-HTTP_WORKERS = 8
+HTTP_WORKERS = 16
 CONNECT_TIMEOUT = 10
 READ_TIMEOUT = 60
 
@@ -281,6 +283,61 @@ def resolve_pointer(ptr, api_key=None):
 
 
 # --------------------------------------------------------------------------
+# Download progress (for the status bar)
+# --------------------------------------------------------------------------
+
+_PROGRESS_LISTENERS = []
+
+
+def add_progress_listener(fn):
+    """``fn(batch_id, label, done_bytes, total_bytes)`` is called while a batch
+    of remote reads downloads (from worker threads; at most every 0.1 s, and
+    once at 100 %). ``batch_id`` tells concurrent downloads apart. The GUI
+    marshals it to the status bar."""
+    if fn not in _PROGRESS_LISTENERS:
+        _PROGRESS_LISTENERS.append(fn)
+
+
+def remove_progress_listener(fn):
+    try:
+        _PROGRESS_LISTENERS.remove(fn)
+    except ValueError:
+        pass
+
+
+class _Progress:
+    """Bytes received for one batch of reads, reported to the listeners."""
+
+    def __init__(self, label, total):
+        self.label, self.total, self.done = label, max(1, int(total)), 0
+        self._lock = threading.Lock()
+        self._last = 0.0
+        self._emit(0)
+
+    def add(self, n):
+        with self._lock:
+            self.done = min(self.total, self.done + int(n))
+            now = time.perf_counter()
+            if now - self._last < 0.1 and self.done < self.total:
+                return
+            self._last = now
+            done = self.done
+        self._emit(done)
+
+    def finish(self):
+        with self._lock:
+            self.done = self.total
+        self._emit(self.total)
+
+    def _emit(self, done):
+        for fn in list(_PROGRESS_LISTENERS):
+            try:
+                fn(id(self), self.label, done, self.total)
+            except Exception:
+                pass
+
+
+# --------------------------------------------------------------------------
 # HTTP plumbing
 # --------------------------------------------------------------------------
 
@@ -357,7 +414,7 @@ class _RangeSource:
 
     # -- HTTP -------------------------------------------------------------
 
-    def _get(self, start, end, total_known=True):
+    def _get(self, start, end, total_known=True, progress=None):
         """Bytes ``[start, end]`` (inclusive) with one Range request.
 
         Returns ``(data, total_size)``. Refuses a 200 response: a server that
@@ -420,7 +477,15 @@ class _RangeSource:
             total = None if m.group(3) == "*" else int(m.group(3))
             if start == 0:
                 self.first_headers = dict(resp.headers)
-            data = resp.content
+            if progress is None:
+                data = resp.content
+            else:
+                parts = []
+                for chunk in resp.iter_content(chunk_size=64 * 1024):
+                    if chunk:
+                        parts.append(chunk)
+                        progress.add(len(chunk))
+                data = b"".join(parts)
         except RemoteError:
             raise
         except Exception as exc:
@@ -532,7 +597,7 @@ class _RangeSource:
         s = offset - first * bs
         return b"".join(blocks)[s:s + (end - offset)]
 
-    def pread(self, offset, n, cached=True):
+    def pread(self, offset, n, cached=True, progress=None):
         """``n`` bytes at ``offset``.
 
         ``cached=True`` (the file API, i.e. the header parse): served from
@@ -555,7 +620,9 @@ class _RangeSource:
             # IFDs) are still served from those blocks.
             data = self._from_cache(offset, end)
             if data is None:
-                data, _ = self._get(offset, end - 1)
+                data, _ = self._get(offset, end - 1, progress=progress)
+            elif progress is not None:
+                progress.add(len(data))
             return data
         bs = self.block_size
         first, last = offset // bs, (end - 1) // bs
@@ -577,14 +644,21 @@ class _RangeSource:
             else:
                 spans.append([off, off + n, [(i, off, n)]])
         out = [b""] * len(ranges)
+        total = sum(sp[1] - sp[0] for sp in spans)
+        progress = _Progress(self.label, total) if spans else None
+        t0 = time.perf_counter()
 
         def fetch(span):
-            return span, self.pread(span[0], span[1] - span[0], cached=False)
+            return span, self.pread(span[0], span[1] - span[0], cached=False, progress=progress)
 
         if len(spans) <= 1:
             done = [fetch(s) for s in spans]
         else:
             done = list(_io_pool().map(fetch, spans))
+        if progress is not None:
+            progress.finish()
+            logging.info("[remote] %s: streamed %.1f MB in %d request(s), %.1f s",
+                         self.label, total / 1e6, len(spans), time.perf_counter() - t0)
         for (start, _end, parts), data in done:
             for i, off, n in parts:
                 out[i] = data[off - start:off - start + n]

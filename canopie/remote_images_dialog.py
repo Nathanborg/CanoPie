@@ -40,6 +40,70 @@ def apply_saved_api_key():
     return bool(key)
 
 
+class StreamProgress(QtWidgets.QWidget):
+    """Right-hand corner of the status bar: what is downloading from remote
+    images right now, 0-100 %, until the tiles have landed.
+
+    remote_raster reports bytes from its download threads; the ``changed``
+    signal carries each report to the GUI thread. Concurrent downloads (the
+    viewers of a root zooming together) are summed into one figure.
+    """
+
+    changed = QtCore.pyqtSignal(object, str, object, object)   # batch id, label, done, total
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(6, 0, 6, 0)
+        self.label = QtWidgets.QLabel("")
+        self.bar = QtWidgets.QProgressBar()
+        self.bar.setRange(0, 100)
+        self.bar.setFixedWidth(140)
+        self.bar.setFixedHeight(14)
+        self.bar.setTextVisible(True)
+        lay.addWidget(self.label)
+        lay.addWidget(self.bar)
+        self._active = {}
+        self._hide = QtCore.QTimer(self)
+        self._hide.setSingleShot(True)
+        self._hide.timeout.connect(self.hide)
+        self.changed.connect(self._on_changed)
+        self.hide()
+
+    def report(self, batch_id, label, done, total):
+        """Listener for remote_raster.add_progress_listener (any thread)."""
+        try:
+            self.changed.emit(batch_id, label, done, total)
+        except RuntimeError:          # widget already deleted
+            pass
+
+    def _on_changed(self, batch_id, label, done, total):
+        self._active[batch_id] = (label, int(done), max(1, int(total)))
+        done_all = sum(d for _l, d, _t in self._active.values())
+        total_all = sum(t for _l, _d, t in self._active.values())
+        names = sorted({l for l, _d, _t in self._active.values()})
+        name = names[0] if len(names) == 1 else "{} images".format(len(names))
+        pct = int(round(100.0 * done_all / total_all))
+        self.bar.setValue(pct)
+        if done_all >= total_all:
+            self.label.setText("{}: {} streamed".format(name, _mb(total_all)))
+            self._active.clear()
+            self._hide.start(3000)
+        else:
+            self.label.setText("Streaming {} ({} of {})".format(name, _mb(done_all), _mb(total_all)))
+            self._hide.stop()
+        self.show()
+
+
+def install_stream_progress(status_bar):
+    """Put a StreamProgress in ``status_bar`` and register it with
+    remote_raster. Returns the widget."""
+    w = StreamProgress(status_bar)
+    status_bar.addPermanentWidget(w)
+    rm.add_progress_listener(w.report)
+    return w
+
+
 def default_pointer_dir(project_tab=None):
     try:
         d = QtCore.QSettings(*_SETTINGS).value(DIR_SETTING, "", type=str)

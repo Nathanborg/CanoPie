@@ -106,8 +106,19 @@ Hosting options:
 Prices are list prices at the time of writing; check the providers' pages.
 Viewing reads tens of MB per session, so download fees stay at cents.
 
-## What does not work on remote images yet
+## What works on remote images
 
-CSV/ML export, Inspect, Export Project Images and EXIF. They say so instead of
-reading the whole file. Viewing, zooming, drawing polygons (stored in
-full-resolution pixels), the image editor and the canopy finder work.
+Viewing and zooming, with a "Streaming … %" counter in the status bar until the
+tiles land and a line in the log for each download. Also: drawing polygons
+(stored in full-resolution pixels), the image editor, the canopy finder,
+Inspect, CSV export with statistics, and ML training and ML CSV export.
+
+Analysis reads only the tiles under your polygons. Before a run of polygons,
+CanoPie downloads the tiles of the next ones in one parallel round. Measured with
+300 scattered crowns on a 39,199 x 30,003 orthomosaic behind a Drive-like delay:
+24 s, against 325 s one polygon at a time, with identical rows.
+
+Not available on remote images: Export Project Images (it would download the
+whole file), EXIF (exiftool needs a local file), and `.ax` edits that need the
+whole image (histogram matching, registration, classification, an up-size).
+Each says so with the reason.

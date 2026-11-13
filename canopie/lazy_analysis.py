@@ -287,6 +287,20 @@ class LazyAnalysis(LazyChannels):
                 x0, y0, x1, y1 = _rot_inv_rect(op[1], op[2], op[3], x0, y0, x1, y1)
         return int(round(x0)), int(round(y0)), int(round(x1)), int(round(y1))
 
+    def _prefetch_plan(self, boxes):
+        """Raw rects under export-frame windows: the same mapping _strip reads
+        through (resize, then crop and rotation undone), all file bands."""
+        W, H = self.width, self.height
+        rects = []
+        for (x0, y0, x1, y1) in boxes:
+            x0 = max(0, int(x0)); y0 = max(0, int(y0))
+            x1 = min(W, int(math.ceil(x1))); y1 = min(H, int(math.ceil(y1)))
+            if x1 <= x0 or y1 <= y0:
+                continue
+            (px0, py0, px1, py1), _bx, _by = self._pre_rect(x0, y0, x1, y1)
+            rects.append(self._raw_rect_for(px0, py0, px1, py1))
+        return rects, 0, list(range(self.n_file))
+
     def read_window(self, x0, y0, x1, y1, max_materialize=None):
         """Every band (file bands, then derived) of export-frame window
         [x0, x1) x [y0, y1), float32, NoData = NaN per band. Recently

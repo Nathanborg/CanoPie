@@ -3047,6 +3047,14 @@ _EXPORT_LAZY_THRESHOLD_BYTES = 64 * 1024 * 1024
 # reader drop to a pyramid level instead. ~1 GB is roughly 3 s of zlib/zstd.
 _PREVIEW_DECODE_BUDGET_BYTES = 1024 * 1024 * 1024
 
+# Compressed bytes ProjectTab.iter_with_remote_prefetch downloads in one
+# parallel round before a run of polygons on remote images (CSV export, ML
+# sampling): big enough that 2,000 crowns are a handful of rounds instead of
+# 2,000 round trips, and well inside the reader's 512 MB prefetch cache.
+_REMOTE_PREFETCH_BATCH_BYTES = 192 * 1024 * 1024
+# ...and the margin around each shape's box (ML window features, rounding).
+_REMOTE_PREFETCH_MARGIN_PX = 8
+
 # Byte ceiling for ONE sklearn-classification feature matrix (H*W*F*4 for
 # float32), shared with ImageEditorDialog._CLASSIFY_FEATURE_BUDGET_BYTES.
 # Past this, classification (render/preview path, and the .ax "appended
@@ -12890,8 +12898,11 @@ class ProjectTab(QtWidgets.QWidget):
         # Just iterate - process_polygon's caching handles the optimization:
         # - First polygon: loads image, computes scene stats, caches everything
         # - Subsequent polygons: cache hits for image and scene stats
+        # On a remote image the tiles under the coming polygons are downloaded
+        # in batches first (iter_with_remote_prefetch); order is unchanged.
         _failed = 0
-        for group_name, polygon_dict in polygon_list:
+        for group_name, polygon_dict in self.iter_with_remote_prefetch(
+                polygon_list, lambda item: (filepath, item[1])):
             try:
                 row, mod_polygon = self.process_polygon(
                     group_name, filepath, polygon_dict,
@@ -12914,6 +12925,84 @@ class ProjectTab(QtWidgets.QWidget):
                 os.path.basename(filepath), _failed, len(polygon_list))
 
         return all_data_rows, all_modified_polygons
+    @staticmethod
+    def _xy_pairs(points):
+        """Every (x, y) in a stored shape: pairs, {x, y} dicts, nested rings."""
+        out = []
+        stack = [points]
+        while stack:
+            p = stack.pop()
+            if isinstance(p, dict):
+                if "x" in p and "y" in p:
+                    out.append((float(p["x"]), float(p["y"])))
+                continue
+            if isinstance(p, (list, tuple)):
+                if len(p) == 2 and all(isinstance(v, (int, float)) for v in p):
+                    out.append((float(p[0]), float(p[1])))
+                else:
+                    stack.extend(p)
+        return out
+
+    def iter_with_remote_prefetch(self, items, key, budget=None):
+        """Yield ``items`` unchanged and in order. ``key(item)`` gives
+        ``(filepath, polygon_dict)``. Before an item on a remote image (.cogref)
+        whose tiles are not in memory yet, the tiles under it AND under the
+        items that follow (up to ``budget`` compressed bytes, one parallel round
+        per image) are downloaded -- so a CSV export or ML sampling of 2,000
+        crowns costs a few network rounds, not 2,000 round trips. Local images
+        pass straight through; nothing is reordered, so CSV rows and ML random
+        draws are exactly what they were."""
+        from .remote_raster import is_cogref
+        items = list(items)
+        budget = int(budget or _REMOTE_PREFETCH_BATCH_BYTES)
+        boxes = {}
+
+        def box(i):
+            if i in boxes:
+                return boxes[i]
+            b = None
+            try:
+                fp, pd = key(items[i])
+                if fp and is_cogref(fp) and isinstance(pd, dict):
+                    img = self._get_export_image(fp)[0]
+                    if img is not None and hasattr(img, "prefetch"):
+                        pts = self._points_to_export_frame(
+                            fp, self._xy_pairs(pd.get("points", [])), pd, img.shape)
+                        if pts:
+                            xs = [p[0] for p in pts]
+                            ys = [p[1] for p in pts]
+                            m = _REMOTE_PREFETCH_MARGIN_PX
+                            b = (img, (min(xs) - m, min(ys) - m, max(xs) + m + 1, max(ys) + m + 1))
+            except Exception as e:
+                logging.debug("[prefetch] no box for item %d: %s", i, e)
+            boxes[i] = b
+            return b
+
+        ready_upto = -1
+        for i, item in enumerate(items):
+            if i > ready_upto and box(i) is not None:
+                plan, total, j = {}, 0, i
+                while j < len(items):
+                    bj = box(j)
+                    if bj is not None:
+                        img_j, rect = bj
+                        try:
+                            cost = img_j.fetch_bytes([rect])
+                        except Exception:
+                            cost = 0
+                        if total + cost > budget and j > i:
+                            break
+                        plan.setdefault(id(img_j), (img_j, []))[1].append(rect)
+                        total += cost
+                    j += 1
+                for img_j, rects in plan.values():
+                    try:
+                        img_j.prefetch(rects)
+                    except Exception as e:
+                        logging.warning("[prefetch] %s", e)
+                ready_upto = j - 1
+            yield item
+
     def invalidate_caches_for_file(self, filepath):
         """
         Clear all caches related to a specific file after reset/modification.
@@ -20112,18 +20201,10 @@ class ProjectTab(QtWidgets.QWidget):
 
             filepath = os.fspath(filepath)
 
-            # Remote images (.cogref) are view-only in this version: CSV/ML
-            # export and Inspect read through here, and are refused with the
-            # reason rather than handed a JSON pointer to decode.
+            # Remote images (.cogref) are analysed window by window like any
+            # oversized raster (_try_lazy_export_channels): CSV, ML, Inspect
+            # and scene statistics read only the tiles they need.
             from .remote_raster import is_cogref as _is_cogref
-            if _is_cogref(filepath):
-                from .remote_raster import not_supported_message as _remote_msg
-                msg = _remote_msg("Analysis and export (CSV, ML, Inspect)", filepath)
-                logging.error("[_get_export_image] %s", msg)
-                if not hasattr(self, "_export_errors"):
-                    self._export_errors = {}
-                self._export_errors[os.path.normcase(os.path.abspath(filepath))] = msg
-                return None, {"error": msg}
 
             # ---------- cache keyed by image & .ax mtimes ----------
             # RAM FIX: byte-budgeted (was an uncapped plain dict, and its own
@@ -20240,6 +20321,30 @@ class ProjectTab(QtWidgets.QWidget):
                 self._last_export_channel_order = "rgb"
                 self._export_image_cache[cache_key] = (_lazy, info, None, list(self._last_export_nodata_values), filepath, "rgb")
                 return (_lazy, info)
+
+            if _is_cogref(filepath):
+                # The fallbacks below read the whole file -- for a remote image,
+                # downloading it. Say why the windowed path was not possible.
+                from .raster_reader import last_probe_error as _lpe
+                from .lazy_analysis import supported as _lazy_supported
+                why = _lpe(filepath)
+                if not why:
+                    why = ("its .ax uses a step that needs the whole image (histogram "
+                           "matching, registration, classification or an up-size), which "
+                           "would download the whole remote file")
+                    try:
+                        from .raster_reader import probe as _probe_r
+                        _pr = _probe_r(filepath)
+                        if _pr is not None and _lazy_supported(_lazy_ax or {}, _pr.width, _pr.height):
+                            why = "the tiled reader could not open it (see the log)"
+                    except Exception:
+                        pass
+                msg = f"{os.path.basename(filepath)}: remote image not analysed: {why}."
+                logging.error("[_get_export_image] %s", msg)
+                if not hasattr(self, "_export_errors"):
+                    self._export_errors = {}
+                self._export_errors[os.path.normcase(os.path.abspath(filepath))] = msg
+                return None, {"error": msg}
 
             # ---------- load RAW, prefer tifffile for TIFF ----------
             from .raster_reader import ensure_hwc as _ensure_hwc, axes_for as _axes_for
@@ -21178,7 +21283,8 @@ class ProjectTab(QtWidgets.QWidget):
                 return None
             if ax is None:
                 ax = self._load_ax_mods(filepath) or {}
-            big = profile.bytes_if_fully_loaded > _EXPORT_LAZY_THRESHOLD_BYTES
+            big = (profile.bytes_if_fully_loaded > _EXPORT_LAZY_THRESHOLD_BYTES
+                   or bool(getattr(profile, "remote", False)))
             if not big:
                 need = self._full_replay_peak_bytes(profile, ax)
                 avail = _available_ram_bytes()
