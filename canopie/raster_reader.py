@@ -202,6 +202,18 @@ _INFLIGHT_TILE_BYTES = 192 * 1024 * 1024
 # set of parallel requests) when its decoded tiles fit in this much memory.
 _REMOTE_PREFETCH_BYTES = 128 * 1024 * 1024
 
+# A remote file's whole-image preview (viewer, editor, band change, scene
+# samples) downloads at most this much: about 6-10 s on a 5-8 MB/s link. It
+# leaves the measured examples where they were -- Sentinel-2 TCI level 2 is
+# 11 MB, a BCI-sized DEFLATE ortho's level 4 ~38 MB -- and moves a 298-band
+# pixel-interleaved cube from a 299 MB level to a 19 MB one.
+_REMOTE_PREVIEW_FETCH_BYTES = 48 * 1024 * 1024
+
+# ...and is sized for a ~1,500 px view rather than the local 2,400 px: a viewer
+# shows a whole orthomosaic in about a screen height, and the first preview of
+# a remote file is the wait before anything appears.
+_REMOTE_PREVIEW_TARGET_DIM = 1500
+
 
 def workers_for_tile_bytes(tile_bytes, cap=None):
     """Thread count for decoding tiles of the given decoded size."""
@@ -890,7 +902,18 @@ class TiledRasterReader:
                 break
         return best
 
-    def level_for_bytes(self, n_bands, max_bytes, decode_budget=None, target_dim=2400):
+    def level_fetch_bytes(self, level, n_bands):
+        """Compressed bytes a whole-level read of ``n_bands`` bands has to
+        fetch: every segment for a pixel-interleaved file (each tile holds all
+        bands), the wanted bands' share of them for a band-interleaved one."""
+        lv = self._levels[level]
+        total = int(sum(int(c) for c in lv["counts"]))
+        if lv["planar"] == 2 and lv["count"]:
+            return int(total * min(1.0, n_bands / float(lv["count"])))
+        return total
+
+    def level_for_bytes(self, n_bands, max_bytes, decode_budget=None, target_dim=2400,
+                        fetch_budget=None):
         """Highest-resolution level that satisfies both output and decode limits.
 
         Two separate costs have to be respected:
@@ -902,11 +925,25 @@ class TiledRasterReader:
           cube. Reading a 298-band BIP COG at level 0 took 94 s for a 39 MB
           result; counting the decode cost picks a pyramid level instead.
 
+        * **fetch** (remote files only) - what has to come over the network.
+          A 298-band pixel-interleaved cube on Google Drive holds every band in
+          each 256 px tile (15-19 MB compressed), so a 3-band preview of its
+          level 1 is a 299 MB download. ``fetch_budget`` (default
+          ``_REMOTE_PREVIEW_FETCH_BYTES`` for a remote file) picks a coarser
+          level instead; the zoom tiles bring the detail where you look.
+
         Falls back to the smallest level; the caller can decimate from there.
         """
         itemsize = np.dtype(self.profile.dtype).itemsize
         if decode_budget is None:
             decode_budget = max_bytes * 2
+        if fetch_budget is None and self._remote is not None:
+            fetch_budget = _REMOTE_PREVIEW_FETCH_BYTES
+        if self._remote is not None and target_dim == 2400:
+            # the default screen size, for a remote file: one level coarser
+            # where the pyramid allows (BCI: level 5, 8 MB, instead of level 4,
+            # 33 MB / 14 s on Drive); the zoom tiles sharpen what you look at
+            target_dim = _REMOTE_PREVIEW_TARGET_DIM
 
         fits = []
         for i, lv in enumerate(self._levels):
@@ -915,6 +952,8 @@ class TiledRasterReader:
             # planar=1 decodes every band whether or not it is wanted.
             decode_bands = lv["count"] if lv["planar"] == 1 else n_bands
             decode_bytes = pixels * decode_bands * itemsize
+            if fetch_budget is not None and self.level_fetch_bytes(i, n_bands) > fetch_budget:
+                continue
             if out_bytes <= max_bytes and decode_bytes <= decode_budget:
                 fits.append(i)
         if not fits:

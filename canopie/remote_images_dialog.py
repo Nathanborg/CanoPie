@@ -138,16 +138,17 @@ class RemoteImagesDialog(QtWidgets.QDialog):
             QtWidgets.QLineEdit.Normal if on else QtWidgets.QLineEdit.Password))
         krow.addWidget(self.key_edit, 1)
         krow.addWidget(show)
-        dl.addRow("API key", krow)
+        dl.addRow("API key (optional)", krow)
         self.remember = QtWidgets.QCheckBox(
             "Remember on this computer (kept in CanoPie's settings, never in pointer files)")
         self.remember.setChecked(bool(settings.value(KEY_SETTING, "", type=str)))
         dl.addRow("", self.remember)
         help_lbl = QtWidgets.QLabel(
-            'Share each file as <i>Anyone with the link</i>. '
-            '<a href="{}">How to get an API key</a>: a Google Cloud project with the '
-            'Google Drive API enabled, then Credentials &gt; Create credentials &gt; API key.'
-            .format(KEY_HELP_URL))
+            'Share each file as <i>Anyone with the link</i>; it then opens without a key. '
+            'With a key CanoPie uses the official Drive API instead (steadier for files '
+            'many people open). <a href="{}">How to get an API key</a>: a Google Cloud '
+            'project with the Google Drive API enabled, then Credentials &gt; Create '
+            'credentials &gt; API key.'.format(KEY_HELP_URL))
         help_lbl.setWordWrap(True)
         help_lbl.setOpenExternalLinks(True)
         dl.addRow("", help_lbl)

@@ -25040,7 +25040,32 @@ class ProjectTab(QtWidgets.QWidget):
                 vp_h = max(1, int(round(scene_rect.height())))
 
             target_dim = max(vp_w, vp_h)
-            if hasattr(reader, "_levels") and len(reader._levels) > 1:
+            remote = bool(getattr(reader, "is_remote", False))
+            if remote and hasattr(reader, "_levels") and len(reader._levels) > 1:
+                # Over the network every tile is a download (Google Drive: ~1 s
+                # per request before any data). Read the COARSEST level that
+                # still has a pixel for every screen pixel of this window, along
+                # both axes (QGIS's rule). The local rule below keeps level 0
+                # until the window is twice the viewport's LONGER side in both
+                # directions: on the BCI ortho a 1:3 zoom then read 60 level-0
+                # tiles (56 MB, 11 s on Drive) where level 1 has enough pixels.
+                try:
+                    dpr = float(viewer.devicePixelRatioF() or 1.0)
+                except Exception:
+                    dpr = 1.0
+                try:
+                    m = float(viewer.transform().m11()) or 1.0
+                    scr_w = min(vp_w, scene_rect.width() * m) * dpr
+                    scr_h = min(vp_h, scene_rect.height() * m) * dpr
+                except Exception:
+                    scr_w, scr_h = vp_w * dpr, vp_h * dpr
+                for i, lv_i in enumerate(reader._levels):
+                    if (win_w * lv_i["width"] / float(full_w) >= scr_w
+                            and win_h * lv_i["height"] / float(full_h) >= scr_h):
+                        level = i
+                    else:
+                        break
+            elif hasattr(reader, "_levels") and len(reader._levels) > 1:
                 # If viewport covers a large fraction of the whole dataset, select overview level.
                 # Otherwise, when inspecting details/zoomed in, select Level 0 (100% native).
                 if win_w >= target_dim * 2 and win_h >= target_dim * 2:
@@ -25088,7 +25113,37 @@ class ProjectTab(QtWidgets.QWidget):
             _pb = getattr(viewer, "_preview_stretch_bounds", None)
             _tile_bounds = _pb if (isinstance(_pb, dict) and _pb.get("img_id") == id(disp)) else None
 
+            def _is_stale():
+                return (request_id is not None
+                        and getattr(viewer, "_highres_request_id", request_id) != request_id)
+
+            # Remote: one tile download per viewer at a time. Five wheel notches
+            # used to start five downloads at once on Drive, which shared the
+            # bandwidth and delivered the last view last; now the newest request
+            # runs as soon as the one in flight ends, and the ones in between
+            # are dropped by _is_stale.
+            fetch_lock = None
+            if remote:
+                fetch_lock = getattr(viewer, "_highres_fetch_lock", None)
+                if fetch_lock is None:
+                    fetch_lock = threading.Lock()
+                    viewer._highres_fetch_lock = fetch_lock
+
             def _fetch_job():
+                # Superseded before it started (the user zoomed or panned
+                # again): skip it. Without this every queued request ran to the
+                # end -- on a remote file, seconds each -- and the view the user
+                # stopped on waited behind all of them.
+                if _is_stale():
+                    return None
+                if fetch_lock is None:
+                    return _fetch_tile()
+                with fetch_lock:
+                    if _is_stale():
+                        return None
+                    return _fetch_tile()
+
+            def _fetch_tile():
                 try:
                     bands = preview_bands if preview_bands else [0, 1, 2]
                     if step > 1:
@@ -25184,7 +25239,10 @@ class ProjectTab(QtWidgets.QWidget):
 
             if not hasattr(self, '_highres_executor'):
                 import concurrent.futures
-                self._highres_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="canopie-highres-vp")
+                # 4: the viewers of a root zoom together, and a remote tile
+                # mostly waits on the network -- with 2, the third viewer's
+                # tile queued behind two downloads.
+                self._highres_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="canopie-highres-vp")
 
             fut = self._highres_executor.submit(_fetch_job)
             fut.add_done_callback(_on_done)

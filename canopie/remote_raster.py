@@ -189,7 +189,8 @@ def gdrive_file_id(url):
         if m:
             return m.group(1)
     parts = urlsplit(url)
-    if parts.netloc.lower() in ("drive.google.com", "docs.google.com"):
+    if parts.netloc.lower() in ("drive.google.com", "docs.google.com",
+                                "drive.usercontent.google.com"):
         ids = parse_qs(parts.query).get("id")
         if ids and re.fullmatch(r"[A-Za-z0-9_-]{10,}", ids[0]):
             return ids[0]
@@ -204,6 +205,12 @@ def _env(name):
 #: Drive API base. A module constant so the QC suite can point it at a local
 #: test server that behaves like the Drive API.
 GDRIVE_API = "https://www.googleapis.com/drive/v3/files"
+#: Drive's public download endpoint: a file shared "Anyone with the link"
+#: downloads from here without any key, and it honours Range. ``confirm=t``
+#: skips the "can't scan this file for viruses" page Drive puts in front of
+#: files over ~100 MB. Not a documented API (the key route is), so it is the
+#: fallback when no key is set.
+GDRIVE_DOWNLOAD = "https://drive.usercontent.google.com/download"
 
 # The key the app was given (File > Add Remote Images, remembered in the
 # user's settings). Never written into pointer files, which travel with the
@@ -236,12 +243,14 @@ def _drive_key(auth, url, api_key=None):
 def resolve_pointer(ptr, api_key=None):
     """``(url, headers)`` to fetch, from a pointer dict.
 
-    Google Drive links become ``files.get?alt=media`` API URLs. The key comes
-    from ``auth.api_key``, else ``api_key``, else the app's key
+    Google Drive links become ``files.get?alt=media`` API URLs when there is
+    a key: ``auth.api_key``, else ``api_key``, else the app's key
     (:func:`set_default_api_key`), else the environment variable
     ``auth.api_key_env`` (default ``CANOPIE_GDRIVE_API_KEY``).
     ``auth.bearer_token_env`` sends an ``Authorization: Bearer`` header
-    instead, for a token made elsewhere.
+    instead, for a token made elsewhere. With neither, the file is read from
+    Drive's public download endpoint (``GDRIVE_DOWNLOAD``), which needs the
+    file shared as "Anyone with the link" and no key at all.
     """
     url = str(ptr["url"]).strip()
     auth = ptr.get("auth") or {}
@@ -259,11 +268,8 @@ def resolve_pointer(ptr, api_key=None):
         if not token:
             key = _drive_key(auth, url, api_key)
             if not key:
-                raise RemoteError(
-                    "Google Drive file {} needs an API key: enter it in File > Add Remote "
-                    "Images (URLs)..., or set the environment variable {}. The file must be "
-                    "shared as 'Anyone with the link'.".format(
-                        file_id, auth.get("api_key_env") or GDRIVE_KEY_ENV))
+                return ("{}?id={}&export=download&confirm=t".format(GDRIVE_DOWNLOAD, file_id),
+                        headers)
             api += "&key=" + key
         return api, headers
 
@@ -340,6 +346,7 @@ class _RangeSource:
         self._lock = threading.Lock()
         self.stats = {"requests": 0, "bytes_fetched": 0, "cache_hits": 0,
                       "http_seconds": 0.0}
+        self.first_headers = {}
         self.size = self._discover_size()
         if size is not None and int(size) != self.size:
             raise RemoteError(
@@ -365,6 +372,33 @@ class _RangeSource:
             raise RemoteError("{}: request failed: {}: {}".format(
                 self.label, type(exc).__name__, redact(exc))) from None
         try:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if resp.status_code in (200, 206) and ("text/html" in ctype or any(
+                    "accounts.google.com" in (h.headers.get("Location") or "")
+                    for h in resp.history)):
+                # A web page instead of the file -- typically Google's sign-in
+                # page for a Drive file that is not shared publicly.
+                signin = "accounts.google.com" in (resp.url or "") or any(
+                    "accounts.google.com" in (h.headers.get("Location") or "") for h in resp.history)
+                try:
+                    page = resp.raw.read(8192, decode_content=True).decode("utf-8", "replace")
+                except Exception:
+                    page = ""
+                tm = re.search(r"<title>(.*?)</title>", page, re.S | re.I)
+                title = " ".join(tm.group(1).split()) if tm else ""
+                if signin:
+                    what, fix = " (a Google sign-in page)", (
+                        "The file is not shared publicly: in Drive, Share > General access > "
+                        "'Anyone with the link' (Viewer).")
+                elif "quota" in title.lower():
+                    what, fix = " ({})".format(title), (
+                        "Google limits downloads of a popular public file for a while; "
+                        "try later, or use an API key.")
+                else:
+                    what, fix = (" ({})".format(title) if title else ""), (
+                        "Use a direct link to the .tif itself.")
+                raise RemoteError("{}: the link returned a web page{} instead of the file. {}"
+                                  .format(self.label, what, fix))
             if resp.status_code == 200:
                 raise RemoteError(
                     "{}: the server ignored the byte-range request (HTTP 200 instead of 206), "
@@ -384,6 +418,8 @@ class _RangeSource:
                 raise RemoteError("{}: bad Content-Range {!r} for bytes {}-{}".format(
                     self.label, resp.headers.get("Content-Range"), start, end))
             total = None if m.group(3) == "*" else int(m.group(3))
+            if start == 0:
+                self.first_headers = dict(resp.headers)
             data = resp.content
         except RemoteError:
             raise
@@ -776,6 +812,17 @@ def gdrive_metadata(file_id, api_key=None, headers=None):
     return resp.json()
 
 
+def _disposition_name(headers):
+    """The file name in a Content-Disposition header, or None."""
+    from urllib.parse import unquote
+    cd = (headers or {}).get("Content-Disposition") or ""
+    m = re.search(r"filename\*=UTF-8''([^;]+)", cd, re.I)
+    if m:
+        return unquote(m.group(1).strip().strip('"'))
+    m = re.search(r'filename="?([^";]+)"?', cd, re.I)
+    return m.group(1).strip() if m else None
+
+
 def _name_from_url(url):
     from urllib.parse import unquote
     name = unquote(os.path.basename(urlsplit(url).path)) or "remote"
@@ -793,13 +840,18 @@ def inspect_url(url, api_key=None):
     url = str(url).strip()
     real, headers = resolve_pointer({"url": url}, api_key=api_key)
     file_id = gdrive_file_id(url)
-    if file_id is not None:
+    keyless = file_id is not None and real.startswith(GDRIVE_DOWNLOAD)
+    if file_id is not None and not keyless:
         key = None if "Authorization" in headers else _drive_key({}, url, api_key)
         name = gdrive_metadata(file_id, api_key=key, headers=headers).get("name") or (
             "gdrive_" + file_id[:10])
+    elif keyless:
+        name = "gdrive_" + file_id[:10]
     else:
         name = _name_from_url(url)
     rf = RangeFile(real, headers=headers, name=name)
+    if keyless:
+        name = _disposition_name(rf._src.first_headers) or name
     import tifffile
     with tifffile.TiffFile(rf) as tf:
         page = tf.pages[0]

@@ -28,7 +28,7 @@ three side by side.
 
 1. Paste the links, one per line: `https://…/ortho.tif`, or a Google Drive share link.
 2. Choose where the pointer files go, and how many images each root shows.
-3. Google Drive links also need an API key (below).
+3. Google Drive: optionally an API key (below).
 4. **Check and Open**. For each link CanoPie checks the file, writes `<name>.cogref` and
    reports its size and pyramid levels. A file that is not tiled, or has no overviews,
    is flagged as slow. Then CanoPie opens the files as roots, as **Open Image files** does.
@@ -46,7 +46,12 @@ python -m canopie.remote_raster info D:\remote\ortho.cogref
 link** (Viewer) → Copy link. Paste that link into the dialog. A Google Workspace
 account (e.g. a university) may not allow link sharing. That is an admin setting.
 
-**The API key** is free for this use:
+**No key is needed** for a file shared by link. CanoPie then reads it from Drive's
+public download address, which honours byte ranges. If the file is not shared,
+CanoPie reports the Google sign-in page it got instead.
+
+**An API key is optional.** With one, CanoPie uses the official Drive API, which is
+documented and steadier if many people open the same file. The key is free:
 
 1. Open <https://console.cloud.google.com/> and sign in.
 2. Create a project (project picker at the top → New project).
@@ -59,24 +64,47 @@ it in its own settings and loads it at start-up. It is never written into a
 `.cogref`, so pointer files can be shared with a project. The other option is the
 environment variable `CANOPIE_GDRIVE_API_KEY`.
 
+**Large hyperspectral cubes:** a cube stored band-interleaved by pixel (every tile
+holds all bands) costs whole tiles even when 3 bands are shown. A cube stored
+band by band costs only the bands on screen. Measured on a 298-band AVIRIS-3 cube
+(1,799 x 1,809, float32, ZSTD), in an 800 x 600 viewer with a Drive-like delay:
+
+| Layout | Open | Zoom to 1:1 | Pan |
+|---|---|---|---|
+| pixel-interleaved (as delivered) | 18.9 MB, 1/8-resolution preview | 546 MB | 471 MB |
+| band-interleaved | 12.9 MB, **full-resolution** preview | nothing | nothing |
+
+The band-interleaved copy held identical pixels and was ~17% larger (1.33 → 1.56 GB).
+
 **First test without your own data:** upload one of the public files above to a
 test folder in your Drive. Its download link is the `url` in the matching
 `.cogref`. Share the copy by link and open it with the dialog. You can then
 compare it with the same file opened from S3.
 
-## Make your files COGs (and smaller)
+## Why Google Drive is slow, and what helps
 
-Speed depends on the bytes per tile. A DEFLATE orthomosaic like BCI averages
-~0.9 MB per 512-px tile, so the first preview is ~38 MB. JPEG is ~10× smaller
-(the example drone orthos are 25-40 KB per tile). With GDAL 3.1 or later:
+Measured from this machine (November 2026) on the BCI orthomosaic:
 
-```
-gdal_translate ortho.tif ortho_cog.tif -of COG -co COMPRESS=JPEG -co QUALITY=90 -co BLOCKSIZE=512 -co OVERVIEWS=AUTO
-```
+- Drive takes **about 1 s to answer each request**, however small. After that it
+  sends ~5 MB/s per stream. S3 answered in ~0.3 s at ~8 MB/s.
+- Tiles fetched one after another therefore manage 0.6 MB/s. CanoPie merges
+  neighbouring tiles into one request and runs separate requests in parallel.
+  On a remote file it reads the coarsest pyramid level that still fills the
+  screen, and it drops zoom requests you have already moved past.
+- BCI is 8-bit data stored as 16-bit, DEFLATE without a predictor:
+  0.94 MB per 512-px tile, so a 1:1 view (about 12 tiles) is ~11 MB. The same
+  tiles as 8-bit JPEG would be ~0.10 MB; the example drone orthos are 25-40 KB per tile.
 
-JPEG takes 1 or 3 bands. If the 4th band of an RGBA orthomosaic is alpha, add
-`-b 1 -b 2 -b 3 -mask 4`. JPEG is lossy: keep the original for pixel statistics,
-or use `COMPRESS=DEFLATE -co PREDICTOR=2` for a lossless COG.
+Hosting options:
+
+| Where | Per-request delay | Cost for an 11 GB orthomosaic |
+|---|---|---|
+| Google Drive (link, or API key) | ~1 s | free (the Drive API has no charge, only request quotas) |
+| Cloudflare R2 (public bucket) | not measured | 10 GB/month free, then ~$0.015/GB-month; no download fees |
+| Amazon S3 / Google Cloud Storage | ~0.3 s (S3) | ~$0.02-0.03/GB-month, plus ~$0.09-0.12/GB downloaded beyond free allowances |
+
+Prices are list prices at the time of writing; check the providers' pages.
+Viewing reads tens of MB per session, so download fees stay at cents.
 
 ## What does not work on remote images yet
 

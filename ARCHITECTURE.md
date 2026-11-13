@@ -446,11 +446,13 @@ identity everywhere (caches, `.ax`, polygon sidecars, project.json), so `ortho.c
 `remote_raster.RangeFile`: the header parse reads aligned 256 KB blocks (cached), tile reads fetch
 exactly their bytes, adjacent tiles share a request and separate requests run in parallel. A
 remote profile never uses memmap and always loads as a viewer/editor preview
-(`_wants_preview`, `_load_editor_preview`); the zoom tiles bring full resolution.
+(`_wants_preview`, `_load_editor_preview`), at a level whose download fits
+`_REMOTE_PREVIEW_FETCH_BYTES` (`level_for_bytes`' fetch budget); the zoom tiles bring full resolution.
 Size, transform and EPSG come from the remote header too (`shapefile_io._tiff_open_target`
 inside `_raw_image_dims` / `get_geotiff_transform` / `epsg_from_geotiff`), so the polygon basis
 is the full raster, never the preview, and the canopy finder reads `.cogref` window by window.
-Google Drive links resolve to `files.get?alt=media`; the API key comes from the app
+Google Drive links resolve to Drive's public download endpoint (`GDRIVE_DOWNLOAD`,
+`confirm=t`; no key, file shared by link) or, when a key is set, to `files.get?alt=media`; the key comes from the app
 (`remote_raster.set_default_api_key`, remembered in QSettings by the dialog and applied in
 `MainWindow.__init__`) or `CANOPIE_GDRIVE_API_KEY`, is masked in every message and is never
 written into a pointer. **File > Add Remote Images (URLs)…** (`remote_images_dialog.py`) runs

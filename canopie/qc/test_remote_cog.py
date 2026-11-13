@@ -65,10 +65,48 @@ class _RangeHandler(BaseHTTPRequestHandler):
         return self._json(200, {"name": name, "size": str(os.path.getsize(local)),
                                 "mimeType": "image/tiff"})
 
+    def _download(self, parts):
+        """Drive's public download endpoint: shared files stream (with Range
+        and a file name); a restricted one redirects to a sign-in page."""
+        from urllib.parse import parse_qs
+        srv = self.server
+        q = {k: v[0] for k, v in parse_qs(parts.query).items()}
+        fid = q.get("id", "")
+        if fid in srv.drive_private:
+            self.send_response(302)
+            self.send_header("Location", srv.base + "accounts.google.com/v3/signin/identifier")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return None
+        if fid not in srv.drive_files or q.get("confirm") != "t":
+            body = b"<html><title>Google Drive - Virus scan warning</title></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return None
+        local, name = srv.drive_files[fid]
+        self._disposition = 'attachment; filename="{}"'.format(name)
+        return local
+
     def do_GET(self):
         srv = self.server
         parts = urlsplit(self.path)
         drive_path = None
+        self._disposition = None
+        if parts.path.startswith("/accounts.google.com/"):
+            body = b"<html><title>Sign in - Google Accounts</title></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if parts.path == "/download":
+            drive_path = self._download(parts)
+            if drive_path is None:
+                return
         if parts.path.startswith("/drive/v3/files/"):
             drive_path = self._drive(parts)
             if drive_path is None:
@@ -111,6 +149,8 @@ class _RangeHandler(BaseHTTPRequestHandler):
                     body = fh.read()
                     self.send_response(200)
                 self.send_header("Content-Type", "image/tiff")
+                if self._disposition:
+                    self.send_header("Content-Disposition", self._disposition)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -130,6 +170,7 @@ def _start_server(root, ignore_range=False):
     srv.bytes_sent = 0
     srv.drive_key = "test-key"
     srv.drive_files = {}
+    srv.drive_private = set()
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     srv.base = "http://127.0.0.1:{}/".format(srv.server_address[1])
@@ -432,8 +473,12 @@ def test_pointer_roundtrip_and_url_kinds(tmp_path, monkeypatch):
     assert rm.gdrive_file_id("https://example.org/file/d/x") is None
 
     monkeypatch.delenv(rm.GDRIVE_KEY_ENV, raising=False)
-    with pytest.raises(rm.RemoteError, match=rm.GDRIVE_KEY_ENV):
-        rm.resolve_pointer({"url": "gdrive://" + fid})
+    monkeypatch.setattr(rm, "_DEFAULT_API_KEY", None)
+    # no key: Drive's public download endpoint (files shared by link)
+    assert rm.resolve_pointer({"url": "gdrive://" + fid}) == (
+        "{}?id={}&export=download&confirm=t".format(rm.GDRIVE_DOWNLOAD, fid), {})
+    assert rm.gdrive_file_id(
+        "https://drive.usercontent.google.com/download?id={}&export=download".format(fid)) == fid
     monkeypatch.setenv(rm.GDRIVE_KEY_ENV, "k123")
     url, headers = rm.resolve_pointer({"url": "https://drive.google.com/file/d/{}/view".format(fid)})
     assert url == ("https://www.googleapis.com/drive/v3/files/{}?alt=media"
@@ -560,6 +605,7 @@ def test_canopy_finder_reads_a_cogref_window_by_window(served):
 # --------------------------------------------------------------------------
 
 DRIVE_ID = "1PyrFixtureFileIdForQC0123456789"
+PRIVATE_ID = "1RestrictedFileIdForQC000000000"
 
 
 @pytest.fixture()
@@ -568,7 +614,9 @@ def fake_drive(served, monkeypatch):
     srv = served["srv"]
     local, _ = served["refs"]["pyr"]
     srv.drive_files = {DRIVE_ID: (local, "plot A ortho.tif")}
+    srv.drive_private = {PRIVATE_ID}
     monkeypatch.setattr(rm, "GDRIVE_API", srv.base + "drive/v3/files")
+    monkeypatch.setattr(rm, "GDRIVE_DOWNLOAD", srv.base + "download")
     monkeypatch.setattr(rm, "_DEFAULT_API_KEY", None)
     monkeypatch.delenv(rm.GDRIVE_KEY_ENV, raising=False)
     return srv
@@ -598,8 +646,19 @@ def test_make_pointer_names_reuses_and_never_clobbers(served, tmp_path):
 
 def test_a_drive_link_end_to_end(fake_drive, served, tmp_path):
     share = "https://drive.google.com/file/d/{}/view?usp=sharing".format(DRIVE_ID)
-    with pytest.raises(rm.RemoteError, match=rm.GDRIVE_KEY_ENV):
-        rm.make_pointer(share, str(tmp_path))                       # no key anywhere
+    local, _ = served["refs"]["pyr"]
+
+    # no key: a file shared by link opens through the public download endpoint,
+    # named from its Content-Disposition
+    keyless = rm.make_pointer(share, str(tmp_path / "keyless"))
+    assert os.path.basename(keyless["path"]) == "plot A ortho.cogref"
+    a, b = rr.open_reader(local), rr.open_reader(keyless["path"])
+    assert b is not None and b.is_remote, rr.last_probe_error(keyless["path"])
+    assert np.array_equal(a.read_window(10, 20, 600, 500), b.read_window(10, 20, 600, 500))
+    # a restricted file: Google's sign-in page, said as such
+    with pytest.raises(rm.RemoteError, match="sign-in page.*Anyone with the link"):
+        rm.make_pointer("https://drive.google.com/open?id=" + PRIVATE_ID, str(tmp_path))
+
     with pytest.raises(rm.RemoteError, match="API key not valid.*check the API key"):
         rm.make_pointer(share, str(tmp_path), api_key="wrong")
     with pytest.raises(rm.RemoteError, match="File not found.*Anyone with the link"):
@@ -612,7 +671,6 @@ def test_a_drive_link_end_to_end(fake_drive, served, tmp_path):
 
     # opening the pointer later uses the app's key (set from the settings)
     rm.set_default_api_key("test-key")
-    local, _ = served["refs"]["pyr"]
     a, b = rr.open_reader(local), rr.open_reader(info["path"])
     assert b is not None and b.is_remote, rr.last_probe_error(info["path"])
     assert np.array_equal(a.read_window(100, 200, 700, 900), b.read_window(100, 200, 700, 900))
@@ -704,3 +762,84 @@ def test_open_image_paths_groups_remote_images_into_roots(served, qapp, tmp_path
         pt.deleteLater()
         tabs.deleteLater()
         qapp.processEvents()
+
+
+def test_remote_preview_level_respects_the_download_budget(served, monkeypatch):
+    """A remote preview picks a coarser level when the finer one would be a
+    big download (a 298-band pixel-interleaved cube: 299 MB vs 19 MB); a
+    local file is unaffected."""
+    local, ref = served["refs"]["pyr"]
+    lr, rrd = rr.open_reader(local), rr.open_reader(ref)
+    sizes = [rrd.level_fetch_bytes(i, 3) for i in range(3)]
+    assert sizes[0] > sizes[1] > sizes[2] > 0
+    assert sizes == [lr.level_fetch_bytes(i, 3) for i in range(3)]
+    big = 1 << 40
+    assert lr.level_for_bytes(3, big, big, target_dim=None) == 0
+    assert rrd.level_for_bytes(3, big, big, target_dim=None) == 0      # all fit 48 MB
+    monkeypatch.setattr(rr, "_REMOTE_PREVIEW_FETCH_BYTES", (sizes[0] + sizes[1]) // 2)
+    assert rrd.level_for_bytes(3, big, big, target_dim=None) == 1
+    assert lr.level_for_bytes(3, big, big, target_dim=None) == 0, "local files have no download budget"
+    monkeypatch.setattr(rr, "_REMOTE_PREVIEW_FETCH_BYTES", 1)
+    assert rrd.level_for_bytes(3, big, big, target_dim=None) == 2, "nothing fits: the smallest level"
+
+
+# --------------------------------------------------------------------------
+# Zoom tiles on a remote file
+# --------------------------------------------------------------------------
+
+def _zoom_request(pt, fp, monkeypatch, request_id=None, current_id=None):
+    """Ask for the zoom tile of a 1200 x 750 raw window shown in a 400 x 250
+    viewport (a 1:3 zoom), the preview being level 2 of the fixture. Returns
+    the levels the reader was asked for."""
+    import time
+    import types
+    from PyQt5 import QtCore
+    prof = rr.probe(fp)
+    reader = rr.open_reader(fp, prof)
+    disp = np.zeros((250, 325, 3), dtype=np.uint8)
+    image_data = types.SimpleNamespace(
+        filepath=fp, image=disp, reader=reader, profile=prof, preview_bands=[0, 1, 2],
+        full_shape=(prof.height, prof.width, prof.count), display_scale=4.0)
+    seen = []
+    original = type(reader).read_window
+
+    def _spy(self, x0, y0, x1, y1, bands=None, level=0, step=1):
+        seen.append(level)
+        return original(self, x0, y0, x1, y1, bands=bands, level=level, step=step)
+
+    monkeypatch.setattr(type(reader), "read_window", _spy)
+
+    class _VP:
+        def width(self): return 400
+        def height(self): return 250
+
+    class _T:
+        def m11(self): return 400 / 300.0
+
+    viewer = types.SimpleNamespace(viewport=lambda: _VP(), transform=lambda: _T(),
+                                   devicePixelRatioF=lambda: 1.0, image_data=image_data,
+                                   _highres_request_id=current_id)
+    rect = QtCore.QRectF(12.5, 31.25, 300.0, 187.5)        # raw 50..1250 x 125..875
+    pt._request_highres_viewport_region(viewer, image_data, rect, request_id=request_id, ax={})
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and not seen and request_id == current_id:
+        time.sleep(0.02)
+    time.sleep(0.3)
+    return seen
+
+
+def test_remote_zoom_tile_reads_the_coarsest_level_with_enough_pixels(
+        served, synthetic_project, monkeypatch):
+    """A 1:3 zoom in a landscape viewport: the local rule keeps level 0 (the
+    window is not twice the viewport's longer side in height) and samples it;
+    a remote file reads level 1, which still has 600 x 375 pixels for the
+    400 x 250 on screen -- a quarter of the tiles."""
+    local, ref = served["refs"]["pyr"]
+    assert _zoom_request(synthetic_project, local, monkeypatch) == [0]
+    assert _zoom_request(synthetic_project, ref, monkeypatch) == [1]
+
+
+def test_a_superseded_zoom_request_never_reads(served, synthetic_project, monkeypatch):
+    _, ref = served["refs"]["pyr"]
+    assert _zoom_request(synthetic_project, ref, monkeypatch, request_id=1, current_id=2) == []
+    assert _zoom_request(synthetic_project, ref, monkeypatch, request_id=3, current_id=3) == [1]
