@@ -66,6 +66,12 @@ from . import polygon_lod
 from .utils import *
 
 
+def _has_project_folder(parent):
+    """A real saved project (a folder path): the bulk engine writes there."""
+    pf = getattr(parent, "project_folder", None)
+    return isinstance(pf, str) and bool(pf)
+
+
 class ShapefileImportWorker(QtCore.QObject):
     """
     Background worker for importing ESRI Shapefiles off the main GUI thread.
@@ -1535,31 +1541,36 @@ class PolygonManager(QtWidgets.QDialog):
         if not group_name:
             return
             
-        # First pass: select the polygon items
+        # First pass: select the polygon items (one selection notification per
+        # viewer -- see ImageViewer.bulk_selection)
+        import contextlib
         for vw_widget, viewer in self._iter_viewers():
-            # Clear previous selections (only polygon items) unless additive
-            if not additive and hasattr(viewer, "get_all_polygons"):
-                try:
-                    for it in viewer.get_all_polygons():
-                        try:
-                            it.setSelected(False)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+            bulk = viewer.bulk_selection() if hasattr(viewer, "bulk_selection")                 else contextlib.nullcontext()
+            with bulk:
+                # Clear previous selections (only polygon items) unless additive
+                if not additive and hasattr(viewer, "get_all_polygons"):
+                    try:
+                        for it in viewer.get_all_polygons():
+                            try:
+                                if it.isSelected():
+                                    it.setSelected(False)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
 
-            # Select the requested group
-            if hasattr(viewer, "get_all_polygons"):
-                for it in viewer.get_all_polygons():
-                    if getattr(it, "name", None) == group_name:
-                        try:
-                            # works zoomed out too (tiles hide the items)
-                            if hasattr(viewer, "select_polygon_item"):
-                                viewer.select_polygon_item(it, True)
-                            else:
-                                it.setSelected(True)
-                        except Exception:
-                            pass
+                # Select the requested group
+                if hasattr(viewer, "get_all_polygons"):
+                    for it in viewer.get_all_polygons():
+                        if getattr(it, "name", None) == group_name:
+                            try:
+                                # works zoomed out too (tiles hide the items)
+                                if hasattr(viewer, "select_polygon_item"):
+                                    viewer.select_polygon_item(it, True)
+                                else:
+                                    it.setSelected(True)
+                            except Exception:
+                                pass
         
         # Second pass: pan to the group at whatever zoom the viewer already
         # has. Delegates to ImageViewer.smart_zoom_to_scene_rect, shared
@@ -1575,7 +1586,7 @@ class PolygonManager(QtWidgets.QDialog):
                 if r is not None:
                     viewer.smart_zoom_to_scene_rect(r)
 
-    def _get_polygon_scene_rect(self, viewer_widget, viewer, group_name):
+    def _get_polygon_scene_rect(self, viewer_widget, viewer, group_name, _keys=None):
         """
         Compute the BOUNDING RECT of the polygon geometry in scene coordinates.
         
@@ -1608,7 +1619,11 @@ class PolygonManager(QtWidgets.QDialog):
         parent = self.parent()
         group_map = parent.all_polygons.get(group_name, {}) or {}
         payload = group_map.get(fp) or {}
-        if not payload:
+        if not payload and _keys is not None:
+            # zoom_to_groups looked the keys up ONCE for all its groups
+            key = _keys.get(group_name)
+            payload = (group_map.get(key) or {}) if key is not None else {}
+        elif not payload:
             try:
                 for gn, key in parent._poly_index_lookup(fp):
                     if gn == group_name and key in group_map:
@@ -1616,7 +1631,13 @@ class PolygonManager(QtWidgets.QDialog):
                         break
             except Exception:
                 logging.debug("[zoom_to_group] index lookup failed", exc_info=True)
-        pts = payload.get("points") or []
+        # A crown still lazy frames by its coarse ring (within the 16 px
+        # overview tolerance): reading 'points' paged in the full outline from
+        # disk -- 3,506 file reads to zoom to a selection of BCI crowns.
+        if isinstance(payload, polygon_lod.LazyPolygonRecord) and not payload.is_materialised                 and dict.get(payload, "display_points"):
+            pts = dict.get(payload, "display_points")
+        else:
+            pts = payload.get("points") or []
 
         if not pts:
             return None
@@ -3341,9 +3362,15 @@ class PolygonManager(QtWidgets.QDialog):
         if not self.current_root:
             return
         
-        # Lazily build reverse index if needed
-        if not hasattr(self, '_groups_by_filepath') or self._groups_by_filepath is None:
+        # Lazily build reverse index if needed -- and again whenever the
+        # project's polygon index changed (a replicate adds records for
+        # existing groups on other images: the group SET is unchanged, so the
+        # set_polygons invalidation never fired and new files were missing).
+        _ver = getattr(self.parent(), "_polygon_index_version", None)
+        if (not hasattr(self, '_groups_by_filepath') or self._groups_by_filepath is None
+                or _ver != getattr(self, "_groups_index_version", None)):
             self._build_reverse_index()
+            self._groups_index_version = _ver
         
         groups_by_fp = self._groups_by_filepath
         
@@ -3418,6 +3445,9 @@ class PolygonManager(QtWidgets.QDialog):
         copy_action = menu.addAction("Copy" + many)
         move_action = menu.addAction("Move" + many)
         copy_to_viewers_action = menu.addAction("Copy to Viewers (This Root)")
+        replicate_action = menu.addAction("Replicate to all viewers" + many)
+        replicate_action.setToolTip("Copy these crowns, with their attributes, onto the other "
+                                    "images shown in the viewers")
         locked_now = self._groups_locked(target_groups)
         lock_action = menu.addAction(("Unlock" if locked_now else "Lock") + many)
         menu.addSeparator()
@@ -3454,6 +3484,8 @@ class PolygonManager(QtWidgets.QDialog):
             self.move_selected_polygons(target_groups)
         elif action == copy_to_viewers_action:
             self.copy_selected_polygons_to_current_root_viewers(target_groups)
+        elif action == replicate_action:
+            self.replicate_groups_to_viewers(target_groups)
         elif action == lock_action:
             self._set_groups_locked(target_groups, not locked_now)
         elif action == delete_all_action:
@@ -3504,14 +3536,28 @@ class PolygonManager(QtWidgets.QDialog):
         QtWidgets.QMessageBox.information(self, "Polygon", f"'{group}' is not shown in any viewer.")
         return False
 
+    def _items_of_groups(self, groups):
+        """On-screen items of many groups in ONE pass over the viewers.
+        Calling _group_items per group scanned every item once per group:
+        right-clicking 3,506 selected BCI crowns took 8 s before the menu
+        showed (12 M attribute reads to label Lock / Unlock)."""
+        wanted = set(groups)
+        out = []
+        for _w, viewer in self._iter_viewers():
+            if not hasattr(viewer, "get_all_polygons"):
+                continue
+            for it in viewer.get_all_polygons():
+                if getattr(it, "name", None) in wanted:
+                    out.append(it)
+        return out
+
     def _groups_locked(self, groups):
-        items = [it for g in groups for _v, it in self._group_items(g)]
+        items = self._items_of_groups(groups)
         return bool(items) and all(getattr(it, "is_locked", False) for it in items)
 
     def _set_groups_locked(self, groups, locked):
-        for g in groups:
-            for _v, it in self._group_items(g):
-                it.is_locked = bool(locked)
+        for it in self._items_of_groups(groups):
+            it.is_locked = bool(locked)
 
     def polygon_stats_for_groups(self, groups):
         """"Polygon Stats…": the CSV export's statistics (process_polygon)
@@ -3599,12 +3645,19 @@ class PolygonManager(QtWidgets.QDialog):
                     # Check Type: Polygon or Point?
                     # Default to 'polygon' if key is missing
                     obj_type = poly_data.get('type', 'polygon')
-                    points_list = poly_data.get('points', [])
 
                     if obj_type == 'point':
                         stats['point_sets'] += 1
-                        # Count how many [x,y] coordinates are in this point set
-                        num_dots = len(points_list)
+                        # Count how many [x,y] coordinates are in this point set.
+                        # A lazy record knows its count: reading 'points' paged
+                        # every crown in from disk (58 s for Polygon Info on
+                        # 3,506 BCI crowns).
+                        if isinstance(poly_data, polygon_lod.LazyPolygonRecord) \
+                                and not poly_data.is_materialised:
+                            num_dots = int(dict.get(poly_data, 'full_point_count')
+                                           or len(dict.get(poly_data, 'display_points') or []))
+                        else:
+                            num_dots = len(poly_data.get('points', []) or [])
                         stats['total_individual_dots'] += num_dots
                     else:
                         stats['polygons'] += 1
@@ -3771,9 +3824,15 @@ class PolygonManager(QtWidgets.QDialog):
         parent = self.parent()
         for vw_widget, viewer in self._iter_viewers():
             combined = None
+            _idata = vw_widget.get("image_data") if isinstance(vw_widget, dict) else None
+            _fp = getattr(_idata, "filepath", None)
+            try:
+                _keys = {g_: k_ for g_, k_ in parent._poly_index_lookup(_fp)} if _fp else {}
+            except Exception:
+                _keys = None
             for g in groups:
-                r = self._get_polygon_scene_rect(vw_widget, viewer, g)
-                logging.info(f"zoom_to_groups: group={g}, rect={r}")
+                r = self._get_polygon_scene_rect(vw_widget, viewer, g, _keys=_keys)
+                logging.debug(f"zoom_to_groups: group={g}, rect={r}")
                 # r may legitimately be zero-width/zero-height (a single
                 # point) -- not "invalid", centerOn handles it fine. Only
                 # "no rect at all" is excluded.
@@ -4147,6 +4206,25 @@ class PolygonManager(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "Import Shapefile", msg)
             return
 
+        # The bulk engine (ProjectTab.import_polygons_bulk / polygon_bulk):
+        # sidecars written off the GUI thread, lazy records, chunked drawing,
+        # one undo step. The code below is the fallback for a tab without a
+        # project folder.
+        if _has_project_folder(parent) and hasattr(parent, "import_polygons_bulk"):
+            n_feat = sum(len(v or {}) for v in imported_data.values())
+
+            def _done(n_ok, n_err):
+                msg = f"Successfully imported {n_ok} feature(s) across {len(imported_data)} group(s)."
+                if n_err:
+                    msg += f"\n{n_err} could not be written (see the log)."
+                if warnings:
+                    msg += f"\n\nWarnings ({len(warnings)}):\n- " + "\n- ".join(warnings[:5])
+                QtWidgets.QMessageBox.information(self, "Shapefile Import Complete", msg)
+            started = parent.import_polygons_bulk(imported_data, parent_widget=self, on_done=_done)
+            if started:
+                logging.info("[ImportShapefile] %d feature(s) handed to the bulk writer", n_feat)
+                return
+
         def _to_scene_pts(vw, img_pts, img_size_hw):
             # Vectorised: one matmul per ring instead of one mapToScene() call
             # per vertex. See image_viewer.image_points_to_scene.
@@ -4409,6 +4487,36 @@ class PolygonManager(QtWidgets.QDialog):
               #  self.parent().save_project_quick(skip_recompute=True)
        # except Exception as e:
             #logging.debug(f"Quick-save after group delete-all failed: {e}")
+
+    def replicate_groups_to_viewers(self, groups, wait=False):
+        """'Replicate to all viewers' for groups picked in this list: each crown
+        is copied from the first viewer image that has it onto every other
+        image in the viewers (ProjectTab.replicate_polygons -- no need to
+        select thousands of items on the canvas first)."""
+        parent = self.parent()
+        if parent is None or not hasattr(parent, "replicate_polygons"):
+            return 0
+        images = []
+        for w in getattr(parent, "viewer_widgets", []) or []:
+            v = w.get("viewer") if isinstance(w, dict) else None
+            fp = getattr(getattr(v, "image_data", None), "filepath", None)
+            if fp and fp not in images:
+                images.append(fp)
+        if len(images) < 2:
+            QtWidgets.QMessageBox.information(self, "Replicate", "Only one image is shown in the viewers.")
+            return 0
+        wanted = set(groups or [])
+        by_src, placed = {}, set()
+        for fp in images:
+            for g, _k in parent._poly_index_lookup(fp):
+                if g in wanted and g not in placed:
+                    placed.add(g)
+                    by_src.setdefault(fp, []).append(g)
+        n = 0
+        for src, gs in by_src.items():
+            n += parent.replicate_polygons(gs, src, [t for t in images if t != src],
+                                           parent_widget=self, wait=wait) or 0
+        return n
 
     def copy_selected_polygons_to_current_root_viewers(self, groups=None):
         """
@@ -4821,6 +4929,13 @@ class PolygonManager(QtWidgets.QDialog):
             QtWidgets.QMessageBox.information(self, "Copy Polygons", "Source and target roots are the same.")
             return
 
+        # The bulk engine (hard links, off the GUI thread, attributes kept,
+        # one undo step), for just these groups.
+        if _has_project_folder(parent) and hasattr(parent, "_copy_roots_bulk"):
+            parent._copy_roots_bulk(source_root, [target_root], broadcast=True,
+                                    title="Copy polygons", groups=group_names)
+            return
+
         # --- helpers to gather target-file sets for pruning ---
         def _paired_thermal_root(ms_root):
             try:
@@ -4933,6 +5048,19 @@ class PolygonManager(QtWidgets.QDialog):
         src_th_root  = _paired_thermal_root(source_root)
         src_th_files = set((getattr(parent, "thermal_rgb_image_data_groups", {}) or {}).get(src_th_root, []) or [])
         src_all_files = src_ms_files | src_th_files
+
+        # The bulk engine: copy these groups, then remove them from the source
+        # root through the undoable bulk delete (it used to os.remove files).
+        if _has_project_folder(parent) and hasattr(parent, "_copy_roots_bulk"):
+            _src_files = list(src_all_files)
+            _groups = list(group_names)
+
+            def _remove_sources(n_ok, n_err):
+                if n_ok and not n_err:
+                    parent.delete_polygons_on_files(_groups, _src_files, title="Move polygons: remove from source")
+            parent._copy_roots_bulk(source_root, [target_root], broadcast=True, title="Move polygons",
+                                    groups=_groups, on_done=_remove_sources)
+            return
 
         tgt_ms_files = set((getattr(parent, "multispectral_image_data_groups", {}) or {}).get(target_root, []) or [])
         tgt_th_root  = _paired_thermal_root(target_root)

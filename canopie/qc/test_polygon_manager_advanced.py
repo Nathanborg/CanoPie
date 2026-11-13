@@ -141,6 +141,22 @@ def test_copy_and_move_polygons_between_roots(qapp, mock_project_tab):
         }
     mock_project_tab.copy_polygons_between_roots = mock_copy
 
+    # A saved project copies through the bulk engine (ProjectTab._copy_roots_bulk,
+    # which calls on_done when the copy is written); Move then removes the
+    # source crowns with the undoable bulk delete (delete_polygons_on_files).
+    def mock_bulk(src, targets, *, broadcast, title, wait=False, groups=None, on_done=None):
+        mock_copy()
+        if on_done is not None:
+            on_done(1, 0)
+        return 1
+
+    def mock_delete(groups, files, title=""):
+        for g in groups:
+            for f in files:
+                mock_project_tab.all_polygons.get(g, {}).pop(f, None)
+    mock_project_tab._copy_roots_bulk = mock_bulk
+    mock_project_tab.delete_polygons_on_files = mock_delete
+
     # We want to move it. Mock the UI selection dialog to choose the thermal root
     with patch('PyQt5.QtWidgets.QInputDialog.getItem', return_value=(th_root, True)):
         # Execute the move

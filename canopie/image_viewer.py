@@ -6355,7 +6355,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 poly = it.polygon
                 if poly is None or len(poly) < 2:
                     continue
-                arr = _np.array([[p.x(), p.y()] for p in poly], dtype=_np.float64)
+                arr = xy_from_qpolygonf(poly)     # one buffer copy, not a list per point
             if len(arr) < 2:
                 continue
 
@@ -6423,6 +6423,11 @@ class ImageViewer(QtWidgets.QGraphicsView):
 
     def _sync_polygon_batch(self):
         """Switch between per-item and tiled rendering for the current zoom."""
+        # A chunked bulk draw (ProjectTab._draw_groups_chunked) holds the
+        # tiles until its last chunk: rebuilding them after every chunk redid
+        # the whole set 15 times for 3,506 replicated crowns.
+        if getattr(self, "_batch_hold", 0):
+            return
         items = self._batch_source_items()
         if len(items) < self._BATCH_MIN_POLYGONS:
             # DROP the tiles, do not merely hide them. Hiding leaves geometry
@@ -6466,6 +6471,31 @@ class ImageViewer(QtWidgets.QGraphicsView):
             keep = (not active) or it.isSelected()
             it.setVisible(keep and visible and not getattr(it, "_filtered_hidden", False))
         self._batch_active = bool(active)
+
+    def bulk_selection(self):
+        """Context manager: select / deselect many items with ONE selection
+        notification. Each setSelected() otherwise emits selectionChanged, and
+        _on_scene_selection_changed walks every crown -- Ctrl+dragging over
+        3,506 zoomed-out crowns, or deselecting them all, was O(n^2)."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def _cm():
+            scene = getattr(self, "_scene", None)
+            if scene is None:
+                yield
+                return
+            was = scene.blockSignals(True)
+            try:
+                yield
+            finally:
+                scene.blockSignals(was)
+                if not was:
+                    try:
+                        scene.selectionChanged.emit()
+                    except Exception:
+                        self._on_scene_selection_changed()
+        return _cm()
 
     def select_polygon_item(self, item, selected=True):
         """Select / deselect a polygon item, also while zoomed out: Qt cannot
@@ -6553,13 +6583,14 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 self.select_polygon_item(hit, not hit.isSelected())
             return
         band = QtGui.QPolygonF(rect)
-        for it in self._tiled_polygons():
-            try:
-                poly = self._poly_scene(it)
-                if poly.boundingRect().intersects(rect) and poly.intersects(band):
-                    self.select_polygon_item(it, True)
-            except RuntimeError:
-                continue
+        with self.bulk_selection():
+            for it in self._tiled_polygons():
+                try:
+                    poly = self._poly_scene(it)
+                    if poly.boundingRect().intersects(rect) and poly.intersects(band):
+                        self.select_polygon_item(it, True)
+                except RuntimeError:
+                    continue
 
     def _on_scene_selection_changed(self):
         """While zoomed out (tiles active), a crown drawn on its own only
@@ -7450,40 +7481,35 @@ class ImageViewer(QtWidgets.QGraphicsView):
             base_for_json = os.path.splitext(os.path.basename(fp_view))[0]
             json_path = os.path.join(polygons_dir, f"{group_name}_{base_for_json}_polygons.json")
 
-            # CRITICAL FIX: Use image.shape dimensions (not pixmap) for consistency with load_polygons
-            # load_polygons uses viewer.image_data.image.shape[:2] as the basis
-            img_arr = getattr(img_data, "image", None)
-            if img_arr is not None:
-                img_h, img_w = img_arr.shape[:2]
-            else:
-                # Fallback to pixmap if no image array
-                pm = self._image.pixmap() if self._image else None
-                img_w = int(pm.width()) if pm else 0
-                img_h = int(pm.height()) if pm else 0
+            # Store in the FULL-RESOLUTION basis (ProjectTab.polygon_basis_hw),
+            # like every other writer. image_data.image is only a preview on a
+            # COG (~16x smaller on BCI), and records stamped in preview pixels
+            # mixed two bases in one project.
+            img_h = img_w = 0
+            try:
+                img_h, img_w = owner.polygon_basis_hw(self)
+            except Exception:
+                pass
+            if not (img_h and img_w):
+                img_arr = getattr(img_data, "image", None)
+                if img_arr is not None:
+                    img_h, img_w = img_arr.shape[:2]
+                else:
+                    pm = self._image.pixmap() if self._image else None
+                    img_w = int(pm.width()) if pm else 0
+                    img_h = int(pm.height()) if pm else 0
 
-            # CRITICAL FIX: Convert scene coordinates to image coordinates
-            # poly_item.polygon is in scene coordinates, we need image coordinates
             pm = self._image.pixmap() if self._image else None
             pm_w = int(pm.width()) if pm else img_w
             pm_h = int(pm.height()) if pm else img_h
-            
-            pts = []
-            for p in poly_item.polygon:
-                # Scene coords -> pixmap coords (via mapFromScene on pixmap item)
-                if self._image:
-                    local_pt = self._image.mapFromScene(p)
-                    px_x, px_y = local_pt.x(), local_pt.y()
-                else:
-                    px_x, px_y = p.x(), p.y()
-                
-                # Pixmap coords -> image coords
-                if pm_w > 0 and pm_h > 0:
-                    img_x = px_x * (img_w / float(pm_w))
-                    img_y = px_y * (img_h / float(pm_h))
-                else:
-                    img_x, img_y = px_x, px_y
-                    
-                pts.append((float(img_x), float(img_y)))
+
+            # Scene -> pixmap (one mapping for the whole ring) -> image basis.
+            poly_local = self._image.mapFromScene(poly_item.mapToScene(poly_item.polygon)) \
+                if self._image else poly_item.mapToScene(poly_item.polygon)
+            xy = xy_from_qpolygonf(poly_local)
+            if pm_w > 0 and pm_h > 0:
+                xy = xy * (img_w / float(pm_w), img_h / float(pm_h))
+            pts = xy.tolist()
 
             # FIX: Get the correct root ID for THIS target file
             root_id = "0"
@@ -7505,8 +7531,10 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 "points": pts
             }
 
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
+            # Replace, never write into: the file may be shared by hard link
+            # with a replicated crown on another image (polygon_bulk).
+            from . import polygon_lod as _plod
+            _plod.dump_sidecar(json_path, payload)
 
             if not hasattr(owner, "all_polygons") or owner.all_polygons is None:
                 owner.all_polygons = {}
@@ -7543,6 +7571,27 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 items = [it for it in self._scene.selectedItems()
                          if isinstance(it, (EditablePolygonItem, EditablePointItem))]
             if not items:
+                return
+
+            # In a project: copy the RECORDS, off the GUI thread
+            # (ProjectTab.replicate_polygons / polygon_bulk). The per-item path
+            # below read every crown's full outline, wrote one indented JSON
+            # and refreshed every list per crown -- 3,511 imported crowns froze
+            # CanoPie -- and dropped the crowns' attributes on the way.
+            owner = self._find_project_owner()
+            fp = getattr(getattr(self, "image_data", None), "filepath", None)
+            if owner is not None and fp and hasattr(owner, "replicate_polygons") \
+                    and getattr(owner, "project_folder", None):
+                groups = [getattr(it, "name", None) for it in items]
+                targets = []
+                for w in getattr(owner, "viewer_widgets", []) or []:
+                    v = w.get("viewer") if isinstance(w, dict) else None
+                    if v is None or v is self:
+                        continue
+                    tfp = getattr(getattr(v, "image_data", None), "filepath", None)
+                    if tfp and tfp not in targets:
+                        targets.append(tfp)
+                owner.replicate_polygons([g for g in groups if g], fp, targets, parent_widget=self)
                 return
 
             payload = []

@@ -63,7 +63,7 @@ def _no_file_basicConfig(*args, **kwargs):
     return _original_basicConfig(*args, **kwargs)
 logging.basicConfig = _no_file_basicConfig
 
-from .image_viewer import ImageViewer, EditablePolygonItem, EditablePointItem, _ZoomBar, qpolygonf_from_xy
+from .image_viewer import ImageViewer, EditablePolygonItem, EditablePointItem, _ZoomBar, qpolygonf_from_xy, xy_from_qpolygonf
 from .image_editor_dialog import ImageEditorDialog
 from .polygon_manager import PolygonManager
 from .machine_learning_manager import MachineLearningManager, AnalysisOptionsDialog, RootOffsetDialog
@@ -3537,6 +3537,72 @@ def _qimage_from_uint8(disp_u8):
         return None
 
 
+class AddPolygonsCommand(QUndoCommand):
+    """Undo / redo of a bulk copy (replicate) -- ProjectTab._apply_bulk_results.
+
+    The copy is already applied when this is pushed (QUndoStack.push runs
+    redo() at once; the first call is a no-op). Undo moves the new sidecars to
+    polygons/.trash and puts back what they replaced; redo swaps again. Both
+    are renames, never re-serialisation, so undoing 3,511 crowns is quick."""
+
+    def __init__(self, tab, entries, text):
+        super().__init__(text)
+        self.tab = tab
+        self.entries = entries
+        self._applied = True
+
+    def redo(self):
+        if self._applied:
+            return
+        self.tab._redo_bulk_add(self.entries)
+        self._applied = True
+
+    def undo(self):
+        self.tab._undo_bulk_add(self.entries)
+        self._applied = False
+
+
+class _IndexBucket(list):
+    """One polygon-index entry (the groups / (group, key) pairs of one file).
+
+    A list -- readers iterate it in insertion order -- that also keeps a set, so
+    `in` and the duplicate check in append are O(1). With plain lists, adding N
+    polygons to one image was O(N^2): 3,511 imported BCI crowns made ~6 M
+    comparisons in each of the two indices."""
+    __slots__ = ("_members",)
+
+    def __init__(self, items=()):
+        super().__init__()
+        self._members = set()
+        for x in items:
+            self.append(x)
+
+    def append(self, x):
+        if x not in self._members:
+            self._members.add(x)
+            list.append(self, x)
+
+    def __contains__(self, x):
+        return x in self._members
+
+    def remove(self, x):
+        if x not in self._members:
+            raise ValueError(x)
+        self._members.discard(x)
+        list.remove(self, x)
+
+
+def _index_bucket(index, key):
+    b = index.get(key)
+    if not isinstance(b, _IndexBucket):
+        b = _IndexBucket(b or ())
+        index[key] = b
+    return b
+
+
+_TRASH_DIRS_MADE = set()
+
+
 class DeletePolygonCommand(QUndoCommand):
     def __init__(self, project_tab, label, filepath, json_path=None, json_content=None, item_points=None, group_name=None):
         super().__init__(f"Delete Polygon '{label}'")
@@ -3632,7 +3698,12 @@ class DeletePolygonCommand(QUndoCommand):
                     # invisible to the loader.
                     trash_dir = os.path.join(os.path.dirname(self.json_path), ".trash")
                     try:
-                        os.makedirs(trash_dir, exist_ok=True)
+                        # Once per process: a makedirs per deleted polygon was
+                        # 1.3 s of a 3,506-crown Clean Vector (a failing mkdir
+                        # syscall each time).
+                        if trash_dir not in _TRASH_DIRS_MADE or not os.path.isdir(trash_dir):
+                            os.makedirs(trash_dir, exist_ok=True)
+                            _TRASH_DIRS_MADE.add(trash_dir)
                         cand = os.path.join(
                             trash_dir, f"{id(self)}_{os.path.basename(self.json_path)}")
                         os.replace(self.json_path, cand)
@@ -4123,6 +4194,11 @@ def _load_and_make_thumb(fp):
 
 
 class ProjectTab(QtWidgets.QWidget):
+    #: Bumped on every polygon-index change (the Polygon Manager rebuilds its
+    #: reverse index when it moves). A class default, so a ProjectTab whose
+    #: QWidget __init__ has not run (tests' bare shells) can still read it.
+    _polygon_index_version = 0
+
     def __init__(self, project_name, tab_widget, parent=None, exiftool_path=None):
         super().__init__(parent)
         self.project_name = project_name
@@ -8146,7 +8222,7 @@ class ProjectTab(QtWidgets.QWidget):
                 x[..., ch] *= float(arr[ch])
         return x
 
-    def load_polygons(self, viewer, image_data, ax_cfg=None):
+    def load_polygons(self, viewer, image_data, ax_cfg=None, only_groups=None):
             """
             Optimized load_polygons (v2 - High Performance):
             1. Prefers in-memory self.all_polygons (Instant).
@@ -8154,6 +8230,9 @@ class ProjectTab(QtWidgets.QWidget):
             3. Batches scene updates to prevent UI freezes.
             4. Accepts optional pre-loaded ax_cfg to avoid redundant disk I/O.
             5. Skips multiplication for identity (1:1) scaling.
+            6. only_groups: draw just these groups (the chunked draw after a
+               bulk replicate -- _draw_groups_chunked). Items already in the
+               scene are skipped either way.
             """
             import os
             import json
@@ -8280,13 +8359,15 @@ class ProjectTab(QtWidgets.QWidget):
             # to 1 on the first refresh after a draw. See _poly_index_lookup.
             if self.all_polygons:
                 for gn, stored_fp in self._poly_index_lookup(filepath):
+                    if only_groups is not None and gn not in only_groups:
+                        continue
                     if gn in self.all_polygons and stored_fp in self.all_polygons[gn]:
                         polygons_to_draw.append((self.all_polygons[gn][stored_fp], gn))
                         memory_hit = True
             t_lookup = time.perf_counter() - t0
 
             # B) Slow Path: Check Disk (Only if memory returned nothing AND we have a project folder)
-            if not memory_hit and self.project_folder:
+            if not memory_hit and self.project_folder and only_groups is None:
                 polygons_dir = os.path.join(self.project_folder, 'polygons')
                 if os.path.exists(polygons_dir):
                     filename = os.path.basename(filepath)
@@ -8332,6 +8413,8 @@ class ProjectTab(QtWidgets.QWidget):
                             pass
             t_disk = time.perf_counter() - t0 if not memory_hit else 0
 
+            if not polygons_to_draw and only_groups is not None:
+                return      # a chunk whose groups are all drawn or gone
             if not polygons_to_draw:
                 # ALWAYS log. This used to be gated on t_total > 0.1s, and the
                 # failing case returns in ~2 ms -- so the one path that leaves a
@@ -8858,6 +8941,585 @@ class ProjectTab(QtWidgets.QWidget):
         cache[key] = (int(H), int(W)) if (H and W) else (None, None)
         return cache[key]
 
+    # ------------------------------------------------------------------
+    # Bulk copy of crowns to other images (replicate) -- polygon_bulk.py
+    # ------------------------------------------------------------------
+    def _viewers_showing(self, fp):
+        """Live grid viewers showing `fp` (either path spelling)."""
+        if not fp:
+            return []
+        key = os.path.normcase(os.path.normpath(fp))
+        out = []
+        for w in getattr(self, "viewer_widgets", []) or []:
+            v = w.get("viewer") if isinstance(w, dict) else None
+            idata = getattr(v, "image_data", None) if v is not None else None
+            f = getattr(idata, "filepath", None)
+            if v is not None and f and os.path.normcase(os.path.normpath(f)) == key and v not in out:
+                out.append(v)
+        return out
+
+    def _file_basis_wh(self, fp):
+        """(w, h) a file's polygons are stored in: the full-resolution raster
+        header, the same authority as polygon_basis_hw and shapefile import."""
+        try:
+            from .shapefile_io import _raw_image_dims
+            h, w = _raw_image_dims(fp)
+            if h and w:
+                return (int(w), int(h))
+        except Exception:
+            pass
+        for v in self._viewers_showing(fp):
+            try:
+                h, w = self.polygon_basis_hw(v)
+                if h and w:
+                    return (int(w), int(h))
+            except Exception:
+                pass
+        return None
+
+    def _ask_replace_existing(self, n, parent_widget=None):
+        """'replace' / 'skip' / None (cancel) for crowns already on a target."""
+        box = QtWidgets.QMessageBox(parent_widget or self)
+        box.setIcon(QtWidgets.QMessageBox.Question)
+        box.setWindowTitle("Crowns already there")
+        box.setText(f"{n} crown(s) already exist on the target image(s) under the same name.")
+        box.setInformativeText("Replace them with the copies, or skip them? "
+                               "(Undo restores anything replaced.)")
+        b_rep = box.addButton("Replace", QtWidgets.QMessageBox.AcceptRole)
+        b_skip = box.addButton("Skip existing", QtWidgets.QMessageBox.ActionRole)
+        box.addButton(QtWidgets.QMessageBox.Cancel)
+        box.setDefaultButton(b_skip)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is b_rep:
+            return "replace"
+        if clicked is b_skip:
+            return "skip"
+        return None
+
+    def replicate_polygons(self, groups, src_fp, target_fps, *, ask=True, parent_widget=None,
+                           wait=False):
+        """Copy the crowns `groups` of image `src_fp` onto every image in
+        `target_fps`, keeping each crown's place as a fraction of the image
+        (image-size ratio), its label, attributes, Annotator values and patches.
+
+        Record level and off the GUI thread (polygon_bulk.BulkPolygonWorker):
+        nothing is read or written per crown here, so 3,511 heavy crowns no
+        longer freeze the window. Returns the number of copies started.
+        `wait=True` (tests, scripts) blocks in a local event loop until done."""
+        from . import polygon_bulk
+        if not self.project_folder:
+            QtWidgets.QMessageBox.warning(
+                parent_widget or self, "Replicate",
+                "Save the project first: copies are stored in its polygons folder.")
+            return 0
+        polygons_dir = os.path.join(self.project_folder, "polygons")
+        os.makedirs(polygons_dir, exist_ok=True)
+
+        wanted = list(dict.fromkeys(g for g in (groups or []) if g))
+        wanted_set = set(wanted)
+        src_keys = {}
+        for g, key in self._poly_index_lookup(src_fp):
+            if g in wanted_set and g not in src_keys and key in (self.all_polygons.get(g) or {}):
+                src_keys[g] = key
+        srcs = []
+        for g in wanted:
+            key = src_keys.get(g)
+            rec = (self.all_polygons.get(g) or {}).get(key) if key is not None else None
+            if isinstance(rec, dict):
+                srcs.append((g, key, rec))
+        src_norm = os.path.normcase(os.path.normpath(src_fp))
+        targets = []
+        for t in target_fps or []:
+            if t and os.path.normcase(os.path.normpath(t)) != src_norm and t not in targets:
+                targets.append(t)
+        if not srcs or not targets:
+            return 0
+
+        # Sidecars are named <group>_<image base>_polygons.json: an image with
+        # the source's base name would write over the source's own files.
+        src_base = os.path.splitext(os.path.basename(src_fp))[0]
+        same_name = [t for t in targets if os.path.splitext(os.path.basename(t))[0] == src_base]
+        targets = [t for t in targets if t not in same_name]
+        if same_name:
+            logging.warning("[replicate] skipped %d image(s) named like the source: %s",
+                            len(same_name), ", ".join(os.path.basename(t) for t in same_name))
+        if not targets:
+            return 0
+
+        src_wh = self._file_basis_wh(src_fp)
+        tinfo = {}
+        for t in targets:
+            tinfo[t] = {
+                "wh": self._file_basis_wh(t),
+                "root_id": self._sidecar_root_id(t),
+                "coords": self._sidecar_coords(t, {}),
+                "existing": {g: k for g, k in self._poly_index_lookup(t)
+                             if k in (self.all_polygons.get(g) or {})},
+            }
+        conflicts = sum(1 for t in targets for g, _k, _r in srcs if g in tinfo[t]["existing"])
+        replace = True
+        if conflicts and ask:
+            choice = self._ask_replace_existing(conflicts, parent_widget)
+            if choice is None:
+                return 0
+            replace = choice == "replace"
+
+        tag = "rep%d" % int(time.time() * 1000)
+        jobs = self._bulk_copy_jobs(srcs, tinfo, polygons_dir, src_wh, replace, tag)
+        if not jobs:
+            return 0
+        return self._run_bulk_jobs(jobs, "Replicating crowns", parent_widget=parent_widget, wait=wait)
+
+    def _copy_roots_bulk(self, source_root, target_roots, *, broadcast, title, wait=False,
+                         groups=None, on_done=None):
+        """Copy every crown of `source_root` onto `target_roots` (Copy to
+        next / previous / all roots) with the polygon_bulk engine: hard links
+        where possible, off the GUI thread, one undo step, attributes kept.
+
+        copy_polygons_between_roots still decides which target file each
+        source file pairs with (suffix, size, position); this used to be
+        followed by per-vertex Python copies and a full root save on the GUI
+        thread (3,506 BCI crowns: 18.5 s frozen, attributes dropped)."""
+        if not self.project_folder:
+            QtWidgets.QMessageBox.warning(self, title, "Save the project first.")
+            return 0
+        polygons_dir = os.path.join(self.project_folder, "polygons")
+        os.makedirs(polygons_dir, exist_ok=True)
+        self._bulk_collect = []
+        try:
+            for tgt in target_roots:
+                self.copy_polygons_between_roots(
+                    source_root, tgt, broadcast_if_ambiguous=broadcast, rescale=True,
+                    defer_viewer_update=True, defer_save=True)
+        finally:
+            pairing, self._bulk_collect = self._bulk_collect, None
+
+        tinfo_all = {}
+
+        def _tinfo(t):
+            if t not in tinfo_all:
+                tinfo_all[t] = {
+                    "wh": self._file_basis_wh(t),
+                    "root_id": self._sidecar_root_id(t),
+                    "coords": self._sidecar_coords(t, {}),
+                    "existing": {g: k for g, k in self._poly_index_lookup(t)
+                                 if k in (self.all_polygons.get(g) or {})},
+                }
+            return tinfo_all[t]
+
+        plan = []           # (srcs, {target: info}, src_wh)
+        skipped_same = 0
+        only = set(groups) if groups is not None else None
+        for s_fp, tfps in pairing:
+            srcs = []
+            for g, k in self._poly_index_lookup(s_fp):
+                if only is not None and g not in only:
+                    continue
+                rec = (self.all_polygons.get(g) or {}).get(k)
+                if isinstance(rec, dict):
+                    srcs.append((g, k, rec))
+            if not srcs:
+                continue
+            s_base = os.path.splitext(os.path.basename(s_fp))[0]
+            tmap = {}
+            for t in tfps:
+                if os.path.normcase(os.path.normpath(t)) == os.path.normcase(os.path.normpath(s_fp)):
+                    continue
+                if os.path.splitext(os.path.basename(t))[0] == s_base:
+                    skipped_same += 1       # same sidecar names: would overwrite the source
+                    continue
+                tmap[t] = _tinfo(t)
+            if tmap:
+                plan.append((srcs, tmap, self._file_basis_wh(s_fp)))
+        if skipped_same:
+            logging.warning("[%s] skipped %d image(s) with the same file name as their source",
+                            title, skipped_same)
+        if not plan:
+            QtWidgets.QMessageBox.information(self, title, "No polygons to copy.")
+            return 0
+
+        conflicts = sum(1 for srcs, tmap, _w in plan for t, info in tmap.items()
+                        for g, _k, _r in srcs if g in info["existing"])
+        replace = True
+        if conflicts:
+            choice = self._ask_replace_existing(conflicts)
+            if choice is None:
+                return 0
+            replace = choice == "replace"
+
+        tag = "cpy%d" % int(time.time() * 1000)
+        jobs, seen = [], set()
+        for n, (srcs, tmap, src_wh) in enumerate(plan):
+            for job in self._bulk_copy_jobs(srcs, tmap, polygons_dir, src_wh, replace,
+                                            "%s_%d" % (tag, n)):
+                key = (job["group"], os.path.normcase(os.path.normpath(job["dst_fp"])))
+                if key in seen:
+                    continue        # an ambiguous broadcast pairing the same file twice
+                seen.add(key)
+                jobs.append(job)
+        if not jobs:
+            QtWidgets.QMessageBox.information(self, title, "Nothing new to copy.")
+            return 0
+        return self._run_bulk_jobs(jobs, title, wait=wait, on_done=on_done)
+
+    def delete_polygons_on_files(self, groups, filepaths, title="Delete polygons"):
+        """Undoable bulk delete of `groups` on `filepaths` (either path
+        spelling): the delete-selected path, restricted to some images."""
+        want = {os.path.normcase(os.path.normpath(f)) for f in filepaths}
+        self.undo_stack.beginMacro(title)
+        try:
+            with self._bulk_polygon_delete():
+                for g in list(groups):
+                    for fp in list((self.all_polygons.get(g) or {}).keys()):
+                        if os.path.normcase(os.path.normpath(fp)) in want:
+                            self.undo_stack.push(DeletePolygonCommand(self, g, fp))
+        finally:
+            self.undo_stack.endMacro()
+
+    def _source_sidecar_if_current(self, group, key, rec):
+        """The sidecar that holds exactly what record `rec` says, or None when
+        memory may be ahead of the file (unsaved or materialised) or there is
+        no file."""
+        dirty = (getattr(self, "_dirty_polygon_entries", None) or set()) | \
+            (getattr(self, "_dirty_polys", None) or set())
+        if (group, key) in dirty:
+            return None
+        if not isinstance(rec, polygon_lod.LazyPolygonRecord) or rec.is_materialised:
+            return None                 # memory is the truth
+        path = rec.source_path
+        return path if path and os.path.exists(path) else None
+
+    def _bulk_copy_jobs(self, srcs, tinfo, polygons_dir, src_wh, replace, tag):
+        """Jobs for polygon_bulk: one per (crown, target image). Hard-link
+        jobs where the source file is current; copies otherwise."""
+        from . import polygon_bulk
+        jobs = []
+        for t, info in tinfo.items():
+            for g, key, rec in srcs:
+                old_key = info["existing"].get(g)
+                if old_key is not None and not replace:
+                    continue
+                job = {
+                    "group": g, "dst_fp": t,
+                    "sidecar": polygon_bulk.sidecar_path(polygons_dir, g, t),
+                    "src_wh": src_wh, "dst_wh": info["wh"],
+                    "root_id": info["root_id"], "coords": info["coords"],
+                    "replace": old_key is not None, "old_key": old_key,
+                    "tag": "%s_%d" % (tag, len(jobs)),
+                }
+                cur = self._source_sidecar_if_current(g, key, rec)
+                if cur and os.path.normcase(os.path.abspath(cur)) != \
+                        os.path.normcase(os.path.abspath(job["sidecar"])):
+                    job["link_from"] = cur
+                    job["meta"] = polygon_bulk.link_meta(rec, g, info["root_id"])
+                else:
+                    job["src"] = dict(rec)                      # in-memory edits win
+                jobs.append(job)
+        return jobs
+
+    def import_polygons_bulk(self, imported, *, parent_widget=None, on_done=None, wait=False):
+        """Install a shapefile import ({group: {filepath: record WITH points}})
+        through polygon_bulk: the sidecars are written off the GUI thread, the
+        records become lazy (coarse ring in memory, full outline on disk), the
+        crowns are drawn in chunks, and the import is one undo step.
+
+        The old path held all 2.1 M BCI vertices as Python tuples in memory and
+        ran the whole save -- a per-vertex payload loop, re-decimating every
+        crown for the overview, project.json pretty-printed -- synchronously
+        on the GUI thread, behind an already-closed progress dialog."""
+        from . import polygon_bulk
+        if not self.project_folder:
+            return 0
+        polygons_dir = os.path.join(self.project_folder, "polygons")
+        os.makedirs(polygons_dir, exist_ok=True)
+        info_by_fp = {}
+        tag = "imp%d" % int(time.time() * 1000)
+        jobs = []
+        for g, fmap in (imported or {}).items():
+            for fp, rec in (fmap or {}).items():
+                if not isinstance(rec, dict):
+                    continue
+                info = info_by_fp.get(fp)
+                if info is None:
+                    info = info_by_fp[fp] = {
+                        "root_id": self._sidecar_root_id(fp),
+                        "coords": self._sidecar_coords(fp, {}),
+                        "existing": {gg: k for gg, k in self._poly_index_lookup(fp)
+                                     if k in (self.all_polygons.get(gg) or {})},
+                    }
+                old_key = info["existing"].get(g)
+                wh = polygon_bulk.record_basis_wh(rec, None)
+                jobs.append({
+                    "group": g, "dst_fp": fp,
+                    "sidecar": polygon_bulk.sidecar_path(polygons_dir, g, fp),
+                    "src": rec, "src_wh": wh, "dst_wh": wh,
+                    "root_id": info["root_id"], "coords": info["coords"],
+                    "replace": old_key is not None, "old_key": old_key,
+                    "tag": "%s_%d" % (tag, len(jobs)),
+                })
+        if not jobs:
+            return 0
+        return self._run_bulk_jobs(jobs, "Importing shapefile", parent_widget=parent_widget,
+                                   wait=wait, on_done=on_done)
+
+    def _run_bulk_jobs(self, jobs, title, parent_widget=None, wait=False, on_done=None):
+        from . import polygon_bulk
+        thread = QtCore.QThread(self)
+        worker = polygon_bulk.BulkPolygonWorker(jobs)
+        worker.moveToThread(thread)
+        dlg = QtWidgets.QProgressDialog(f"{title}: 0 of {len(jobs)}", "Cancel", 0, len(jobs),
+                                        parent_widget or self)
+        dlg.setWindowTitle(title)
+        dlg.setWindowModality(QtCore.Qt.WindowModal)
+        dlg.setMinimumDuration(300)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setValue(0)
+        dlg.canceled.connect(worker.cancel, QtCore.Qt.DirectConnection)
+        if not hasattr(self, "_bulk_threads"):
+            self._bulk_threads = set()
+        self._bulk_threads.add(thread)
+        done = {"flag": False}
+
+        def _progress(n, total):
+            try:
+                dlg.setLabelText(f"{title}: {n} of {total}")
+                dlg.setValue(n)
+            except RuntimeError:
+                pass
+
+        def _finished(results, errors):
+            try:
+                try:
+                    dlg.setLabelText(f"{title}: drawing...")
+                except RuntimeError:
+                    pass
+                self._apply_bulk_results(jobs, results, errors, title)
+            finally:
+                done["flag"] = True
+                try:
+                    dlg.close()
+                    dlg.deleteLater()
+                except RuntimeError:
+                    pass
+            if on_done is not None:
+                try:
+                    on_done(len(results), len(errors))
+                except Exception:
+                    logging.debug("[bulk] on_done failed", exc_info=True)
+
+        def _cleanup():
+            self._bulk_threads.discard(thread)
+            worker.deleteLater()
+            thread.deleteLater()
+
+        worker.progress.connect(_progress)
+        worker.finished.connect(_finished)
+        worker.finished.connect(thread.quit)
+        thread.started.connect(worker.run)
+        thread.finished.connect(_cleanup)
+        self._bulk_last_worker = worker
+        thread.start()
+        if wait:
+            loop_t0 = time.time()
+            while not done["flag"] and time.time() - loop_t0 < 600:
+                QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
+        return len(jobs)
+
+    def _apply_bulk_results(self, jobs, results, errors, title="Copy"):
+        """GUI side of a bulk copy: install the written crowns as lazy records,
+        index them, draw them in chunks, one undo entry, one refresh."""
+        entries, pairs = [], []
+        by_fp = {}
+        dirty_sets = [getattr(self, "_dirty_polygon_entries", None), getattr(self, "_dirty_polys", None)]
+        for i, meta, trash in results:
+            job = jobs[i]
+            g, t = job["group"], job["dst_fp"]
+            grp = self.all_polygons.setdefault(g, {})
+            old_key = job.get("old_key")
+            old_rec = None
+            if old_key is not None and old_key in grp:
+                old_rec = grp.pop(old_key)
+                if old_key != t:
+                    self._remove_from_polygon_index(g, old_key)
+                # A pending flush for the replaced key must not write (or, under
+                # the other spelling, DELETE) the file just written.
+                for ds in dirty_sets:
+                    if ds is not None:
+                        ds.discard((g, old_key))
+            meta = dict(meta)
+            pinned = ("root",) if meta.pop("_linked", False) else ()
+            grp[t] = polygon_lod.LazyPolygonRecord(meta, job["sidecar"], pinned=pinned)
+            pairs.append((g, t))
+            entries.append({"group": g, "fp": t, "sidecar": job["sidecar"], "meta": meta,
+                            "pinned": pinned,
+                            "old_key": old_key, "old_rec": old_rec, "old_trash": trash,
+                            "tag": job.get("tag", "bulk")})
+            by_fp.setdefault(t, set()).add(g)
+        self._add_many_to_polygon_index(pairs)
+        for i, msg in errors[:20]:
+            logging.warning("[%s] %s -> %s failed: %s", title, jobs[i]["group"],
+                            os.path.basename(jobs[i]["dst_fp"]), msg)
+        if entries:
+            self.undo_stack.push(AddPolygonsCommand(
+                self, entries, f"{title}: {len(entries)} crown(s)"))
+            self._redraw_bulk_groups(by_fp)
+            self._after_bulk_polygon_change()
+        n_cancel = len(jobs) - len(results) - len(errors)
+        logging.info("[%s] %d copied, %d failed, %d cancelled", title, len(entries), len(errors), n_cancel)
+        self._last_bulk_result = {"copied": len(entries), "failed": len(errors), "cancelled": n_cancel}
+        if errors or n_cancel:
+            QtWidgets.QMessageBox.information(
+                self, title,
+                f"{len(entries)} crown(s) copied"
+                + (f", {len(errors)} failed (see the log)" if errors else "")
+                + (f", {n_cancel} not copied (cancelled)" if n_cancel else "") + ".")
+
+    def _after_bulk_polygon_change(self):
+        try:
+            self._write_polygon_overview(background=True)
+        except Exception as e:
+            logging.warning("[bulk] overview refresh failed: %s", e)
+        try:
+            self.update_polygon_manager()
+        except Exception:
+            logging.debug("[bulk] polygon manager refresh failed", exc_info=True)
+
+    def _redraw_bulk_groups(self, by_fp, draw=True):
+        """For every image in `by_fp` ({filepath: groups}), drop those groups'
+        items from the viewers showing it (one scene scan per viewer) and draw
+        what the records now say, in chunks."""
+        for fp, groups in by_fp.items():
+            for v in self._viewers_showing(fp):
+                try:
+                    gone = False
+                    scene = getattr(v, "_scene", None)
+                    for it in list(v.get_all_polygons()):
+                        if getattr(it, "name", None) in groups and scene is not None:
+                            scene.removeItem(it)
+                            gone = True
+                    if gone:
+                        v.prune_detached_polygon_records()
+                        v.invalidate_polygon_batch()
+                except Exception:
+                    logging.debug("[bulk] clearing items failed", exc_info=True)
+                if draw:
+                    self._draw_groups_chunked(v, groups)
+
+    def _draw_groups_chunked(self, viewer, groups, chunk=250):
+        """load_polygons for `groups` a chunk per event-loop turn, so drawing
+        thousands of crowns never blocks the window for long."""
+        from PyQt5 import sip
+        groups = sorted(groups)
+        idata = getattr(viewer, "image_data", None)
+        fp = getattr(idata, "filepath", None)
+        if not groups or not fp:
+            return
+        try:
+            ax_cfg = self._load_ax_json(fp) or {}
+        except Exception:
+            ax_cfg = None
+        state = {"i": 0}
+        timer = QtCore.QTimer(self)
+        timer.setInterval(0)
+        if not hasattr(self, "_chunk_draw_timers"):
+            self._chunk_draw_timers = set()
+        self._chunk_draw_timers.add(timer)
+
+        viewer._batch_hold = getattr(viewer, "_batch_hold", 0) + 1
+
+        def _stop():
+            timer.stop()
+            self._chunk_draw_timers.discard(timer)
+            timer.deleteLater()
+            try:
+                if not sip.isdeleted(viewer):
+                    viewer._batch_hold = max(0, getattr(viewer, "_batch_hold", 1) - 1)
+                    if not viewer._batch_hold:
+                        viewer.invalidate_polygon_batch()
+                        viewer.viewport().update()
+            except Exception:
+                pass
+
+        def _tick():
+            try:
+                if sip.isdeleted(viewer):
+                    return _stop()
+                cur = getattr(viewer, "image_data", None)
+                if cur is None or getattr(cur, "filepath", None) != fp:
+                    return _stop()          # navigated away: the next load draws all
+                part = groups[state["i"]:state["i"] + chunk]
+                state["i"] += chunk
+                if part:
+                    self.load_polygons(viewer, cur, ax_cfg=ax_cfg, only_groups=set(part))
+                if state["i"] >= len(groups):
+                    _stop()
+                    viewer.viewport().update()
+            except Exception:
+                logging.debug("[bulk] chunked draw failed", exc_info=True)
+                _stop()
+
+        timer.timeout.connect(_tick)
+        timer.start()
+
+    def _undo_bulk_add(self, entries):
+        from . import polygon_bulk
+        by_fp = {}
+        dirty_sets = [getattr(self, "_dirty_polygon_entries", None), getattr(self, "_dirty_polys", None)]
+        for e in reversed(entries):
+            g, t = e["group"], e["fp"]
+            grp = self.all_polygons.get(g)
+            if isinstance(grp, dict):
+                grp.pop(t, None)
+            self._remove_from_polygon_index(g, t)
+            for ds in dirty_sets:
+                if ds is not None:
+                    ds.discard((g, t))
+            try:
+                e["new_trash"] = polygon_bulk.trash_aside(e["sidecar"], "undo_" + e["tag"])
+            except Exception as ex:
+                logging.warning("[bulk undo] could not move %s aside: %s", e["sidecar"], ex)
+                e["new_trash"] = None
+            if e.get("old_rec") is not None:
+                if e.get("old_trash") and os.path.exists(e["old_trash"]):
+                    try:
+                        os.replace(e["old_trash"], e["sidecar"])
+                    except Exception as ex:
+                        logging.warning("[bulk undo] could not restore %s: %s", e["sidecar"], ex)
+                self.all_polygons.setdefault(g, {})[e["old_key"]] = e["old_rec"]
+                self._add_to_polygon_index(g, e["old_key"])
+            elif isinstance(grp, dict) and not grp:
+                self.all_polygons.pop(g, None)
+            by_fp.setdefault(t, set()).add(g)
+        self._redraw_bulk_groups(by_fp)
+        self._after_bulk_polygon_change()
+
+    def _redo_bulk_add(self, entries):
+        from . import polygon_bulk
+        by_fp = {}
+        pairs = []
+        for e in entries:
+            g, t = e["group"], e["fp"]
+            grp = self.all_polygons.setdefault(g, {})
+            if e.get("old_rec") is not None:
+                grp.pop(e["old_key"], None)
+                if e["old_key"] != t:
+                    self._remove_from_polygon_index(g, e["old_key"])
+                try:
+                    e["old_trash"] = polygon_bulk.trash_aside(e["sidecar"], "redo_" + e["tag"])
+                except Exception as ex:
+                    logging.warning("[bulk redo] could not move %s aside: %s", e["sidecar"], ex)
+            if e.get("new_trash") and os.path.exists(e["new_trash"]):
+                os.replace(e["new_trash"], e["sidecar"])
+            grp[t] = polygon_lod.LazyPolygonRecord(e["meta"], e["sidecar"],
+                                                   pinned=e.get("pinned", ()))
+            pairs.append((g, t))
+            by_fp.setdefault(t, set()).add(g)
+        self._add_many_to_polygon_index(pairs)
+        self._redraw_bulk_groups(by_fp)
+        self._after_bulk_polygon_change()
+
     def copy_polygons_between_roots(
         self,
         source_root,
@@ -9137,6 +9799,22 @@ class ProjectTab(QtWidgets.QWidget):
         # Instead of iterating ALL polygon groups (could be thousands), use the index
         # to find only groups that have polygons in the source root files.
         self._ensure_polygon_index()
+
+        # Bulk mode (_copy_roots_bulk): report only WHICH target file each
+        # source file pairs with; polygon_bulk does the copying.
+        collect = getattr(self, "_bulk_collect", None)
+        if collect is not None:
+            for s_fp in list(src_ms_files) + list(src_th_files):
+                if s_fp in src_ms_index:
+                    cands, imap = tgt_ms_files, src_ms_index
+                else:
+                    cands, imap = tgt_th_files, src_th_index
+                if not cands:
+                    continue
+                tfps = _best_targets_for_src(s_fp, cands, imap) or []
+                if tfps:
+                    collect.append((s_fp, list(tfps)))
+            return
         
         relevant_groups = set()
         for src_fp in src_files_set:
@@ -9381,9 +10059,10 @@ class ProjectTab(QtWidgets.QWidget):
             # FIX: Force redraw for target root to ensure new polygons appear
             self._redraw_polys_for_root(target_root)
 
-        print(f"[copy_polygons_between_roots] Copied {copies_made} polygon-set(s) "
-              f"{source_root} → {target_root} (MS:{len(tgt_ms_files)}, TRGB:{len(tgt_th_files)}; "
-              f"rescale={rescale}, defer_viewer_update={defer_viewer_update}, defer_save={defer_save}).")
+        logging.info("[copy_polygons_between_roots] Copied %d polygon-set(s) %s -> %s "
+                     "(MS:%d, TRGB:%d; rescale=%s, defer_viewer_update=%s, defer_save=%s).",
+                     copies_made, source_root, target_root, len(tgt_ms_files), len(tgt_th_files),
+                     rescale, defer_viewer_update, defer_save)
 
     def copy_polygons_to_next_tab(self):
         """
@@ -10032,6 +10711,14 @@ class ProjectTab(QtWidgets.QWidget):
         if resp != QtWidgets.QMessageBox.Yes:
             return
 
+        # Hard links off the GUI thread (polygon_bulk). The "fast / rescale"
+        # question below is moot there: both placed a crown at the same
+        # fraction of the image, which is what a link keeps.
+        if self.project_folder:
+            self._copy_roots_bulk(current_root, targets, broadcast=True,
+                                  title="Copy to all roots")
+            return
+
         # fast vs rescale
         res = QtWidgets.QMessageBox.question(
             self, "Copy mode",
@@ -10217,6 +10904,11 @@ class ProjectTab(QtWidgets.QWidget):
             current_root = self.multispectral_root_names[self.current_root_index]
             prev_root    = self.multispectral_root_names[self.current_root_index - 1]
 
+            if self.project_folder:
+                self._copy_roots_bulk(current_root, [prev_root], broadcast=False,
+                                      title="Copy to previous root")
+                return
+
             # Fast copy, but STRICT pairing: do NOT broadcast ambiguous matches
             self.copy_polygons_between_roots(
                 current_root, prev_root,
@@ -10271,6 +10963,14 @@ class ProjectTab(QtWidgets.QWidget):
         if self.current_root_index < len(self.multispectral_root_names) - 1:
             current_root = self.multispectral_root_names[self.current_root_index]
             next_root    = self.multispectral_root_names[self.current_root_index + 1]
+
+            # Hard links off the GUI thread, attributes kept, one undo step
+            # (polygon_bulk). The old path below froze CanoPie for 18.5 s on
+            # 3,506 BCI crowns and dropped their attributes.
+            if self.project_folder:
+                self._copy_roots_bulk(current_root, [next_root], broadcast=False,
+                                      title="Copy to next root")
+                return
 
             # Fast copy, but STRICT pairing: do NOT broadcast ambiguous matches
             self.copy_polygons_between_roots(
@@ -22451,6 +23151,29 @@ class ProjectTab(QtWidgets.QWidget):
         cache[key] = hw
         return hw
 
+    def _scene_to_image_xy(self, viewer, xy):
+        """scene_to_image_coords for a whole (N, 2) ring at once (numpy)."""
+        a = np.asarray(xy, dtype=np.float64).reshape(-1, 2)
+        if viewer is None or viewer.image_data is None or viewer._image is None or not len(a):
+            return a
+        pixitem = viewer._image
+        img_h, img_w = self.polygon_basis_hw(viewer)
+        if not (img_h and img_w):
+            img_h, img_w = viewer.image_data.image.shape[:2]
+        pixmap = pixitem.pixmap()
+        pw, ph = max(1, pixmap.width()), max(1, pixmap.height())
+        inv, ok = pixitem.sceneTransform().inverted()
+        if not ok:
+            return np.array([[p.x(), p.y()] for p in
+                             (self.scene_to_image_coords(viewer, QtCore.QPointF(x, y))
+                              for x, y in a)], dtype=np.float64).reshape(-1, 2)
+        x = a[:, 0] * inv.m11() + a[:, 1] * inv.m21() + inv.dx()
+        y = a[:, 0] * inv.m12() + a[:, 1] * inv.m22() + inv.dy()
+        if inv.type() == QtGui.QTransform.TxProject:
+            w = a[:, 0] * inv.m13() + a[:, 1] * inv.m23() + inv.m33()
+            x, y = x / w, y / w
+        return np.column_stack((x * (img_w / float(pw)), y * (img_h / float(ph))))
+
     def scene_to_image_coords(self, viewer, scene_point):
         """
         Map scene -> image pixels using the pixmap item’s own transform.
@@ -22542,7 +23265,7 @@ class ProjectTab(QtWidgets.QWidget):
             for fp in fm:
                 # Exact path index (FAST - just string hashing)
                 if fp not in self._poly_exact_index:
-                    self._poly_exact_index[fp] = []
+                    self._poly_exact_index[fp] = _IndexBucket()
                 self._poly_exact_index[fp].append(gn)
                 
                 # Normalized index (for case-insensitive lookups)
@@ -22551,12 +23274,13 @@ class ProjectTab(QtWidgets.QWidget):
                 except Exception:
                     fp_norm = str(fp).lower()
                 if fp_norm not in self._poly_norm_index:
-                    self._poly_norm_index[fp_norm] = []
+                    self._poly_norm_index[fp_norm] = _IndexBucket()
                 self._poly_norm_index[fp_norm].append((gn, fp))
                 
                 entry_count += 1
         
         self._poly_norm_index_invalid = False
+        self._polygon_index_version = getattr(self, "_polygon_index_version", 0) + 1
         
         elapsed = time.perf_counter() - t0
         # Always log on first build, then only if slow
@@ -22576,22 +23300,21 @@ class ProjectTab(QtWidgets.QWidget):
         if not hasattr(self, '_poly_norm_index') or self._poly_norm_index is None:
             self._poly_norm_index = {}
         
-        # Add to exact index
-        if filepath not in self._poly_exact_index:
-            self._poly_exact_index[filepath] = []
-        if group_name not in self._poly_exact_index[filepath]:
-            self._poly_exact_index[filepath].append(group_name)
-        
+        # Add to exact index (an _IndexBucket: O(1) membership, see its docstring)
+        _index_bucket(self._poly_exact_index, filepath).append(group_name)
+
         # Add to normalized index
         try:
             fp_norm = os.path.normpath(filepath).lower() if filepath else ""
         except Exception:
             fp_norm = str(filepath).lower()
-        if fp_norm not in self._poly_norm_index:
-            self._poly_norm_index[fp_norm] = []
-        entry = (group_name, filepath)
-        if entry not in self._poly_norm_index[fp_norm]:
-            self._poly_norm_index[fp_norm].append(entry)
+        _index_bucket(self._poly_norm_index, fp_norm).append((group_name, filepath))
+        self._polygon_index_version = getattr(self, "_polygon_index_version", 0) + 1
+
+    def _add_many_to_polygon_index(self, pairs):
+        """_add_to_polygon_index for many (group, filepath) pairs at once."""
+        for group_name, filepath in pairs:
+            self._add_to_polygon_index(group_name, filepath)
 
     def _remove_from_polygon_index(self, group_name: str, filepath: str):
         """
@@ -22625,6 +23348,7 @@ class ProjectTab(QtWidgets.QWidget):
                         del self._poly_norm_index[fp_norm]
                 except (ValueError, KeyError):
                     pass
+        self._polygon_index_version = getattr(self, "_polygon_index_version", 0) + 1
 
     def _poly_index_lookup(self, filepath: str):
         """Every (group_name, storage_key) that holds polygons for `filepath`.
@@ -22929,7 +23653,7 @@ class ProjectTab(QtWidgets.QWidget):
                             else:
                                 poly_local = it.polygon
                             poly_scene = it.mapToScene(poly_local)
-                            pts_scene = [(float(p.x()), float(p.y())) for p in poly_scene]
+                            pts_scene = xy_from_qpolygonf(poly_scene)      # (N, 2) array
                             shape_type = "polygon"
                         except Exception:
                             # fallback: read local as-is
@@ -22987,17 +23711,18 @@ class ProjectTab(QtWidgets.QWidget):
                     else:
                         continue
 
-                    if not pts_scene:
+                    if len(pts_scene) == 0:
                         continue
 
                     # CRITICAL FIX: Convert scene -> image coords directly using scene_to_image_coords.
                     # This ensures the coordinate conversion uses the SAME basis as image_ref_size
                     # (viewer.image_data.image.shape). The old _map_points_scene_to_image approach
                     # could cause mismatch after reset/refresh.
-                    img_pts = []
-                    for pt in pts_scene:
-                        ip = self.scene_to_image_coords(viewer, QtCore.QPointF(pt[0], pt[1]))
-                        img_pts.append((float(ip.x()), float(ip.y())))
+                    # One numpy transform per crown: this ran scene_to_image_coords
+                    # per VERTEX (a QPointF, a mapFromScene and a basis lookup
+                    # each) for every full-detail crown on every autosave.
+                    img_pts = [tuple(p) for p in
+                               self._scene_to_image_xy(viewer, pts_scene).tolist()]
 
                     if not img_pts:
                         continue
@@ -23343,6 +24068,7 @@ class ProjectTab(QtWidgets.QWidget):
             self._bulk_delete_depth -= 1
             if self._bulk_delete_depth <= 0:
                 self._bulk_delete_depth = 0
+                self.__dict__.pop("_bulk_no_ax_files", None)
                 self._flush_bulk_delete_pending()
 
     def _flush_bulk_delete_pending(self):
@@ -28533,7 +29259,17 @@ class ProjectTab(QtWidgets.QWidget):
         
         if not filepath or not polygon_name:
             return
-        
+
+        # Inside a bulk delete (thousands of polygons on a few images) an image
+        # with no .ax file is looked up once: this ran twice per deleted
+        # polygon, each a path build plus file-exists checks (1.5 s of a
+        # 3,506-crown Clean Vector).
+        _no_ax = None
+        if getattr(self, "_bulk_delete_depth", 0) > 0:
+            _no_ax = self.__dict__.setdefault("_bulk_no_ax_files", set())
+            if filepath in _no_ax:
+                return
+
         try:
             # Get the .ax file path
             ax_path = None
@@ -28543,6 +29279,8 @@ class ProjectTab(QtWidgets.QWidget):
                 ax_path = self._ax_path_for_fp(filepath)
 
             if not ax_path or not os.path.exists(ax_path):
+                if _no_ax is not None:
+                    _no_ax.add(filepath)
                 return
 
             # Read current .ax config -- via the mtime+size-keyed cache, not a
@@ -30080,7 +30818,7 @@ class ProjectTab(QtWidgets.QWidget):
                     'display_points': e.get('p') or [],
                     'display_level': level,
                     'full_point_count': e.get('np', 0),
-                }, src)
+                }, src, pinned=tuple(e.get('pin') or ()))
                 n_lazy += 1
             # THE OVERVIEW IS A CACHE, NOT A FILTER.
             #
@@ -30133,7 +30871,7 @@ class ProjectTab(QtWidgets.QWidget):
             logging.warning("[load_polygons_from_dir] overview build failed: %s", e)
         return result
 
-    def _write_polygon_overview(self, all_polygons=None):
+    def _write_polygon_overview(self, all_polygons=None, background=False):
         """(Re)write the coarse-geometry index the fast load path reads.
 
         Cheap enough to run after every save: it only touches the small
@@ -30166,25 +30904,45 @@ class ProjectTab(QtWidgets.QWidget):
                         'points': [None] * int(dict.get(data, 'full_point_count', 0) or 0),
                         'lod': {str(dict.get(data, 'display_level', polygon_lod.OVERVIEW_LEVEL)):
                                 dict.get(data, 'display_points') or []},
+                        '_pin': data.pinned,
                     }))
                 else:
                     records.append((group, fp, data))
-        # DIAGNOSTIC + SAFETY: this rebuilds the whole overview from MEMORY.
-        # If memory is ever incomplete when a save runs, the overview shrinks to
-        # match, and the fast load path then reads the smaller set. Refuse and
-        # say so rather than silently narrowing what the project describes.
-        try:
-            on_disk = len([f for f in os.listdir(polygons_dir)
-                           if f.endswith('_polygons.json') and not f.startswith('_')])
-            if on_disk and len(records) < on_disk * 0.9:
-                logging.warning("[overview] REFUSING to rewrite: memory has %d polygon(s) "
-                                "but %d sidecar(s) exist on disk. Writing would hide %d of "
-                                "them from the fast load path.",
-                                len(records), on_disk, on_disk - len(records))
+        def _write():
+            # DIAGNOSTIC + SAFETY: this rebuilds the whole overview from MEMORY.
+            # If memory is ever incomplete when a save runs, the overview shrinks to
+            # match, and the fast load path then reads the smaller set. Refuse and
+            # say so rather than silently narrowing what the project describes.
+            try:
+                on_disk = len([f for f in os.listdir(polygons_dir)
+                               if f.endswith('_polygons.json') and not f.startswith('_')])
+                if on_disk and len(records) < on_disk * 0.9:
+                    logging.warning("[overview] REFUSING to rewrite: memory has %d polygon(s) "
+                                    "but %d sidecar(s) exist on disk. Writing would hide %d of "
+                                    "them from the fast load path.",
+                                    len(records), on_disk, on_disk - len(records))
+                    return 0
+            except Exception:
+                pass
+            return polygon_lod.write_overview(polygons_dir, records)
+
+        if not background:
+            return _write()
+        # Off the GUI thread (after a bulk copy: 7,000 entries, a few MB of
+        # JSON). One writer thread, so writes land in order; the newest wins.
+        import concurrent.futures
+        ex = getattr(self, "_overview_executor", None)
+        if ex is None:
+            ex = self._overview_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+        def _safe():
+            try:
+                return _write()
+            except Exception as e:
+                logging.warning("[overview] background write failed: %s", e)
                 return 0
-        except Exception:
-            pass
-        return polygon_lod.write_overview(polygons_dir, records)
+        self._overview_future = ex.submit(_safe)
+        return 0
 
     def _upgrade_item_to_full_geometry(self, viewer, item):
         """Replace a coarse (pyramid) item's outline with the real coordinates.
