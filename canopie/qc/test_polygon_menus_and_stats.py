@@ -83,6 +83,7 @@ def test_polygon_stats_rows_are_the_csv_exports(project_tab):
     assert [r.get("Mean") for r in got] == [r.get("Mean") for r in ref]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="two spellings of one path exist only on Windows (backslash vs slash)")
 def test_polygon_stats_finds_an_imported_crown_under_the_other_spelling(project_tab):
     pt = project_tab
     (g, f), = _polygon_pairs(pt, 1)

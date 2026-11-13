@@ -12,6 +12,8 @@ record from scratch (losing species / tag / class ...), kept the stale coarse
 overview geometry, and could not be undone.
 """
 import numpy as np
+import os
+
 import pytest
 from PyQt5 import QtCore, QtWidgets
 
@@ -126,6 +128,7 @@ def _other_spelling(fp):
     return fp.replace("/", "\\") if "/" in fp else fp.replace("\\", "/")
 
 
+@pytest.mark.skipif(os.name != "nt", reason="two spellings of one path exist only on Windows (backslash vs slash)")
 def test_resize_finds_a_crown_stored_under_the_import_spelling(decimated_viewer):
     r"""THE BCI bug ("+ / - do nothing on shapefile-imported crowns"): the
     record lookup was an exact all_polygons[group].get(viewer_filepath). The
@@ -179,6 +182,7 @@ def test_each_resize_key_has_exactly_one_shortcut(synthetic_project):
     assert fired == ["ok"]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="two spellings of one path exist only on Windows (backslash vs slash)")
 def test_a_moved_imported_crown_stays_put_on_the_next_resize(decimated_viewer):
     r"""Move, then + / -: the crown went back to where it was before the move.
     The move's ModifyPolygonCommand looked the record up under the viewer's

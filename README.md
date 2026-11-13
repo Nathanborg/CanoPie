@@ -4,7 +4,7 @@
 [![Latest release](https://img.shields.io/github/v/release/Nathanborg/CanoPie)](https://github.com/Nathanborg/CanoPie/releases/latest)
 
 **DOI:** [10.5281/zenodo.23772111](https://doi.org/10.5281/zenodo.23772111) ·
-**Zenodo:** [record](https://zenodo.org/records/23772112) ·
+**Zenodo:** [record](https://zenodo.org/records/24181400) ·
 **Download:** [latest release](https://github.com/Nathanborg/CanoPie/releases/latest) ·
 **Docs:** [tutorial](docs/tutorial.md), [white paper](docs/whitepaper.md)
 
@@ -118,7 +118,7 @@ Gonçalves, N. B., & Stark, S. C. (2026). *CanoPie: A Graphical User Interface f
 Data Analysis* (Version 1.2.0) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.23772111
 
 This DOI always resolves to the latest version; each release also has its own DOI on
-[Zenodo](https://doi.org/10.5281/zenodo.23772111) (1.1.0: `10.5281/zenodo.23772112`). GitHub's
+[Zenodo](https://doi.org/10.5281/zenodo.23772111) (1.2.0: `10.5281/zenodo.24181400`; 1.1.0: `10.5281/zenodo.23772112`). GitHub's
 "Cite this repository" button (from `CITATION.cff`) gives the same reference in APA and BibTeX.
 
 ### Funding

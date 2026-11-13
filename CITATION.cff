@@ -10,6 +10,9 @@ identifiers:
     value: 10.5281/zenodo.23772111
     description: "All versions (resolves to the latest)"
   - type: doi
+    value: 10.5281/zenodo.24181400
+    description: "Version 1.2.0"
+  - type: doi
     value: 10.5281/zenodo.23772112
     description: "Version 1.1.0"
 license: MIT
