@@ -400,7 +400,7 @@ def classify_targets(src_fp, src_rec, src_ax, targets, opts, project_folder=None
 
     def georef_of(t):
         fp = t["fp"]
-        if not str(fp).lower().endswith((".tif", ".tiff")):
+        if not str(fp).lower().endswith((".tif", ".tiff", ".cogref")):
             return t, None
         if M.georef_flag(fp) is False:              # known (cache, file unchanged): a plain TIFF
             return t, None

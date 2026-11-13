@@ -157,7 +157,7 @@ def _mtime(path):
 @functools.lru_cache(maxsize=512)
 def _georef_cached(path, _mtime_key):
     from .shapefile_io import get_geotiff_transform, epsg_from_geotiff, _raw_image_dims
-    if not str(path).lower().endswith((".tif", ".tiff")):
+    if not str(path).lower().endswith((".tif", ".tiff", ".cogref")):
         return None
     tr, wkt = get_geotiff_transform(path)
     if not tr or not (tr[1] * tr[5] - tr[2] * tr[4]):
@@ -593,7 +593,8 @@ _FULL_KEY_LOCKS = {}
 
 
 def _is_tiff(path):
-    return str(path).lower().endswith((".tif", ".tiff"))
+    # .cogref: a remote COG, read through raster_reader like any tiled TIFF
+    return str(path).lower().endswith((".tif", ".tiff", ".cogref"))
 
 
 def _decode(path):
@@ -613,6 +614,11 @@ def _decode(path):
             arr = _FULL_CACHE.get(key)
         if arr is not None:
             return arr
+        if str(path).lower().endswith(".cogref"):
+            # A remote image is only ever read window by window; a whole
+            # decode here would download the file.
+            from .remote_raster import not_supported_message
+            raise ValueError(not_supported_message("Reading the whole image", path))
         if _is_tiff(path):
             import tifffile
             try:
@@ -2186,7 +2192,7 @@ def export_crowns(src, results, out_dir, fmt="tif", frames=None, saved=None):
 
 def file_dtype_is_u8(fp):
     """The file's samples are 8-bit (a JPEG / 8-bit TIFF): kept as they are in a JPEG export."""
-    if not str(fp).lower().endswith((".tif", ".tiff")):
+    if not str(fp).lower().endswith((".tif", ".tiff", ".cogref")):
         return True
     try:
         rd = _reader(fp)

@@ -17,3 +17,4 @@ sip==6.7.12
 tifffile
 imagecodecs
 pyproj
+requests

@@ -1653,7 +1653,10 @@ class ImageEditorDialog(QDialog):
             if profile is None or not profile.is_windowable:
                 return None
             from .project_tab import _PREVIEW_MAX_PIXELS
-            if (profile.bytes_if_fully_loaded <= self._EDITOR_PREVIEW_BYTES
+            # A remote (.cogref) image always comes through the tiled reader:
+            # the whole-file loaders below need a local file.
+            if (not getattr(profile, "remote", False)
+                    and profile.bytes_if_fully_loaded <= self._EDITOR_PREVIEW_BYTES
                     and int(profile.width) * int(profile.height) <= _PREVIEW_MAX_PIXELS):
                 return None            # small enough to load whole, keep old path
 
@@ -5322,6 +5325,13 @@ class ImageEditorDialog(QDialog):
             return self.base_image.shape if self.base_image is not None else None
 
         ext = os.path.splitext(self.image_filepath)[1].lower()
+        if ext == ".cogref":
+            # remote image: its header, through the same reader the viewer uses
+            from .raster_reader import probe
+            prof = probe(self.image_filepath)
+            if prof is not None:
+                return (int(prof.height), int(prof.width), int(prof.count))
+            return self.base_image.shape if self.base_image is not None else None
         if ext in (".tif", ".tiff"):
             try:
                 import tifffile as tiff

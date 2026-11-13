@@ -669,7 +669,7 @@ def image_size(path):
     if hit and hit[0] == st:
         return hit[1]
     wh = None
-    if str(path).lower().endswith((".tif", ".tiff")):
+    if str(path).lower().endswith((".tif", ".tiff", ".cogref")):
         try:
             from .shapefile_io import _raw_image_dims
             h, w = _raw_image_dims(path)

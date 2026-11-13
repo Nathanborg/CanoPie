@@ -11004,11 +11004,13 @@ class ProjectTab(QtWidgets.QWidget):
         import os
         ext = os.path.splitext(filepath)[1].lower()
 
-        # 1. TIFF / GeoTIFF: read only the series/page header.
-        if ext in ('.tif', '.tiff'):
+        # 1. TIFF / GeoTIFF: read only the series/page header (for a remote
+        #    .cogref, the remote file's header, from the cached first blocks).
+        if ext in ('.tif', '.tiff', '.cogref'):
             try:
                 import tifffile
-                with tifffile.TiffFile(filepath) as tf:
+                from .shapefile_io import _tiff_open_target
+                with tifffile.TiffFile(_tiff_open_target(filepath)) as tf:
                     ser = tf.series[0]
                     shape = tuple(ser.shape)
                     axes = (getattr(ser, "axes", "") or "")

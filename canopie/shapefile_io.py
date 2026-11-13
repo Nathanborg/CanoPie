@@ -92,10 +92,19 @@ def wkt_for_epsg(code):
     return None
 
 
+def _tiff_open_target(filepath):
+    """What tifffile.TiffFile should open: the path, or for a remote image
+    (.cogref pointer) a RangeFile on it. The header blocks are cached per
+    pointer, so asking for the transform, EPSG and size costs no extra
+    requests once the image has been opened."""
+    from .remote_raster import is_cogref, open_pointer
+    return open_pointer(filepath) if is_cogref(filepath) else filepath
+
+
 def epsg_from_geotiff(filepath):
     """Return the EPSG code declared in a GeoTIFF's GeoKeyDirectory, or None."""
     try:
-        with tifffile.TiffFile(filepath) as tif:
+        with tifffile.TiffFile(_tiff_open_target(filepath)) as tif:
             gk = tif.pages[0].tags.get('GeoKeyDirectoryTag')
             if not gk:
                 return None
@@ -426,7 +435,7 @@ def get_geotiff_transform(filepath):
     Extract affine transform from GeoTIFF using tifffile.TiffFile.
     """
     try:
-        with tifffile.TiffFile(filepath) as tif:
+        with tifffile.TiffFile(_tiff_open_target(filepath)) as tif:
             tags = tif.pages[0].tags
             
             model_tiepoint = tags.get('ModelTiepointTag')
@@ -831,9 +840,9 @@ def _raw_image_dims_cached(filepath, _version):
     ``ProjectTab._image_dims_only``), falling back to the page shape and then cv2.
     """
     ext = os.path.splitext(filepath)[1].lower()
-    if ext in ('.tif', '.tiff'):
+    if ext in ('.tif', '.tiff', '.cogref'):
         try:
-            with tifffile.TiffFile(filepath) as tif:
+            with tifffile.TiffFile(_tiff_open_target(filepath)) as tif:
                 ser = tif.series[0]
                 shape = tuple(ser.shape)
                 axes = (getattr(ser, "axes", "") or "")

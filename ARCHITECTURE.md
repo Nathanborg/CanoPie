@@ -36,6 +36,8 @@ main.py
               ├── machine_learning_manager.py  MachineLearningManager + RootOffsetDialog + AnalysisOptionsDialog
               ├── loaders.py              async image loading (QThreadPool/QRunnable), EXIF batch, ImageProcessor
               ├── image_data.py           ImageData — reads one image file, classifies rgb/thermal/multispectral
+              ├── raster_reader.py        tiled/windowed TIFF + COG reads, previews, the decoded-tile cache (no Qt)
+              │     └── remote_raster.py  RangeFile + .cogref pointers: a COG over HTTP Range requests (no Qt)
               ├── performance.py          optional accelerators (NumExpr/Numba/joblib) with NumPy fallback
               ├── utils.py                shared helpers: band math, veg indices, crop/rotate geom, exiftool
               (image_pipeline.py was REMOVED — it was a dead, divergent copy of the .ax replay;
@@ -433,6 +435,25 @@ end-to-end; check the others by inspection when you add a new one.
   *future* picker genuinely needs Qt's own non-native dialog (custom sidebar, multi-selection UI
   beyond what `getExistingDirectory`/`getOpenFileName` support), document the reason right next to
   the flag — don't reintroduce it silently, and check this list isn't missing a new site.
+
+### Remote COGs (`.cogref`)
+
+A `.cogref` is a small JSON pointer (`{"canopie_cogref": 1, "url": ..., "size": ...}`, optional
+`auth`) that stands in for a remote Cloud-Optimized GeoTIFF. The pointer's PATH is the image's
+identity everywhere (caches, `.ax`, polygon sidecars, project.json), so `ortho.cogref` shares
+`ortho.ax` with a local `ortho.tif`. `raster_reader.probe`/`open_reader` open it through
+`remote_raster.RangeFile`: the header parse reads aligned 256 KB blocks (cached), tile reads fetch
+exactly their bytes, adjacent tiles share a request and separate requests run in parallel. A
+remote profile never uses memmap and always loads as a viewer/editor preview
+(`_wants_preview`, `_load_editor_preview`); the zoom tiles bring full resolution.
+Size, transform and EPSG come from the remote header too (`shapefile_io._tiff_open_target`
+inside `_raw_image_dims` / `get_geotiff_transform` / `epsg_from_geotiff`), so the polygon basis
+is the full raster, never the preview, and the canopy finder reads `.cogref` window by window.
+Google Drive links resolve to `files.get?alt=media` with an API key from
+`CANOPIE_GDRIVE_API_KEY` (masked in every message). Make a pointer with
+`python -m canopie.remote_raster make <url> ortho.cogref`; measure with
+`scripts/bench_remote_cog.py`. View-only for now: `_get_export_image` (CSV/ML/Inspect),
+Export Project Images and the exiftool paths refuse `.cogref` with the reason.
 
 ## Where to start for common tasks
 

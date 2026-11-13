@@ -106,10 +106,18 @@ def _start_server(root, ignore_range=False):
 # Fixtures
 # --------------------------------------------------------------------------
 
+# GeoTIFF tags for level 0: 5 cm pixels, UTM 17N (EPSG:32617, BCI's zone)
+_GEO_EXTRATAGS = [
+    (33550, "d", 3, (0.05, 0.05, 0.0), True),                            # ModelPixelScale
+    (33922, "d", 6, (0.0, 0.0, 0.0, 626000.0, 1012000.0, 0.0), True),   # ModelTiepoint
+    (34735, "H", 16, (1, 1, 0, 3, 1024, 0, 1, 1, 1025, 0, 1, 1, 3072, 0, 1, 32617), True),
+]
+
+
 def _write_pyramid(path, data, tile=256):
     with tifffile.TiffWriter(path) as tw:
         tw.write(data, tile=(tile, tile), compression="deflate", photometric="minisblack",
-                 planarconfig="contig", subifds=2)
+                 planarconfig="contig", subifds=2, extratags=_GEO_EXTRATAGS)
         tw.write(data[::2, ::2], tile=(tile, tile), compression="deflate",
                  photometric="minisblack", planarconfig="contig", subfiletype=1)
         tw.write(data[::4, ::4], tile=(tile, tile), compression="deflate",
@@ -450,3 +458,64 @@ def test_project_tab_explains_an_unreachable_pointer(served, synthetic_project, 
     rm.write_pointer(ref, served["srv"].base + "no_such.tif")
     with pytest.raises(RuntimeError, match=r"cannot open the remote image: .*HTTP 404"):
         synthetic_project._imagedata_or_fallback(ref)
+
+
+@pytest.mark.editor
+def test_image_editor_opens_a_cogref_from_its_preview(served, synthetic_project, qapp):
+    """The editor only writes .ax parameters, so a preview from the tiled
+    reader is all it needs; the whole-file loaders cannot read a pointer."""
+    from ..image_editor_dialog import ImageEditorDialog
+    _, ref = served["refs"]["pyr"]
+    dlg = ImageEditorDialog(synthetic_project, image_data=None, image_filepath=ref)
+    try:
+        assert dlg.base_image is not None
+        assert dlg.base_image.shape[:2] == (1000, 1300)
+        assert dlg._editor_channel_order == "rgb"
+        assert np.array_equal(dlg.base_image, served["pyr"][..., list(dlg._editor_bands)])
+        assert dlg._header_size() == {"h": 1000, "w": 1300, "c": 4}
+        assert dlg._raw_shape() == (1000, 1300, 4)
+    finally:
+        dlg.close()
+        dlg.deleteLater()
+
+
+# --------------------------------------------------------------------------
+# Size and georeference: the full-resolution frame, never the preview's
+# --------------------------------------------------------------------------
+
+def test_size_and_georeference_come_from_the_remote_header(served):
+    from ..shapefile_io import _raw_image_dims, get_geotiff_transform, epsg_from_geotiff
+    local, ref = served["refs"]["pyr"]
+    assert _raw_image_dims(ref) == (1000, 1300)
+    tr, wkt = get_geotiff_transform(ref)
+    assert tr is not None and (tr, wkt) == get_geotiff_transform(local)
+    assert tr == [626000.0, 0.05, 0, 1012000.0, 0, -0.05]
+    assert epsg_from_geotiff(ref) == epsg_from_geotiff(local) == 32617
+
+
+def test_polygon_basis_of_a_decimated_remote_preview_is_full_resolution(
+        served, synthetic_project, monkeypatch):
+    """Polygons are stored in full-raster pixels. On a remote image the size
+    used to come back unknown, and the basis fell back to the PREVIEW's
+    shape, so crowns drawn on it would have been stored 4x too small."""
+    from .. import project_tab as ptm
+    monkeypatch.setattr(ptm, "_PREVIEW_LOAD_THRESHOLD_BYTES", 600_000)   # -> level 2 preview
+    pt = synthetic_project
+    _, ref = served["refs"]["pyr"]
+    lite = pt._imagedata_or_fallback(ref)
+    assert lite.image.shape[:2] == (250, 325) and lite.display_scale == 4.0
+    assert pt.polygon_basis_hw(None, image_data=lite) == (1000, 1300)
+    assert pt._image_dims_only(ref) == (1000, 1300)
+
+
+def test_canopy_finder_reads_a_cogref_window_by_window(served):
+    from .. import canopy_finder as CF
+    local, ref = served["refs"]["pyr"]
+    g = CF.georef(ref)
+    assert g is not None and (g.raw_w, g.raw_h) == (1300, 1000) and g.epsg == 32617
+    assert CF.file_band_count(ref) == 4
+    a, real_a = CF.read_raw_window(local, 1200, 900, 1400, 1100)      # runs off the edge
+    b, real_b = CF.read_raw_window(ref, 1200, 900, 1400, 1100)
+    assert np.array_equal(a, b) and np.array_equal(real_a, real_b)
+    with pytest.raises(ValueError, match="not available for remote images"):
+        CF._decode(ref)
