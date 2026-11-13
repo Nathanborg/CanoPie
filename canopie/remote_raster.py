@@ -65,6 +65,12 @@ __all__ = [
     "gdrive_file_id",
     "open_pointer",
     "clear_sources",
+    "set_default_api_key",
+    "default_api_key",
+    "gdrive_metadata",
+    "inspect_url",
+    "make_pointer",
+    "pointer_stem",
     "redact",
     "not_supported_message",
 ]
@@ -195,13 +201,47 @@ def _env(name):
     return val.strip() if val and val.strip() else None
 
 
-def resolve_pointer(ptr):
+#: Drive API base. A module constant so the QC suite can point it at a local
+#: test server that behaves like the Drive API.
+GDRIVE_API = "https://www.googleapis.com/drive/v3/files"
+
+# The key the app was given (File > Add Remote Images, remembered in the
+# user's settings). Never written into pointer files, which travel with the
+# project; see set_default_api_key.
+_DEFAULT_API_KEY = None
+
+
+def set_default_api_key(key):
+    """The Google Drive API key to use when a pointer names none. Set by the
+    GUI from its settings; ``None`` clears it."""
+    global _DEFAULT_API_KEY
+    _DEFAULT_API_KEY = (str(key).strip() or None) if key else None
+
+
+def default_api_key():
+    return _DEFAULT_API_KEY
+
+
+def _drive_key(auth, url, api_key=None):
+    """Key for a Drive request: the pointer's own, the caller's, the app's,
+    the environment's, or one already in the URL -- in that order."""
+    key = (auth.get("api_key") or api_key or _DEFAULT_API_KEY
+           or _env(auth.get("api_key_env") or GDRIVE_KEY_ENV))
+    if not key:
+        existing = parse_qs(urlsplit(url).query).get("key")
+        key = existing[0] if existing else None
+    return key
+
+
+def resolve_pointer(ptr, api_key=None):
     """``(url, headers)`` to fetch, from a pointer dict.
 
     Google Drive links become ``files.get?alt=media`` API URLs. The key comes
-    from ``auth.api_key``, else the environment variable ``auth.api_key_env``
-    (default ``CANOPIE_GDRIVE_API_KEY``). ``auth.bearer_token_env`` sends an
-    ``Authorization: Bearer`` header instead, for a token made elsewhere.
+    from ``auth.api_key``, else ``api_key``, else the app's key
+    (:func:`set_default_api_key`), else the environment variable
+    ``auth.api_key_env`` (default ``CANOPIE_GDRIVE_API_KEY``).
+    ``auth.bearer_token_env`` sends an ``Authorization: Bearer`` header
+    instead, for a token made elsewhere.
     """
     url = str(ptr["url"]).strip()
     auth = ptr.get("auth") or {}
@@ -215,17 +255,13 @@ def resolve_pointer(ptr):
 
     file_id = gdrive_file_id(url)
     if file_id is not None:
-        api = ("https://www.googleapis.com/drive/v3/files/{}?alt=media"
-               "&supportsAllDrives=true".format(file_id))
+        api = "{}/{}?alt=media&supportsAllDrives=true".format(GDRIVE_API, file_id)
         if not token:
-            key = auth.get("api_key") or _env(auth.get("api_key_env") or GDRIVE_KEY_ENV)
-            if not key:
-                existing = parse_qs(urlsplit(url).query).get("key")
-                key = existing[0] if existing else None
+            key = _drive_key(auth, url, api_key)
             if not key:
                 raise RemoteError(
-                    "Google Drive file {} needs an API key: set the environment variable {} "
-                    "(or name another one in the pointer's auth.api_key_env). The file must be "
+                    "Google Drive file {} needs an API key: enter it in File > Add Remote "
+                    "Images (URLs)..., or set the environment variable {}. The file must be "
                     "shared as 'Anyone with the link'.".format(
                         file_id, auth.get("api_key_env") or GDRIVE_KEY_ENV))
             api += "&key=" + key
@@ -702,6 +738,130 @@ def open_pointer(path):
 def clear_sources():
     with _SOURCES_LOCK:
         _SOURCES.clear()
+
+
+# --------------------------------------------------------------------------
+# Checking a link and writing its pointer (File > Add Remote Images)
+# --------------------------------------------------------------------------
+
+def _drive_error(resp):
+    """The message in a Drive API error response, without secrets."""
+    try:
+        msg = resp.json().get("error", {}).get("message") or ""
+    except Exception:
+        msg = resp.text[:300] if resp.text else ""
+    msg = redact(msg).strip()
+    hint = ""
+    if resp.status_code == 404:
+        hint = " -- check the link, and that the file is shared as 'Anyone with the link'"
+    elif resp.status_code in (400, 403) and "key" in msg.lower():
+        hint = " -- check the API key, and that the Google Drive API is enabled for its project"
+    return "Google Drive: HTTP {} {}{}".format(resp.status_code, msg, hint)
+
+
+def gdrive_metadata(file_id, api_key=None, headers=None):
+    """``{"name", "size", "mimeType"}`` of a Drive file, through the API."""
+    params = {"fields": "name,size,mimeType", "supportsAllDrives": "true"}
+    if api_key:
+        params["key"] = api_key
+    try:
+        resp = _session().get("{}/{}".format(GDRIVE_API, file_id), params=params,
+                              headers=dict(headers or {}),
+                              timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+    except Exception as exc:
+        raise RemoteError("Google Drive: request failed: {}: {}".format(
+            type(exc).__name__, redact(exc))) from None
+    if resp.status_code != 200:
+        raise RemoteError(_drive_error(resp))
+    return resp.json()
+
+
+def _name_from_url(url):
+    from urllib.parse import unquote
+    name = unquote(os.path.basename(urlsplit(url).path)) or "remote"
+    return name
+
+
+def inspect_url(url, api_key=None):
+    """Check a link before CanoPie uses it: reachable, Range-capable, a TIFF,
+    and whether it is a real COG. Reads the name (from the Drive API for a
+    Drive link), the size and the header -- nothing else.
+
+    Returns a dict: url, name, size, width, height, bands, dtype, tiled,
+    levels, compression, warning (None or why it will be slow), requests,
+    bytes_fetched."""
+    url = str(url).strip()
+    real, headers = resolve_pointer({"url": url}, api_key=api_key)
+    file_id = gdrive_file_id(url)
+    if file_id is not None:
+        key = None if "Authorization" in headers else _drive_key({}, url, api_key)
+        name = gdrive_metadata(file_id, api_key=key, headers=headers).get("name") or (
+            "gdrive_" + file_id[:10])
+    else:
+        name = _name_from_url(url)
+    rf = RangeFile(real, headers=headers, name=name)
+    import tifffile
+    with tifffile.TiffFile(rf) as tf:
+        page = tf.pages[0]
+        try:
+            levels = len(tf.series[0].levels)
+        except Exception:
+            levels = 1
+        info = {
+            "url": url, "name": name, "size": rf.size,
+            "width": int(page.imagewidth), "height": int(page.imagelength),
+            "bands": int(page.samplesperpixel or 1), "dtype": str(page.dtype),
+            "tiled": bool(page.is_tiled), "levels": int(levels),
+            "compression": int(page.compression),
+        }
+    warning = None
+    if not info["tiled"]:
+        warning = ("not tiled: every view reads whole rows of the image -- convert it to a "
+                   "Cloud-Optimized GeoTIFF")
+    elif info["levels"] < 2 and max(info["width"], info["height"]) > 4096:
+        warning = ("no overviews: the first preview reads the full-resolution image -- "
+                   "convert it to a Cloud-Optimized GeoTIFF")
+    info["warning"] = warning
+    st = rf.stats()
+    info["requests"], info["bytes_fetched"] = st["requests"], st["bytes_fetched"]
+    return info
+
+
+_UNSAFE_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def pointer_stem(name):
+    """A file-name stem for a remote image called ``name``."""
+    stem = str(name)
+    if stem.lower().endswith((".tif", ".tiff")):
+        stem = os.path.splitext(stem)[0]
+    stem = _UNSAFE_NAME.sub("_", stem).strip(" .")
+    return (stem or "remote")[:120]
+
+
+def make_pointer(url, folder, api_key=None):
+    """Check ``url`` (:func:`inspect_url`) and write ``<name>.cogref`` in
+    ``folder``. A pointer already there for the same link is reused; one for
+    another link keeps its name and the new one gets ``_2``, ``_3``...
+    The API key is never written. Returns the info dict plus ``path``."""
+    info = inspect_url(url, api_key=api_key)
+    os.makedirs(folder, exist_ok=True)
+    stem = pointer_stem(info["name"])
+    n = 1
+    while True:
+        path = os.path.join(folder, stem + ("" if n == 1 else "_{}".format(n)) + COGREF_EXT)
+        if not os.path.exists(path):
+            break
+        try:
+            old = read_pointer(path)
+            if str(old.get("url", "")).strip() == info["url"]:
+                break
+        except RemoteError:
+            pass
+        n += 1
+    write_pointer(path, info["url"], size=info["size"], name=info["name"])
+    info["path"] = path
+    return info
 
 
 # --------------------------------------------------------------------------

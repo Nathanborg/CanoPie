@@ -34273,6 +34273,25 @@ class ProjectTab(QtWidgets.QWidget):
             return
         self.batch_size = batch_size
         settings.setValue("last_batch_size", batch_size)
+        self.open_image_paths(paths, batch_size)
+
+    def open_image_paths(self, paths, batch_size, root_prefix="Selection", sort=True):
+        """Show ``paths`` as roots of ``batch_size`` viewers each, replacing
+        the tab's current images (the grouping of File > Open Image files).
+        Shared by that picker and File > Add Remote Images, which passes the
+        .cogref pointers it wrote, in link order (``sort=False``)."""
+        import os, logging
+        from math import ceil
+        from collections import defaultdict
+        from PyQt5 import QtWidgets
+
+        paths = list(dict.fromkeys(os.fspath(p) for p in paths))
+        if not paths:
+            return
+        if sort:
+            paths.sort()
+        batch_size = max(1, int(batch_size or 1))
+        self.batch_size = batch_size
 
         # --- Reset state like your existing flow ---
         if hasattr(self, "reset_data_structures"):
@@ -34300,7 +34319,7 @@ class ProjectTab(QtWidgets.QWidget):
         num_roots = ceil(total / batch_size)
         for i in range(num_roots):
             chunk = paths[i * batch_size : (i + 1) * batch_size]
-            root = f"Selection{i + 1}"
+            root = f"{root_prefix}{i + 1}"
             self.multispectral_root_names.append(root)
             self.multispectral_image_data_groups[root].extend(chunk)
 
@@ -34333,6 +34352,17 @@ class ProjectTab(QtWidgets.QWidget):
                 self, "Loading Error",
                 "Failed to load selected images. Ensure they are valid and accessible."
             )
+
+    def open_remote_images(self):
+        """File > Add Remote Images (URLs)...: check links to Cloud-Optimized
+        GeoTIFFs, write a .cogref pointer for each and open them as roots."""
+        from PyQt5 import QtWidgets
+        from .remote_images_dialog import RemoteImagesDialog
+        dlg = RemoteImagesDialog(self, project_tab=self)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted or not dlg.result_paths:
+            return
+        self.open_image_paths(dlg.result_paths, dlg.batch_size, root_prefix="Remote", sort=False)
+
     def _stats_inputs(self, filepaths):
         """What process_polygon needs besides the polygon, shared by the
         viewer's Stats button and Polygon Stats: the analysis options (reused,

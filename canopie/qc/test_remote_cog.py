@@ -38,9 +38,41 @@ class _RangeHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):          # quiet
         pass
 
+    def _json(self, code, obj):
+        import json
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _drive(self, parts):
+        """Just enough of the Drive v3 files API: metadata and alt=media."""
+        from urllib.parse import parse_qs
+        srv = self.server
+        q = {k: v[0] for k, v in parse_qs(parts.query).items()}
+        file_id = parts.path.rsplit("/", 1)[-1]
+        if q.get("key") != srv.drive_key:
+            return self._json(400, {"error": {"code": 400, "message":
+                                              "API key not valid. Please pass a valid API key."}})
+        if file_id not in srv.drive_files:
+            return self._json(404, {"error": {"code": 404,
+                                              "message": "File not found: {}.".format(file_id)}})
+        local, name = srv.drive_files[file_id]
+        if q.get("alt") == "media":
+            return local                      # served below, with Range
+        return self._json(200, {"name": name, "size": str(os.path.getsize(local)),
+                                "mimeType": "image/tiff"})
+
     def do_GET(self):
         srv = self.server
         parts = urlsplit(self.path)
+        drive_path = None
+        if parts.path.startswith("/drive/v3/files/"):
+            drive_path = self._drive(parts)
+            if drive_path is None:
+                return
         if "forbidden" in parts.path:
             body = b'{"error": {"code": 403, "message": "The request is missing a valid API key."}}'
             self.send_response(403)
@@ -49,7 +81,7 @@ class _RangeHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        path = os.path.join(srv.root, unquote(parts.path.lstrip("/")))
+        path = drive_path or os.path.join(srv.root, unquote(parts.path.lstrip("/")))
         if not os.path.isfile(path):
             self.send_response(404)
             self.send_header("Content-Length", "0")
@@ -96,6 +128,8 @@ def _start_server(root, ignore_range=False):
     srv.lock = threading.Lock()
     srv.log = []
     srv.bytes_sent = 0
+    srv.drive_key = "test-key"
+    srv.drive_files = {}
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     srv.base = "http://127.0.0.1:{}/".format(srv.server_address[1])
@@ -519,3 +553,154 @@ def test_canopy_finder_reads_a_cogref_window_by_window(served):
     assert np.array_equal(a, b) and np.array_equal(real_a, real_b)
     with pytest.raises(ValueError, match="not available for remote images"):
         CF._decode(ref)
+
+
+# --------------------------------------------------------------------------
+# File > Add Remote Images: checking links, writing pointers, opening roots
+# --------------------------------------------------------------------------
+
+DRIVE_ID = "1PyrFixtureFileIdForQC0123456789"
+
+
+@pytest.fixture()
+def fake_drive(served, monkeypatch):
+    """The test server answers as the Drive API for one shared file."""
+    srv = served["srv"]
+    local, _ = served["refs"]["pyr"]
+    srv.drive_files = {DRIVE_ID: (local, "plot A ortho.tif")}
+    monkeypatch.setattr(rm, "GDRIVE_API", srv.base + "drive/v3/files")
+    monkeypatch.setattr(rm, "_DEFAULT_API_KEY", None)
+    monkeypatch.delenv(rm.GDRIVE_KEY_ENV, raising=False)
+    return srv
+
+
+def test_make_pointer_names_reuses_and_never_clobbers(served, tmp_path):
+    srv = served["srv"]
+    info = rm.make_pointer(srv.base + "pyr.tif", str(tmp_path))
+    assert info["path"] == str(tmp_path / "pyr.cogref")
+    assert (info["width"], info["height"], info["bands"], info["levels"]) == (1300, 1000, 4, 3)
+    assert info["warning"] is None and info["tiled"]
+    ptr = rm.read_pointer(info["path"])
+    assert ptr["url"] == srv.base + "pyr.tif" and ptr["size"] == info["size"]
+    # the same link again: the same pointer
+    assert rm.make_pointer(srv.base + "pyr.tif", str(tmp_path))["path"] == info["path"]
+    # another file with the same name: a new pointer, the old one untouched
+    sub = served["root"] / "sub"
+    sub.mkdir(exist_ok=True)
+    import shutil
+    shutil.copy(served["refs"]["strips"][0], sub / "pyr.tif")
+    other = rm.make_pointer(srv.base + "sub/pyr.tif", str(tmp_path))
+    assert other["path"] == str(tmp_path / "pyr_2.cogref")
+    assert rm.read_pointer(info["path"])["url"] == srv.base + "pyr.tif"
+    # a stripped, overview-less file is flagged as slow
+    assert other["warning"] and "not tiled" in other["warning"]
+
+
+def test_a_drive_link_end_to_end(fake_drive, served, tmp_path):
+    share = "https://drive.google.com/file/d/{}/view?usp=sharing".format(DRIVE_ID)
+    with pytest.raises(rm.RemoteError, match=rm.GDRIVE_KEY_ENV):
+        rm.make_pointer(share, str(tmp_path))                       # no key anywhere
+    with pytest.raises(rm.RemoteError, match="API key not valid.*check the API key"):
+        rm.make_pointer(share, str(tmp_path), api_key="wrong")
+    with pytest.raises(rm.RemoteError, match="File not found.*Anyone with the link"):
+        rm.make_pointer("gdrive://1NoSuchFileIdForQC000000000", str(tmp_path), api_key="test-key")
+
+    info = rm.make_pointer(share, str(tmp_path), api_key="test-key")
+    assert info["path"] == str(tmp_path / "plot A ortho.cogref"), "named after the Drive file"
+    text = open(info["path"], encoding="utf-8").read()
+    assert "test-key" not in text, "the API key must never be written into a pointer"
+
+    # opening the pointer later uses the app's key (set from the settings)
+    rm.set_default_api_key("test-key")
+    local, _ = served["refs"]["pyr"]
+    a, b = rr.open_reader(local), rr.open_reader(info["path"])
+    assert b is not None and b.is_remote, rr.last_probe_error(info["path"])
+    assert np.array_equal(a.read_window(100, 200, 700, 900), b.read_window(100, 200, 700, 900))
+    assert "test-key" not in (rr.probe(info["path"]).source or "")
+
+
+def test_parse_urls_keeps_order_and_skips_comments():
+    from ..remote_images_dialog import parse_urls
+    text = "\n  https://a/x.tif \n# a note\n\nhttps://b/y.tif\nhttps://a/x.tif\n"
+    assert parse_urls(text) == ["https://a/x.tif", "https://b/y.tif"]
+
+
+@pytest.fixture()
+def qc_settings(monkeypatch):
+    """Keep the dialog's QSettings away from the user's real CanoPie settings."""
+    from PyQt5 import QtCore
+    from .. import remote_images_dialog as rid
+    monkeypatch.setattr(rid, "_SETTINGS", ("CanoPie-QC", "remote-images-test"))
+    yield rid
+    QtCore.QSettings("CanoPie-QC", "remote-images-test").clear()
+
+
+def test_dialog_checks_links_writes_pointers_and_reports_failures(
+        fake_drive, served, tmp_path, qapp, qc_settings):
+    rid = qc_settings
+    srv = served["srv"]
+    dlg = rid.RemoteImagesDialog(None, batch_size=2)
+    try:
+        dlg.urls_edit.setPlainText("\n".join([
+            "https://drive.google.com/file/d/{}/view".format(DRIVE_ID),
+            srv.base + "strips.tif",
+            srv.base + "missing.tif",
+        ]))
+        dlg.folder_edit.setText(str(tmp_path / "pointers"))
+        dlg.key_edit.setText("test-key")
+        dlg.remember.setChecked(False)
+        dlg._check_and_open()          # QMessageBox.question -> Yes (conftest)
+        assert dlg.result() == dlg.Accepted
+        assert [os.path.basename(p) for p in dlg.result_paths] == [
+            "plot A ortho.cogref", "strips.cogref"], "link order, failures left out"
+        assert dlg.batch_size == 2
+        failed = [r for r in dlg.results if r[1] is None]
+        assert len(failed) == 1 and "HTTP 404" in failed[0][2]
+        assert dlg.results_list.count() == 3
+        assert rm.default_api_key() == "test-key"
+        from PyQt5 import QtCore
+        assert not QtCore.QSettings(*rid._SETTINGS).value(rid.KEY_SETTING, ""), \
+            "the key was remembered although 'Remember' was off"
+    finally:
+        dlg.deleteLater()
+
+
+def test_open_image_paths_groups_remote_images_into_roots(served, qapp, tmp_path):
+    """Three pointers, two per root: Remote1 shows two remote viewers."""
+    import time
+    from PyQt5 import QtWidgets
+    from ..project_tab import ProjectTab
+    paths = [served["refs"]["strips"][1], served["refs"]["pyr"][1]]
+    third = str(tmp_path / "third.cogref")
+    rm.write_pointer(third, served["srv"].base + "pyr.tif")
+    paths.append(third)
+
+    tabs = QtWidgets.QTabWidget()
+    pt = ProjectTab("remote-qc", tabs)
+    try:
+        pt.open_image_paths(paths, 2, root_prefix="Remote", sort=False)
+        assert pt.root_names == ["Remote1", "Remote2"]
+        assert pt.multispectral_image_data_groups["Remote1"] == paths[:2]
+        assert pt.multispectral_image_data_groups["Remote2"] == paths[2:]
+        end = time.time() + 30
+
+        def ready():
+            return len(pt.viewer_widgets) == 2 and all(
+                getattr(getattr(w["viewer"], "image_data", None), "reader", None) is not None
+                for w in pt.viewer_widgets)
+
+        while time.time() < end and not ready():
+            qapp.processEvents()
+            time.sleep(0.02)
+        assert ready(), "the two viewers of Remote1 did not load"
+        shown = [w["viewer"].image_data.filepath for w in pt.viewer_widgets]
+        assert sorted(map(os.path.normcase, shown)) == sorted(map(os.path.normcase, paths[:2]))
+        assert all(w["viewer"].image_data.reader.is_remote for w in pt.viewer_widgets)
+    finally:
+        for attr in ("_poly_idle_timer", "_autosave_timer"):
+            t = getattr(pt, attr, None)
+            if t is not None:
+                t.stop()
+        pt.deleteLater()
+        tabs.deleteLater()
+        qapp.processEvents()

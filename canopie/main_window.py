@@ -89,6 +89,13 @@ class MainWindow(QMainWindow):
             load_polygon_style()
         except Exception:
             pass
+        # a Google Drive API key remembered by File > Add Remote Images, so a
+        # project with Drive pointers opens without visiting that dialog
+        try:
+            from .remote_images_dialog import apply_saved_api_key
+            apply_saved_api_key()
+        except Exception:
+            pass
         self.init_ui()
         self.status = self.statusBar()
 
@@ -230,6 +237,13 @@ class MainWindow(QMainWindow):
         open_rgb_picker_action.setStatusTip("Select specific images with preview and choose images-per-root")
         open_rgb_picker_action.triggered.connect(self.open_rgb_picker)
         file_menu.addAction(open_rgb_picker_action)
+
+        open_remote_action = QAction("Add Remote Images (URLs)…", self)
+        open_remote_action.setShortcut("Ctrl+Shift+U")
+        open_remote_action.setStatusTip(
+            "Open Cloud-Optimized GeoTIFFs from a web link or Google Drive without downloading them")
+        open_remote_action.triggered.connect(self.open_remote_images)
+        file_menu.addAction(open_remote_action)
         
         file_menu.addSeparator()
 
@@ -479,6 +493,13 @@ class MainWindow(QMainWindow):
         current_tab = self.get_current_tab()
         if current_tab:
             current_tab.open_rgb_folder()
+        else:
+            QMessageBox.warning(self, "No Tab Selected", "Please select a project tab.")
+
+    def open_remote_images(self):
+        current_tab = self.get_current_tab()
+        if current_tab and hasattr(current_tab, "open_remote_images"):
+            current_tab.open_remote_images()
         else:
             QMessageBox.warning(self, "No Tab Selected", "Please select a project tab.")
 

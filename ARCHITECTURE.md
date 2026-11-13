@@ -38,6 +38,7 @@ main.py
               ├── image_data.py           ImageData — reads one image file, classifies rgb/thermal/multispectral
               ├── raster_reader.py        tiled/windowed TIFF + COG reads, previews, the decoded-tile cache (no Qt)
               │     └── remote_raster.py  RangeFile + .cogref pointers: a COG over HTTP Range requests (no Qt)
+              ├── remote_images_dialog.py File > Add Remote Images (URLs)…: check links, write pointers, open as roots
               ├── performance.py          optional accelerators (NumExpr/Numba/joblib) with NumPy fallback
               ├── utils.py                shared helpers: band math, veg indices, crop/rotate geom, exiftool
               (image_pipeline.py was REMOVED — it was a dead, divergent copy of the .ax replay;
@@ -449,10 +450,14 @@ remote profile never uses memmap and always loads as a viewer/editor preview
 Size, transform and EPSG come from the remote header too (`shapefile_io._tiff_open_target`
 inside `_raw_image_dims` / `get_geotiff_transform` / `epsg_from_geotiff`), so the polygon basis
 is the full raster, never the preview, and the canopy finder reads `.cogref` window by window.
-Google Drive links resolve to `files.get?alt=media` with an API key from
-`CANOPIE_GDRIVE_API_KEY` (masked in every message). Make a pointer with
-`python -m canopie.remote_raster make <url> ortho.cogref`; measure with
-`scripts/bench_remote_cog.py`. View-only for now: `_get_export_image` (CSV/ML/Inspect),
+Google Drive links resolve to `files.get?alt=media`; the API key comes from the app
+(`remote_raster.set_default_api_key`, remembered in QSettings by the dialog and applied in
+`MainWindow.__init__`) or `CANOPIE_GDRIVE_API_KEY`, is masked in every message and is never
+written into a pointer. **File > Add Remote Images (URLs)…** (`remote_images_dialog.py`) runs
+`remote_raster.make_pointer` per link and opens the pointers through
+`ProjectTab.open_image_paths` -- the grouping into roots that File > Open Image files also uses.
+CLI: `python -m canopie.remote_raster make <url> ortho.cogref`; measure with
+`scripts/bench_remote_cog.py`; examples and user steps in `examples/remote_cogs/`. View-only for now: `_get_export_image` (CSV/ML/Inspect),
 Export Project Images and the exiftool paths refuse `.cogref` with the reason.
 
 ## Where to start for common tasks
