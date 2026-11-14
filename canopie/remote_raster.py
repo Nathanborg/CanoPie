@@ -1098,6 +1098,10 @@ def make_pointer(url, folder, api_key=None, provider=None):
     ``folder``. A pointer already there for the same link is reused; one for
     another link keeps its name and the new one gets ``_2``, ``_3``...
     The API key is never written. Returns the info dict plus ``path``."""
+    from .remote_tiles import looks_like_tile_service
+    if provider in (None, "arcgis-tiles") and looks_like_tile_service(url):
+        from .remote_tiles import make_pointer as _tiles_pointer
+        return _tiles_pointer(url, folder)
     info = inspect_url(url, api_key=api_key, provider=provider)
     os.makedirs(folder, exist_ok=True)
     stem = pointer_stem(info["name"])

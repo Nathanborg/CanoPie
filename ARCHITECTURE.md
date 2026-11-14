@@ -461,6 +461,11 @@ remote profile never uses memmap and always loads as a viewer/editor preview
 Size, transform and EPSG come from the remote header too (`shapefile_io._tiff_open_target`
 inside `_raw_image_dims` / `get_geotiff_transform` / `epsg_from_geotiff`), so the polygon basis
 is the full raster, never the preview, and the canopy finder reads `.cogref` window by window.
+Tiled ArcGIS services (`remote_tiles.py`; pointer `"kind": "arcgis-tiles"`, made from a MapServer /
+ImageServer URL or an ArcGIS item / Hub page): `raster_reader.probe` defers to `remote_tiles.probe` and
+`open_reader` returns `TileServiceReader`, a `TiledRasterReader` subclass whose levels are the service's
+zoom levels (level 0 = finest zoom with data, cropped to the extent, 4 bands RGBA) and whose I/O fetches
+`.../tile/{z}/{row}/{col}`; size/georeference helpers in shapefile_io answer from the service (EPSG:3857).
 OneDrive / SharePoint share links (`onedrive_kind`, or a pointer's `"provider"`) get a resolver:
 `resolve_onedrive` tries the consumer shares endpoint and `?download=1` (and `/redir` -> `/download`),
 keeps the first address answering a Range request with file bytes, and `_RangeSource` renews it on

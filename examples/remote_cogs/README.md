@@ -81,6 +81,22 @@ test folder in your Drive. Its download link is the `url` in the matching
 `.cogref`. Share the copy by link and open it with the dialog. You can then
 compare it with the same file opened from S3.
 
+## ArcGIS tile services (e.g. the STRI data portal)
+
+Paste an ArcGIS Hub / open-data page (`https://stridata-si.opendata.arcgis.com/maps/<id>/about`),
+an ArcGIS Online item link, or a tiled `.../rest/services/<name>/MapServer` (or `ImageServer`)
+URL into the dialog. CanoPie reads the service's tile pyramid like a COG's: each zoom level is a
+pyramid level and each 256-px tile is a tile. It finds the finest zoom that has data and
+georeferences the image in the service's grid (Web Mercator, EPSG:3857).
+
+Measured on the STRI **BCI 50 ha Plot Orthophoto, May 2021**: 19,613 x 12,285 px at 7.5 cm/px,
+link checked in 2.5 s, first view in 1.7 s, a 1:1 view (1,600 x 1,000) in about 1 s for 0.7 MB.
+
+It is the published picture: 8-bit RGB (plus an alpha band that is 0 where the service has no
+tile), usually JPEG-compressed. That suits viewing, drawing crowns, the canopy finder and
+colour statistics, but it is not the original sensor values. Resolution stops at the finest
+zoom level the service publishes. Credit the data owner (the dialog shows the credit line).
+
 ## OneDrive and SharePoint
 
 Paste a OneDrive share link (`1drv.ms/…`, `onedrive.live.com/…`) or a work/school

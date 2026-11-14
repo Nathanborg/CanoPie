@@ -103,6 +103,12 @@ def _tiff_open_target(filepath):
 
 def epsg_from_geotiff(filepath):
     """Return the EPSG code declared in a GeoTIFF's GeoKeyDirectory, or None."""
+    from .remote_tiles import is_tile_pointer, georef
+    if is_tile_pointer(filepath):
+        try:
+            return georef(filepath)[1]
+        except Exception:
+            return None
     try:
         with tifffile.TiffFile(_tiff_open_target(filepath)) as tif:
             gk = tif.pages[0].tags.get('GeoKeyDirectoryTag')
@@ -434,6 +440,15 @@ def get_geotiff_transform(filepath):
     """
     Extract affine transform from GeoTIFF using tifffile.TiffFile.
     """
+    from .remote_tiles import is_tile_pointer, georef
+    if is_tile_pointer(filepath):
+        # a tiled map service: the service's own grid (Web Mercator, usually)
+        try:
+            tr, epsg, _hw = georef(filepath)
+            return tr, (wkt_for_epsg(epsg) if epsg else None)
+        except Exception as e:
+            logging.warning(f"Failed to read the tile service's georeference for {filepath}: {e}")
+            return None, None
     try:
         with tifffile.TiffFile(_tiff_open_target(filepath)) as tif:
             tags = tif.pages[0].tags
@@ -840,6 +855,13 @@ def _raw_image_dims_cached(filepath, _version):
     ``ProjectTab._image_dims_only``), falling back to the page shape and then cv2.
     """
     ext = os.path.splitext(filepath)[1].lower()
+    from .remote_tiles import is_tile_pointer
+    if is_tile_pointer(filepath):
+        try:
+            from .remote_tiles import georef
+            return georef(filepath)[2]
+        except Exception:
+            return None, None
     if ext in ('.tif', '.tiff', '.cogref'):
         try:
             with tifffile.TiffFile(_tiff_open_target(filepath)) as tif:

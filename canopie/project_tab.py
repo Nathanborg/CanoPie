@@ -11714,6 +11714,11 @@ class ProjectTab(QtWidgets.QWidget):
 
         # 1. TIFF / GeoTIFF: read only the series/page header (for a remote
         #    .cogref, the remote file's header, from the cached first blocks).
+        from .remote_tiles import is_tile_pointer
+        if is_tile_pointer(filepath):
+            from .raster_reader import probe
+            prof = probe(filepath)
+            return (int(prof.height), int(prof.width)) if prof is not None else None
         if ext in ('.tif', '.tiff', '.cogref'):
             try:
                 import tifffile

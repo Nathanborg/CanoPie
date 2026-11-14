@@ -123,9 +123,16 @@ def _mb(n):
 
 def describe(info):
     """One line for the results list."""
-    text = "{name}: {w} x {h} px, {b} band(s), {lv} level(s), {size}".format(
+    if info.get("size") is None:                 # a tile service: no file size
+        extra = "tile service, {:.1f} cm/px".format(100 * info["pixel_m"]) \
+            if info.get("pixel_m") else "tile service"
+        if info.get("credit"):
+            extra += ", (c) " + str(info["credit"])
+    else:
+        extra = _mb(info["size"])
+    text = "{name}: {w} x {h} px, {b} band(s), {lv} level(s), {extra}".format(
         name=info["name"], w=info["width"], h=info["height"], b=info["bands"],
-        lv=info["levels"], size=_mb(info["size"]))
+        lv=info["levels"], extra=extra)
     if info.get("warning"):
         text += "  [slow: {}]".format(info["warning"])
     return text
@@ -160,9 +167,10 @@ class RemoteImagesDialog(QtWidgets.QDialog):
         lay = QtWidgets.QVBoxLayout(self)
         intro = QtWidgets.QLabel(
             "Paste links to Cloud-Optimized GeoTIFFs, one per line: an https:// link "
-            "(a web server or a public bucket), or a Google Drive or OneDrive share link "
-            "(shared as 'Anyone with the link'). CanoPie reads only the tiles it shows; "
-            "nothing is downloaded.")
+            "(a web server or a public bucket), a Google Drive or OneDrive share link "
+            "(shared as 'Anyone with the link'), or a tiled ArcGIS layer (a MapServer / "
+            "ImageServer URL, or its ArcGIS Hub / open-data page). CanoPie reads only the "
+            "tiles it shows; nothing is downloaded.")
         intro.setWordWrap(True)
         lay.addWidget(intro)
 
@@ -170,7 +178,8 @@ class RemoteImagesDialog(QtWidgets.QDialog):
         self.urls_edit.setPlaceholderText(
             "https://example.org/orthomosaics/plot_A.tif\n"
             "https://drive.google.com/file/d/FILE_ID/view?usp=sharing\n"
-            "https://1drv.ms/i/s!...   or   https://yourorg-my.sharepoint.com/:i:/g/personal/...")
+            "https://1drv.ms/i/s!...   or   https://yourorg-my.sharepoint.com/:i:/g/personal/...\n"
+            "https://<site>.opendata.arcgis.com/maps/<item id>/about   or   .../rest/services/<name>/MapServer")
         lay.addWidget(self.urls_edit, 2)
 
         form = QtWidgets.QFormLayout()

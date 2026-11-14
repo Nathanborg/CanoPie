@@ -247,6 +247,9 @@ class RasterProfile:
         # remote: True for a .cogref (pixels come over HTTP); source: the
         # remote file's display name (never carries an API key).
         "remote", "source",
+        # service: a remote_tiles.TileService for a tiled ArcGIS service
+        # pointer (the reader is then a remote_tiles.TileServiceReader)
+        "service",
     )
 
     def __init__(self, **kw):
@@ -458,6 +461,19 @@ def probe(path):
 
     remote = is_cogref(path)
     err_key = os.path.normcase(os.path.abspath(str(path)))
+    if remote:
+        from .remote_tiles import is_tile_pointer
+        if is_tile_pointer(path):
+            # a tiled ArcGIS service: no TIFF header, the service describes it
+            try:
+                from .remote_tiles import probe as _tiles_probe
+                prof = _tiles_probe(path)
+                _REMOTE_ERRORS.pop(err_key, None)
+                return prof
+            except Exception as exc:
+                _REMOTE_ERRORS[err_key] = str(exc)
+                logging.warning("tile service probe failed for %s: %s", os.path.basename(str(path)), exc)
+                return None
     try:
         source = _tiff_source(path)
         with tifffile.TiffFile(source) as tf:
@@ -1557,7 +1573,11 @@ def open_reader(path, profile=None):
             return reader
 
     try:
-        reader = TiledRasterReader(profile)
+        if getattr(profile, "service", None) is not None:
+            from .remote_tiles import TileServiceReader
+            reader = TileServiceReader(profile)
+        else:
+            reader = TiledRasterReader(profile)
     except Exception as exc:
         logging.debug("open_reader failed for %s: %s", path, exc)
         return None
