@@ -62,7 +62,8 @@ class PortalFinderDialog(QtWidgets.QDialog):
         else:
             self.kind_combo.addItem("Rasters CanoPie can stream", ("stream",))
             self.kind_combo.addItem("Rasters that only download", ("download",))
-            self.kind_combo.addItem("All rasters", ("stream", "download"))
+            self.kind_combo.addItem("Vector layers (imported as polygons)", ("vector",))
+            self.kind_combo.addItem("Everything", ("stream", "download", "vector"))
         row.addWidget(self.kind_combo)
         self.search_btn = QtWidgets.QPushButton("Search")
         self.search_btn.clicked.connect(self.run_search)
@@ -84,7 +85,7 @@ class PortalFinderDialog(QtWidgets.QDialog):
         lay.addWidget(self.status)
 
         buttons = QtWidgets.QDialogButtonBox()
-        self.add_btn = buttons.addButton("Add selected" if mode == "rasters" else "Import selected",
+        self.add_btn = buttons.addButton("Add selected" if mode == "rasters" else "Import selected",  # noqa
                                          QtWidgets.QDialogButtonBox.AcceptRole)
         buttons.addButton(QtWidgets.QDialogButtonBox.Close)
         buttons.accepted.connect(self._accept)

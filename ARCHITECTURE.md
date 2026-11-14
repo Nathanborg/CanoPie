@@ -464,7 +464,9 @@ is the full raster, never the preview, and the canopy finder reads `.cogref` win
 Data portals: `remote_portal.py` (no Qt, no GDAL) finds a Hub site's org, searches it and classifies
 items as stream / download / vector, downloads (zip-slip safe) and turns feature services (GeoJSON
 pages), GeoPackages (sqlite3 + Shapely WKB) and GeoJSON into shapefiles; `portal_finder_dialog.py` is
-the search window (rasters from Add Remote Images, vectors from PolygonManager.on_import_from_portal,
+the search window (rasters and vectors from Add Remote Images -- vectors imported by
+ProjectTab.import_portal_vectors_when_ready once the viewers have their images -- and vectors from
+Import Shapefile > From a data portal, i.e. PolygonManager.on_import_from_portal,
 which hands the shapefiles to on_import_shapefile(file_paths=...)). LERC image services stream as
 float32 data (`TileService.data`).
 Tiled ArcGIS services (`remote_tiles.py`; pointer `"kind": "arcgis-tiles"`, made from a MapServer /

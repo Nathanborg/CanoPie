@@ -99,7 +99,7 @@ zoom level the service publishes. Credit the data owner (the dialog shows the cr
 
 ## Finding data in a portal
 
-**Add Remote Images > Find in a data portal...** searches an ArcGIS Hub / open-data site
+**File > Add Remote Images and Vectors (URLs)... > Find in a data portal...** searches an ArcGIS Hub / open-data site
 (the STRI data portal by default; any Hub site works) and lists what CanoPie can use:
 
 - **Stream:** tiled map services (orthophotos, historic aerials, topo sheets), tiled imagery
@@ -107,11 +107,14 @@ zoom level the service publishes. Credit the data owner (the dialog shows the cr
   files. They go into the links box.
 - **Download:** rasters that only download whole (zipped image collections). CanoPie asks first,
   shows the size, and downloads into the pointer folder's `downloads`.
+- **Vector layers:** imported as polygons onto the images once they are open (needs a saved
+  project: the shapes are kept as shapefiles in its `portal_vectors` folder).
 
 In the STRI portal (November 2026): 390 streamable rasters, among them the BCI 50 ha drone
 orthophotos of several dates and the 1955-1983 historic aerials, and 2 download-only ones.
 
-**Polygon Manager > Import from data portal...** lists the portal's vector layers (604 feature
+**Polygon Manager > Import Shapefile** asks *From a file...* or *From a data portal...*; the portal
+choice lists the portal's vector layers (604 feature
 layers, 22 shapefiles, 3 GeoJSON in STRI's) and imports their shapes as polygons, through the same
 reprojection and image matching as Import Shapefile. Import Shapefile also accepts GeoPackage
 (`.gpkg`) and GeoJSON now. None of this uses GDAL. Tested: the STRI "Barro Colorado Island

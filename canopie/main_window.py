@@ -246,10 +246,10 @@ class MainWindow(QMainWindow):
         open_rgb_picker_action.triggered.connect(self.open_rgb_picker)
         file_menu.addAction(open_rgb_picker_action)
 
-        open_remote_action = QAction("Add Remote Images (URLs)…", self)
+        open_remote_action = QAction("Add Remote Images and Vectors (URLs)…", self)
         open_remote_action.setShortcut("Ctrl+Shift+U")
         open_remote_action.setStatusTip(
-            "Open Cloud-Optimized GeoTIFFs from a web link or Google Drive without downloading them")
+            "Stream images (COGs, Drive/OneDrive links, ArcGIS layers) and import vector layers from a data portal")
         open_remote_action.triggered.connect(self.open_remote_images)
         file_menu.addAction(open_remote_action)
         

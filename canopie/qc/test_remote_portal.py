@@ -220,3 +220,47 @@ def test_geojson_with_mixed_geometry_splits_into_one_shapefile_per_type(tmp_path
     assert kinds == sorted([shapefile.POLYGON, shapefile.POINT])
     poly = [s for s in shps if shapefile.Reader(s).shapeType == shapefile.POLYGON][0]
     assert len(shapefile.Reader(poly).shape(0).parts) == 2
+
+
+# --------------------------------------------------------------------------
+# Where the user meets it: Import Shapefile asks, Add Remote Images lists vectors
+# --------------------------------------------------------------------------
+
+def test_import_shapefile_asks_file_or_portal(synthetic_project, monkeypatch):
+    from PyQt5 import QtWidgets
+    pm = synthetic_project.polygon_manager
+    calls = []
+    monkeypatch.setattr(pm, "on_import_from_portal", lambda: calls.append("portal"))
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileNames",
+                        staticmethod(lambda *a, **k: (calls.append("file") or [], "")))
+    for answer, want in (("portal", ["portal"]), ("file", ["file"]), (None, [])):
+        calls.clear()
+        monkeypatch.setattr(pm, "_ask_import_source", lambda a=answer: a)
+        pm.on_import_shapefile()
+        assert calls == want, (answer, calls)
+    assert not hasattr(pm, "import_portal_button"), "the extra button is gone"
+
+
+def test_add_remote_images_lists_vectors_and_accepts_them_alone(qapp, monkeypatch):
+    from PyQt5 import QtCore
+    from .. import portal_finder_dialog as pfd
+    from .. import remote_images_dialog as rid
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", staticmethod(lambda *a, **k: None))   # no search
+    f = pfd.PortalFinderDialog(None, mode="rasters")
+    try:
+        kinds = [f.kind_combo.itemData(i) for i in range(f.kind_combo.count())]
+        assert ("vector",) in kinds and ("stream", "download", "vector") in kinds
+    finally:
+        f.deleteLater()
+    monkeypatch.setattr(rid, "_SETTINGS", ("CanoPie-QC", "portal-vectors-test"))
+    d = rid.RemoteImagesDialog(None)
+    try:
+        d.vector_items = [{"id": "f" * 32, "title": "50ha plot polygons", "type": "Feature Service",
+                           "kind": "vector", "url": "x", "name": "p", "snippet": "", "owner": ""}]
+        d._update_extra_label()
+        assert "imported as polygons" in d.local_label.text()
+        d._check_and_open()
+        assert d.result() == d.Accepted and d.result_paths == []
+    finally:
+        QtCore.QSettings("CanoPie-QC", "portal-vectors-test").clear()
+        d.deleteLater()

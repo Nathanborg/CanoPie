@@ -1073,17 +1073,12 @@ class PolygonManager(QtWidgets.QDialog):
 
         self.import_shapefile_button = QtWidgets.QPushButton("Import Shapefile (.shp)")
         self.import_shapefile_button.setStyleSheet("background:#2e7d32; color:white; font-weight:600; padding:8px; border-radius:4px;")
-        self.import_shapefile_button.setToolTip("Import ESRI Shapefiles (.shp/.dbf) into the active project with spatial matching and reprojection.")
+        self.import_shapefile_button.setToolTip(
+            "Import shapes as polygons, with spatial matching and reprojection: from a file "
+            "(shapefile, GeoPackage, GeoJSON) or from a data portal (e.g. the STRI data portal).")
         self.import_buttons_layout.addWidget(self.import_shapefile_button)
         self.import_shapefile_button.clicked.connect(lambda: self.on_import_shapefile())
 
-        self.import_portal_button = QtWidgets.QPushButton("Import from data portal...")
-        self.import_portal_button.setStyleSheet("background:#2e7d32; color:white; font-weight:600; padding:8px; border-radius:4px;")
-        self.import_portal_button.setToolTip(
-            "Find vector layers (feature layers, shapefiles, GeoPackages, GeoJSON) in an ArcGIS Hub / "
-            "open-data portal -- the STRI data portal by default -- and import their shapes as polygons.")
-        self.import_buttons_layout.addWidget(self.import_portal_button)
-        self.import_portal_button.clicked.connect(lambda: self.on_import_from_portal())
 
         self.layout.addLayout(self.import_buttons_layout)
 
@@ -4030,6 +4025,20 @@ class PolygonManager(QtWidgets.QDialog):
         if shps:
             self.on_import_shapefile(file_paths=shps)
 
+    def _ask_import_source(self):
+        """'file', 'portal' or None: where Import Shapefile takes shapes from."""
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Import shapes")
+        box.setText("Import polygons from a file on this computer, or from a data portal "
+                    "(an ArcGIS Hub / open-data site such as the STRI data portal)?")
+        b_file = box.addButton("From a file...", QtWidgets.QMessageBox.AcceptRole)
+        b_portal = box.addButton("From a data portal...", QtWidgets.QMessageBox.AcceptRole)
+        box.addButton(QtWidgets.QMessageBox.Cancel)
+        box.setDefaultButton(b_file)
+        box.exec_()
+        clicked = box.clickedButton()
+        return "file" if clicked is b_file else ("portal" if clicked is b_portal else None)
+
     def on_import_shapefile(self, file_paths=None):
         """
         Import user-selected ESRI Shapefile(s) (.shp/.dbf) into the active project.
@@ -4047,6 +4056,12 @@ class PolygonManager(QtWidgets.QDialog):
             return
 
         if not isinstance(file_paths, (list, tuple)) or not file_paths:
+            source = self._ask_import_source()
+            if source is None:
+                return
+            if source == "portal":
+                self.on_import_from_portal()
+                return
             start_dir = getattr(parent, "current_folder_path", None) or project_folder
             file_paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
                 self, "Import Shapefile (.shp)", start_dir,

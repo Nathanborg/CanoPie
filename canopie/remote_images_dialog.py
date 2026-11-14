@@ -156,7 +156,7 @@ class RemoteImagesDialog(QtWidgets.QDialog):
 
     def __init__(self, parent=None, project_tab=None, batch_size=None):
         super().__init__(parent)
-        self.setWindowTitle("Add Remote Images (URLs)")
+        self.setWindowTitle("Add Remote Images and Vectors (URLs)")
         self.setWindowFlags(self.windowFlags() & ~QtCore.Qt.WindowContextHelpButtonHint)
         self.resize(760, 560)
         self.result_paths = []
@@ -184,13 +184,14 @@ class RemoteImagesDialog(QtWidgets.QDialog):
         frow = QtWidgets.QHBoxLayout()
         self.find_btn = QtWidgets.QPushButton("Find in a data portal...")
         self.find_btn.setToolTip("Search an ArcGIS Hub / open-data portal (default: the STRI data portal) "
-                                 "for rasters CanoPie can stream, or download")
+                                 "for rasters to stream or download, and vector layers to import as polygons")
         self.find_btn.clicked.connect(self._find_in_portal)
         frow.addWidget(self.find_btn)
         self.local_label = QtWidgets.QLabel("")
         frow.addWidget(self.local_label, 1)
         lay.addLayout(frow)
         self.local_paths = []                 # downloaded rasters to open with the links
+        self.vector_items = []                # portal vector layers to import once images are open
 
         form = QtWidgets.QFormLayout()
         row = QtWidgets.QHBoxLayout()
@@ -328,16 +329,28 @@ class RemoteImagesDialog(QtWidgets.QDialog):
         if links:
             have = self.urls_edit.toPlainText().rstrip()
             self.urls_edit.setPlainText((have + "\n" if have else "") + "\n".join(links))
+        vec = [it for it in dlg.selected if it["kind"] == "vector"]
+        if vec:
+            self.vector_items += [it for it in vec if it not in self.vector_items]
         dl = [it for it in dlg.selected if it["kind"] == "download"]
         if dl:
             folder = os.path.join(self.folder_edit.text().strip() or default_pointer_dir(), "downloads")
             self.local_paths += fetch_download_items(self, dl, folder)
-            if self.local_paths:
-                self.local_label.setText("{} downloaded file(s) will open too".format(len(self.local_paths)))
+        self._update_extra_label()
+
+    def _update_extra_label(self):
+        parts = []
+        if self.local_paths:
+            parts.append("{} downloaded file(s) will open too".format(len(self.local_paths)))
+        if self.vector_items:
+            parts.append("{} vector layer(s) will be imported as polygons: {}".format(
+                len(self.vector_items), ", ".join(it["title"] for it in self.vector_items[:3])
+                + (" ..." if len(self.vector_items) > 3 else "")))
+        self.local_label.setText("; ".join(parts))
 
     def _check_and_open(self):
         urls = parse_urls(self.urls_edit.toPlainText())
-        if not urls and self.local_paths:
+        if not urls and (self.local_paths or self.vector_items):
             self.result_paths = list(self.local_paths)
             self.batch_size = self.batch_spin.value()
             self.accept()

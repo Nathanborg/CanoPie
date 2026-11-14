@@ -35373,9 +35373,46 @@ class ProjectTab(QtWidgets.QWidget):
         from PyQt5 import QtWidgets
         from .remote_images_dialog import RemoteImagesDialog
         dlg = RemoteImagesDialog(self, project_tab=self)
-        if dlg.exec_() != QtWidgets.QDialog.Accepted or not dlg.result_paths:
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
             return
-        self.open_image_paths(dlg.result_paths, dlg.batch_size, root_prefix="Remote", sort=False)
+        if dlg.result_paths:
+            self.open_image_paths(dlg.result_paths, dlg.batch_size, root_prefix="Remote", sort=False)
+        if getattr(dlg, "vector_items", None):
+            self.import_portal_vectors_when_ready(list(dlg.vector_items))
+
+    def import_portal_vectors_when_ready(self, items, timeout_s=90):
+        """Import portal vector layers as polygons once the viewers have their
+        images (polygons are placed on the images they overlap)."""
+        from PyQt5 import QtCore, QtWidgets
+        if not getattr(self, "project_folder", None):
+            QtWidgets.QMessageBox.information(
+                self, "Save the project first",
+                "Vector layers are saved as shapefiles in the project folder before they are "
+                "imported. Save the project, then use Polygon Manager > Import Shapefile > "
+                "From a data portal.")
+            return
+        import time as _time
+        deadline = _time.time() + timeout_s
+        timer = QtCore.QTimer(self)
+        timer.setInterval(300)
+
+        def ready():
+            vws = getattr(self, "viewer_widgets", None) or []
+            return bool(vws) and all(getattr(w.get("image_data") or getattr(w.get("viewer"), "image_data", None),
+                                             "filepath", None) for w in vws)
+
+        def tick():
+            if not ready() and _time.time() < deadline:
+                return
+            timer.stop()
+            from .portal_finder_dialog import vectors_to_shapefiles
+            pm = getattr(self, "polygon_manager", None)
+            shps = vectors_to_shapefiles(pm or self, items, os.path.join(self.project_folder, "portal_vectors"))
+            if shps and pm is not None:
+                pm.on_import_shapefile(file_paths=shps)
+
+        timer.timeout.connect(tick)
+        timer.start()
 
     def _stats_inputs(self, filepaths):
         """What process_polygon needs besides the polygon, shared by the
