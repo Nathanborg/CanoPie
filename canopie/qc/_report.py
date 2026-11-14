@@ -55,6 +55,17 @@ FEATURE_MAP = {
         "Export Manager under Modules; viewer and Polygon Manager menus share their entries (Edit vertices / "
         "properties, Find canopy, Lock, Polygon Stats, Polygon Info); Polygon Stats = process_polygon rows for "
         "the selected polygons (several, viewer or manager, either path spelling); old counts = Polygon Info"),
+    "test_bulk_polygons": (
+        "Bulk copies: replicate, copy to next/all roots, shapefile import (polygon_bulk)",
+        "crowns are copied by hard link (same fraction of the frame = same file) or, when memory is ahead of "
+        "the file, written scaled to the target's full-resolution basis; attributes, Annotator values and "
+        "patches kept; the window never freezes (heartbeat); copies drawn in chunks on the target viewer "
+        "only (not on viewers outside the grid); existing crowns asked about once (replace / skip / "
+        "cancel); one undo step restores everything; crowns under the import's path spelling found; the "
+        "import writes off the GUI thread and installs lazy records; saving one name of a linked crown "
+        "never changes the other; many selections notify once; index buckets are O(1); Polygon Manager with "
+        "thousands of groups: Lock label in one pass, Info and Zoom without reading crown files, Copy / Move "
+        "selected through the engine (Move deletes the source undoably); a bulk delete checks a missing .ax once"),
     "test_filter_rules_and_selection": (
         "Filter rules: suggestions, hidden attributes, speed; zoomed-out selection; last_modified; filtered lists",
         "property list (hidden area / perimeter / last_modified first) and value suggestions (commonest labels, "

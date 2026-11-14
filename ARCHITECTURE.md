@@ -33,6 +33,7 @@ main.py
               ├── image_editor_dialog.py  ImageEditorDialog (QDialog) — per-image non-destructive edits (.ax files)
               ├── polygon_manager.py      PolygonManager (QDialog) — polygon-group tree, import/visibility
               │     └── annotator.py      Annotator (PolygonManager subclass) — custom per-polygon properties
+              ├── polygon_bulk.py         bulk crown copies (replicate, copy to roots, import) off the GUI thread
               ├── machine_learning_manager.py  MachineLearningManager + RootOffsetDialog + AnalysisOptionsDialog
               ├── loaders.py              async image loading (QThreadPool/QRunnable), EXIF batch, ImageProcessor
               ├── image_data.py           ImageData — reads one image file, classifies rgb/thermal/multispectral
@@ -85,6 +86,15 @@ fast functions (wrapped in try/except — the app runs without NumExpr/Numba ins
    Patches of different properties never overlap (PatchCanvas.set_blocked: the crown's other
    properties' paint is off limits). With the Annotator open a click on a locked crown only
    opens it; a drag past startDragDistance asks to unlock (ImageViewer._locked_drag).
+   **Bulk copies** (Replicate to all viewers, Copy to next / previous / all roots, shapefile
+   import) go through `polygon_bulk.py`: a list of jobs (one crown, one image) run by
+   `BulkPolygonWorker` on a QThread, then `ProjectTab._apply_bulk_results` on the GUI thread
+   (lazy records, `_draw_groups_chunked`, one `AddPolygonsCommand` undo step). A copy is placed
+   by image-size ratio -- the same FRACTION of the frame, which is how records are stored -- so
+   its sidecar is the source's bytes and is made by HARD LINK (~0.2 ms; a written file costs
+   1-2 ms on Windows). Every sidecar writer must REPLACE the file (`polygon_lod.dump_sidecar`:
+   temp file + os.replace), never write into it, or a linked crown changes on both images. A
+   linked record pins its own `root` (`LazyPolygonRecord(pinned=...)`, kept in the overview).
 4. **ImageEditorDialog** applies non-destructive per-image edits saved as **.ax** sidecars.
 5. **MachineLearningManager** trains sklearn models from polygon labels and/or applies a
    model during CSV export. Heavy pixel math is offloaded to **performance.py** when available.

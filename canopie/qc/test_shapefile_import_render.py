@@ -302,6 +302,10 @@ def test_import_finished_catches_a_bad_polygon_and_continues(
 
     monkeypatch.setattr(pm, "_iter_viewers",
                         lambda: [({"image_data": imgd}, viewer)])
+    # The draw loop under test is the fallback for a tab without a project
+    # folder; a project tab hands imports to ProjectTab.import_polygons_bulk
+    # (test_bulk_polygons.py).
+    monkeypatch.setattr(synthetic_project, "import_polygons_bulk", lambda *a, **k: 0, raising=False)
 
     class _Progress:
         def close(self):
@@ -423,6 +427,10 @@ def test_import_draws_decimated_geometry_but_saves_exact(
     viewer.set_image(pixmap)
     monkeypatch.setattr(pm, "_iter_viewers",
                         lambda: [({"image_data": imgd}, viewer)])
+    # The draw loop under test is the fallback for a tab without a project
+    # folder; a project tab hands imports to ProjectTab.import_polygons_bulk
+    # (test_bulk_polygons.py).
+    monkeypatch.setattr(synthetic_project, "import_polygons_bulk", lambda *a, **k: 0, raising=False)
     monkeypatch.setattr(QtWidgets.QMessageBox, "information", lambda *a, **k: None)
     monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *a, **k: None)
 

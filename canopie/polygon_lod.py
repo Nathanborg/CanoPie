@@ -177,7 +177,13 @@ def dump_sidecar(path, data, remember=False):
                 break
             import time as _time
             _time.sleep(0.05 * (attempt + 1))
-    # Last resort: write in place rather than lose the save.
+    # Last resort: write in place rather than lose the save -- after unlinking,
+    # so a sidecar shared by hard link (a replicated crown) is never changed
+    # under its other name.
+    try:
+        os.remove(path)
+    except OSError:
+        pass
     with open(path, 'w', encoding='utf-8') as f:
         f.write(text)
     try:
@@ -309,7 +315,7 @@ def write_overview(polygons_dir, records, level=OVERVIEW_LEVEL):
             if coarse is None and pts:
                 coarse = np.round(decimate(pts, 2.0 ** level),
                                   COORD_DECIMALS).tolist()
-        entries.append({
+        entry = {
             'g': group,
             'f': filepath,
             'n': data.get('name', group),
@@ -319,12 +325,23 @@ def write_overview(polygons_dir, records, level=OVERVIEW_LEVEL):
             'rs': data.get('image_ref_size') or {},
             'p': coarse or [],
             'np': len(pts),
-        })
+        }
+        pin = dict.get(data, '_pin') or getattr(data, 'pinned', None)
+        if pin:
+            entry['pin'] = list(pin)
+        entries.append(entry)
 
     tmp = overview_path(polygons_dir) + ".tmp"
     # json.dumps (C encoder), not json.dump (always pure Python) -- see dump_sidecar.
-    text = json.dumps({'version': 1, 'level': level, 'entries': entries},
-                      separators=(',', ':'))
+    # In slices: the C encoder holds the GIL for the whole call, and this runs
+    # on a background thread after bulk copies -- one 6 MB dumps froze the
+    # window for ~0.4 s. Slices of 200 entries let the GUI thread in between;
+    # the text is identical.
+    parts = []
+    for i in range(0, len(entries), 200):
+        parts.append(json.dumps(entries[i:i + 200], separators=(',', ':'))[1:-1])
+    text = ('{"version":1,"level":%d,"entries":[' % int(level)
+            + ",".join(p for p in parts if p) + ']}')
     with open(tmp, 'w', encoding='utf-8') as f:
         f.write(text)
     os.replace(tmp, overview_path(polygons_dir))
@@ -371,10 +388,18 @@ class LazyPolygonRecord(dict):
     _EXACT_KEYS = frozenset({'points', 'coordinates', 'properties', 'lod', 'annotator_patches',
                              'last_modified'})
 
-    def __init__(self, meta, source_path):
+    def __init__(self, meta, source_path, pinned=()):
         super().__init__(meta)
         self._source_path = source_path
         self._materialised = False
+        # Meta keys the file must not override when it is read: a crown
+        # replicated by HARD LINK (polygon_bulk) shares its source's file, whose
+        # 'root' is the source image's root.
+        self._pinned = tuple(pinned or ())
+
+    @property
+    def pinned(self):
+        return self._pinned
 
     @property
     def is_materialised(self):
@@ -406,9 +431,12 @@ class LazyPolygonRecord(dict):
     def _merge_full(self, full):
         if isinstance(full, dict):
             display = dict.get(self, 'display_points')
+            keep = {k: dict.get(self, k) for k in self._pinned if dict.get(self, k) is not None}
             dict.update(self, full)
             if display is not None:
                 dict.__setitem__(self, 'display_points', display)
+            for k, v in keep.items():
+                dict.__setitem__(self, k, v)
 
     def __getitem__(self, key):
         if key in self._EXACT_KEYS and not self._materialised:
