@@ -160,15 +160,17 @@ class RemoteImagesDialog(QtWidgets.QDialog):
         lay = QtWidgets.QVBoxLayout(self)
         intro = QtWidgets.QLabel(
             "Paste links to Cloud-Optimized GeoTIFFs, one per line: an https:// link "
-            "(a web server or a public bucket) or a Google Drive share link. CanoPie "
-            "reads only the tiles it shows; nothing is downloaded.")
+            "(a web server or a public bucket), or a Google Drive or OneDrive share link "
+            "(shared as 'Anyone with the link'). CanoPie reads only the tiles it shows; "
+            "nothing is downloaded.")
         intro.setWordWrap(True)
         lay.addWidget(intro)
 
         self.urls_edit = QtWidgets.QPlainTextEdit()
         self.urls_edit.setPlaceholderText(
             "https://example.org/orthomosaics/plot_A.tif\n"
-            "https://drive.google.com/file/d/FILE_ID/view?usp=sharing")
+            "https://drive.google.com/file/d/FILE_ID/view?usp=sharing\n"
+            "https://1drv.ms/i/s!...   or   https://yourorg-my.sharepoint.com/:i:/g/personal/...")
         lay.addWidget(self.urls_edit, 2)
 
         form = QtWidgets.QFormLayout()

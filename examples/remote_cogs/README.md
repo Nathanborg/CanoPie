@@ -81,6 +81,19 @@ test folder in your Drive. Its download link is the `url` in the matching
 `.cogref`. Share the copy by link and open it with the dialog. You can then
 compare it with the same file opened from S3.
 
+## OneDrive and SharePoint
+
+Paste a OneDrive share link (`1drv.ms/…`, `onedrive.live.com/…`) or a work/school
+one (`…-my.sharepoint.com/:i:/…`) into the dialog. The file must be shared as
+**Anyone with the link** (Can view). CanoPie turns the link into the file's
+direct download address and reuses it. When that address expires, CanoPie
+fetches a new one and carries on. The temporary token in it is never written
+into the pointer. If your organisation does not allow link sharing, CanoPie
+says so; reading such a file would need a sign-in, which CanoPie does not do.
+
+So far this is tested against a stand-in of OneDrive's behaviour, not against
+real OneDrive. The speed per request is not measured yet.
+
 ## Why Google Drive is slow, and what helps
 
 Measured from this machine (November 2026) on the BCI orthomosaic:

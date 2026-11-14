@@ -90,11 +90,59 @@ class _RangeHandler(BaseHTTPRequestHandler):
         self._disposition = 'attachment; filename="{}"'.format(name)
         return local
 
+    def _redirect(self, location):
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _onedrive(self, parts):
+        """Share page, ?download=1 and the shares endpoint redirect to a blob
+        address with a temporary token; a private file goes to sign-in."""
+        import base64
+        from urllib.parse import parse_qs
+        srv = self.server
+        q = {k: v[0] for k, v in parse_qs(parts.query).items()}
+        path = parts.path
+        with srv.lock:
+            srv.paths.append(path)
+        if path.startswith("/od/api/shares/"):
+            tok = path.split("/")[4][2:]
+            share = base64.urlsafe_b64decode(tok + "=" * (-len(tok) % 4)).decode()
+            name = urlsplit(share).path.rsplit("/", 1)[-1]
+            if name in srv.od_private:
+                return self._json(401, {"error": {"code": "unauthenticated"}})
+            return self._redirect(srv.base + "od/blob/{}?tempauth={}".format(name, srv.od_token))
+        if path.startswith("/od/share/"):
+            name = path.rsplit("/", 1)[-1]
+            if q.get("download") == "1":
+                if name in srv.od_private:
+                    return self._redirect(srv.base + "accounts.google.com/../login.microsoftonline.com")
+                return self._redirect(srv.base + "od/blob/{}?tempauth={}".format(name, srv.od_token))
+            body = b"<html><title>OneDrive</title></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return None
+        if path.startswith("/od/blob/"):
+            if q.get("tempauth") != srv.od_token:
+                return self._json(401, {"error": {"code": "expired"}})
+            name = path.rsplit("/", 1)[-1]
+            self._disposition = 'attachment; filename="{}"'.format(name)
+            return os.path.join(srv.root, name)
+        return None
+
     def do_GET(self):
         srv = self.server
         parts = urlsplit(self.path)
         drive_path = None
         self._disposition = None
+        if parts.path.startswith("/od/"):
+            drive_path = self._onedrive(parts)
+            if drive_path is None:
+                return
         if parts.path.startswith("/accounts.google.com/"):
             body = b"<html><title>Sign in - Google Accounts</title></html>"
             self.send_response(200)
@@ -171,6 +219,9 @@ def _start_server(root, ignore_range=False):
     srv.drive_key = "test-key"
     srv.drive_files = {}
     srv.drive_private = set()
+    srv.paths = []
+    srv.od_token = "t1"
+    srv.od_private = set()
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     srv.base = "http://127.0.0.1:{}/".format(srv.server_address[1])
@@ -1060,3 +1111,85 @@ def test_status_bar_shows_streaming_percent_until_the_tiles_land(qapp):
     finally:
         rm.remove_progress_listener(w.report)
         win.deleteLater()
+
+
+
+# --------------------------------------------------------------------------
+# OneDrive / SharePoint links
+# --------------------------------------------------------------------------
+
+def test_onedrive_and_sharepoint_links_are_recognised():
+    assert rm.onedrive_kind("https://1drv.ms/i/s!AbCdEf") == "onedrive"
+    assert rm.onedrive_kind("https://onedrive.live.com/?redeem=aHR0cHM6") == "onedrive"
+    assert rm.onedrive_kind("https://contoso-my.sharepoint.com/:i:/g/personal/x/EaBc") == "sharepoint"
+    assert rm.onedrive_kind("https://example.org/ortho.tif") is None
+    assert rm.onedrive_kind("http://127.0.0.1:1/od/share/x.tif", provider="sharepoint") == "sharepoint"
+    assert rm.gdrive_file_id("https://1drv.ms/i/s!AbCdEf") is None
+
+
+def _od_count(srv, prefix):
+    with srv.lock:
+        return sum(1 for p in srv.paths if p.startswith(prefix))
+
+
+def test_a_sharepoint_link_streams_from_its_direct_address(served, tmp_path):
+    srv = served["srv"]
+    local, _ = served["refs"]["pyr"]
+    srv.od_token = "t1"
+    share = srv.base + "od/share/pyr.tif"
+    info = rm.make_pointer(share, str(tmp_path), provider="sharepoint")
+    assert os.path.basename(info["path"]) == "pyr.cogref" and info["provider"] == "sharepoint"
+    assert rm.read_pointer(info["path"])["provider"] == "sharepoint"
+    assert "t1" not in open(info["path"], encoding="utf-8").read(), "a temporary token was saved"
+    rm.clear_sources()
+    a, b = rr.open_reader(local), rr.open_reader(info["path"])
+    assert b is not None, rr.last_probe_error(info["path"])
+    shares = _od_count(srv, "/od/share/")
+    for win in ((0, 0, 1300, 1000), (700, 300, 1200, 900)):
+        assert np.array_equal(a.read_window(*win), b.read_window(*win))
+    assert _od_count(srv, "/od/share/") == shares, \
+        "tile reads went through the share link (a redirect per request) instead of the direct address"
+
+
+def test_an_expired_download_address_is_renewed(served, tmp_path):
+    srv = served["srv"]
+    local, _ = served["refs"]["pyr"]
+    srv.od_token = "t1"
+    ref = str(tmp_path / "pyr.cogref")
+    rm.write_pointer(ref, srv.base + "od/share/pyr.tif", provider="sharepoint")
+    b = rr.open_reader(ref)
+    assert b is not None, rr.last_probe_error(ref)
+    srv.od_token = "t2"                                     # the old address now answers 401
+    a = rr.open_reader(local)
+    assert np.array_equal(a.read_window(0, 0, 640, 480, level=1), b.read_window(0, 0, 640, 480, level=1))
+    assert "tempauth=t2" in b._remote._src.url
+
+
+def test_a_personal_onedrive_link_uses_the_shares_endpoint(served, tmp_path, monkeypatch):
+    srv = served["srv"]
+    local, _ = served["refs"]["pyr"]
+    srv.od_token = "t1"
+    monkeypatch.setattr(rm, "ONEDRIVE_API", srv.base + "od/api/shares")
+    before = _od_count(srv, "/od/api/")
+    info = rm.make_pointer(srv.base + "od/share/pyr.tif", str(tmp_path), provider="onedrive")
+    assert _od_count(srv, "/od/api/") > before
+    rm.clear_sources()
+    a, b = rr.open_reader(local), rr.open_reader(info["path"])
+    assert np.array_equal(a.read_window(10, 10, 900, 700), b.read_window(10, 10, 900, 700))
+
+
+def test_a_onedrive_file_that_is_not_shared_says_so(served, tmp_path, monkeypatch):
+    srv = served["srv"]
+    srv.od_private = {"secret.tif"}
+    monkeypatch.setattr(rm, "ONEDRIVE_API", srv.base + "od/api/shares")
+    try:
+        with pytest.raises(rm.RemoteError, match="Anyone with the link") as ei:
+            rm.make_pointer(srv.base + "od/share/secret.tif", str(tmp_path), provider="onedrive")
+        assert "tempauth" not in str(ei.value)
+    finally:
+        srv.od_private = set()
+
+
+def test_onedrive_tokens_are_masked():
+    assert "abc123" not in rm.redact("https://x.sharepoint.com/download.aspx?UniqueId=1&tempauth=abc123")
+    assert "zzz" not in rm.redact("https://onedrive.live.com/download?resid=1&authkey=zzz")

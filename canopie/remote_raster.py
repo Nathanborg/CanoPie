@@ -42,6 +42,7 @@ No Qt here, and ``requests`` is imported only when a remote file is opened.
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import logging
@@ -51,7 +52,7 @@ import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 
 __all__ = [
     "COGREF_EXT",
@@ -66,6 +67,8 @@ __all__ = [
     "open_pointer",
     "clear_sources",
     "set_default_api_key",
+    "onedrive_kind",
+    "resolve_onedrive",
     "add_progress_listener",
     "remove_progress_listener",
     "default_api_key",
@@ -103,11 +106,16 @@ class RemoteError(IOError):
     """A remote read failed. The message never contains an API key."""
 
 
+class _Expired(RemoteError):
+    """A temporary download address (OneDrive / SharePoint) stopped working."""
+
+
 # --------------------------------------------------------------------------
 # Secrets stay out of names, messages and logs
 # --------------------------------------------------------------------------
 
-_SECRET_QUERY_RE = re.compile(r"(?i)([?&](?:key|access_token|token|sig|signature)=)[^&#\s'\"]+")
+_SECRET_QUERY_RE = re.compile(
+    r"(?i)([?&](?:key|access_token|token|sig|signature|tempauth|authkey|download_token)=)[^&#\s'\"]+")
 
 
 def redact(text):
@@ -240,6 +248,90 @@ def _drive_key(auth, url, api_key=None):
         existing = parse_qs(urlsplit(url).query).get("key")
         key = existing[0] if existing else None
     return key
+
+
+# --------------------------------------------------------------------------
+# OneDrive (personal) and SharePoint / OneDrive for work or school
+# --------------------------------------------------------------------------
+
+#: The consumer OneDrive "shares" endpoint; a module constant so the QC suite
+#: can point it at a local stand-in.
+ONEDRIVE_API = "https://api.onedrive.com/v1.0/shares"
+_ONEDRIVE_HOSTS = ("1drv.ms", "onedrive.live.com", "api.onedrive.com")
+
+
+def onedrive_kind(url, provider=None):
+    """``"onedrive"`` (personal), ``"sharepoint"`` (work or school) or None.
+    ``provider`` (a pointer's own "provider" field) wins over the host name."""
+    if provider in ("onedrive", "sharepoint"):
+        return provider
+    host = urlsplit(str(url).strip()).netloc.lower().split(":")[0]
+    if host in _ONEDRIVE_HOSTS or host.endswith(".onedrive.live.com"):
+        return "onedrive"
+    if host.endswith(".sharepoint.com"):
+        return "sharepoint"
+    return None
+
+
+def _share_token(url):
+    """Microsoft's encoding of a sharing URL for the shares endpoint."""
+    return "u!" + base64.urlsafe_b64encode(str(url).encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _with_query(url, **params):
+    parts = urlsplit(url)
+    q = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k not in params]
+    q += list(params.items())
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(q), parts.fragment))
+
+
+def _onedrive_candidates(url, kind, headers):
+    """Addresses that may serve the file itself, most direct first. A share
+    link opens a web page; these are the forms that download instead."""
+    if kind == "onedrive":
+        yield "{}/{}/root/content".format(ONEDRIVE_API, _share_token(url))
+    yield _with_query(url, download="1")
+    if kind == "onedrive":
+        # an older-style link resolves to onedrive.live.com/redir?...; its
+        # /download twin serves the file
+        try:
+            r = _session().get(url, headers=dict(headers or {}), stream=True,
+                               timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), allow_redirects=True)
+            final = r.url
+            r.close()
+            if "/redir" in final:
+                yield final.replace("/redir", "/download", 1)
+        except Exception:
+            pass
+
+
+def resolve_onedrive(url, kind, headers=None):
+    """The direct, Range-capable address of a OneDrive / SharePoint share
+    link: the first candidate that answers a 1-byte Range request with 206
+    and file bytes (not a web page). Its final address after redirects is
+    returned, so later reads skip the redirect -- it carries a temporary
+    token, which _RangeSource renews when it expires."""
+    tried = []
+    for cand in _onedrive_candidates(url, kind, headers):
+        try:
+            hdrs = dict(headers or {})
+            hdrs["Range"] = "bytes=0-0"
+            r = _session().get(cand, headers=hdrs, stream=True,
+                               timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), allow_redirects=True)
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            ok = r.status_code == 206 and "text/html" not in ctype
+            final = r.url
+            r.close()
+            if ok:
+                return final
+            tried.append("HTTP {}{}".format(r.status_code, " (a web page)" if "text/html" in ctype else ""))
+        except Exception as exc:
+            tried.append(type(exc).__name__)
+    raise RemoteError(
+        "{}: no direct download address for this {} link ({}). Share the file as "
+        "'Anyone with the link' (Can view); a work or school account may not allow "
+        "that.".format(_name_from_url(url), "OneDrive" if kind == "onedrive" else "SharePoint",
+                       "; ".join(tried) or "nothing answered"))
 
 
 def resolve_pointer(ptr, api_key=None):
@@ -391,10 +483,14 @@ class _RangeSource:
     """Shared state behind one URL: size, block cache, statistics."""
 
     def __init__(self, url, *, headers=None, size=None, label=None,
-                 block_size=BLOCK_SIZE, cache_bytes=CACHE_BYTES):
-        self.url = url
-        self.headers = dict(headers or {})
+                 block_size=BLOCK_SIZE, cache_bytes=CACHE_BYTES, resolver=None):
+        # resolver: a callable giving the real download address (OneDrive /
+        # SharePoint). Called now, and again when that address expires.
+        self._resolver = resolver
+        self._resolve_lock = threading.Lock()
         self.label = label or redact(url)
+        self.url = resolver() if resolver is not None else url
+        self.headers = dict(headers or {})
         self.block_size = int(block_size)
         self.cache_budget = int(cache_bytes)
         self._cache = OrderedDict()
@@ -415,6 +511,17 @@ class _RangeSource:
     # -- HTTP -------------------------------------------------------------
 
     def _get(self, start, end, total_known=True, progress=None):
+        """:meth:`_get_once`, renewing an expired download address once."""
+        used = self.url
+        try:
+            return self._get_once(start, end, total_known, progress)
+        except _Expired:
+            with self._resolve_lock:
+                if self.url == used:                   # nobody renewed it meanwhile
+                    self.url = self._resolver()
+            return self._get_once(start, end, total_known, progress)
+
+    def _get_once(self, start, end, total_known=True, progress=None):
         """Bytes ``[start, end]`` (inclusive) with one Range request.
 
         Returns ``(data, total_size)``. Refuses a 200 response: a server that
@@ -461,6 +568,9 @@ class _RangeSource:
                     "{}: the server ignored the byte-range request (HTTP 200 instead of 206), "
                     "so it would send the whole file. Host the COG somewhere that supports "
                     "HTTP Range requests.".format(self.label))
+            if resp.status_code in (401, 403, 410) and self._resolver is not None:
+                raise _Expired("{}: download address expired (HTTP {})".format(
+                    self.label, resp.status_code))
             if resp.status_code != 206:
                 try:
                     body = resp.raw.read(600, decode_content=True) or b""
@@ -815,6 +925,21 @@ _SOURCES_LOCK = threading.Lock()
 _MAX_SOURCES = 16
 
 
+def _source_for(ptr, label, api_key=None):
+    """The _RangeSource for a pointer dict: resolved URL, headers, and for a
+    OneDrive / SharePoint link a resolver that finds and renews the direct
+    download address."""
+    url, headers = resolve_pointer(ptr, api_key=api_key)
+    kind = onedrive_kind(ptr["url"], ptr.get("provider"))
+    resolver = None
+    if kind is not None:
+        share = str(ptr["url"]).strip()
+
+        def resolver():
+            return resolve_onedrive(share, kind, headers)
+    return _RangeSource(url, headers=headers, size=ptr.get("size"), label=label, resolver=resolver)
+
+
 def open_pointer(path):
     """A :class:`RangeFile` for a ``.cogref`` pointer.
 
@@ -834,9 +959,7 @@ def open_pointer(path):
             _SOURCES.move_to_end(key)
     if src is None:
         ptr = read_pointer(abspath)
-        url, headers = resolve_pointer(ptr)
-        src = _RangeSource(url, headers=headers, size=ptr.get("size"),
-                           label=os.path.basename(abspath))
+        src = _source_for(ptr, os.path.basename(abspath))
         with _SOURCES_LOCK:
             src = _SOURCES.setdefault(key, src)
             _SOURCES.move_to_end(key)
@@ -903,7 +1026,7 @@ def _name_from_url(url):
     return name
 
 
-def inspect_url(url, api_key=None):
+def inspect_url(url, api_key=None, provider=None):
     """Check a link before CanoPie uses it: reachable, Range-capable, a TIFF,
     and whether it is a real COG. Reads the name (from the Drive API for a
     Drive link), the size and the header -- nothing else.
@@ -913,6 +1036,7 @@ def inspect_url(url, api_key=None):
     bytes_fetched."""
     url = str(url).strip()
     real, headers = resolve_pointer({"url": url}, api_key=api_key)
+    kind = onedrive_kind(url, provider)
     file_id = gdrive_file_id(url)
     keyless = file_id is not None and real.startswith(GDRIVE_DOWNLOAD)
     if file_id is not None and not keyless:
@@ -923,8 +1047,11 @@ def inspect_url(url, api_key=None):
         name = "gdrive_" + file_id[:10]
     else:
         name = _name_from_url(url)
-    rf = RangeFile(real, headers=headers, name=name)
-    if keyless:
+    ptr = {"url": url}
+    if provider:
+        ptr["provider"] = provider
+    rf = RangeFile(name=name, _source=_source_for(ptr, name, api_key=api_key))
+    if keyless or kind is not None:
         name = _disposition_name(rf._src.first_headers) or name
     import tifffile
     with tifffile.TiffFile(rf) as tf:
@@ -939,6 +1066,7 @@ def inspect_url(url, api_key=None):
             "bands": int(page.samplesperpixel or 1), "dtype": str(page.dtype),
             "tiled": bool(page.is_tiled), "levels": int(levels),
             "compression": int(page.compression),
+            "provider": kind,
         }
     warning = None
     if not info["tiled"]:
@@ -965,12 +1093,12 @@ def pointer_stem(name):
     return (stem or "remote")[:120]
 
 
-def make_pointer(url, folder, api_key=None):
+def make_pointer(url, folder, api_key=None, provider=None):
     """Check ``url`` (:func:`inspect_url`) and write ``<name>.cogref`` in
     ``folder``. A pointer already there for the same link is reused; one for
     another link keeps its name and the new one gets ``_2``, ``_3``...
     The API key is never written. Returns the info dict plus ``path``."""
-    info = inspect_url(url, api_key=api_key)
+    info = inspect_url(url, api_key=api_key, provider=provider)
     os.makedirs(folder, exist_ok=True)
     stem = pointer_stem(info["name"])
     n = 1
@@ -985,7 +1113,8 @@ def make_pointer(url, folder, api_key=None):
         except RemoteError:
             pass
         n += 1
-    write_pointer(path, info["url"], size=info["size"], name=info["name"])
+    extra = {"provider": provider} if provider else {}
+    write_pointer(path, info["url"], size=info["size"], name=info["name"], **extra)
     info["path"] = path
     return info
 

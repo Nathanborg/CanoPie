@@ -451,7 +451,10 @@ remote profile never uses memmap and always loads as a viewer/editor preview
 Size, transform and EPSG come from the remote header too (`shapefile_io._tiff_open_target`
 inside `_raw_image_dims` / `get_geotiff_transform` / `epsg_from_geotiff`), so the polygon basis
 is the full raster, never the preview, and the canopy finder reads `.cogref` window by window.
-Google Drive links resolve to Drive's public download endpoint (`GDRIVE_DOWNLOAD`,
+OneDrive / SharePoint share links (`onedrive_kind`, or a pointer's `"provider"`) get a resolver:
+`resolve_onedrive` tries the consumer shares endpoint and `?download=1` (and `/redir` -> `/download`),
+keeps the first address answering a Range request with file bytes, and `_RangeSource` renews it on
+401/403/410 (its token expires). Google Drive links resolve to Drive's public download endpoint (`GDRIVE_DOWNLOAD`,
 `confirm=t`; no key, file shared by link) or, when a key is set, to `files.get?alt=media`; the key comes from the app
 (`remote_raster.set_default_api_key`, remembered in QSettings by the dialog and applied in
 `MainWindow.__init__`) or `CANOPIE_GDRIVE_API_KEY`, is masked in every message and is never
