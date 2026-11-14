@@ -33250,6 +33250,17 @@ class ProjectTab(QtWidgets.QWidget):
                     return None
                 vals = np.asarray(a3[ey, ex, :], dtype=np.float64)
             else:
+                # A remote image whose tile under (ex, ey) is not in memory:
+                # never wait for the network on the GUI thread (hover inspect
+                # runs on every mouse move -- on Drive that froze the window
+                # ~1 s per pixel crossed). Show the preview's value now, fetch
+                # the tile in the background, redo the readout when it lands.
+                if (threading.current_thread() is threading.main_thread()
+                        and hasattr(img, "fetch_bytes")
+                        and img.fetch_bytes([(ex, ey, ex + 1, ey + 1)]) > 0):
+                    self._inspect_remote_later(viewer, img, ex, ey)
+                    return self._inspect_preview_payload(idata, ex, ey, eh, ew)
+                self._inspect_want = None          # an exact value is shown: drop pending redo
                 cols = img.read_window(ex, ey, ex + 1, ey + 1)
                 vals = np.array([float(np.asarray(c)[0, 0]) for c in cols], dtype=np.float64)
                 if info.get("nodata") == "rules":
@@ -33265,6 +33276,82 @@ class ProjectTab(QtWidgets.QWidget):
         vals = [float(x) for x in vals]
         return {"values": vals, "names": list(names), "is_nodata": False,
                 "channel_nodata": [not np.isfinite(x) for x in vals], "pixel": (int(ex), int(ey))}
+
+    @staticmethod
+    def _inspect_preview_payload(idata, ex, ey, eh, ew):
+        """The readout from the viewer's preview while the full-resolution tile
+        of a remote image downloads: the preview pixel covering (ex, ey), its
+        band names marked "~" (approximate)."""
+        import numpy as np
+        from .band_layout import file_band_names
+        data = getattr(idata, "image", None)
+        if not isinstance(data, np.ndarray) or data.ndim not in (2, 3):
+            return None
+        d3 = data if data.ndim == 3 else data[..., None]
+        ph, pw = d3.shape[:2]
+        py = min(ph - 1, max(0, int(ey * ph / float(max(1, eh)))))
+        px = min(pw - 1, max(0, int(ex * pw / float(max(1, ew)))))
+        vals = [float(x) for x in np.asarray(d3[py, px, :], dtype=np.float64)]
+        full = getattr(idata, "full_shape", None)
+        n_file = int(full[2]) if full is not None and len(full) >= 3 else len(vals)
+        all_names = file_band_names(max(1, n_file))
+        bands = list(getattr(idata, "preview_bands", None) or range(len(vals)))
+        names = [all_names[b] if b < len(all_names) else "band_{}".format(b + 1) for b in bands]
+        names += ["derived_{}".format(k + 1) for k in range(len(vals) - len(names))]
+        names = [n + " ~" for n in names[:len(vals)]]
+        return {"values": vals, "names": names, "is_nodata": False, "approximate": True,
+                "channel_nodata": [not np.isfinite(x) for x in vals], "pixel": (int(ex), int(ey))}
+
+    def _inspect_remote_later(self, viewer, img, ex, ey):
+        """Fetch the remote tile under (ex, ey) off the GUI thread, then redo
+        the readout there. Only the newest position matters: while a fetch
+        runs, newer hovers just replace the wanted pixel, and the worker goes
+        on to that one."""
+        import concurrent.futures
+        self._inspect_want = (viewer, img, int(ex), int(ey))
+        if getattr(self, "_inspect_busy", False):
+            return
+        self._inspect_busy = True
+        if getattr(self, "_inspect_executor", None) is None:
+            self._inspect_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="canopie-inspect")
+
+        def job():
+            try:
+                while True:
+                    want = self._inspect_want
+                    if want is None:
+                        break
+                    _v, im, x, y = want
+                    try:
+                        im.prefetch([(x - 32, y - 32, x + 33, y + 33)])
+                    except Exception as e:
+                        logging.debug("[inspect] remote fetch failed: %s", e)
+                    if self._inspect_want is want:
+                        break
+            finally:
+                self._inspect_busy = False
+            try:
+                QtCore.QMetaObject.invokeMethod(self, "_inspect_redo", QtCore.Qt.QueuedConnection)
+            except RuntimeError:              # the tab is gone
+                pass
+
+        self._inspect_executor.submit(job)
+
+    @QtCore.pyqtSlot()
+    def _inspect_redo(self):
+        """GUI thread: the tile for the wanted pixel has landed; show its exact value."""
+        want = getattr(self, "_inspect_want", None)
+        if want is None:
+            return
+        viewer, _img, x, y = want
+        try:
+            payload = self.inspect_export_pixel(viewer, x, y)
+            if payload is not None and not payload.get("approximate"):
+                self._inspect_want = None
+                viewer.pixel_clicked.emit(QtCore.QPointF(float(x), float(y)), payload)
+        except (RuntimeError, AttributeError) as e:      # viewer deleted meanwhile
+            logging.debug("[inspect] redo skipped: %s", e)
 
     def display_pixel_value(self, point, payload):
         """

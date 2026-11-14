@@ -1193,3 +1193,60 @@ def test_a_onedrive_file_that_is_not_shared_says_so(served, tmp_path, monkeypatc
 def test_onedrive_tokens_are_masked():
     assert "abc123" not in rm.redact("https://x.sharepoint.com/download.aspx?UniqueId=1&tempauth=abc123")
     assert "zzz" not in rm.redact("https://onedrive.live.com/download?resid=1&authkey=zzz")
+
+
+# --------------------------------------------------------------------------
+# Hover inspect never waits for the network on the GUI thread
+# --------------------------------------------------------------------------
+
+@pytest.mark.viewer
+def test_hover_inspect_on_a_remote_image_answers_at_once_then_exactly(
+        served, synthetic_project, qapp, monkeypatch):
+    """Hover inspect runs on every mouse move. On a remote image whose
+    full-resolution tile is not in memory it used to read it over the network
+    on the GUI thread (~1 s per pixel on Drive): the window froze while
+    panning. Now the preview's value comes back at once, and the exact value
+    follows when the tile has downloaded in the background."""
+    import time
+    from PyQt5 import QtCore
+    from .. import project_tab as ptm
+    monkeypatch.setattr(ptm, "_PREVIEW_LOAD_THRESHOLD_BYTES", 600_000)    # a level-2 preview
+    pt = synthetic_project
+    local, ref = served["refs"]["pyr"]
+    lite = pt._imagedata_or_fallback(ref)
+    assert lite.display_scale == 4.0
+
+    class _Viewer(QtCore.QObject):
+        pixel_clicked = QtCore.pyqtSignal(object, object)
+
+    v = _Viewer()
+    v.image_data = lite
+    got = []
+    v.pixel_clicked.connect(lambda pt_, payload: got.append(payload))
+    for attr in ("_export_image_cache", "_export_cache"):
+        c = getattr(pt, attr, None)
+        if hasattr(c, "clear"):
+            c.clear()
+
+    src = rm.open_pointer(ref)
+    ex, ey = 1001, 777
+    t0 = time.perf_counter()
+    before = src.stats()["requests"]
+    first = pt.inspect_export_pixel(v, ex, ey)
+    took = time.perf_counter() - t0
+    assert first is not None and first.get("approximate"), first
+    assert took < 0.5 and src.stats()["requests"] == before, \
+        "the hover readout waited for the network on the GUI thread"
+    assert all(n.endswith("~") for n in first["names"])
+
+    deadline = time.monotonic() + 15
+    while not got and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.01)
+    assert got, "the exact value never arrived"
+    exact = got[-1]
+    assert not exact.get("approximate") and exact["pixel"] == (ex, ey)
+    assert exact["values"][:4] == [float(x) for x in served["pyr"][ey, ex, :4]]
+    # the tile is in memory now: the next readout there is exact at once
+    again = pt.inspect_export_pixel(v, ex + 1, ey)
+    assert again is not None and not again.get("approximate")
