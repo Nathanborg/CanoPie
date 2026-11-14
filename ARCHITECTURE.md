@@ -461,6 +461,12 @@ remote profile never uses memmap and always loads as a viewer/editor preview
 Size, transform and EPSG come from the remote header too (`shapefile_io._tiff_open_target`
 inside `_raw_image_dims` / `get_geotiff_transform` / `epsg_from_geotiff`), so the polygon basis
 is the full raster, never the preview, and the canopy finder reads `.cogref` window by window.
+Data portals: `remote_portal.py` (no Qt, no GDAL) finds a Hub site's org, searches it and classifies
+items as stream / download / vector, downloads (zip-slip safe) and turns feature services (GeoJSON
+pages), GeoPackages (sqlite3 + Shapely WKB) and GeoJSON into shapefiles; `portal_finder_dialog.py` is
+the search window (rasters from Add Remote Images, vectors from PolygonManager.on_import_from_portal,
+which hands the shapefiles to on_import_shapefile(file_paths=...)). LERC image services stream as
+float32 data (`TileService.data`).
 Tiled ArcGIS services (`remote_tiles.py`; pointer `"kind": "arcgis-tiles"`, made from a MapServer /
 ImageServer URL or an ArcGIS item / Hub page): `raster_reader.probe` defers to `remote_tiles.probe` and
 `open_reader` returns `TileServiceReader`, a `TiledRasterReader` subclass whose levels are the service's

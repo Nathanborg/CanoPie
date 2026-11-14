@@ -1075,7 +1075,15 @@ class PolygonManager(QtWidgets.QDialog):
         self.import_shapefile_button.setStyleSheet("background:#2e7d32; color:white; font-weight:600; padding:8px; border-radius:4px;")
         self.import_shapefile_button.setToolTip("Import ESRI Shapefiles (.shp/.dbf) into the active project with spatial matching and reprojection.")
         self.import_buttons_layout.addWidget(self.import_shapefile_button)
-        self.import_shapefile_button.clicked.connect(self.on_import_shapefile)
+        self.import_shapefile_button.clicked.connect(lambda: self.on_import_shapefile())
+
+        self.import_portal_button = QtWidgets.QPushButton("Import from data portal...")
+        self.import_portal_button.setStyleSheet("background:#2e7d32; color:white; font-weight:600; padding:8px; border-radius:4px;")
+        self.import_portal_button.setToolTip(
+            "Find vector layers (feature layers, shapefiles, GeoPackages, GeoJSON) in an ArcGIS Hub / "
+            "open-data portal -- the STRI data portal by default -- and import their shapes as polygons.")
+        self.import_buttons_layout.addWidget(self.import_portal_button)
+        self.import_portal_button.clicked.connect(lambda: self.on_import_from_portal())
 
         self.layout.addLayout(self.import_buttons_layout)
 
@@ -4006,7 +4014,23 @@ class PolygonManager(QtWidgets.QDialog):
                 self, "Shapefile Export Error", f"Export failed:\n{e}"
             )
 
-    def on_import_shapefile(self):
+    def on_import_from_portal(self):
+        """Find vector layers in a data portal, turn them into shapefiles in the
+        project folder, and import them like any shapefile."""
+        parent = self.parent()
+        project_folder = getattr(parent, "project_folder", None) if parent else None
+        if not project_folder:
+            QtWidgets.QMessageBox.warning(self, "Project Folder Missing", "Please open or create a project first.")
+            return
+        from .portal_finder_dialog import PortalFinderDialog, vectors_to_shapefiles
+        dlg = PortalFinderDialog(self, mode="vectors")
+        if dlg.exec_() != QtWidgets.QDialog.Accepted or not dlg.selected:
+            return
+        shps = vectors_to_shapefiles(self, dlg.selected, os.path.join(project_folder, "portal_vectors"))
+        if shps:
+            self.on_import_shapefile(file_paths=shps)
+
+    def on_import_shapefile(self, file_paths=None):
         """
         Import user-selected ESRI Shapefile(s) (.shp/.dbf) into the active project.
         Uses spatial index & coordinate reprojection in a background worker thread.
@@ -4022,12 +4046,31 @@ class PolygonManager(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "Project Folder Missing", "Please open or create a project first.")
             return
 
-        start_dir = getattr(parent, "current_folder_path", None) or project_folder
-        file_paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
-            self, "Import Shapefile (.shp)", start_dir, "ESRI Shapefiles (*.shp);;All Files (*)"
-        )
-        if not file_paths:
-            return
+        if not isinstance(file_paths, (list, tuple)) or not file_paths:
+            start_dir = getattr(parent, "current_folder_path", None) or project_folder
+            file_paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+                self, "Import Shapefile (.shp)", start_dir,
+                "Vector files (*.shp *.gpkg *.geojson *.json);;ESRI Shapefiles (*.shp);;"
+                "GeoPackage (*.gpkg);;GeoJSON (*.geojson *.json);;All Files (*)"
+            )
+            if not file_paths:
+                return
+        # GeoPackage / GeoJSON: converted to shapefiles first (no GDAL needed)
+        if any(not str(f).lower().endswith(".shp") for f in file_paths):
+            from .remote_portal import vector_to_shapefiles
+            conv, bad = [], []
+            for f in file_paths:
+                try:
+                    conv += vector_to_shapefiles(
+                        f, os.path.join(project_folder, "converted_vectors",
+                                        os.path.splitext(os.path.basename(f))[0]))
+                except Exception as e:
+                    bad.append("{}: {}".format(os.path.basename(f), e))
+            if bad:
+                QtWidgets.QMessageBox.warning(self, "Not imported", "\n".join(bad[:10]))
+            file_paths = conv
+            if not file_paths:
+                return
 
         from .shapefile_import_dialog import inspect_shapefile_schema, ShapefileImportDialog, ShapefileImportProgressDialog
         fields = inspect_shapefile_schema(file_paths)
@@ -4046,6 +4089,10 @@ class PolygonManager(QtWidgets.QDialog):
             if not path or not os.path.isfile(path):
                 return None, None
             ext = os.path.splitext(path)[1].lower()
+            if ext == '.cogref':
+                # a remote image: the size from its header / tile service
+                from .shapefile_io import _raw_image_dims as _dims
+                return _dims(path)
             if ext in ('.tif', '.tiff'):
                 try:
                     from .raster_reader import probe

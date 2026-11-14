@@ -181,6 +181,16 @@ class RemoteImagesDialog(QtWidgets.QDialog):
             "https://1drv.ms/i/s!...   or   https://yourorg-my.sharepoint.com/:i:/g/personal/...\n"
             "https://<site>.opendata.arcgis.com/maps/<item id>/about   or   .../rest/services/<name>/MapServer")
         lay.addWidget(self.urls_edit, 2)
+        frow = QtWidgets.QHBoxLayout()
+        self.find_btn = QtWidgets.QPushButton("Find in a data portal...")
+        self.find_btn.setToolTip("Search an ArcGIS Hub / open-data portal (default: the STRI data portal) "
+                                 "for rasters CanoPie can stream, or download")
+        self.find_btn.clicked.connect(self._find_in_portal)
+        frow.addWidget(self.find_btn)
+        self.local_label = QtWidgets.QLabel("")
+        frow.addWidget(self.local_label, 1)
+        lay.addLayout(frow)
+        self.local_paths = []                 # downloaded rasters to open with the links
 
         form = QtWidgets.QFormLayout()
         row = QtWidgets.QHBoxLayout()
@@ -306,8 +316,32 @@ class RemoteImagesDialog(QtWidgets.QDialog):
 
     # -- the button -------------------------------------------------------
 
+    def _find_in_portal(self):
+        """Search a data portal; streamable layers go into the links box,
+        download-only ones are downloaded (after asking) into the folder."""
+        from .portal_finder_dialog import PortalFinderDialog, fetch_download_items
+        dlg = PortalFinderDialog(self, mode="rasters")
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        from . import remote_portal as rp
+        links = [rp.item_link(it) for it in dlg.selected if it["kind"] == "stream"]
+        if links:
+            have = self.urls_edit.toPlainText().rstrip()
+            self.urls_edit.setPlainText((have + "\n" if have else "") + "\n".join(links))
+        dl = [it for it in dlg.selected if it["kind"] == "download"]
+        if dl:
+            folder = os.path.join(self.folder_edit.text().strip() or default_pointer_dir(), "downloads")
+            self.local_paths += fetch_download_items(self, dl, folder)
+            if self.local_paths:
+                self.local_label.setText("{} downloaded file(s) will open too".format(len(self.local_paths)))
+
     def _check_and_open(self):
         urls = parse_urls(self.urls_edit.toPlainText())
+        if not urls and self.local_paths:
+            self.result_paths = list(self.local_paths)
+            self.batch_size = self.batch_spin.value()
+            self.accept()
+            return
         if not urls:
             QtWidgets.QMessageBox.information(self, "No links", "Paste at least one link.")
             return
@@ -337,6 +371,6 @@ class RemoteImagesDialog(QtWidgets.QDialog):
         settings = QtCore.QSettings(*_SETTINGS)
         settings.setValue(DIR_SETTING, folder)
         settings.setValue(BATCH_SETTING, self.batch_spin.value())
-        self.result_paths = ok
+        self.result_paths = ok + [p for p in self.local_paths if p not in ok]
         self.batch_size = self.batch_spin.value()
         self.accept()
