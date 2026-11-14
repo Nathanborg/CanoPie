@@ -126,6 +126,18 @@ class TileService:
                                  "pyramid to stream".format(self.url))
         self.name = meta.get("documentInfo", {}).get("Title") or meta.get("name") \
             or self.url.rstrip("/").split("/")[-2]
+        # A tiled IMAGE service with LERC tiles carries data values (elevation,
+        # classes, model outputs); everything else is a rendered picture (RGBA).
+        fmt = str(ti.get("format") or "").upper()
+        self.data = fmt.startswith("LERC")
+        if self.data:
+            self.bands = int(meta.get("bandCount") or 1)
+            self.band_names = list(meta.get("bandNames") or [])[:self.bands] or None
+            self.pixel_type = str(meta.get("pixelType") or "F32")
+        else:
+            self.bands = 4
+            self.band_names = ["red", "green", "blue", "alpha"]
+            self.pixel_type = "U8"
         self.copyright = meta.get("copyrightText") or ""
         self.tile = int(ti.get("cols") or 256)
         if int(ti.get("rows") or self.tile) != self.tile:
@@ -151,10 +163,9 @@ class TileService:
     def _has_tile(self, z, row, col):
         try:
             resp = rm._session().get(self.tile_url(z, row, col), timeout=(rm.CONNECT_TIMEOUT, rm.READ_TIMEOUT))
-            ok = resp.status_code == 200 and resp.content[:4] in (
-                b"\xff\xd8\xff\xe0", b"\xff\xd8\xff\xe1", b"\xff\xd8\xff\xdb", b"\x89PNG") or (
-                resp.status_code == 200 and resp.content[:2] == b"\xff\xd8")
-            return ok
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            return resp.status_code == 200 and bool(resp.content) and "text/html" not in ctype \
+                and "json" not in ctype
         except Exception:
             return False
 
@@ -245,12 +256,15 @@ def _profile_from(path, svc):
     geo = svc.geometry()
     z, ox, oy, w, h = geo[0]
     r = svc.res[z]
+    nb = svc.bands
     return RasterProfile(
-        path=os.path.abspath(os.fspath(path)), width=w, height=h, count=4,
-        dtype=np.dtype(np.uint8), axes="YXS", tiled=True, tile_w=svc.tile, tile_h=svc.tile,
-        planar=1, compression=7, predictor=1, n_levels=len(geo),
-        level_shapes=[(lh, lw, 4) for (_z, _x, _y, lw, lh) in geo],
-        band_names=["red", "green", "blue", "alpha"], wavelengths=[None] * 4, nodata=None,
+        path=os.path.abspath(os.fspath(path)), width=w, height=h, count=nb,
+        dtype=np.dtype(np.float32 if svc.data else np.uint8), axes="YXS", tiled=True,
+        tile_w=svc.tile, tile_h=svc.tile, planar=1, compression=34887 if svc.data else 7,
+        predictor=1, n_levels=len(geo),
+        level_shapes=[(lh, lw, nb) for (_z, _x, _y, lw, lh) in geo],
+        band_names=svc.band_names or [None] * nb, wavelengths=[None] * nb,
+        nodata=float("nan") if svc.data else None,
         epsg=svc.epsg, transform=[svc.ox + ox * r, r, 0.0, svc.oy - oy * r, 0.0, -r],
         strategy=STRATEGY_TILES_BIP, channel_origin="tifffile", remote=True,
         source=svc.url, service=svc)
@@ -289,8 +303,9 @@ def make_pointer(url, folder):
                      **({"credit": svc.copyright} if svc.copyright else {}))
     geo = svc.geometry()
     z, _ox, _oy, w, h = geo[0]
-    return {"url": svc_url, "name": name, "size": None, "width": w, "height": h, "bands": 4,
-            "dtype": "uint8", "tiled": True, "levels": len(geo), "compression": 7,
+    return {"url": svc_url, "name": name, "size": None, "width": w, "height": h, "bands": svc.bands,
+            "dtype": "float32" if svc.data else "uint8", "tiled": True, "levels": len(geo),
+            "compression": 34887 if svc.data else 7, "data": svc.data,
             "provider": KIND, "warning": None, "path": path,
             "pixel_m": svc.res[z], "zoom": z, "credit": svc.copyright,
             "requests": 0, "bytes_fetched": 0}
@@ -324,6 +339,36 @@ class _TileStats:
 
     def close(self):
         pass
+
+
+def _decode_lerc(data, tile, bands):
+    """float32 (tile, tile, bands) from a LERC tile, NaN where it has no data."""
+    import imagecodecs
+    try:
+        out = imagecodecs.lerc_decode(data, masks=True)
+    except Exception:
+        return None
+    arr, mask = (out[0], out[1]) if isinstance(out, tuple) else (out, None)
+    a = np.asarray(arr, dtype=np.float32)
+    if a.ndim == 3 and a.shape[0] == bands and a.shape[-1] != bands:
+        a = np.moveaxis(a, 0, -1)
+    if a.ndim == 2:
+        a = a[..., None]
+    a = np.array(a, dtype=np.float32, copy=True)
+    if mask is not None:
+        m = np.asarray(mask).astype(bool)
+        if m.ndim == 2:
+            a[~m] = np.nan
+        elif m.ndim == 3:
+            m = np.moveaxis(m, 0, -1) if m.shape[0] == bands and m.shape[-1] != bands else m
+            a[~m] = np.nan
+    a[np.abs(a) > 1e37] = np.nan                     # ArcGIS float NoData sentinels
+    if a.shape[:2] != (tile, tile) or a.shape[2] != bands:
+        full = np.full((tile, tile, bands), np.nan, np.float32)
+        full[:min(tile, a.shape[0]), :min(tile, a.shape[1]), :min(bands, a.shape[2])] = \
+            a[:tile, :tile, :bands]
+        a = full
+    return a
 
 
 def _decode_tile(data, tile):
@@ -384,11 +429,13 @@ class TileServiceReader(TiledRasterReader):
             tx0, ty0 = ox // T, oy // T
             across = (ox + w - 1) // T - tx0 + 1
             down = (oy + h - 1) // T - ty0 + 1
+            nb = self._svc.bands
             self._levels.append({
-                "page": None, "width": w, "height": h, "count": 4, "planar": 1,
+                "page": None, "width": w, "height": h, "count": nb, "planar": 1,
                 "tw": T, "th": T, "across": across, "down": down, "per_plane": across * down,
                 "offsets": None, "counts": [DEFAULT_TILE_BYTES] * (across * down),
-                "tile_bytes": T * T * 4, "workers": 8, "decode_kwargs": {},
+                "tile_bytes": T * T * nb * np.dtype(profile.dtype).itemsize, "workers": 8,
+                "decode_kwargs": {},
                 "z": z, "ox": ox, "oy": oy, "tx0": tx0, "ty0": ty0})
 
     # -- tiles --------------------------------------------------------------
@@ -475,9 +522,14 @@ class TileServiceReader(TiledRasterReader):
             v = out.get(k) if k not in fetched else fetched[k]
             if isinstance(v, np.ndarray):
                 continue
-            arr = _decode_tile(v, T) if v else None
-            if arr is None:
-                arr = np.zeros((T, T, 4), np.uint8)          # no tile: alpha 0
+            if self._svc.data:
+                arr = _decode_lerc(v, T, self._svc.bands) if v else None
+                if arr is None:                              # no tile: no data
+                    arr = np.full((T, T, self._svc.bands), np.nan, np.float32)
+            else:
+                arr = _decode_tile(v, T) if v else None
+                if arr is None:
+                    arr = np.zeros((T, T, 4), np.uint8)      # no tile: alpha 0
             out[k] = arr
             _TILE_CACHE.put((self.path, level, k), arr)
         return out
@@ -512,14 +564,15 @@ class TileServiceReader(TiledRasterReader):
         lv = self._levels[level]
         x0 = max(0, int(x0)); y0 = max(0, int(y0))
         x1 = min(lv["width"], int(x1)); y1 = min(lv["height"], int(y1))
+        dt = np.dtype(self.profile.dtype)
         if x1 <= x0 or y1 <= y0:
-            return np.empty((0, 0, 0), np.uint8)
-        bands = list(range(4)) if bands is None else [int(b) for b in bands]
+            return np.empty((0, 0, 0), dt)
+        bands = list(range(lv["count"])) if bands is None else [int(b) for b in bands]
         step = max(1, int(step or 1))
         T = lv["tw"]
         rows = np.arange(y0, y1, step) + lv["oy"]
         cols = np.arange(x0, x1, step) + lv["ox"]
-        out = np.empty((len(rows), len(cols), len(bands)), np.uint8)
+        out = np.empty((len(rows), len(cols), len(bands)), dt)
         trows, tcols = rows // T, cols // T
         keys = [(int(ty), int(tx)) for ty in np.unique(trows) for tx in np.unique(tcols)]
         tiles = self._tiles(level, keys)

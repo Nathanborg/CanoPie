@@ -39,6 +39,19 @@ def pattern(gx, gy):
                      np.full(np.broadcast(gx, gy).shape, 255)], axis=-1).astype(np.uint8)
 
 
+DTM_Z = 4                              # 1 m at zoom 4
+DTM_ORIGIN = (620914.0, 1020672.0)     # UTM 17N, the tile grid's corner
+DTM_MISSING = (1, 2)                   # a tile the service does not have
+
+
+def dtm_values(z, gx, gy):
+    """Elevation-like float32 at global pixel (gx, gy) of zoom z, with an
+    ArcGIS NoData sentinel in one corner."""
+    v = (40.0 + 0.5 * gx + 0.25 * gy + 0.125 * (DTM_Z - z)).astype(np.float32)
+    v[(gx < 20) & (gy < 20)] = -3.4028234663852886e38
+    return v
+
+
 class _Arcgis(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -70,6 +83,25 @@ class _Arcgis(BaseHTTPRequestHandler):
             jj, ii = np.mgrid[0:256, 0:256]
             tile = pattern(col * 256 + ii, row * 256 + jj)
             return self._send(200, imagecodecs.png_encode(tile), "image/png")
+        m = re.fullmatch(r"/arcgis/rest/services/Dtm/ImageServer/tile/(\d+)/(\d+)/(\d+)", parts.path)
+        if m:
+            z, row, col = (int(v) for v in m.groups())
+            if z > DTM_Z or (row, col) == DTM_MISSING:
+                return self._send(404, b"<html>no tile</html>", "text/html")
+            jj, ii = np.mgrid[0:256, 0:256]
+            vals = dtm_values(z, col * 256 + ii, row * 256 + jj)
+            return self._send(200, imagecodecs.lerc_encode(vals, 0.0), "application/octet-stream")
+        if parts.path == "/arcgis/rest/services/Dtm/ImageServer":
+            meta = {"name": "Dtm", "bandCount": 1, "pixelType": "F32", "bandNames": ["Band_1"],
+                    "tileInfo": {"rows": 256, "cols": 256, "format": "LERC2D",
+                                 "origin": {"x": DTM_ORIGIN[0], "y": DTM_ORIGIN[1]},
+                                 "spatialReference": {"wkid": 32617, "latestWkid": 32617},
+                                 "lods": [{"level": z, "resolution": 2.0 ** (DTM_Z - z)} for z in range(DTM_Z + 1)]},
+                    "extent": {"xmin": DTM_ORIGIN[0], "ymin": DTM_ORIGIN[1] - 700, "xmax": DTM_ORIGIN[0] + 900,
+                               "ymax": DTM_ORIGIN[1], "spatialReference": {"wkid": 32617}},
+                    "fullExtent": {"xmin": DTM_ORIGIN[0], "ymin": DTM_ORIGIN[1] - 700, "xmax": DTM_ORIGIN[0] + 900,
+                                   "ymax": DTM_ORIGIN[1], "spatialReference": {"wkid": 32617}}}
+            return self._send(200, json.dumps(meta).encode(), "application/json")
         if parts.path == "/arcgis/rest/services/Test/MapServer":
             meta = {"name": "Test", "copyrightText": "Test lab 2021",
                     "tileInfo": {"rows": 256, "cols": 256, "format": "MIXED",
@@ -206,3 +238,34 @@ def test_canopie_opens_and_analyses_a_tile_service(pointer, synthetic_project):
     assert by["R"]["Pixel Count"] == len(want)
     for k, ch in enumerate(("R", "G", "B")):
         assert by[ch]["Mean"] == pytest.approx(want[:, k].mean(), abs=1e-6)
+
+
+
+# --------------------------------------------------------------------------
+# Data tiles (LERC): an elevation model in its own UTM grid
+# --------------------------------------------------------------------------
+
+def test_a_lerc_image_service_streams_its_float_values(arcgis, tmp_path):
+    info = rm.make_pointer(arcgis.base + "arcgis/rest/services/Dtm/ImageServer", str(tmp_path))
+    assert info["data"] and info["bands"] == 1 and info["dtype"] == "float32" and info["zoom"] == DTM_Z
+    prof = rr.probe(info["path"])
+    assert prof.count == 1 and prof.dtype == np.float32 and prof.epsg == 32617
+    assert prof.transform == pytest.approx([DTM_ORIGIN[0], 1.0, 0.0, DTM_ORIGIN[1], 0.0, -1.0])
+    assert (prof.width, prof.height) == (900, 700)
+    r = rr.open_reader(info["path"], prof)
+    w = r.read_window(0, 0, 900, 700, level=0)[..., 0]
+    jj, ii = np.mgrid[0:700, 0:900]
+    want = dtm_values(DTM_Z, ii, jj)
+    sentinel = np.abs(want) > 1e37
+    missing = (jj // 256 == DTM_MISSING[0]) & (ii // 256 == DTM_MISSING[1])
+    assert np.isnan(w[sentinel]).all(), "the NoData sentinel must read as NaN"
+    assert np.isnan(w[missing]).all(), "a tile the service does not have must read as NaN"
+    ok = ~sentinel & ~missing
+    assert np.array_equal(w[ok], want[ok])
+    # a coarser level is that zoom's own values
+    lv = r._levels[1]
+    jj, ii = np.mgrid[0:lv["height"], 0:lv["width"]]
+    w1 = r.read_bands_full([0], level=1)[..., 0]
+    want1 = dtm_values(DTM_Z - 1, lv["ox"] + ii, lv["oy"] + jj)
+    ok1 = (np.abs(want1) < 1e37) & ~((jj // 256 == DTM_MISSING[0]) & (ii // 256 == DTM_MISSING[1]))
+    assert np.array_equal(w1[ok1], want1[ok1])
