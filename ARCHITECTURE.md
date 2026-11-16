@@ -497,6 +497,35 @@ compressed bytes held in the reader's raw cache). Downloads report progress
 (`remote_raster.add_progress_listener`) to the status bar's `StreamProgress`; each batch logs one
 INFO line. Still refused: Export Project Images and exiftool.
 
+### Display stretch: statistics and Stretch to view
+
+Every display stretch takes its bounds from `canopie/stretch_stats.py`: the render engine
+(`ProjectTab._compute_stretched_preview`, used by `_render_with_viewer_stretch` and the live
+`_stretch_apply_preview`), the in-viewer `_StretchBar`, and the Stretch Viewer dialog
+(`ImageStretchDialog._valid_range`). NaN/Inf, float sentinels (|v| > 1e37, ArcGIS
+-3.4e38), -9999 and the file's effective NoData (`ProjectTab._stretch_nodata_values` →
+`effective_nodata_values`, the .ax list UNION the GDAL_NODATA tag) never enter percentile,
+±σ or min/max statistics. The statistics are a strided sample of the FULL-resolution stack,
+taken before the display downsample (INTER_AREA blends a -9999 border into values no NoData
+test can find). Zoom tiles are read raw from the file, so `_request_highres_viewport_region`
+turns their NoData into NaN (`stretch_stats.nan_nodata_window`) before rendering them with the
+preview's bounds. With no `.ax`, `apply_aux_modifications` still applies the declared tag NoData
+for `.tif`/`.tiff`/`.cogref`.
+
+**Stretch to view** (ENVI's "stretch to view", QGIS's "current extent"): the "View" toggle next
+to the bottom-left overlay square (`_StretchToViewButton`) sets `viewer.stretch_to_view` for every
+viewer in the tab (`ProjectTab._stretch_to_view_on`, carried to the next root). While it is on,
+`_render_with_viewer_stretch` passes `stretch_stats.view_window(viewer, shape)` (the on-screen
+part of the preview, GUI thread only) as `stats_window`; a fixed (absolute) range is treated as a
+percentile stretch there. Pan/zoom re-runs it debounced (`ImageViewer._trigger_view_stretch` →
+`ProjectTab._apply_view_stretch`, only when the visible rect actually changed), which records the
+new `_preview_stretch_bounds` and then re-requests the zoom tile so it maps with them. Dragging a
+stretch-bar slider turns it off.
+
+The Stretch Viewer's body is a scroll area bounded by the screen (`ImageStretchDialog.adjustSize`)
+and its band combos are compact (`_compact_band_combo`), so a 298-band cube with long band names
+no longer makes a window several thousand pixels wide.
+
 ## Where to start for common tasks
 
 | Task | Start here |

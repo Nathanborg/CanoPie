@@ -2423,6 +2423,12 @@ class ImageViewer(QtWidgets.QGraphicsView):
         if not hasattr(ImageViewer, "overlays_muted"):
             ImageViewer.overlays_muted = False
         self._overlay_toggle_btn = _OverlayToggleButton(self)
+        # Stretch to view (ENVI / QGIS "current extent"): statistics from the
+        # pixels on screen only, recomputed as the view is panned / zoomed.
+        self.stretch_to_view = False
+        self._view_stretch_callback = None
+        self._view_stretch_last_key = None
+        self._stretch_view_btn = _StretchToViewButton(self)
 
         # Panning / focus
         self.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
@@ -3895,7 +3901,68 @@ class ImageViewer(QtWidgets.QGraphicsView):
         reads full resolution once zoomed in, so the pixels are there to see."""
         return float(base) * self.native_per_preview()
 
+    # --- Stretch to view ----------------------------------------------------
+    def set_view_stretch_callback(self, callback):
+        """`callback(viewer)` re-renders this viewer's preview for Stretch to
+        view (ProjectTab._apply_view_stretch)."""
+        self._view_stretch_callback = callback
+
+    def set_stretch_to_view(self, on, rerender=True):
+        """Turn Stretch to view on / off for this viewer."""
+        on = bool(on)
+        changed = on != bool(getattr(self, "stretch_to_view", False))
+        self.stretch_to_view = on
+        self._view_stretch_last_key = None
+        btn = getattr(self, "_stretch_view_btn", None)
+        if btn is not None:
+            btn.sync()
+        if changed and rerender:
+            self._run_view_stretch()
+
+    def _view_key(self):
+        """What the screen shows, coarsely: the visible scene rect."""
+        try:
+            r = self.mapToScene(self.viewport().rect()).boundingRect()
+            return (round(r.left(), 1), round(r.top(), 1),
+                    round(r.width(), 1), round(r.height(), 1))
+        except Exception:
+            return None
+
+    def _trigger_view_stretch(self):
+        """Debounced re-stretch after the view moved (Stretch to view on)."""
+        if not getattr(self, "stretch_to_view", False):
+            return
+        timer = getattr(self, "_view_stretch_timer", None)
+        if timer is None:
+            timer = QtCore.QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(180)
+            timer.timeout.connect(self._on_view_stretch_timeout)
+            self._view_stretch_timer = timer
+        timer.start()
+
+    def _on_view_stretch_timeout(self):
+        if not getattr(self, "stretch_to_view", False):
+            return
+        key = self._view_key()
+        if key is not None and key == getattr(self, "_view_stretch_last_key", None):
+            return          # the view did not actually move
+        self._run_view_stretch()
+
+    def _run_view_stretch(self):
+        self._view_stretch_last_key = self._view_key()
+        cb = getattr(self, "_view_stretch_callback", None)
+        if cb is None:
+            pt = _find_nodata_owner(self)
+            cb = getattr(pt, "_apply_view_stretch", None) if pt is not None else None
+        if callable(cb):
+            try:
+                cb(self)
+            except Exception as e:
+                logging.debug(f"[ImageViewer] view stretch failed: {e}")
+
     def _trigger_highres_update(self):
+        self._trigger_view_stretch()
         if not getattr(self, "_highres_enabled", False):
             return
         self.cancel_pending_highres_requests()
@@ -3910,6 +3977,11 @@ class ImageViewer(QtWidgets.QGraphicsView):
 
     def _on_highres_timer_timeout(self):
         if not getattr(self, "_highres_enabled", False):
+            return
+        _vst = getattr(self, "_view_stretch_timer", None)
+        if getattr(self, "stretch_to_view", False) and _vst is not None and _vst.isActive():
+            # The view's new stretch is about to be computed; it asks for the
+            # tile itself, mapped with the new bounds.
             return
         current_req_id = getattr(self, "_highres_request_id", 0)
         scale = self.transform().m11()
@@ -8159,6 +8231,90 @@ class _OverlayToggleButton(QtWidgets.QToolButton):
         except Exception:
             pass
 
+# --- Stretch to view button ---------------------------------------------------
+class _StretchToViewButton(QtWidgets.QToolButton):
+    """The small square next to the overlay toggle (bottom-left of the
+    viewer): ENVI's "stretch to view" / QGIS's "Stretch using current extent".
+
+    On: the stretch statistics come from the pixels currently on screen and
+    are recomputed whenever the view is panned or zoomed; the zoom tiles map
+    with the same bounds. Off: the whole image's statistics, as before."""
+
+    _STYLE = """
+        QToolButton {
+            background: rgba(0, 0, 0, 0.4);
+            color: rgba(255, 255, 255, 0.85);
+            border-radius: 6px;
+            font-size: 11px;
+            font-weight: bold;
+            border: 1px solid rgba(255, 255, 255, 0.3);
+        }
+        QToolButton:hover {
+            background: rgba(0, 0, 0, 0.9);
+            color: white;
+            border: 1px solid rgba(255, 255, 255, 0.6);
+        }
+        QToolButton:checked {
+            background: rgba(255, 215, 0, 0.85);
+            color: black;
+            border: 1px solid rgba(0, 100, 0, 0.9);
+        }
+    """
+
+    def __init__(self, viewer):
+        super().__init__(viewer)
+        self.viewer = viewer
+        self.setObjectName("_StretchToViewButton")
+        self.setFixedSize(36, 36)
+        self.setCheckable(True)
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+        self.setText("View")
+        self.setStyleSheet(self._STYLE)
+        self.sync()
+        self.toggled.connect(self._on_toggled)
+        self.reposition()
+        self.show()
+
+        old_resize = viewer.resizeEvent
+
+        def _resized(ev):
+            try:
+                self.reposition()
+            except Exception:
+                pass
+            if callable(old_resize):
+                old_resize(ev)
+        viewer.resizeEvent = _resized
+
+    def sync(self):
+        on = bool(getattr(self.viewer, "stretch_to_view", False))
+        b = self.blockSignals(True)
+        try:
+            self.setChecked(on)
+        finally:
+            self.blockSignals(b)
+        self.setToolTip(
+            "Stretch to view is ON: the stretch uses only the pixels on screen "
+            "and follows pan / zoom. Click to stretch by the whole image again."
+            if on else
+            "Stretch to view (ENVI style): stretch using only the pixels "
+            "currently on screen, updated as you pan and zoom.")
+
+    def _on_toggled(self, checked):
+        try:
+            self.viewer.set_stretch_to_view(bool(checked))
+        except Exception as e:
+            logging.debug(f"[_StretchToViewButton] toggle failed: {e}")
+
+    def reposition(self):
+        vp_geom = self.viewer.viewport().geometry()
+        margin = 15
+        eye = getattr(self.viewer, "_overlay_toggle_btn", None)
+        x = vp_geom.x() + margin + (eye.width() + 6 if eye is not None else 0)
+        y = max(vp_geom.y(), vp_geom.bottom() - self.height() - margin + 1)
+        self.move(x, y)
+
+
 # --- ZoomBar overlay for ImageViewer -----------------------------------------
 class _ZoomBar(QtWidgets.QFrame):
     """
@@ -9639,6 +9795,20 @@ def _make_stretch_params(**kwargs):
         return _Params(**kwargs)
 
 
+def _find_nodata_owner(viewer):
+    """The ProjectTab a viewer belongs to (the first ancestor offering
+    effective_nodata_values), or None."""
+    try:
+        p = viewer.parent() if viewer is not None else None
+        while p is not None:
+            if hasattr(p, "effective_nodata_values") and hasattr(p, "all_polygons"):
+                return p
+            p = p.parent()
+    except Exception:
+        pass
+    return None
+
+
 # --- StretchBar overlay for ImageViewer ----------------------------------------
 class _StretchBar(QtWidgets.QFrame):
     """
@@ -9787,28 +9957,47 @@ class _StretchBar(QtWidgets.QFrame):
         return ("single", pos)
 
     def _nodata_values(self):
-        """NoData literals for the current file: in-memory ax_config, else .ax."""
+        """NoData values for the current file.
+
+        ProjectTab.effective_nodata_values when the viewer belongs to one: the
+        .ax list UNIONed with the raster's own GDAL_NODATA tag. (The bar used
+        to read the .ax alone, so a DEM declaring -9999 only in its tag put
+        -9999 at the bottom of the sliders.) The in-memory ax_config / sidecar
+        .ax are the fallback for a viewer without a ProjectTab."""
         idata = getattr(self._view, "image_data", None)
+        fp = getattr(idata, "filepath", None)
+        pt = _find_nodata_owner(self._view)
+        if pt is not None and fp:
+            try:
+                return list(pt.effective_nodata_values(fp) or [])
+            except Exception:
+                pass
+        ax_cfg = None
         try:
-            ax_cfg = getattr(idata, "ax_config", None) or {}
-            if ax_cfg.get("nodata_enabled", True):
-                vals = list(ax_cfg.get("nodata_values", []) or [])
-                if vals:
-                    return vals
+            ax_cfg = getattr(idata, "ax_config", None) or None
         except Exception:
-            pass
-        try:
-            fp = getattr(idata, "filepath", None)
-            if fp:
+            ax_cfg = None
+        if not ax_cfg and fp:
+            try:
                 ax_path = os.path.splitext(fp)[0] + ".ax"
                 if os.path.exists(ax_path):
                     with open(ax_path, "r", encoding="utf-8") as f:
                         ax_cfg = json.load(f) or {}
-                    if ax_cfg.get("nodata_enabled", True):
-                        return list(ax_cfg.get("nodata_values", []) or [])
+            except Exception:
+                ax_cfg = None
+        ax_cfg = ax_cfg or {}
+        if not ax_cfg.get("nodata_enabled", True):
+            return []
+        vals = list(ax_cfg.get("nodata_values", []) or [])
+        # ...UNIONed with the raster's own tag, as effective_nodata_values does
+        try:
+            from .project_tab import declared_file_nodata
+            for nv in declared_file_nodata(fp) if fp else []:
+                if nv not in vals:
+                    vals.append(nv)
         except Exception:
             pass
-        return []
+        return vals
 
     def _stats_slice_for_key(self, img, key):
         """The pixels whose min/max the bar should report for band context `key`."""
@@ -9829,34 +10018,16 @@ class _StretchBar(QtWidgets.QFrame):
             return img
 
     def _compute_data_range(self, arr):
-        """Min/max over `arr`, sampled and NoData-filtered exactly the way
-        ImageStretchDialog computes the range it displays -- same k=400 stride
-        sampler, same .ax NoData exclusion -- so the bar's bounds always agree
-        with the Stretch Viewer's. Returns None when nothing is usable."""
-        a = np.asarray(arr, dtype=np.float64)
-        if a.ndim >= 2:
-            H, W = a.shape[:2]
-            stride = max(1, int(np.sqrt((H * W) / 400.0)))
-            s = a[::stride, ::stride, ...] if a.ndim == 3 else a[::stride, ::stride]
-        else:
-            s = a
-        if s.size == 0:
+        """Valid min/max over `arr` -- canopie.stretch_stats.data_range, the
+        same rule (and sampler) ImageStretchDialog uses, so the bar's bounds
+        always agree with the Stretch Viewer's: NaN, |v| > 1e37 sentinels,
+        -9999 and the file's effective NoData never count. Returns None when
+        nothing is usable."""
+        from .stretch_stats import data_range
+        a = np.asarray(arr)
+        if a.size == 0:
             return None
-
-        finite_mask = np.isfinite(s)
-        for nd in self._nodata_values():
-            try:
-                nd_val = float(nd)
-            except (ValueError, TypeError):
-                continue        # an expression rule, not a value to drop here
-            if not np.isnan(nd_val):
-                finite_mask &= (s != nd_val)
-
-        if np.any(finite_mask):
-            return float(np.nanmin(s[finite_mask])), float(np.nanmax(s[finite_mask]))
-        if np.any(np.isfinite(s)):
-            return float(np.nanmin(s)), float(np.nanmax(s))
-        return None
+        return data_range(a, nodata_values=self._nodata_values())
 
     def _range_cache(self):
         """Per-band range cache for the file currently loaded in the viewer.
@@ -9867,6 +10038,10 @@ class _StretchBar(QtWidgets.QFrame):
         view = self._view
         idata = getattr(view, "image_data", None)
         fp = getattr(idata, "filepath", None) if idata is not None else None
+        # ...and whenever the array itself is replaced (an edit, a band
+        # expression, a remote preview upgraded): the same file with new
+        # pixels has a new range.
+        fp = (fp, id(getattr(idata, "image", None)) if idata is not None else None)
         cache = getattr(view, "_stretch_data_ranges", None)
         if not isinstance(cache, dict) or getattr(view, "_stretch_data_ranges_fp", None) != fp:
             cache = {}
@@ -9908,6 +10083,18 @@ class _StretchBar(QtWidgets.QFrame):
         key = self._current_band_key()
         cache = self._range_cache()
         rng = cache.get(key)
+        if getattr(self._view, "stretch_to_view", False):
+            # Stretch to view: the sliders span what is on screen.
+            try:
+                from .stretch_stats import view_window, _window
+                win = view_window(self._view, img.shape)
+                if win is not None:
+                    vr = self._compute_data_range(
+                        _window(self._stats_slice_for_key(img, key), win)[0])
+                    if vr is not None:
+                        rng = vr
+            except Exception as e:
+                logging.debug(f"[_StretchBar] view range failed: {e}")
         if rng is None:
             try:
                 rng = self._compute_data_range(self._stats_slice_for_key(img, key))
@@ -9994,6 +10181,12 @@ class _StretchBar(QtWidgets.QFrame):
     def _apply_stretch(self):
         """Apply absolute stretch — preserves all display_mode/band settings from the
         current stretch_params so the bar never changes which band/composite is shown."""
+        if getattr(self._view, "stretch_to_view", False):
+            # A range set by hand replaces the automatic one (as in ENVI).
+            try:
+                self._view.set_stretch_to_view(False, rerender=False)
+            except Exception:
+                pass
         pmin = self._slider_min.value()
         pmax = self._slider_max.value()
         c_min = self._pos_to_val(pmin)

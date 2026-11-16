@@ -1715,9 +1715,66 @@ class CollapsibleBox(QtWidgets.QWidget):
                 break
             p = p.parent()
 
+def _compact_band_combo(combo, min_chars=14, popup_max=520):
+    """A band combo that does not grow with its longest item: the box shows
+    ~`min_chars` characters (elided), its drop-down list is as wide as the
+    names need, up to `popup_max` px."""
+    try:
+        combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        combo.setMinimumContentsLength(int(min_chars))
+        combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        view = combo.view()
+        fm = combo.fontMetrics()
+        longest = 0
+        for i in range(min(combo.count(), 2000)):
+            longest = max(longest, fm.horizontalAdvance(combo.itemText(i))
+                          if hasattr(fm, "horizontalAdvance") else fm.width(combo.itemText(i)))
+        view.setMinimumWidth(min(int(popup_max), longest + 40))
+        view.setTextElideMode(QtCore.Qt.ElideRight)
+    except Exception as e:
+        logging.debug(f"_compact_band_combo: {e}")
+    return combo
+
+
 class ImageStretchDialog(QtWidgets.QDialog):
     resetRequested   = QtCore.pyqtSignal(str)
     applyRequested   = QtCore.pyqtSignal(object)  # emits _StretchParams without closing
+
+    #: The dialog never asks for more than this share of the screen.
+    _MAX_SCREEN_W = 0.45
+    _MAX_SCREEN_H = 0.85
+    _MAX_W_PX = 560
+
+    def adjustSize(self):
+        """Fit the content, bounded by the screen (CollapsibleBox calls this
+        when a section opens or closes): the scroll area takes the rest."""
+        content = getattr(self, "_content", None)
+        scroll = getattr(self, "_scroll", None)
+        if content is None or scroll is None:
+            return super().adjustSize()
+        try:
+            scr = self.screen() if hasattr(self, "screen") else None
+            avail = (scr.availableGeometry() if scr is not None
+                     else QtWidgets.QApplication.desktop().availableGeometry(self))
+            hint = content.sizeHint()
+            sb_w = scroll.verticalScrollBar().sizeHint().width()
+            max_h = int(avail.height() * self._MAX_SCREEN_H)
+            max_w = min(self._MAX_W_PX, int(avail.width() * self._MAX_SCREEN_W))
+            outer = self.layout()
+            m = outer.contentsMargins() if outer is not None else QtCore.QMargins()
+            others = 0
+            if outer is not None:
+                for i in range(outer.count()):
+                    w = outer.itemAt(i).widget()
+                    if w is not None and w is not scroll:
+                        others += w.sizeHint().height() + outer.spacing()
+            want_h = hint.height() + others + m.top() + m.bottom()
+            h = min(want_h, max_h)
+            w =max(self.minimumWidth(), min(max_w, hint.width() + sb_w + m.left() + m.right()))
+            self.resize(int(w), int(h))
+        except Exception as e:
+            logging.debug(f"ImageStretchDialog.adjustSize: {e}")
+            super().adjustSize()
 
     def __init__(self, parent, base_image, initial_params=None, image_filepath="",
                  band_names=None, preview_bands=None, reload_bands_cb=None,
@@ -1806,48 +1863,10 @@ class ImageStretchDialog(QtWidgets.QDialog):
             logging.warning(f"Stretch dialog stats source failed: {e}")
             stats_img = self._img
 
-        # small sampler for label
-        def _sample_for_stats_local(arr, k=400):
-            a = np.asarray(arr)
-            if a.ndim == 3:
-                H, W, _ = a.shape
-                stride = max(1, int(np.sqrt((H * W) / float(max(1, k)))))
-                return a[::stride, ::stride, :]
-            H, W = a.shape[:2]
-            stride = max(1, int(np.sqrt((H * W) / float(max(1, k)))))
-            return a[::stride, ::stride]
-
-        s = _sample_for_stats_local(stats_img)
-        
-        # Filter NoData values if available
-        if s is not None:
-            finite_mask = np.isfinite(s)
-            nodata_values = []
-            try:
-                ax_path = self.parent_tab._ax_path_for(self.image_filepath)
-                if os.path.exists(ax_path):
-                    with open(ax_path, 'r', encoding='utf-8') as f:
-                        ax = json.load(f) or {}
-                    if ax.get("nodata_enabled", True):
-                        nodata_values = list(ax.get("nodata_values", []) or [])
-            except Exception:
-                pass
-
-            for nd in nodata_values:
-                try:
-                    nd_val = float(nd)
-                    if not np.isnan(nd_val):
-                        finite_mask &= (s != nd_val)
-                except (ValueError, TypeError):
-                    pass
-            
-            if np.any(finite_mask):
-                self._real_min = float(np.nanmin(s[finite_mask]))
-                self._real_max = float(np.nanmax(s[finite_mask]))
-            else:
-                self._real_min, self._real_max = 0.0, 1.0
-        else:
-            self._real_min, self._real_max = 0.0, 1.0
+        # Data range of the stats source, from VALID pixels only
+        # (canopie.stretch_stats: NaN, |v| > 1e37, -9999 and the file's
+        # effective NoData -- .ax UNION raster tag -- never count).
+        self._real_min, self._real_max = self._valid_range(stats_img)
 
         # ---------- UI Helpers ----------
         def _fixw(widget, w):
@@ -1855,9 +1874,22 @@ class ImageStretchDialog(QtWidgets.QDialog):
             return widget
 
         # ========== Sidebar Layout ==========
-        main_layout = QtWidgets.QVBoxLayout(self)
-        main_layout.setContentsMargins(8, 8, 8, 8)
+        outer_layout = QtWidgets.QVBoxLayout(self)
+        outer_layout.setContentsMargins(8, 8, 8, 8)
+        outer_layout.setSpacing(8)
+        # The settings live in a scroll area bounded by the screen, so the
+        # window keeps a compact size whatever the band count (a 298-band
+        # AVIRIS-3 cube made each band combo ask for ~820 px, three in a row).
+        self._content = QtWidgets.QWidget()
+        main_layout = QtWidgets.QVBoxLayout(self._content)
+        main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(8)
+        self._scroll = QtWidgets.QScrollArea(self)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self._scroll.setWidget(self._content)
+        outer_layout.addWidget(self._scroll, 1)
 
         # 1. DISPLAY & BANDS
         disp_group = CollapsibleBox("Display & Bands")
@@ -1916,6 +1948,11 @@ class ImageStretchDialog(QtWidgets.QDialog):
         disp_form.addRow("Display:", self.cb_disp_mode)
         disp_form.addRow("Single band:", self.cb_band)
         disp_form.addRow("RGB bands:", row_rgb)
+
+        # Compact band pickers: sized to a short label, not to the longest
+        # band name; the drop-down list itself is wide enough to read them.
+        for combo in (self.cb_band, self.cb_r, self.cb_g, self.cb_b):
+            _compact_band_combo(combo)
 
         if self._preview_mode:
             for combo in (self.cb_r, self.cb_g, self.cb_b):
@@ -2075,7 +2112,7 @@ class ImageStretchDialog(QtWidgets.QDialog):
         self._btn_apply.clicked.connect(self._on_apply_clicked)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
-        main_layout.addWidget(btns)
+        outer_layout.addWidget(btns)
 
         self.setSizeGripEnabled(True)
         self.setMinimumWidth(380)
@@ -2255,65 +2292,34 @@ class ImageStretchDialog(QtWidgets.QDialog):
         """
         import numpy as np
         arr = np.asarray(self._current_display_array())
+        from .stretch_stats import data_range
+        lo_l, hi_l = data_range(arr, nodata_values=self._nodata_values(), per_channel=True)
+        lo = [0.0 if v is None else float(v) for v in lo_l]
+        hi = [1.0 if v is None else float(v) for v in hi_l]
+        if arr.ndim == 3:
+            return (lo + [0.0] * 3)[:3], (hi + [1.0] * 3)[:3]
+        return [lo[0]] * 3, [hi[0]] * 3
 
-        def _sample(a, k=400):
-            if a.ndim == 3:
-                H, W, _ = a.shape
-                stride = max(1, int(np.sqrt((H * W) / float(max(1, k)))))
-                return a[::stride, ::stride, :]
-            H, W = a.shape[:2]
-            stride = max(1, int(np.sqrt((H * W) / float(max(1, k)))))
-            return a[::stride, ::stride]
-
-        s = _sample(arr)
-        
-        finite_mask = np.isfinite(s)
-        nodata_values = []
-        try:
-            ax_path = self.parent_tab._ax_path_for(self.image_filepath)
-            if os.path.exists(ax_path):
-                import json
-                with open(ax_path, 'r', encoding='utf-8') as f:
-                    ax = json.load(f) or {}
-                if ax.get("nodata_enabled", True):
-                    nodata_values = list(ax.get("nodata_values", []) or [])
-        except Exception:
-            pass
-
-        for nd in nodata_values:
+    def _nodata_values(self):
+        """The file's effective NoData (.ax UNION the raster's own tag)."""
+        pt = getattr(self, "parent_tab", None)
+        fp = getattr(self, "image_filepath", None)
+        if pt is not None and fp and hasattr(pt, "_stretch_nodata_values"):
             try:
-                nd_val = float(nd)
-                if not np.isnan(nd_val):
-                    if s.ndim == 3:
-                        finite_mask &= (s != nd_val)
-                    else:
-                        finite_mask &= (s != nd_val)
-            except (ValueError, TypeError):
+                return pt._stretch_nodata_values(fp)
+            except Exception:
                 pass
-                
-        if s.ndim == 3:
-            C = s.shape[2]
-            lo, hi = [], []
-            for c in range(C):
-                channel_data = s[..., c]
-                channel_mask = finite_mask[..., c]
-                if np.any(channel_mask):
-                    lo.append(float(np.nanmin(channel_data[channel_mask])))
-                    hi.append(float(np.nanmax(channel_data[channel_mask])))
-                else:
-                    lo.append(0.0)
-                    hi.append(1.0)
-            
-            lo = (lo + [0.0] * 3)[:3]
-            hi = (hi + [1.0] * 3)[:3]
-            return lo, hi
-            
-        if np.any(finite_mask):
-            v_lo = float(np.nanmin(s[finite_mask]))
-            v_hi = float(np.nanmax(s[finite_mask]))
-        else:
-            v_lo, v_hi = 0.0, 1.0
-        return [v_lo, v_lo, v_lo], [v_hi, v_hi, v_hi]
+        return list(declared_file_nodata(fp)) if fp else []
+
+    def _valid_range(self, arr):
+        """(min, max) of the valid pixels of `arr`; (0, 1) when none are."""
+        try:
+            from .stretch_stats import data_range
+            rng = data_range(arr, nodata_values=self._nodata_values())
+        except Exception as e:
+            logging.debug(f"Stretch dialog range failed: {e}")
+            rng = None
+        return (float(rng[0]), float(rng[1])) if rng else (0.0, 1.0)
 
     def _recompute_and_seed_per_channel_boxes(self, seed_from_init=False):
         """
@@ -2518,25 +2524,12 @@ class ImageStretchDialog(QtWidgets.QDialog):
 
     def _refresh_stats_for_display(self):
         import numpy as np
-        # recompute label stats on the currently displayed stack (FIXED: no extra ')')
-        def _sample_for_stats_local(arr, k=400):
-            a = np.asarray(arr)
-            if a.ndim == 3:
-                H, W, _ = a.shape
-                stride = max(1, int(np.sqrt((H * W) / float(max(1, k)))))
-                return a[::stride, ::stride, :]
-            H, W = a.shape[:2]
-            stride = max(1, int(np.sqrt((H * W) / float(max(1, k)))))
-            return a[::stride, ::stride]
-
-        # Compute the real value range of the CURRENT display bands. Wrapped so a bad slice /
-        # all-NaN band can never leave the sliders stuck on a stale (or default 0..255-looking)
-        # range — the sliders must always map to the real values of the band(s) in view.
+        # Compute the real value range of the CURRENT display bands, from valid
+        # pixels only (it used to take nanmin over everything, so a DEM's -9999
+        # border set the bottom of every slider). Wrapped so a bad slice /
+        # all-NaN band can never leave the sliders stuck on a stale range.
         try:
-            s = _sample_for_stats_local(self._current_display_array())
-            with np.errstate(all="ignore"):
-                rmin = float(np.nanmin(s)) if s is not None and s.size else 0.0
-                rmax = float(np.nanmax(s)) if s is not None and s.size else 1.0
+            rmin, rmax = self._valid_range(self._current_display_array())
         except Exception:
             rmin, rmax = 0.0, 1.0
         if not np.isfinite(rmin):
@@ -4524,7 +4517,8 @@ class ProjectTab(QtWidgets.QWidget):
             if v and idata:
                 # per-viewer schedule with 0ms because we already debounced globally
                 self._schedule_polygons_for_viewer(v, idata, delay_ms=0, nav_seq=seq) 
-    def _compute_stretched_preview(self, base_img, params, mask=None, bounds=None, bounds_out=None):
+    def _compute_stretched_preview(self, base_img, params, mask=None, bounds=None, bounds_out=None,
+                                   nodata_values=None, stats_window=None):
         """
         Build a DISPLAY-ONLY frame from `base_img` (your current scientific array),
         apply stretch per `params`, and return a uint8 (H,W) or (H,W,3).
@@ -4537,6 +4531,11 @@ class ProjectTab(QtWidgets.QWidget):
             bounds: {"lo", "hi"} to map with instead of computing them (a zoom
                 tile uses the preview's, so the whole image has ONE stretch)
             bounds_out: dict that receives the {"lo", "hi"} used
+            nodata_values: the file's effective NoData numbers (.ax UNION the
+                raster tag); kept out of the statistics with NaN, |v| > 1e37
+                sentinels and -9999 (canopie.stretch_stats)
+            stats_window: (x0, y0, x1, y1) in `base_img` pixels -- take the
+                statistics from that part only (Stretch to view)
         """
         def _pick_display_stack(img, p):
             if img is None:
@@ -4720,6 +4719,12 @@ class ProjectTab(QtWidgets.QWidget):
             except Exception:
                 mask = None
 
+        # Statistics come from the FULL-resolution stack (strided, see
+        # stretch_stats.stats_sample), taken before the display downsample:
+        # INTER_AREA blends a -9999 border into its neighbours and makes values
+        # no NoData test can find, which dragged every DEM's low percentile.
+        _stat_src, _stat_src_mask = disp, mask
+
         # PERFORMANCE: Downsample large images before stretch for dialog preview
         try:
             disp, _ds_scale = _downsample_for_stretch(disp)
@@ -4742,15 +4747,42 @@ class ProjectTab(QtWidgets.QWidget):
             if bounds is not None:
                 lo, hi = bounds["lo"], bounds["hi"]
             else:
-                _stat_disp, _stat_mask = _stats_view(disp, mask)
+                from . import stretch_stats as _ss
+                _mode = (params.mode or "percentile").lower()
+                if stats_window is not None and _mode not in ("percentile", "stddev", "std"):
+                    # Stretch to view is an automatic stretch: a fixed
+                    # (absolute) range would ignore the view entirely.
+                    _mode = "percentile"
+                _multi = getattr(_stat_src, "ndim", 2) == 3
                 with _warnings.catch_warnings():
                     _warnings.simplefilter("ignore", RuntimeWarning)
                     with np.errstate(all="ignore"):
-                        lo, hi = _minmax_from_mode(_stat_disp, params, _stat_mask)
-                if (params.mode or "percentile") in ("percentile", "stddev", "std"):
-                    _smp = np.asarray(_stat_disp, dtype=np.float32)
-                    if _stat_mask is not None and _smp.shape[:2] == np.asarray(_stat_mask).shape[:2]:
-                        _smp = _smp[~np.asarray(_stat_mask, dtype=bool)]
+                        if _mode in ("percentile", "stddev", "std"):
+                            lo, hi = _ss.channel_bounds(
+                                _stat_src, _mode, params.low_p, params.high_p, params.k_sigma,
+                                nodata_values=nodata_values, mask=_stat_src_mask,
+                                window=stats_window)
+                        elif (_multi and params.per_channel and getattr(params, "band_mins", None)
+                              and getattr(params, "band_maxs", None)):
+                            lo = np.asarray(params.band_mins, dtype=np.float32)
+                            hi = np.asarray(params.band_maxs, dtype=np.float32)
+                        else:
+                            lo, hi = params.min_val, params.max_val
+                            if lo is None or hi is None:
+                                _rng = _ss.data_range(
+                                    _ss._window(np.asarray(_stat_src), stats_window)[0]
+                                    if stats_window is not None else _stat_src,
+                                    nodata_values=nodata_values,
+                                    mask=None if stats_window is not None else _stat_src_mask)
+                                _rng = _rng or (0.0, 1.0)
+                                lo = _rng[0] if lo is None else lo
+                                hi = _rng[1] if hi is None else hi
+                if _mode in ("percentile", "stddev", "std"):
+                    _smp = _ss.stats_sample(
+                        _ss._window(np.asarray(_stat_src), stats_window)[0]
+                        if stats_window is not None else _stat_src)[0]
+                    _smp = np.asarray(_smp, dtype=np.float32)
+                    _smp = np.where(_ss.valid_mask(_smp, nodata_values), _smp, np.nan)
                     lo, hi = _binary_stretch_bounds(_smp, lo, hi)
             if bounds_out is not None:
                 bounds_out["lo"] = np.array(lo, dtype=np.float32, copy=True)
@@ -4842,8 +4874,6 @@ class ProjectTab(QtWidgets.QWidget):
                 if ax_path and os.path.exists(ax_path):
                     with open(ax_path, "r", encoding="utf-8") as f:
                         ax_cfg = json.load(f) or {}
-                    nodata_values = list(ax_cfg.get("nodata_values", []) or [])
-                    
                     # Check if mask_polygon is enabled
                     mp_cfg = ax_cfg.get("mask_polygon", {}) or {}
                     if isinstance(mp_cfg, dict) and mp_cfg.get("enabled", False):
@@ -4878,6 +4908,11 @@ class ProjectTab(QtWidgets.QWidget):
             except Exception:
                 pass
             
+            # The .ax list UNIONed with the raster's own GDAL_NODATA tag (it
+            # used to be the project-folder .ax alone, so a DEM's declared
+            # -9999 entered the statistics of every live apply).
+            nodata_values = self._stretch_nodata_values(fp)
+
             # Add nodata mask using shared function.
             # include_nonfinite=True so NaN/Inf in float imagery is excluded from the
             # stretch statistics even when no explicit NoData value is configured —
@@ -4922,8 +4957,11 @@ class ProjectTab(QtWidgets.QWidget):
                 except Exception:
                     mask = None  # a mask failure must never stop the stretch from applying
                 _b_out = {}
-                preview = self._compute_stretched_preview(base_img, effective_params, mask,
-                                                          bounds_out=_b_out)
+                preview = self._compute_stretched_preview(
+                    base_img, effective_params, mask, bounds_out=_b_out,
+                    nodata_values=self._stretch_nodata_values(
+                        getattr(getattr(v, "image_data", None), "filepath", None)),
+                    stats_window=self._view_window_for(v, base_img))
                 if preview is None:
                     return
                 # remember params per-viewer for consistency
@@ -5448,7 +5486,7 @@ class ProjectTab(QtWidgets.QWidget):
         if not os.path.exists(mod_filename):
             # No .ax: nothing to replay, except the NoData the raster itself
             # declares (GDAL_NODATA), which the CSV / ML export honour too.
-            if not (str(image_filepath or "").lower().endswith((".tif", ".tiff"))
+            if not (str(image_filepath or "").lower().endswith((".tif", ".tiff", ".cogref"))
                     and declared_file_nodata(image_filepath)):
                 return image
             ax = {}
@@ -25946,6 +25984,10 @@ class ProjectTab(QtWidgets.QWidget):
                 elif (lx1 - lx0) * (ly1 - ly0) <= 40_000_000:
                     step = 1                # exact area averages
 
+            _tile_nodata = None
+            if (ax or {}).get("nodata_enabled", True):
+                _tile_nodata = self._stretch_nodata_values(getattr(image_data, 'filepath', None), ax)
+
             # ONE stretch for the whole image: the preview's own bounds (D2)
             _pb = getattr(viewer, "_preview_stretch_bounds", None)
             _tile_bounds = _pb if (isinstance(_pb, dict) and _pb.get("img_id") == id(disp)) else None
@@ -25993,6 +26035,15 @@ class ProjectTab(QtWidgets.QWidget):
                     logging.debug(f"[highres_viewport] arr shape: {getattr(arr, 'shape', None)}")
                     if arr is None or getattr(arr, "size", 0) == 0:
                         return None
+
+                    # NoData -> NaN, as apply_aux_modifications did for the
+                    # preview underneath: the window comes raw from the file,
+                    # so a DEM's -9999 (or an ArcGIS 3.4e38 sentinel) was drawn
+                    # black on the tile and, without preview bounds, dragged
+                    # the tile's own percentiles.
+                    if _tile_nodata is not None:
+                        from .stretch_stats import nan_nodata_window
+                        arr = nan_nodata_window(arr, _tile_nodata, list(bands))
 
                     # Replay the pointwise part of the .ax, then the rotation.
                     # Both commute with windowing, so doing them here reproduces
@@ -26127,8 +26178,70 @@ class ProjectTab(QtWidgets.QWidget):
                           expr_str, e)
             return arr
 
+    def _stretch_nodata_values(self, filepath, ax=None):
+        """NoData numbers a display stretch must leave out of its statistics:
+        the .ax list UNIONed with the raster's own GDAL_NODATA tag
+        (effective_nodata_values). Empty when NoData is disabled for the file
+        or there is no file; NaN, |v| > 1e37 and -9999 are always left out on
+        top of these (canopie.stretch_stats)."""
+        if not filepath:
+            return []
+        try:
+            return list(self.effective_nodata_values(filepath, ax) or [])
+        except Exception:
+            return []
+
+    def _view_window_for(self, viewer, arr):
+        """Stretch to view: the on-screen part of `arr` (the viewer's preview),
+        or None when the viewer is not stretching to view."""
+        if not getattr(viewer, "stretch_to_view", False) or arr is None:
+            return None
+        from .stretch_stats import view_window
+        return view_window(viewer, np.asarray(arr).shape)
+
+    def _apply_view_stretch(self, viewer):
+        """Re-render the viewer's preview for Stretch to view (toggled, or the
+        view was panned / zoomed while it is on), keeping the view, then ask
+        for a new zoom tile so it maps with the new bounds."""
+        try:
+            if viewer is None or sip.isdeleted(viewer):
+                return
+            on = bool(getattr(viewer, "stretch_to_view", False))
+            if on != bool(getattr(self, "_stretch_to_view_on", False)):
+                # A toggle: it holds for every viewer of the tab, and for the
+                # viewers the next root opens.
+                self._stretch_to_view_on = on
+                for rec in (getattr(self, "viewer_widgets", None) or []):
+                    v = rec.get("viewer") if isinstance(rec, dict) else None
+                    if v is None or v is viewer or sip.isdeleted(v):
+                        continue
+                    if hasattr(v, "set_stretch_to_view"):
+                        v.set_stretch_to_view(on)
+            idata = getattr(viewer, "image_data", None)
+            base = getattr(idata, "image", None)
+            if base is None:
+                return
+            arr = self._render_with_viewer_stretch(base, viewer, _as_array=True)
+            if arr is None:
+                return
+            arr = np.asarray(arr)
+            # _render_with_viewer_stretch(_as_array=True) hands back BGR (or gray)
+            viewer.show_preview_array(arr, channel_order="bgr")
+            try:
+                viewer._trigger_highres_update()
+            except Exception:
+                pass
+            try:
+                sb = getattr(viewer, "_stretchbar", None)
+                if sb is not None:
+                    sb.refresh_range()
+            except Exception:
+                pass
+        except Exception as e:
+            logging.debug(f"[_apply_view_stretch] failed: {e}")
+
     def _render_with_viewer_stretch(self, cv_img, viewer, prefer_last_band=False, mask=None, ax_override=None, _as_array=False, sp_override=None,
-                                    bounds=None):
+                                    bounds=None, stats_window=None):
         """
         Render using the SAME pipeline your old version used (display mapping -> preview plane
         -> viewer stretch), with two surgical fixes:
@@ -26456,8 +26569,20 @@ class ProjectTab(QtWidgets.QWidget):
             if _normal and (not prefer_last_band) and base is not None and hasattr(base, "ndim"):
                 _b_in = bounds if (isinstance(bounds, dict) and bounds.get("engine") == "C0") else None
                 _b_out = {} if _is_viewer_preview else None
+                # Stretch to view: the statistics of the part on screen only.
+                _win = stats_window
+                # (Qt geometry is read on the GUI thread only: the parallel
+                # navigation render runs on workers, against the previous
+                # image's pixmap -- a new image opens fitted anyway.)
+                if (_win is None and _b_in is None and _is_viewer_preview
+                        and getattr(viewer, "stretch_to_view", False)
+                        and threading.current_thread() is threading.main_thread()):
+                    from .stretch_stats import view_window as _view_window
+                    _win = _view_window(viewer, base.shape)
                 disp = self._compute_stretched_preview(base, sp, mask=precomputed_nodata_mask,
-                                                       bounds=_b_in, bounds_out=_b_out)
+                                                       bounds=_b_in, bounds_out=_b_out,
+                                                       nodata_values=self._stretch_nodata_values(fp, ax),
+                                                       stats_window=_win)
                 if _b_out:
                     _record_preview_bounds("C0", _b_out)
                 if disp is not None:
@@ -27487,6 +27612,11 @@ class ProjectTab(QtWidgets.QWidget):
             stretch_button.clicked.connect(lambda _=False, v=viewer, rn=root_name: self.open_stretch_dialog(v, rn))
             viewer.band_selected.connect(lambda band_idx, v=viewer, rn=root_name: self._on_band_bar_clicked(v, rn, band_idx))
             viewer.stretch_applied.connect(lambda params, v=viewer, rn=root_name: self._on_viewer_stretch_applied(params, v, rn))
+            if hasattr(viewer, "set_view_stretch_callback"):
+                viewer.set_view_stretch_callback(self._apply_view_stretch)
+                if getattr(self, "_stretch_to_view_on", False):
+                    # the toggle carries over to the next root (rendered below)
+                    viewer.set_stretch_to_view(True, rerender=False)
 
             buttons_layout.addWidget(clean_button)
             buttons_layout.addWidget(edit_button)
