@@ -8801,6 +8801,11 @@ class _ZoomBar(QtWidgets.QFrame):
         act.setChecked(bool(getattr(pt, "view_alignment_on", True)))
         act.toggled.connect(lambda c: pt.set_view_alignment_enabled(c))
         m.addAction("Show matches\u2026", pt.show_view_alignment_matches)
+        upd = m.addAction("Update with my polygons\u2026",
+                          lambda: pt.refit_view_alignment_with_polygons(v))
+        upd.setToolTip("Re-fit with crowns you drew or corrected on both images (same name): "
+                       "they fix the scale and rotation where you work")
+        upd.setEnabled(not str(_tip).startswith("Align viewers: not aligned"))
         m.addAction("Clear this alignment", lambda: pt.clear_view_alignment(v))
         self.sync_align_button()
 

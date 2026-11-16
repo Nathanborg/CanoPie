@@ -452,6 +452,85 @@ def test_a_rotated_view_draws_smoothly(viewer_factory, qapp):
     assert v.renderHints() & smooth, "a rotated, zoomed-out view draws nearest-neighbour"
 
 
+def test_a_kept_pair_is_never_dropped():
+    M = _sim(1.2, 4.0, -30.0, 15.0)
+    spots = _spots(M, n=6, noise=0.3)
+    spots[2]["dst"] = spots[2]["dst"] + 35.0
+    spots[2]["keep"] = True                     # the user said so
+    for mode in ("global", "local"):
+        f = VA.fit_alignment(spots, mode=mode)
+        assert f["used"][2], mode
+
+
+def test_my_corrected_crowns_update_the_alignment(aligned, qapp):
+    """Update with my polygons: crowns on the reference and on the aligned
+    image under the same name are tie points. Corrected copies pair vertex
+    by vertex, a crown drawn twice by its centroid, an untouched copy is left
+    out; the update fixes a wrong alignment."""
+    from ..view_alignment_dialog import PolygonRefitDialog
+    pt, sc = aligned.pt, aligned.scene
+    aligned.dlg.apply()
+    A = pt._alignment_sets()
+    sid, st = A.set_for(sc.src)
+    entry = st["targets"][sc.tgt]
+    # a wrong alignment: 6 px off and no local field, and only crowns to fix it
+    M_bad = np.asarray(entry["M"], np.float64).copy()
+    M_bad[:, 2] += (6.0, -4.0)
+    entry.update(M=M_bad.tolist(), local=None, mode="local", loo_px=5.0)
+    A.changed()
+    n = sc.B.shape[0]
+    m = sc.m
+    rng = np.random.default_rng(11)
+    made = {}
+    ang = np.linspace(0, 2 * np.pi, 10, endpoint=False)
+    for k, c in enumerate(rng.uniform(n * 0.15, n * 0.85, (7, 2))):
+        g = f"__crown_{k}"
+        ring = c + np.column_stack((40 * np.cos(ang), 30 * np.sin(ang)))
+        if k == 5:      # an untouched copy: exactly where the (wrong) fit puts it
+            tgt = VA.warp_forward({"M": M_bad}, ring)
+        elif k == 6:    # drawn twice: another outline (fewer points) of the same tree
+            tgt = sc.truth(c + np.column_stack((38 * np.cos(ang[::2]), 31 * np.sin(ang[::2]))))
+        else:           # a copy the user corrected onto the tree
+            tgt = sc.truth(ring)
+        made[g] = {sc.src: {"points": ring.tolist(), "coord_space": "image",
+                            "image_ref_size": {"w": n, "h": n}, "name": g, "type": "polygon", "root": "1"},
+                   sc.tgt: {"points": np.asarray(tgt).tolist(), "coord_space": "image",
+                            "image_ref_size": {"w": m, "h": m}, "name": g, "type": "polygon", "root": "1"}}
+    pt.all_polygons.update(made)
+    saved_lookup = pt.__dict__.get("_poly_index_lookup")
+    pt._poly_index_lookup = lambda fp: [(g, fp) for g in made if fp in pt.all_polygons.get(g, {})]
+    try:
+        dlg = PolygonRefitDialog(pt, sid, st)
+        rows = {r["group"]: r for r in dlg.rows}
+        assert len(rows) == 7
+        assert rows["__crown_5"]["copy"], "an untouched copy was taken for a correction"
+        assert rows["__crown_6"]["kind"] == "centroid"
+        assert rows["__crown_0"]["kind"] == "vertices" and rows["__crown_0"]["offset"] > 4.0
+        checked = [dlg.table.item(i, 0).checkState() == QtCore.Qt.Checked for i in range(len(dlg.rows))]
+        assert sum(checked) == 6
+        dlg.keep_spots.setChecked(False)         # only the crowns
+        dlg.refit()
+        f = dlg.new[sc.tgt]
+        assert f["n_used"] == 6
+        P = np.array([[300.0, 300.0], [500, 450], [650, 600]])
+        assert np.abs(VA.warp_forward(f["warp"], P) - sc.truth(P)).max() < 1.0
+        dlg.apply()
+        ch = pt._alignment_sets().chain(sc.src, sc.tgt)
+        assert np.abs(VA.chain_apply(ch, P) - sc.truth(P)).max() < 1.0
+        st2 = pt._alignment_sets().set_for(sc.src)[1]
+        assert st2["targets"][sc.tgt]["n_crowns"] == 6
+        # after the update the corrected crowns sit on the fit
+        assert max(r["offset"] for r in dlg.rows if r["kind"] == "vertices" and r["group"] != "__crown_5") < 1.0
+        dlg.close(); dlg.deleteLater()
+    finally:
+        for g in made:
+            pt.all_polygons.pop(g, None)
+        if saved_lookup is None:
+            pt.__dict__.pop("_poly_index_lookup", None)
+        else:
+            pt._poly_index_lookup = saved_lookup
+
+
 def test_the_button_sits_beside_fix(viewer_factory):
     v = viewer_factory()
     zb = v._zoombar

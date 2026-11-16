@@ -105,7 +105,8 @@ def spot_residuals(M, spots):
 def fit_similarity(spots, min_spots=2, side_px=None, reject=True):
     """Least-squares similarity (no reflection) from matched spots.
 
-    spots: [{"src": (k, 2) points, "dst": (k, 2) points, "weight": float}]
+    spots: [{"src": (k, 2) points, "dst": (k, 2) points, "weight": float,
+             "keep": bool (never dropped as an outlier: a pair the user chose)}]
     -- every spot contributes all its corners, so even two spots fix the
     rotation well. Outliers are dropped one spot at a time while the worst
     residual exceeds max(3 x the median, 1.5 % of the spot side) and at least
@@ -140,7 +141,11 @@ def fit_similarity(spots, min_spots=2, side_px=None, reject=True):
             rest = idx[:j] + idx[j + 1:]
             Mj, _r = _fit(rest)
             loo.append(spot_residuals(Mj, [spots[idx[j]]])[0])
-        k = int(np.argmax(loo))
+        # a spot marked "keep" (a crown the user corrected) is never dropped
+        cand = [j for j in range(len(idx)) if not spots[idx[j]].get("keep")]
+        if not cand:
+            break
+        k = max(cand, key=lambda j: loo[j])
         med = float(np.median(loo))
         if loo[k] <= max(3.0 * med, 0.015 * side_px):
             break
@@ -313,7 +318,8 @@ def fit_alignment(spots, mode="local", min_spots=2, side_px=None):
     #    third of the spots can be mismatches, which would inflate the median
     #    the local test below is judged against and keep them all)
     g0 = fit_similarity(spots, min_spots=min_spots, side_px=side_px, reject=True)
-    inl = [i for i, u in enumerate(g0["used"]) if u]
+    inl = sorted(set(i for i, u in enumerate(g0["used"]) if u)
+                 | set(i for i in idx if spots[i].get("keep")))
     if len(inl) >= 3:
         # 2. a spot the global test dropped only because it sits in a
         #    distorted part of the mosaic comes back when the field of the
@@ -334,7 +340,10 @@ def fit_alignment(spots, mode="local", min_spots=2, side_px=None):
     M, refl = _glob(idx)
     errs = _loo(idx, M)
     while len(idx) > 4:
-        k = int(np.argmax(errs))
+        cand = [j for j in range(len(idx)) if not spots[idx[j]].get("keep")]
+        if not cand:
+            break
+        k = max(cand, key=lambda j: errs[j])
         if errs[k] <= max(3.0 * float(np.median(errs)), 0.015 * side_px):
             break
         idx.pop(k)

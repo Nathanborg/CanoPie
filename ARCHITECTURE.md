@@ -554,6 +554,15 @@ reprojected.
   `CanopyBrowser` (`browser_allows_save = False`), so spots that were not found can be dragged
   into place, then Re-fit, Re-match with this fit (the fit's local affine around each spot
   becomes its prior), or Apply. Apply switches Fix on.
+- **Update with my polygons** (⌖ menu → `ProjectTab.refit_view_alignment_with_polygons` →
+  `PolygonRefitDialog`): crowns under the same name on the reference and an aligned image are
+  tie points the user checked by eye.
+  - Copies the user never touched (within 0.5 px of the current fit) are left out.
+  - A corrected copy pairs vertex by vertex, which fixes local rotation and scale. Otherwise
+    (drawn twice, or the crown changed) its centroid is used.
+  - The user picks the crowns, optionally together with the stored matched spots. Picked crowns
+    have `keep` and are never dropped as outliers. Re-fit shows the between-spots error before
+    and after; Apply replaces the stored fit.
 - **Fit:** `fit_alignment`.
   - **Global:** `fit_similarity`, a weighted Umeyama over every spot point (a spot's weight is
     shared by its points) with leave-one-out outlier rejection.

@@ -26524,6 +26524,43 @@ class ProjectTab(QtWidgets.QWidget):
                 out.append((g, rec))
         return out
 
+    def _view_align_record_raw(self, fp, rec):
+        """A polygon record's points in raw file pixels of `fp`, or None."""
+        from . import view_alignment as VA
+        try:
+            if str(rec.get("coord_space", "image") or "image") != "image":
+                return None
+            pts = [tuple(map(float, p[:2])) for p in (rec.get("points") or [])]
+            if not pts:
+                return None
+            ax, rw, rh = self._align_raw_info(fp)
+            if not (rw and rh):
+                return None
+            ref = rec.get("image_ref_size") or {}
+            ref_wh = (float(ref["w"]), float(ref["h"])) if isinstance(ref, dict) and ref.get("w") and ref.get("h")                 else None
+            return VA.record_to_raw_pts(np.asarray(pts, np.float64), ax, rw, rh, ref_wh=ref_wh)
+        except Exception as e:
+            logging.debug(f"[view alignment] record to raw failed: {e}")
+            return None
+
+    def refit_view_alignment_with_polygons(self, viewer):
+        """Update the alignment `viewer`'s image belongs to with the crowns the
+        user drew or corrected on both images (view_alignment_dialog.PolygonRefitDialog)."""
+        from .view_alignment_dialog import PolygonRefitDialog
+        fp = getattr(getattr(viewer, "image_data", None), "filepath", None)
+        sid, st = self._alignment_sets().set_for(fp, enabled_only=False) if fp else (None, None)
+        if st is None:
+            QtWidgets.QMessageBox.information(self, "Align viewers",
+                                              "This image is not aligned yet: run Align viewers first.")
+            return
+        old = getattr(self, "_view_align_refit_dialog", None)
+        if old is not None and not sip.isdeleted(old):
+            old.close()
+        dlg = PolygonRefitDialog(self, sid, st)
+        self._view_align_refit_dialog = dlg
+        dlg.show()
+        dlg.raise_()
+
     def start_view_alignment(self, viewer, manual=False):
         """Open the alignment window with `viewer`'s image as the reference."""
         from .view_alignment_dialog import AlignmentDialog

@@ -26,7 +26,7 @@ from . import canopy_finder as CF
 from . import canopy_finder_dialog as D
 from . import view_alignment as VA
 
-__all__ = ["AlignmentDialog", "ClickSpotsMode"]
+__all__ = ["AlignmentDialog", "PolygonRefitDialog", "ClickSpotsMode"]
 
 
 def _affine_from_3(P, Q):
@@ -621,6 +621,254 @@ class AlignmentDialog(QtWidgets.QDialog):
             self.worker.cancel()
             self.worker.wait(3000)
         super().closeEvent(ev)
+
+
+class PolygonRefitDialog(QtWidgets.QDialog):
+    """Update a stored alignment with the user's own crowns.
+
+    A crown drawn (or copied and then corrected) on the reference AND on an
+    aligned image, under the same group name, is a tie point the user checked
+    by eye: no matching, no wrong match. Copies that were never touched only
+    repeat the current fit and are left out. A crown with the same vertices
+    on both images (a corrected copy) pairs point by point, which fixes the
+    local rotation and scale; otherwise its centroid is used (a crown drawn
+    twice, or one that changed between dates). The user picks the crowns;
+    the ones picked are never dropped as outliers. The matched spots of the
+    alignment can be kept alongside."""
+
+    COPY_PX = 0.5          # closer than this to where the fit puts it: an untouched copy
+
+    def __init__(self, pt, sid, st):
+        super().__init__(pt, QtCore.Qt.Window)
+        self.setWindowTitle("Update alignment with my polygons")
+        self.setStyleSheet(D.STYLE)
+        self.pt, self.sid, self.st = pt, sid, st
+        self.ref_fp = st["reference"]
+        self.rows = []              # [{"group", "fp", "src", "dst", "kind", "offset", "copy"}]
+        self.new = {}               # target fp -> fit
+        self._gsd = {}
+        self._build_ui()
+        self._collect()
+        self.resize(820, 520)
+
+    # ---------------- UI ----------------
+    def _build_ui(self):
+        lay = QtWidgets.QVBoxLayout(self)
+        self.info = QtWidgets.QLabel()
+        self.info.setWordWrap(True)
+        lay.addWidget(self.info)
+        self.table = QtWidgets.QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Crown", "Image", "Pairs by", "Off the current fit", "Note"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.setSortingEnabled(False)
+        lay.addWidget(self.table, 3)
+        row = QtWidgets.QHBoxLayout()
+        self.keep_spots = QtWidgets.QCheckBox("Keep the matched spots")
+        self.keep_spots.setChecked(True)
+        self.keep_spots.setToolTip("Fit the crowns together with the spots the alignment matched; "
+                                   "off: only the crowns")
+        b_all = QtWidgets.QPushButton("Check all corrected")
+        b_none = QtWidgets.QPushButton("Uncheck all")
+        b_all.clicked.connect(lambda: self._check(lambda r: not r["copy"]))
+        b_none.clicked.connect(lambda: self._check(lambda r: False))
+        row.addWidget(self.keep_spots); row.addStretch(1); row.addWidget(b_all); row.addWidget(b_none)
+        lay.addLayout(row)
+        self.result = QtWidgets.QTableWidget(0, 5)
+        self.result.setHorizontalHeaderLabels(["Image", "Crowns", "Spots used", "Between spots: before",
+                                               "after"])
+        self.result.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        self.result.verticalHeader().setVisible(False)
+        self.result.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        lay.addWidget(self.result, 2)
+        btns = QtWidgets.QHBoxLayout()
+        self.b_refit = QtWidgets.QPushButton("Re-fit")
+        self.b_apply = QtWidgets.QPushButton("Apply")
+        self.b_apply.setDefault(True)
+        self.b_apply.setEnabled(False)
+        b_close = QtWidgets.QPushButton("Close")
+        btns.addWidget(self.b_refit); btns.addStretch(1); btns.addWidget(self.b_apply); btns.addWidget(b_close)
+        lay.addLayout(btns)
+        self.b_refit.clicked.connect(self.refit)
+        self.b_apply.clicked.connect(self.apply)
+        b_close.clicked.connect(self.close)
+
+    def _check(self, pred):
+        for i, r in enumerate(self.rows):
+            it = self.table.item(i, 0)
+            if it is not None:
+                it.setCheckState(QtCore.Qt.Checked if pred(r) else QtCore.Qt.Unchecked)
+
+    def _gsd_of(self, fp):
+        if fp not in self._gsd:
+            g = None
+            try:
+                ax = (self.pt._load_ax_mods(fp) or {}) if hasattr(self.pt, "_load_ax_mods") else {}
+                tg = CF.frame_for(fp, ax=ax)
+                base = tg.base or tg
+                if base.located:
+                    w, h = int(tg.ref_w or tg.raw_w), int(tg.ref_h or tg.raw_h)
+                    g = float(min(CF.gsd_m(base, w / 2.0, h / 2.0)))
+            except Exception:
+                g = None
+            self._gsd[fp] = g
+        return self._gsd[fp]
+
+    def _px(self, v, fp):
+        if v is None or not np.isfinite(v):
+            return ""
+        g = self._gsd_of(fp)
+        return f"{v:.1f} px" + (f" ({v * g:.2f} m)" if g else "")
+
+    # ---------------- crowns ----------------
+    def _collect(self):
+        A = self.pt._alignment_sets()
+        ref_recs = {}
+        for g, rec in self.pt._view_align_polygon_records(self.ref_fp):
+            ref_recs.setdefault(g, rec)
+        self.rows = []
+        for fp in (self.st.get("targets") or {}):
+            w = A.warp_of(self.st, fp)
+            if w is None:
+                continue
+            for g, rec_t in self.pt._view_align_polygon_records(fp):
+                rec_r = ref_recs.get(g)
+                if rec_r is None:
+                    continue
+                src = self.pt._view_align_record_raw(self.ref_fp, rec_r)
+                dst = self.pt._view_align_record_raw(fp, rec_t)
+                if src is None or dst is None or len(src) < 3 or len(dst) < 3:
+                    continue
+                pred = VA.warp_forward(w, src)
+                c_off = float(np.hypot(*(pred.mean(0) - dst.mean(0))))
+                kind, off = "centroid", c_off
+                if len(src) == len(dst):
+                    p_off = float(np.hypot(*(pred - dst).T).mean())
+                    # same vertex count but a different outline (drawn twice
+                    # with the same number of points): pairing by vertex
+                    # would be wrong
+                    if p_off <= 2.0 * c_off + 2.0:
+                        kind, off = "vertices", p_off
+                self.rows.append({"group": g, "fp": fp, "src": src, "dst": dst, "kind": kind,
+                                  "offset": off, "copy": kind == "vertices" and off < self.COPY_PX})
+        self.rows.sort(key=lambda r: (os.path.basename(r["fp"]), r["group"]))
+        self.table.setRowCount(len(self.rows))
+        for i, r in enumerate(self.rows):
+            it = QtWidgets.QTableWidgetItem(r["group"])
+            it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
+            it.setCheckState(QtCore.Qt.Unchecked if r["copy"] else QtCore.Qt.Checked)
+            self.table.setItem(i, 0, it)
+            name = QtWidgets.QTableWidgetItem(os.path.basename(r["fp"]))
+            name.setToolTip(r["fp"])
+            self.table.setItem(i, 1, name)
+            self.table.setItem(i, 2, QtWidgets.QTableWidgetItem(
+                f"{len(r['src'])} vertices" if r["kind"] == "vertices" else "centroid"))
+            self.table.setItem(i, 3, QtWidgets.QTableWidgetItem(self._px(r["offset"], r["fp"])))
+            self.table.setItem(i, 4, QtWidgets.QTableWidgetItem(
+                "untouched copy: says nothing new" if r["copy"] else
+                ("corrected copy" if r["kind"] == "vertices" else "drawn on both")))
+        n_ok = sum(1 for r in self.rows if not r["copy"])
+        self.info.setText(
+            f"Reference: <b>{os.path.basename(self.ref_fp)}</b>. Crowns with the same name on the reference "
+            f"and an aligned image: <b>{len(self.rows)}</b>, {n_ok} corrected by you. "
+            "Check the ones to use (a large offset can be a wrong pair: the same name on two different "
+            "trees), then Re-fit." if self.rows else
+            f"No crown is drawn under the same name on <b>{os.path.basename(self.ref_fp)}</b> and on an "
+            "aligned image. Draw a crown on the reference with Sync on (it is copied by the alignment), "
+            "correct the copy on the other image, then come back here.")
+        self.b_refit.setEnabled(bool(self.rows))
+
+    def _chosen(self):
+        out = []
+        for i, r in enumerate(self.rows):
+            it = self.table.item(i, 0)
+            if it is not None and it.checkState() == QtCore.Qt.Checked:
+                out.append(r)
+        return out
+
+    @staticmethod
+    def _stored_pairs(entry):
+        wts = {"edited": 2.0, "found": 1.0, "low_score": 0.3}
+        out = []
+        for sp in entry.get("spots") or []:
+            if sp.get("status") == "crown" or sp.get("dst") is None or sp.get("src") is None:
+                continue
+            out.append({"group": sp.get("group"), "status": sp.get("status"), "score": sp.get("score"),
+                        "src": np.asarray(sp["src"], np.float64), "dst": np.asarray(sp["dst"], np.float64),
+                        "weight": wts.get(sp.get("status"), 1.0)})
+        return out
+
+    def refit(self):
+        chosen = self._chosen()
+        self.new = {}
+        tg = self.st.get("targets") or {}
+        fps = sorted({r["fp"] for r in chosen}, key=os.path.basename)
+        self.result.setRowCount(len(fps))
+        for row, fp in enumerate(fps):
+            entry = tg.get(fp) or {}
+            pairs = self._stored_pairs(entry) if self.keep_spots.isChecked() else []
+            spot_side = None
+            if pairs:
+                spot_side = float(np.median([np.ptp(p["src"], axis=0).max() for p in pairs]))
+            crowns = [r for r in chosen if r["fp"] == fp]
+            for r in crowns:
+                src, dst = r["src"], r["dst"]
+                if r["kind"] != "vertices":
+                    src, dst = src.mean(0, keepdims=True), dst.mean(0, keepdims=True)
+                pairs.append({"group": r["group"], "status": "crown", "score": None, "src": src, "dst": dst,
+                              "weight": 2.0, "keep": True})
+            if spot_side is None:
+                spot_side = float(np.median([np.ptp(r["src"], axis=0).max() for r in crowns]))
+            fit = VA.fit_alignment(pairs, mode=entry.get("mode") or "local", min_spots=2, side_px=spot_side)
+            self.result.setItem(row, 0, QtWidgets.QTableWidgetItem(os.path.basename(fp)))
+            self.result.setItem(row, 1, QtWidgets.QTableWidgetItem(str(len(crowns))))
+            if fit is None:
+                self.result.setItem(row, 2, QtWidgets.QTableWidgetItem("too few pairs"))
+                continue
+            fit["pairs"] = pairs
+            self.new[fp] = fit
+            self.result.setItem(row, 2, QtWidgets.QTableWidgetItem(f"{fit['n_used']} / {len(pairs)}"))
+            before = entry.get("loo_px")
+            self.result.setItem(row, 3, QtWidgets.QTableWidgetItem(
+                self._px(float(before), fp) if before is not None else ""))
+            self.result.setItem(row, 4, QtWidgets.QTableWidgetItem(self._px(fit.get("loo_px"), fp)))
+        self.b_apply.setEnabled(bool(self.new))
+
+    def apply(self):
+        if not self.new:
+            return
+        targets = {k: dict(v) for k, v in (self.st.get("targets") or {}).items()}
+        for fp, f in self.new.items():
+            spots = []
+            used = f.get("used") or []
+            for k, p in enumerate(f["pairs"]):
+                spots.append({"group": p["group"], "status": p["status"], "score": p.get("score"),
+                              "src": np.asarray(p["src"]).round(3).tolist(),
+                              "dst": np.asarray(p["dst"]).round(3).tolist(),
+                              "used": bool(used[k]) if k < len(used) else False})
+            loo = f.get("loo_px", float("nan"))
+            e = targets.get(fp) or {}
+            g = self._gsd_of(fp)
+            e.update({"M": np.asarray(f["M"]).tolist(), "local": f.get("local"), "mode": f.get("mode", "global"),
+                      "rms_px": float(f["rms_px"]), "rms_m": f["rms_px"] * g if g else None,
+                      "loo_px": float(loo) if np.isfinite(loo) else None,
+                      "loo_m": float(loo) * g if g and np.isfinite(loo) else None,
+                      "n_used": int(f["n_used"]), "spots": spots,
+                      "n_crowns": sum(1 for p in f["pairs"] if p["status"] == "crown"),
+                      "updated": time.strftime("%Y-%m-%d %H:%M:%S")})
+            targets[fp] = e
+        self.pt.apply_view_alignment(self.ref_fp, targets, root=self.st.get("root"))
+        n = len(self.new)
+        self.new = {}
+        self.b_apply.setEnabled(False)
+        # the stored set was replaced: offsets are now against the new fit
+        _sid, st = self.pt._alignment_sets().set_for(self.ref_fp, enabled_only=False)
+        if st is not None:
+            self.sid, self.st = _sid, st
+            self._collect()
+        self.info.setText(f"Updated {n} image(s) with your crowns. " + self.info.text())
 
 
 class ClickSpotsMode(QtCore.QObject):
