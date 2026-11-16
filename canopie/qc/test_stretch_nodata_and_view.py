@@ -325,10 +325,42 @@ def test_toggle_and_pan_run_the_view_stretch(viewer_factory, qapp):
     viewer.set_view_stretch_callback(lambda v: calls.append(v.stretch_to_view))
     viewer._stretch_view_btn.click()
     assert viewer.stretch_to_view is True and calls == [True]
-    viewer.fitInView(QtCore.QRectF(10, 10, 50, 50), QtCore.Qt.KeepAspectRatio)
-    QTest.qWait(400)
+    key0 = viewer._view_key()
+    viewer.setTransform(QtGui.QTransform.fromScale(4.0, 4.0))
+    viewer.centerOn(30, 30)
+    assert viewer._view_key() != key0, "the test did not move the view"
+    for _ in range(60):                  # the re-stretch is debounced
+        if len(calls) >= 2:
+            break
+        QTest.qWait(50)
     assert len(calls) == 2, "panning / zooming did not re-stretch the view"
     QTest.qWait(400)
     assert len(calls) == 2, "the view stretch re-ran without the view moving"
     viewer._stretch_view_btn.click()
     assert viewer.stretch_to_view is False and calls[-1] is False
+
+
+def test_square_beside_auto_switches_stretch_to_view(viewer_factory):
+    """The stretch bar's small square beside Auto is the same switch as the
+    bottom-left "View" square, and both show the viewer's state."""
+    arr = _two_halves()
+    viewer = _viewer_with(viewer_factory, arr)
+    calls = []
+    viewer.set_view_stretch_callback(lambda v: calls.append(v.stretch_to_view))
+    sb = viewer._stretchbar
+    lay = sb.layout()
+    order = [lay.itemAt(i).widget() for i in range(lay.count())]
+    assert order.index(sb._btn_view) == order.index(sb._btn_auto) + 1, "the square is not beside Auto"
+    sb._btn_view.click()
+    assert viewer.stretch_to_view is True and calls == [True]
+    assert viewer._stretch_view_btn.isChecked(), "the bottom-left square did not follow"
+    viewer._stretch_view_btn.click()
+    assert viewer.stretch_to_view is False and not sb._btn_view.isChecked()
+
+
+def test_stretch_bar_is_only_as_wide_as_its_content(viewer_factory):
+    viewer = _viewer_with(viewer_factory, _two_halves())
+    viewer.resize(1200, 600)
+    sb = viewer._stretchbar
+    sb.reposition()
+    assert sb.width() <= sb.sizeHint().width()

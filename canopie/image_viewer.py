@@ -3916,6 +3916,9 @@ class ImageViewer(QtWidgets.QGraphicsView):
         btn = getattr(self, "_stretch_view_btn", None)
         if btn is not None:
             btn.sync()
+        sb = getattr(self, "_stretchbar", None)
+        if sb is not None and hasattr(sb, "sync_view_button"):
+            sb.sync_view_button()
         if changed and rerender:
             self._run_view_stretch()
 
@@ -9854,6 +9857,10 @@ class _StretchBar(QtWidgets.QFrame):
             QToolButton:pressed {
                 background: rgba(0, 0, 0, 50);
             }
+            QToolButton:checked {
+                background: rgba(255, 215, 0, 230);
+                border: 1px solid rgba(0, 100, 0, 220);
+            }
             QSlider::groove:horizontal {
                 height: 4px;
                 background: rgba(180, 180, 180, 200);
@@ -9907,6 +9914,20 @@ class _StretchBar(QtWidgets.QFrame):
         self._btn_auto.setToolTip("Reset to default auto percentile stretch")
         self._btn_auto.clicked.connect(self._on_auto_clicked)
         layout.addWidget(self._btn_auto)
+
+        # Stretch to view (ENVI): the small square beside Auto. Same switch
+        # as the "View" square at the bottom-left of the viewer.
+        self._btn_view = QtWidgets.QToolButton(self)
+        self._btn_view.setObjectName("_StretchBarViewBtn")
+        self._btn_view.setText("\u25a3")
+        self._btn_view.setCheckable(True)
+        self._btn_view.setFixedSize(24, 20)
+        self._btn_view.setStyleSheet("QToolButton { font-size: 14px; padding: 0px; }")
+        self._btn_view.setToolTip(
+            "Stretch to view (ENVI): stretch by the pixels on screen only, "
+            "following pan and zoom")
+        self._btn_view.toggled.connect(self._on_view_toggled)
+        layout.addWidget(self._btn_view)
 
         self._slider_min.valueChanged.connect(self._on_slider_changed)
         self._slider_max.valueChanged.connect(self._on_slider_changed)
@@ -10240,6 +10261,23 @@ class _StretchBar(QtWidgets.QFrame):
         except Exception as e:
             logging.debug(f"[_StretchBar] stretch_applied emit failed: {e}")
 
+    def sync_view_button(self):
+        btn = getattr(self, "_btn_view", None)
+        if btn is None:
+            return
+        b = btn.blockSignals(True)
+        try:
+            btn.setChecked(bool(getattr(self._view, "stretch_to_view", False)))
+        finally:
+            btn.blockSignals(b)
+
+    def _on_view_toggled(self, checked):
+        try:
+            self._view.set_stretch_to_view(bool(checked))
+        except Exception as e:
+            logging.debug(f"[_StretchBar] stretch to view toggle failed: {e}")
+        self.show_briefly()
+
     def _on_auto_clicked(self):
         """Restore the saved stretch (file → root → project) without wiping band selection.
         Emits None so the ProjectTab re-runs its normal stretch lookup chain."""
@@ -10301,8 +10339,9 @@ class _StretchBar(QtWidgets.QFrame):
                 return
             m = 8
             s = self.sizeHint()
-            target_w = max(s.width(), min(480, vp.width() - 2 * m))
-            bar_w = max(s.width(), min(target_w, vp.width() - 2 * m))
+            # As wide as its content, never wider: stretching it to 480 px
+            # only opened gaps between the sliders and their labels.
+            bar_w = min(s.width(), max(120, vp.width() - 2 * m))
             x = max(m, (vp.width() - bar_w) // 2)
             y = m
             new_geom = QtCore.QRect(x, y, bar_w, s.height())

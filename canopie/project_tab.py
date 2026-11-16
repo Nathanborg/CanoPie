@@ -1829,6 +1829,28 @@ class ImageStretchDialog(QtWidgets.QDialog):
                 font-weight: bold;
                 font-size: 11pt;
             }
+            /* Same slim slider as the in-viewer stretch bar (the platform
+               default drew a big square handle on a long bare groove). */
+            QSlider::groove:horizontal {
+                height: 4px;
+                background: #c8c8c8;
+                border-radius: 2px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #8fb3d1;
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                background: #4682B4;
+                border: 1px solid #2B547E;
+                width: 12px;
+                height: 12px;
+                margin: -5px 0;
+                border-radius: 7px;
+            }
+            QSlider::handle:horizontal:hover { background: #1E90FF; }
+            QSlider::handle:horizontal:disabled { background: #b0b0b0; border-color: #909090; }
+            QSlider:disabled { }
         """)
 
         self.setWindowTitle("Stretch Viewer")
@@ -2012,6 +2034,7 @@ class ImageStretchDialog(QtWidgets.QDialog):
         self.lb_range.setStyleSheet("color: #006400; font-weight: bold;")
         self.sp_min = QtWidgets.QDoubleSpinBox(); self.sp_min.setRange(-1e12, 1e12); self.sp_min.setDecimals(6)
         self.sp_max = QtWidgets.QDoubleSpinBox(); self.sp_max.setRange(-1e12, 1e12); self.sp_max.setDecimals(6)
+        _fixw(self.sp_min, 104); _fixw(self.sp_max, 104)
         self.sp_min.setValue(self._init.min_val if self._init.min_val is not None else self._real_min)
         self.sp_max.setValue(self._init.max_val if self._init.max_val is not None else self._real_max)
 
@@ -2020,7 +2043,9 @@ class ImageStretchDialog(QtWidgets.QDialog):
         # _global_slider_range(). Requested so single-band images get sliders too.
         self.sl_min = QtWidgets.QSlider(QtCore.Qt.Horizontal); self.sl_min.setRange(0, self._SLIDER_RES if hasattr(self, "_SLIDER_RES") else 1000)
         self.sl_max = QtWidgets.QSlider(QtCore.Qt.Horizontal); self.sl_max.setRange(0, self.sl_min.maximum())
-        _fixw(self.sl_min, 120); _fixw(self.sl_max, 120)
+        for _sl in (self.sl_min, self.sl_max):
+            _sl.setMinimumWidth(90)
+            _sl.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 
         # Per-channel (Absolute) UI
         # NOTE: real per-channel ranges + labels are (re)computed in
@@ -2041,10 +2066,12 @@ class ImageStretchDialog(QtWidgets.QDialog):
             lbl = QtWidgets.QLabel(f"Ch {c+1}:")
             sp_lo = QtWidgets.QDoubleSpinBox(); sp_lo.setRange(-1e12, 1e12); sp_lo.setDecimals(6)
             sp_hi = QtWidgets.QDoubleSpinBox(); sp_hi.setRange(-1e12, 1e12); sp_hi.setDecimals(6)
-            _fixw(sp_lo, 78); _fixw(sp_hi, 78)
+            _fixw(sp_lo, 86); _fixw(sp_hi, 86)
             sl_lo = QtWidgets.QSlider(QtCore.Qt.Horizontal); sl_lo.setRange(0, self._SLIDER_RES)
             sl_hi = QtWidgets.QSlider(QtCore.Qt.Horizontal); sl_hi.setRange(0, self._SLIDER_RES)
-            _fixw(sl_lo, 70); _fixw(sl_hi, 70)
+            for _sl in (sl_lo, sl_hi):
+                _sl.setMinimumWidth(50)
+                _sl.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
             self.sp_min_ch.append(sp_lo); self.sp_max_ch.append(sp_hi)
             self.sl_min_ch.append(sl_lo); self.sl_max_ch.append(sl_hi)
             self._per_band_labels.append(lbl)
