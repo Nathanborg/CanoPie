@@ -2428,7 +2428,6 @@ class ImageViewer(QtWidgets.QGraphicsView):
         self.stretch_to_view = False
         self._view_stretch_callback = None
         self._view_stretch_last_key = None
-        self._stretch_view_btn = _StretchToViewButton(self)
 
         # Panning / focus
         self.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
@@ -3913,9 +3912,6 @@ class ImageViewer(QtWidgets.QGraphicsView):
         changed = on != bool(getattr(self, "stretch_to_view", False))
         self.stretch_to_view = on
         self._view_stretch_last_key = None
-        btn = getattr(self, "_stretch_view_btn", None)
-        if btn is not None:
-            btn.sync()
         sb = getattr(self, "_stretchbar", None)
         if sb is not None and hasattr(sb, "sync_view_button"):
             sb.sync_view_button()
@@ -8234,90 +8230,6 @@ class _OverlayToggleButton(QtWidgets.QToolButton):
         except Exception:
             pass
 
-# --- Stretch to view button ---------------------------------------------------
-class _StretchToViewButton(QtWidgets.QToolButton):
-    """The small square next to the overlay toggle (bottom-left of the
-    viewer): ENVI's "stretch to view" / QGIS's "Stretch using current extent".
-
-    On: the stretch statistics come from the pixels currently on screen and
-    are recomputed whenever the view is panned or zoomed; the zoom tiles map
-    with the same bounds. Off: the whole image's statistics, as before."""
-
-    _STYLE = """
-        QToolButton {
-            background: rgba(0, 0, 0, 0.4);
-            color: rgba(255, 255, 255, 0.85);
-            border-radius: 6px;
-            font-size: 11px;
-            font-weight: bold;
-            border: 1px solid rgba(255, 255, 255, 0.3);
-        }
-        QToolButton:hover {
-            background: rgba(0, 0, 0, 0.9);
-            color: white;
-            border: 1px solid rgba(255, 255, 255, 0.6);
-        }
-        QToolButton:checked {
-            background: rgba(255, 215, 0, 0.85);
-            color: black;
-            border: 1px solid rgba(0, 100, 0, 0.9);
-        }
-    """
-
-    def __init__(self, viewer):
-        super().__init__(viewer)
-        self.viewer = viewer
-        self.setObjectName("_StretchToViewButton")
-        self.setFixedSize(36, 36)
-        self.setCheckable(True)
-        self.setCursor(QtCore.Qt.PointingHandCursor)
-        self.setText("View")
-        self.setStyleSheet(self._STYLE)
-        self.sync()
-        self.toggled.connect(self._on_toggled)
-        self.reposition()
-        self.show()
-
-        old_resize = viewer.resizeEvent
-
-        def _resized(ev):
-            try:
-                self.reposition()
-            except Exception:
-                pass
-            if callable(old_resize):
-                old_resize(ev)
-        viewer.resizeEvent = _resized
-
-    def sync(self):
-        on = bool(getattr(self.viewer, "stretch_to_view", False))
-        b = self.blockSignals(True)
-        try:
-            self.setChecked(on)
-        finally:
-            self.blockSignals(b)
-        self.setToolTip(
-            "Stretch to view is ON: the stretch uses only the pixels on screen "
-            "and follows pan / zoom. Click to stretch by the whole image again."
-            if on else
-            "Stretch to view (ENVI style): stretch using only the pixels "
-            "currently on screen, updated as you pan and zoom.")
-
-    def _on_toggled(self, checked):
-        try:
-            self.viewer.set_stretch_to_view(bool(checked))
-        except Exception as e:
-            logging.debug(f"[_StretchToViewButton] toggle failed: {e}")
-
-    def reposition(self):
-        vp_geom = self.viewer.viewport().geometry()
-        margin = 15
-        eye = getattr(self.viewer, "_overlay_toggle_btn", None)
-        x = vp_geom.x() + margin + (eye.width() + 6 if eye is not None else 0)
-        y = max(vp_geom.y(), vp_geom.bottom() - self.height() - margin + 1)
-        self.move(x, y)
-
-
 # --- ZoomBar overlay for ImageViewer -----------------------------------------
 class _ZoomBar(QtWidgets.QFrame):
     """
@@ -9915,8 +9827,7 @@ class _StretchBar(QtWidgets.QFrame):
         self._btn_auto.clicked.connect(self._on_auto_clicked)
         layout.addWidget(self._btn_auto)
 
-        # Stretch to view (ENVI): the small square beside Auto. Same switch
-        # as the "View" square at the bottom-left of the viewer.
+        # Stretch to view (ENVI): the small square beside Auto.
         self._btn_view = QtWidgets.QToolButton(self)
         self._btn_view.setObjectName("_StretchBarViewBtn")
         self._btn_view.setText("\u25a3")

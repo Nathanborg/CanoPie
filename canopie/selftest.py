@@ -33,7 +33,7 @@ CANOPIE_MODULES = [
     "performance", "phenocam_filter", "polygon_bulk", "polygon_lod", "polygon_manager", "portal_finder_dialog",
     "project_tab", "random_shapes_dialog", "random_shapes_generator",
     "raster_reader", "remote_images_dialog", "remote_portal", "remote_raster", "remote_tiles", "shapefile_import_dialog", "shapefile_io",
-    "similarity_dialog", "spatial_index", "thumbnail_options_dialog", "utils",
+    "similarity_dialog", "spatial_index", "stretch_stats", "thumbnail_options_dialog", "utils",
 ]
 
 

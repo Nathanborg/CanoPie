@@ -273,12 +273,13 @@ def _two_halves():
     return a
 
 
-def test_stretch_to_view_button_sits_beside_the_overlay_square(viewer_factory):
+def test_no_view_button_at_the_bottom_left(viewer_factory):
+    """The switch lives beside Auto only (Nathan asked for the bottom-left
+    "View" square to go)."""
     viewer = viewer_factory()
-    btn = viewer._stretch_view_btn
-    eye = viewer._overlay_toggle_btn
-    assert btn.isCheckable() and not btn.isChecked()
-    assert btn.x() > eye.x() and abs(btn.y() - eye.y()) <= 1
+    assert not hasattr(viewer, "_stretch_view_btn")
+    btns = [w for w in viewer.findChildren(QtWidgets.QToolButton) if w.text() == "View"]
+    assert not btns
 
 
 def test_stretch_to_view_takes_the_statistics_on_screen(synthetic_project, viewer_factory, qapp):
@@ -323,7 +324,7 @@ def test_toggle_and_pan_run_the_view_stretch(viewer_factory, qapp):
     viewer = _viewer_with(viewer_factory, arr)
     calls = []
     viewer.set_view_stretch_callback(lambda v: calls.append(v.stretch_to_view))
-    viewer._stretch_view_btn.click()
+    viewer._stretchbar._btn_view.click()
     assert viewer.stretch_to_view is True and calls == [True]
     key0 = viewer._view_key()
     viewer.setTransform(QtGui.QTransform.fromScale(4.0, 4.0))
@@ -336,13 +337,13 @@ def test_toggle_and_pan_run_the_view_stretch(viewer_factory, qapp):
     assert len(calls) == 2, "panning / zooming did not re-stretch the view"
     QTest.qWait(400)
     assert len(calls) == 2, "the view stretch re-ran without the view moving"
-    viewer._stretch_view_btn.click()
+    viewer._stretchbar._btn_view.click()
     assert viewer.stretch_to_view is False and calls[-1] is False
 
 
 def test_square_beside_auto_switches_stretch_to_view(viewer_factory):
-    """The stretch bar's small square beside Auto is the same switch as the
-    bottom-left "View" square, and both show the viewer's state."""
+    """The stretch bar's small square beside Auto switches Stretch to view and
+    shows the viewer's state when it is switched from elsewhere."""
     arr = _two_halves()
     viewer = _viewer_with(viewer_factory, arr)
     calls = []
@@ -353,8 +354,7 @@ def test_square_beside_auto_switches_stretch_to_view(viewer_factory):
     assert order.index(sb._btn_view) == order.index(sb._btn_auto) + 1, "the square is not beside Auto"
     sb._btn_view.click()
     assert viewer.stretch_to_view is True and calls == [True]
-    assert viewer._stretch_view_btn.isChecked(), "the bottom-left square did not follow"
-    viewer._stretch_view_btn.click()
+    viewer.set_stretch_to_view(False)
     assert viewer.stretch_to_view is False and not sb._btn_view.isChecked()
 
 
@@ -364,3 +364,77 @@ def test_stretch_bar_is_only_as_wide_as_its_content(viewer_factory):
     sb = viewer._stretchbar
     sb.reposition()
     assert sb.width() <= sb.sizeHint().width()
+
+
+# ---------------------------------------------------------------------------
+# Each band keeps its stretch (band bar clicks)
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def band_viewer(synthetic_project, viewer_factory, tmp_path):
+    """A real viewer showing a COPY of an 8-band fixture (its .ax is written)."""
+    import shutil, os
+    src = fixture_image_path("multiband_8band_ancillary")
+    fp = str(tmp_path / f"bandmem_{tmp_path.name}.tif")
+    shutil.copy(src, fp)
+    pt = synthetic_project
+    lite = pt._imagedata_or_fallback(fp)
+    arr = lite.image
+    h, w = arr.shape[:2]
+    viewer = viewer_factory()
+    viewer.resize(420, 340)
+    qimg = QtGui.QImage(w, h, QtGui.QImage.Format_RGB32)
+    qimg.fill(0)
+    viewer.set_image(QtGui.QPixmap.fromImage(qimg))
+    viewer.image_data = lite
+    yield pt, viewer, fp
+    try:
+        axp = pt._ax_path_for(fp)
+        if os.path.exists(axp):
+            os.remove(axp)
+    except Exception:
+        pass
+
+
+def _set_by_hand(pt, viewer, lo, hi):
+    """What releasing a stretch-bar slider does."""
+    sp = viewer.stretch_params
+    params = _StretchParams(mode="absolute", min_val=lo, max_val=hi, scope="viewer",
+                            display_mode="single", display_band=sp.display_band)
+    viewer.stretch_params = params
+    pt._on_viewer_stretch_applied(params, viewer, "root_x")
+
+
+def test_a_band_comes_back_with_the_stretch_it_was_left_with(band_viewer):
+    pt, viewer, fp = band_viewer
+    pt._on_band_bar_clicked(viewer, "root_x", 1)
+    assert viewer.stretch_params.mode == "percentile"
+    _set_by_hand(pt, viewer, 10.0, 20.0)
+
+    pt._on_band_bar_clicked(viewer, "root_x", 2)
+    assert viewer.stretch_params.mode == "percentile", "band 3 took band 2's stretch"
+
+    pt._on_band_bar_clicked(viewer, "root_x", -1)          # composite
+    pt._on_band_bar_clicked(viewer, "root_x", 1)
+    sp = viewer.stretch_params
+    assert (sp.mode, sp.min_val, sp.max_val) == ("absolute", 10.0, 20.0), (
+        "band 2 lost the stretch the user left it with")
+    assert str(sp.display_mode).lower() == "single"
+
+
+def test_auto_forgets_the_bands_stretch(band_viewer):
+    pt, viewer, fp = band_viewer
+    pt._on_band_bar_clicked(viewer, "root_x", 1)
+    _set_by_hand(pt, viewer, 10.0, 20.0)
+    viewer.stretch_params = None                             # the bar's Auto
+    pt._on_viewer_stretch_applied(None, viewer, "root_x")
+    pt._on_band_bar_clicked(viewer, "root_x", 2)
+    pt._on_band_bar_clicked(viewer, "root_x", 1)
+    assert viewer.stretch_params.mode == "percentile", "Auto did not reset the band"
+
+
+def test_reset_image_forgets_every_band(band_viewer):
+    pt, viewer, fp = band_viewer
+    pt._on_band_bar_clicked(viewer, "root_x", 1)
+    _set_by_hand(pt, viewer, 10.0, 20.0)
+    pt._clear_file_stretch(fp)
+    assert pt._load_band_stretch(fp, "1") is None

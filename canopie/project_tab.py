@@ -26739,9 +26739,12 @@ class ProjectTab(QtWidgets.QWidget):
         try:
             axp = self._ax_path_for(filepath)
             d = self._read_json_silently(axp)
-            if "viewer_stretch" in d:
+            if "viewer_stretch" in d or "band_stretches" in d:
                 d.pop("viewer_stretch", None)
+                d.pop("band_stretches", None)
                 self._write_json_safely(axp, d)
+                if hasattr(self, "_ax_cache"):
+                    self._ax_cache.pop(os.path.normcase(os.path.abspath(filepath)), None)
         except Exception:
             pass
 
@@ -26961,6 +26964,14 @@ class ProjectTab(QtWidgets.QWidget):
                 try:
                     if params is None:
                         # "Auto" button was clicked -> clear the saved file stretch
+                        # and what the band on screen remembered: Auto is a
+                        # change, the next click on that band shows Auto too.
+                        try:
+                            ax = self._load_ax_json(fp) if hasattr(self, "_load_ax_json") else {}
+                            self._forget_band_stretch(
+                                fp, self._band_stretch_key((ax or {}).get("viewer_stretch")))
+                        except Exception:
+                            pass
                         self._clear_file_stretch(fp)
                     elif getattr(params, "scope", "") == "viewer":
                         # Slider was released -> save the new custom stretch
@@ -27123,6 +27134,7 @@ class ProjectTab(QtWidgets.QWidget):
                 # Restore the actual composite stretch stashed just before the
                 # first band-bar click switched this viewer to single-band mode.
                 composite = (getattr(viewer, "_composite_stretch_params", None)
+                             or self._load_band_stretch(fp, "composite")
                              or getattr(viewer, "stretch_params", None)
                              or self._load_file_stretch(fp)
                              or self._load_root_stretch(root_name)
@@ -27185,11 +27197,19 @@ class ProjectTab(QtWidgets.QWidget):
                 # Fully-loaded plain image -- band_idx is already a channel position.
                 channel_pos = band_idx
 
-            # Plain default percentile stretch -- deliberately NOT inheriting
-            # the actual Auto/RGB composite's mode/percentiles/sigma/absolute
-            # range (see docstring).
-            new_params = _StretchParams(scope="viewer", display_mode="single",
-                                        display_band=channel_pos)
+            # The stretch this band was last left with (kept until the user
+            # changes it); else a plain default percentile stretch --
+            # deliberately NOT inheriting the actual Auto/RGB composite's
+            # mode/percentiles/sigma/absolute range (see docstring).
+            band_key = band_idx if (profile is not None and preview_bands) \
+                else self._file_band_of_position(viewer, channel_pos)
+            new_params = self._load_band_stretch(fp, band_key)
+            if new_params is not None and str(new_params.display_mode).lower() == "single":
+                new_params.scope = "viewer"
+                new_params.display_band = channel_pos
+            else:
+                new_params = _StretchParams(scope="viewer", display_mode="single",
+                                            display_band=channel_pos)
 
             self._stretch_apply_preview(new_params, viewer, root_name)
 
@@ -27493,8 +27513,73 @@ class ProjectTab(QtWidgets.QWidget):
 
     def _save_file_stretch(self, filepath, sp, viewer=None):
         """`viewer`: the one the stretch was chosen on -- its array tells which
-        FILE bands the positions are (BUG-024)."""
-        self._merge_write_ax(filepath, {"viewer_stretch": self._stretch_to_dict(sp, viewer)})
+        FILE bands the positions are (BUG-024).
+
+        The stretch is also remembered for the band it shows, in the .ax's
+        `band_stretches` ({"<file band>": stretch, "composite": stretch}):
+        clicking that band (or the composite button) on the band bar again
+        brings it back until the user changes it, instead of starting over
+        from the default percentile stretch."""
+        d = self._stretch_to_dict(sp, viewer)
+        patch = {"viewer_stretch": d}
+        key = self._band_stretch_key(d)
+        if key is not None:
+            try:
+                ax = self._load_ax_json(filepath) if hasattr(self, "_load_ax_json") else {}
+                bs = dict((ax or {}).get("band_stretches") or {})
+            except Exception:
+                bs = {}
+            bs[key] = d
+            patch["band_stretches"] = bs
+        self._merge_write_ax(filepath, patch)
+
+    @staticmethod
+    def _band_stretch_key(d):
+        """Where a persisted stretch dict is remembered in `band_stretches`:
+        its FILE band (or derived band name) when it shows one band,
+        "composite" otherwise; None when that cannot be told."""
+        if not isinstance(d, dict):
+            return None
+        if str(d.get("display_mode", "auto") or "auto").lower() != "single":
+            return "composite"
+        b = d.get("display_band")
+        if b is None or isinstance(b, bool):
+            return None
+        return str(b)
+
+    def _load_band_stretch(self, filepath, key):
+        """The stretch remembered for band `key` of a file (see
+        _save_file_stretch), or None."""
+        if not filepath or key is None:
+            return None
+        try:
+            ax = self._load_ax_json(filepath) if hasattr(self, "_load_ax_json") else {}
+            d = ((ax or {}).get("band_stretches") or {}).get(str(key))
+            return self._stretch_from_dict(d)
+        except Exception:
+            return None
+
+    def _forget_band_stretch(self, filepath, key):
+        if not filepath or key is None:
+            return
+        try:
+            ax = self._load_ax_json(filepath) if hasattr(self, "_load_ax_json") else {}
+            bs = dict((ax or {}).get("band_stretches") or {})
+            if str(key) in bs:
+                bs.pop(str(key), None)
+                self._merge_write_ax(filepath, {"band_stretches": bs})
+        except Exception as e:
+            logging.debug(f"_forget_band_stretch failed: {e}")
+
+    def _file_band_of_position(self, viewer, pos):
+        """The FILE band (or derived band name) at array position `pos`."""
+        try:
+            m = self._display_band_map(viewer)
+            if m is not None and 0 <= int(pos) < len(m):
+                return m[int(pos)][1]
+        except Exception:
+            pass
+        return pos
 
 
     # ---- Load scopes ----

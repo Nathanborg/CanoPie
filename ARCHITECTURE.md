@@ -512,15 +512,21 @@ turns their NoData into NaN (`stretch_stats.nan_nodata_window`) before rendering
 preview's bounds. With no `.ax`, `apply_aux_modifications` still applies the declared tag NoData
 for `.tif`/`.tiff`/`.cogref`.
 
-**Stretch to view** (ENVI's "stretch to view", QGIS's "current extent"): the "View" toggle next
-to the bottom-left overlay square (`_StretchToViewButton`) sets `viewer.stretch_to_view` for every
-viewer in the tab (`ProjectTab._stretch_to_view_on`, carried to the next root). While it is on,
+**Stretch to view** (ENVI's "stretch to view", QGIS's "current extent"): the small ▣ square
+beside Auto on the in-viewer stretch bar (`_StretchBar._btn_view`) sets `viewer.stretch_to_view`
+for every viewer in the tab (`ProjectTab._stretch_to_view_on`, carried to the next root). While it is on,
 `_render_with_viewer_stretch` passes `stretch_stats.view_window(viewer, shape)` (the on-screen
 part of the preview, GUI thread only) as `stats_window`; a fixed (absolute) range is treated as a
 percentile stretch there. Pan/zoom re-runs it debounced (`ImageViewer._trigger_view_stretch` →
 `ProjectTab._apply_view_stretch`, only when the visible rect actually changed), which records the
 new `_preview_stretch_bounds` and then re-requests the zoom tile so it maps with them. Dragging a
 stretch-bar slider turns it off.
+
+**Each band keeps its stretch.** `_save_file_stretch` also stores the stretch under the band it
+shows in the `.ax`'s `band_stretches` (`{"<file band>": stretch, "composite": stretch}`), and a
+band-bar click (`_on_band_bar_clicked`) restores that band's entry before falling back to the
+default percentile stretch, so the values stay until the user changes them. Auto on the stretch bar
+forgets the entry of the band on screen; Reset Image (`_clear_file_stretch`) forgets them all.
 
 The Stretch Viewer's body is a scroll area bounded by the screen (`ImageStretchDialog.adjustSize`)
 and its band combos are compact (`_compact_band_combo`), so a 298-band cube with long band names
