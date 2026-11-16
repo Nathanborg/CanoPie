@@ -512,15 +512,15 @@ turns their NoData into NaN (`stretch_stats.nan_nodata_window`) before rendering
 preview's bounds. With no `.ax`, `apply_aux_modifications` still applies the declared tag NoData
 for `.tif`/`.tiff`/`.cogref`.
 
-**Stretch to view** (ENVI's "stretch to view", QGIS's "current extent"): the small ▣ square
-beside Auto on the in-viewer stretch bar (`_StretchBar._btn_view`) sets `viewer.stretch_to_view`
-for every viewer in the tab (`ProjectTab._stretch_to_view_on`, carried to the next root). While it is on,
-`_render_with_viewer_stretch` passes `stretch_stats.view_window(viewer, shape)` (the on-screen
-part of the preview, GUI thread only) as `stats_window`; a fixed (absolute) range is treated as a
-percentile stretch there. Pan/zoom re-runs it debounced (`ImageViewer._trigger_view_stretch` →
-`ProjectTab._apply_view_stretch`, only when the visible rect actually changed), which records the
-new `_preview_stretch_bounds` and then re-requests the zoom tile so it maps with them. Dragging a
-stretch-bar slider turns it off.
+**Stretch to view** (ENVI's "stretch to view"): the small ▣ square beside Auto on the in-viewer
+stretch bar (`_StretchBar._btn_view`) is a ONE-SHOT action, not a mode. `ImageViewer.stretch_to_view()`
+→ `ProjectTab._apply_view_stretch` computes the bounds from the on-screen part of the preview
+(`stretch_stats.view_window`; the viewer's own percentile/±σ method, 0.5–99.5 % for a fixed range;
+`_compute_stretched_preview(..., bounds_only=True)`), and applies them as an absolute stretch
+(per channel for a composite) through `_on_viewer_stretch_applied`, so they are saved like a
+stretch-bar change and stay while the user pans and zooms. Nothing is recomputed on view changes:
+an earlier continuous version re-rendered every viewer and re-requested the COG zoom tiles on each
+pan. Pressing it again stretches to the new view.
 
 **Each band keeps its stretch.** `_save_file_stretch` also stores the stretch under the band it
 shows in the `.ax`'s `band_stretches` (`{"<file band>": stretch, "composite": stretch}`), and a

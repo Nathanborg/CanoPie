@@ -4545,7 +4545,7 @@ class ProjectTab(QtWidgets.QWidget):
                 # per-viewer schedule with 0ms because we already debounced globally
                 self._schedule_polygons_for_viewer(v, idata, delay_ms=0, nav_seq=seq) 
     def _compute_stretched_preview(self, base_img, params, mask=None, bounds=None, bounds_out=None,
-                                   nodata_values=None, stats_window=None):
+                                   nodata_values=None, stats_window=None, bounds_only=False):
         """
         Build a DISPLAY-ONLY frame from `base_img` (your current scientific array),
         apply stretch per `params`, and return a uint8 (H,W) or (H,W,3).
@@ -4563,6 +4563,8 @@ class ProjectTab(QtWidgets.QWidget):
                 sentinels and -9999 (canopie.stretch_stats)
             stats_window: (x0, y0, x1, y1) in `base_img` pixels -- take the
                 statistics from that part only (Stretch to view)
+            bounds_only: fill `bounds_out` and return None without mapping
+                the image (Stretch to view needs the numbers, not a frame)
         """
         def _pick_display_stack(img, p):
             if img is None:
@@ -4712,6 +4714,41 @@ class ProjectTab(QtWidgets.QWidget):
                 except Exception as e:
                     logging.debug(f"_compute_stretched_preview: uint8 LUT path skipped: {e}")
 
+            # 16-bit input: the same mapping through a 65,536-entry table per
+            # channel (uint16 has no NaN). The float path below cost ~0.8 s per
+            # render on a 3000 x 3000 uint16 ortho preview; this is ~0.1 s and
+            # bit-identical (the table is built with the same float32 ops).
+            if x_in.dtype == np.uint16:
+                try:
+                    ramp = np.arange(65536, dtype=np.float32)
+
+                    def _lut(lo_c, dn_c):
+                        t = np.empty(65536, dtype=np.float32)
+                        np.subtract(ramp, np.float32(lo_c), out=t)
+                        np.divide(t, np.float32(dn_c), out=t)
+                        if clip:
+                            np.clip(t, 0.0, 1.0, out=t)
+                        t = np.nan_to_num(t, nan=0.0, posinf=1.0, neginf=0.0, copy=False)
+                        np.multiply(t, 255.0, out=t)
+                        np.add(t, 0.5, out=t)
+                        return t.astype(np.uint8)
+
+                    if lo_f.ndim == 0 or x_in.ndim == 2:
+                        lut = _lut(float(lo_f.reshape(-1)[0]), float(np.asarray(denom).reshape(-1)[0]))
+                        return lut[x_in]
+                    C = x_in.shape[2]
+                    lo_v = np.asarray(lo_f, dtype=np.float32).reshape(-1)
+                    dn_v = np.asarray(denom, dtype=np.float32).reshape(-1)
+                    if lo_v.size < C:
+                        lo_v = np.full(C, lo_v[0], np.float32)
+                        dn_v = np.full(C, dn_v[0], np.float32)
+                    out = np.empty(x_in.shape, dtype=np.uint8)
+                    for c in range(C):
+                        out[..., c] = _lut(float(lo_v[c]), float(dn_v[c]))[x_in[..., c]]
+                    return out
+                except Exception as e:
+                    logging.debug(f"_compute_stretched_preview: uint16 LUT path skipped: {e}")
+
             # Float/other dtypes: map in place into a single scratch buffer. The
             # expression form allocated a new full-size temporary per operation, which
             # dominated the render cost on large float stacks; this is bit-identical.
@@ -4814,6 +4851,8 @@ class ProjectTab(QtWidgets.QWidget):
             if bounds_out is not None:
                 bounds_out["lo"] = np.array(lo, dtype=np.float32, copy=True)
                 bounds_out["hi"] = np.array(hi, dtype=np.float32, copy=True)
+            if bounds_only:
+                return None
             out = _apply_stretch_uint8(disp, lo, hi, clip=params.clip)
         except Exception:
             logging.exception("_compute_stretched_preview: stretch math failed; using min-max fallback")
@@ -4988,7 +5027,7 @@ class ProjectTab(QtWidgets.QWidget):
                     base_img, effective_params, mask, bounds_out=_b_out,
                     nodata_values=self._stretch_nodata_values(
                         getattr(getattr(v, "image_data", None), "filepath", None)),
-                    stats_window=self._view_window_for(v, base_img))
+                    stats_window=None)
                 if preview is None:
                     return
                 # remember params per-viewer for consistency
@@ -26218,44 +26257,62 @@ class ProjectTab(QtWidgets.QWidget):
         except Exception:
             return []
 
-    def _view_window_for(self, viewer, arr):
-        """Stretch to view: the on-screen part of `arr` (the viewer's preview),
-        or None when the viewer is not stretching to view."""
-        if not getattr(viewer, "stretch_to_view", False) or arr is None:
-            return None
-        from .stretch_stats import view_window
-        return view_window(viewer, np.asarray(arr).shape)
-
     def _apply_view_stretch(self, viewer):
-        """Re-render the viewer's preview for Stretch to view (toggled, or the
-        view was panned / zoomed while it is on), keeping the view, then ask
-        for a new zoom tile so it maps with the new bounds."""
+        """Stretch to view, ENVI style, as ONE action: the bounds are computed
+        from the pixels on screen now (the viewer's own method: its
+        percentiles / sigma, or 0.5-99.5 % for a fixed range) and applied as a
+        fixed (absolute) stretch, saved like a stretch-bar change -- so it
+        stays while the user pans and zooms, comes back with the band, and
+        nothing is recomputed or re-read on every view change (the earlier
+        continuous version re-rendered both viewers and re-asked for the COG
+        zoom tiles on every pan)."""
         try:
             if viewer is None or sip.isdeleted(viewer):
                 return
-            on = bool(getattr(viewer, "stretch_to_view", False))
-            if on != bool(getattr(self, "_stretch_to_view_on", False)):
-                # A toggle: it holds for every viewer of the tab, and for the
-                # viewers the next root opens.
-                self._stretch_to_view_on = on
-                for rec in (getattr(self, "viewer_widgets", None) or []):
-                    v = rec.get("viewer") if isinstance(rec, dict) else None
-                    if v is None or v is viewer or sip.isdeleted(v):
-                        continue
-                    if hasattr(v, "set_stretch_to_view"):
-                        v.set_stretch_to_view(on)
             idata = getattr(viewer, "image_data", None)
             base = getattr(idata, "image", None)
+            fp = getattr(idata, "filepath", None)
             if base is None:
                 return
-            arr = self._render_with_viewer_stretch(base, viewer, _as_array=True)
-            if arr is None:
+            import copy
+            from .stretch_stats import view_window
+            win = view_window(viewer, np.asarray(base).shape)
+            cur = getattr(viewer, "stretch_params", None)
+            if cur is None and fp:
+                cur = self._resolve_stretch_for_viewer(fp, self.get_root_by_filepath(fp)
+                                                       if hasattr(self, "get_root_by_filepath") else None)
+            cur = cur or _StretchParams(scope="viewer", display_mode="auto")
+            cur = self._sp_to_positions(cur, viewer)
+            stat = copy.copy(cur)
+            if str(stat.mode or "").lower() not in ("percentile", "stddev", "std"):
+                stat.mode, stat.low_p, stat.high_p = "percentile", 0.5, 99.5
+            b = {}
+            self._compute_stretched_preview(base, stat, bounds_out=b,
+                                            nodata_values=self._stretch_nodata_values(fp),
+                                            stats_window=win, bounds_only=True)
+            if "lo" not in b:
                 return
-            arr = np.asarray(arr)
-            # _render_with_viewer_stretch(_as_array=True) hands back BGR (or gray)
-            viewer.show_preview_array(arr, channel_order="bgr")
+            lo = np.atleast_1d(np.asarray(b["lo"], dtype=np.float64))
+            hi = np.atleast_1d(np.asarray(b["hi"], dtype=np.float64))
+            new = copy.copy(cur)
+            new.mode = "absolute"
+            new.scope = "viewer"
+            new.min_val, new.max_val = float(lo.min()), float(hi.max())
+            if lo.size > 1:
+                new.per_channel = True
+                new.band_mins = [float(v) for v in lo]
+                new.band_maxs = [float(v) for v in hi]
+            else:
+                new.band_mins = new.band_maxs = None
+            viewer.stretch_params = new
+            root_name = (self.get_root_by_filepath(fp)
+                         if fp and hasattr(self, "get_root_by_filepath") else None)
+            self._on_viewer_stretch_applied(new, viewer, root_name)
+            # The zoom tile on screen was mapped with the old bounds: ask for
+            # it again, once.
             try:
-                viewer._trigger_highres_update()
+                if getattr(viewer, "_highres_enabled", False):
+                    viewer._trigger_highres_update()
             except Exception:
                 pass
             try:
@@ -26596,16 +26653,7 @@ class ProjectTab(QtWidgets.QWidget):
             if _normal and (not prefer_last_band) and base is not None and hasattr(base, "ndim"):
                 _b_in = bounds if (isinstance(bounds, dict) and bounds.get("engine") == "C0") else None
                 _b_out = {} if _is_viewer_preview else None
-                # Stretch to view: the statistics of the part on screen only.
                 _win = stats_window
-                # (Qt geometry is read on the GUI thread only: the parallel
-                # navigation render runs on workers, against the previous
-                # image's pixmap -- a new image opens fitted anyway.)
-                if (_win is None and _b_in is None and _is_viewer_preview
-                        and getattr(viewer, "stretch_to_view", False)
-                        and threading.current_thread() is threading.main_thread()):
-                    from .stretch_stats import view_window as _view_window
-                    _win = _view_window(viewer, base.shape)
                 disp = self._compute_stretched_preview(base, sp, mask=precomputed_nodata_mask,
                                                        bounds=_b_in, bounds_out=_b_out,
                                                        nodata_values=self._stretch_nodata_values(fp, ax),
@@ -27726,9 +27774,6 @@ class ProjectTab(QtWidgets.QWidget):
             viewer.stretch_applied.connect(lambda params, v=viewer, rn=root_name: self._on_viewer_stretch_applied(params, v, rn))
             if hasattr(viewer, "set_view_stretch_callback"):
                 viewer.set_view_stretch_callback(self._apply_view_stretch)
-                if getattr(self, "_stretch_to_view_on", False):
-                    # the toggle carries over to the next root (rendered below)
-                    viewer.set_stretch_to_view(True, rerender=False)
 
             buttons_layout.addWidget(clean_button)
             buttons_layout.addWidget(edit_button)

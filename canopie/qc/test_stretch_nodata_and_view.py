@@ -282,80 +282,96 @@ def test_no_view_button_at_the_bottom_left(viewer_factory):
     assert not btns
 
 
+def _zoom_to_bright_half(viewer, qapp):
+    viewer.fitInView(QtCore.QRectF(130, 70, 60, 60), QtCore.Qt.KeepAspectRatio)
+    qapp.processEvents()
+
+
 def test_stretch_to_view_takes_the_statistics_on_screen(synthetic_project, viewer_factory, qapp):
+    """B, zoomed into the bright half: the stretch is that half's, kept as a
+    fixed (absolute) range."""
+    pt = synthetic_project
+    arr = _two_halves()
+    viewer = _viewer_with(viewer_factory, arr)
+    viewer.stretch_params = _sp(low_p=0.0, high_p=100.0)
+    _zoom_to_bright_half(viewer, qapp)
+    win = ss.view_window(viewer, arr.shape)
+    assert win is not None and win[0] >= 100, f"view window {win} is not the bright half"
+
+    pt._apply_view_stretch(viewer)
+    sp = viewer.stretch_params
+    want = ss.channel_bounds(arr, "percentile", 0, 100, window=win)
+    assert sp.mode == "absolute"
+    assert (sp.min_val, sp.max_val) == (pytest.approx(want[0]), pytest.approx(want[1]))
+    assert float(np.asarray(viewer._preview_stretch_bounds["lo"])) >= 1000.0
+
+
+def test_stretch_to_view_values_stay_while_panning(synthetic_project, viewer_factory, qapp):
+    """The values B set do not follow the view: panning and zooming
+    afterwards recompute nothing (and so start no extra render or tile read
+    -- the COG loading Nathan saw it interfere with)."""
+    from PyQt5.QtTest import QTest
     pt = synthetic_project
     arr = _two_halves()
     viewer = _viewer_with(viewer_factory, arr)
     viewer.stretch_params = _sp()
-    viewer.fitInView(QtCore.QRectF(130, 70, 60, 60), QtCore.Qt.KeepAspectRatio)
-    qapp.processEvents()
+    calls = []
+    viewer.set_view_stretch_callback(lambda v: (calls.append(1), pt._apply_view_stretch(v)))
+    _zoom_to_bright_half(viewer, qapp)
+    viewer._stretchbar._btn_view.click()
+    assert calls == [1]
+    kept = (viewer.stretch_params.min_val, viewer.stretch_params.max_val)
 
-    viewer.stretch_to_view = False
+    viewer.fitInView(QtCore.QRectF(5, 5, 60, 60), QtCore.Qt.KeepAspectRatio)   # the dark half
+    viewer.centerOn(40, 40)
+    QTest.qWait(500)
+    assert calls == [1], "panning re-ran the stretch"
+    assert (viewer.stretch_params.min_val, viewer.stretch_params.max_val) == kept
+
+    # a re-render (refresh, navigation) maps with the kept values too
     pt._render_with_viewer_stretch(arr, viewer, _as_array=True)
-    lo_full = float(np.asarray(viewer._preview_stretch_bounds["lo"]))
+    assert float(np.asarray(viewer._preview_stretch_bounds["lo"])) == pytest.approx(kept[0])
 
-    viewer.stretch_to_view = True
-    win = ss.view_window(viewer, arr.shape)
-    assert win is not None and win[0] >= 100, f"view window {win} is not the bright half"
-    pt._render_with_viewer_stretch(arr, viewer, _as_array=True)
-    lo_view = float(np.asarray(viewer._preview_stretch_bounds["lo"]))
-    hi_view = float(np.asarray(viewer._preview_stretch_bounds["hi"]))
-    assert lo_full == pytest.approx(0.0, abs=1e-3)
-    assert lo_view >= 1000.0, "Stretch to view still used the whole image"
-    want = ss.channel_bounds(arr, "percentile", 0, 100, window=win)
-    assert (lo_view, hi_view) == (pytest.approx(want[0]), pytest.approx(want[1]))
+    # pressing B again stretches to the NEW view
+    viewer._stretchbar._btn_view.click()
+    assert calls == [1, 1]
+    assert viewer.stretch_params.max_val <= 100.0
 
 
-def test_stretch_to_view_overrides_a_fixed_range(synthetic_project, viewer_factory, qapp):
+def test_stretch_to_view_replaces_a_fixed_range(synthetic_project, viewer_factory, qapp):
     pt = synthetic_project
     arr = _two_halves()
     viewer = _viewer_with(viewer_factory, arr)
     viewer.stretch_params = _sp(mode="absolute", min_val=0.0, max_val=2000.0)
-    viewer.fitInView(QtCore.QRectF(130, 70, 60, 60), QtCore.Qt.KeepAspectRatio)
-    qapp.processEvents()
-    viewer.stretch_to_view = True
-    pt._render_with_viewer_stretch(arr, viewer, _as_array=True)
-    assert float(np.asarray(viewer._preview_stretch_bounds["lo"])) >= 1000.0
+    _zoom_to_bright_half(viewer, qapp)
+    pt._apply_view_stretch(viewer)
+    assert viewer.stretch_params.min_val >= 1000.0
 
 
-def test_toggle_and_pan_run_the_view_stretch(viewer_factory, qapp):
-    from PyQt5.QtTest import QTest
-    arr = _two_halves()
+def test_stretch_to_view_is_per_channel_for_a_composite(synthetic_project, viewer_factory, qapp):
+    pt = synthetic_project
+    arr = np.stack([_two_halves(), _two_halves() * 2, _two_halves() * 3], axis=2)
     viewer = _viewer_with(viewer_factory, arr)
-    calls = []
-    viewer.set_view_stretch_callback(lambda v: calls.append(v.stretch_to_view))
-    viewer._stretchbar._btn_view.click()
-    assert viewer.stretch_to_view is True and calls == [True]
-    key0 = viewer._view_key()
-    viewer.setTransform(QtGui.QTransform.fromScale(4.0, 4.0))
-    viewer.centerOn(30, 30)
-    assert viewer._view_key() != key0, "the test did not move the view"
-    for _ in range(60):                  # the re-stretch is debounced
-        if len(calls) >= 2:
-            break
-        QTest.qWait(50)
-    assert len(calls) == 2, "panning / zooming did not re-stretch the view"
-    QTest.qWait(400)
-    assert len(calls) == 2, "the view stretch re-ran without the view moving"
-    viewer._stretchbar._btn_view.click()
-    assert viewer.stretch_to_view is False and calls[-1] is False
+    viewer.stretch_params = _sp()
+    _zoom_to_bright_half(viewer, qapp)
+    pt._apply_view_stretch(viewer)
+    sp = viewer.stretch_params
+    assert sp.band_mins is not None and len(sp.band_mins) == 3
+    assert sp.band_mins[1] == pytest.approx(2 * sp.band_mins[0], rel=1e-3)
 
 
-def test_square_beside_auto_switches_stretch_to_view(viewer_factory):
-    """The stretch bar's small square beside Auto switches Stretch to view and
-    shows the viewer's state when it is switched from elsewhere."""
-    arr = _two_halves()
-    viewer = _viewer_with(viewer_factory, arr)
+def test_square_beside_auto_is_a_one_shot_button(viewer_factory):
+    viewer = _viewer_with(viewer_factory, _two_halves())
     calls = []
-    viewer.set_view_stretch_callback(lambda v: calls.append(v.stretch_to_view))
+    viewer.set_view_stretch_callback(lambda v: calls.append(1))
     sb = viewer._stretchbar
     lay = sb.layout()
     order = [lay.itemAt(i).widget() for i in range(lay.count())]
     assert order.index(sb._btn_view) == order.index(sb._btn_auto) + 1, "the square is not beside Auto"
+    assert not sb._btn_view.isCheckable(), "B is an action, not an on/off mode"
     sb._btn_view.click()
-    assert viewer.stretch_to_view is True and calls == [True]
-    viewer.set_stretch_to_view(False)
-    assert viewer.stretch_to_view is False and not sb._btn_view.isChecked()
+    sb._btn_view.click()
+    assert calls == [1, 1]
 
 
 def test_stretch_bar_is_only_as_wide_as_its_content(viewer_factory):
@@ -438,3 +454,32 @@ def test_reset_image_forgets_every_band(band_viewer):
     _set_by_hand(pt, viewer, 10.0, 20.0)
     pt._clear_file_stretch(fp)
     assert pt._load_band_stretch(fp, "1") is None
+
+
+def test_a_band_keeps_the_stretch_b_gave_it(band_viewer, qapp):
+    pt, viewer, fp = band_viewer
+    pt._on_band_bar_clicked(viewer, "root_x", 1)
+    viewer.fitInView(QtCore.QRectF(0, 0, 12, 12), QtCore.Qt.KeepAspectRatio)
+    qapp.processEvents()
+    pt._apply_view_stretch(viewer)
+    kept = (viewer.stretch_params.min_val, viewer.stretch_params.max_val)
+    assert viewer.stretch_params.mode == "absolute"
+    pt._on_band_bar_clicked(viewer, "root_x", 2)
+    pt._on_band_bar_clicked(viewer, "root_x", 1)
+    sp = viewer.stretch_params
+    assert sp.mode == "absolute" and (sp.min_val, sp.max_val) == (
+        pytest.approx(kept[0]), pytest.approx(kept[1])), "band 2 lost the stretch B gave it"
+
+
+@pytest.mark.parametrize("shape", [(60, 80), (60, 80, 3)])
+@pytest.mark.parametrize("kw", [dict(), dict(mode="absolute", min_val=100.0, max_val=40000.0),
+                                dict(clip=False)], ids=["pct", "abs", "noclip"])
+def test_uint16_lookup_table_renders_like_the_float_path(synthetic_project, shape, kw):
+    """16-bit images map through a lookup table (a 3000 x 3000 ortho preview
+    went 0.8 s -> 0.1 s); it must give exactly the float path's pixels."""
+    pt = synthetic_project
+    a = np.random.default_rng(7).integers(0, 65535, size=shape, dtype=np.uint16)
+    sp = _sp(**kw) if kw else _StretchParams()
+    got = np.asarray(pt._compute_stretched_preview(a, sp))
+    ref = np.asarray(pt._compute_stretched_preview(a.astype(np.float32), sp))
+    assert np.array_equal(got, ref)

@@ -2423,11 +2423,8 @@ class ImageViewer(QtWidgets.QGraphicsView):
         if not hasattr(ImageViewer, "overlays_muted"):
             ImageViewer.overlays_muted = False
         self._overlay_toggle_btn = _OverlayToggleButton(self)
-        # Stretch to view (ENVI / QGIS "current extent"): statistics from the
-        # pixels on screen only, recomputed as the view is panned / zoomed.
-        self.stretch_to_view = False
+        # Stretch to view (ENVI): a one-shot action -- see stretch_to_view().
         self._view_stretch_callback = None
-        self._view_stretch_last_key = None
 
         # Panning / focus
         self.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
@@ -3900,56 +3897,17 @@ class ImageViewer(QtWidgets.QGraphicsView):
         reads full resolution once zoomed in, so the pixels are there to see."""
         return float(base) * self.native_per_preview()
 
-    # --- Stretch to view ----------------------------------------------------
+    # --- Stretch to view (one shot) ----------------------------------------
     def set_view_stretch_callback(self, callback):
-        """`callback(viewer)` re-renders this viewer's preview for Stretch to
-        view (ProjectTab._apply_view_stretch)."""
+        """`callback(viewer)` stretches this viewer by the pixels it shows
+        (ProjectTab._apply_view_stretch)."""
         self._view_stretch_callback = callback
 
-    def set_stretch_to_view(self, on, rerender=True):
-        """Turn Stretch to view on / off for this viewer."""
-        on = bool(on)
-        changed = on != bool(getattr(self, "stretch_to_view", False))
-        self.stretch_to_view = on
-        self._view_stretch_last_key = None
-        sb = getattr(self, "_stretchbar", None)
-        if sb is not None and hasattr(sb, "sync_view_button"):
-            sb.sync_view_button()
-        if changed and rerender:
-            self._run_view_stretch()
-
-    def _view_key(self):
-        """What the screen shows, coarsely: the visible scene rect."""
-        try:
-            r = self.mapToScene(self.viewport().rect()).boundingRect()
-            return (round(r.left(), 1), round(r.top(), 1),
-                    round(r.width(), 1), round(r.height(), 1))
-        except Exception:
-            return None
-
-    def _trigger_view_stretch(self):
-        """Debounced re-stretch after the view moved (Stretch to view on)."""
-        if not getattr(self, "stretch_to_view", False):
-            return
-        timer = getattr(self, "_view_stretch_timer", None)
-        if timer is None:
-            timer = QtCore.QTimer(self)
-            timer.setSingleShot(True)
-            timer.setInterval(180)
-            timer.timeout.connect(self._on_view_stretch_timeout)
-            self._view_stretch_timer = timer
-        timer.start()
-
-    def _on_view_stretch_timeout(self):
-        if not getattr(self, "stretch_to_view", False):
-            return
-        key = self._view_key()
-        if key is not None and key == getattr(self, "_view_stretch_last_key", None):
-            return          # the view did not actually move
-        self._run_view_stretch()
-
-    def _run_view_stretch(self):
-        self._view_stretch_last_key = self._view_key()
+    def stretch_to_view(self):
+        """ENVI's "stretch to view": compute the stretch from the pixels on
+        screen NOW and keep those values. Panning and zooming afterwards do
+        not change it (nothing is recomputed, nothing extra is loaded); press
+        again to stretch to the new view."""
         cb = getattr(self, "_view_stretch_callback", None)
         if cb is None:
             pt = _find_nodata_owner(self)
@@ -3958,10 +3916,9 @@ class ImageViewer(QtWidgets.QGraphicsView):
             try:
                 cb(self)
             except Exception as e:
-                logging.debug(f"[ImageViewer] view stretch failed: {e}")
+                logging.debug(f"[ImageViewer] stretch to view failed: {e}")
 
     def _trigger_highres_update(self):
-        self._trigger_view_stretch()
         if not getattr(self, "_highres_enabled", False):
             return
         self.cancel_pending_highres_requests()
@@ -3976,11 +3933,6 @@ class ImageViewer(QtWidgets.QGraphicsView):
 
     def _on_highres_timer_timeout(self):
         if not getattr(self, "_highres_enabled", False):
-            return
-        _vst = getattr(self, "_view_stretch_timer", None)
-        if getattr(self, "stretch_to_view", False) and _vst is not None and _vst.isActive():
-            # The view's new stretch is about to be computed; it asks for the
-            # tile itself, mapped with the new bounds.
             return
         current_req_id = getattr(self, "_highres_request_id", 0)
         scale = self.transform().m11()
@@ -9827,17 +9779,18 @@ class _StretchBar(QtWidgets.QFrame):
         self._btn_auto.clicked.connect(self._on_auto_clicked)
         layout.addWidget(self._btn_auto)
 
-        # Stretch to view (ENVI): the small square beside Auto.
+        # Stretch to view (ENVI): the small square beside Auto. One click
+        # stretches by the pixels on screen and keeps those values.
         self._btn_view = QtWidgets.QToolButton(self)
         self._btn_view.setObjectName("_StretchBarViewBtn")
         self._btn_view.setText("\u25a3")
-        self._btn_view.setCheckable(True)
         self._btn_view.setFixedSize(24, 20)
         self._btn_view.setStyleSheet("QToolButton { font-size: 14px; padding: 0px; }")
         self._btn_view.setToolTip(
-            "Stretch to view (ENVI): stretch by the pixels on screen only, "
-            "following pan and zoom")
-        self._btn_view.toggled.connect(self._on_view_toggled)
+            "Stretch to view (ENVI): stretch by the pixels on screen now. "
+            "The values stay while you pan and zoom; click again to stretch "
+            "to the new view.")
+        self._btn_view.clicked.connect(self._on_view_clicked)
         layout.addWidget(self._btn_view)
 
         self._slider_min.valueChanged.connect(self._on_slider_changed)
@@ -10015,18 +9968,6 @@ class _StretchBar(QtWidgets.QFrame):
         key = self._current_band_key()
         cache = self._range_cache()
         rng = cache.get(key)
-        if getattr(self._view, "stretch_to_view", False):
-            # Stretch to view: the sliders span what is on screen.
-            try:
-                from .stretch_stats import view_window, _window
-                win = view_window(self._view, img.shape)
-                if win is not None:
-                    vr = self._compute_data_range(
-                        _window(self._stats_slice_for_key(img, key), win)[0])
-                    if vr is not None:
-                        rng = vr
-            except Exception as e:
-                logging.debug(f"[_StretchBar] view range failed: {e}")
         if rng is None:
             try:
                 rng = self._compute_data_range(self._stats_slice_for_key(img, key))
@@ -10113,12 +10054,6 @@ class _StretchBar(QtWidgets.QFrame):
     def _apply_stretch(self):
         """Apply absolute stretch — preserves all display_mode/band settings from the
         current stretch_params so the bar never changes which band/composite is shown."""
-        if getattr(self._view, "stretch_to_view", False):
-            # A range set by hand replaces the automatic one (as in ENVI).
-            try:
-                self._view.set_stretch_to_view(False, rerender=False)
-            except Exception:
-                pass
         pmin = self._slider_min.value()
         pmax = self._slider_max.value()
         c_min = self._pos_to_val(pmin)
@@ -10172,21 +10107,11 @@ class _StretchBar(QtWidgets.QFrame):
         except Exception as e:
             logging.debug(f"[_StretchBar] stretch_applied emit failed: {e}")
 
-    def sync_view_button(self):
-        btn = getattr(self, "_btn_view", None)
-        if btn is None:
-            return
-        b = btn.blockSignals(True)
+    def _on_view_clicked(self):
         try:
-            btn.setChecked(bool(getattr(self._view, "stretch_to_view", False)))
-        finally:
-            btn.blockSignals(b)
-
-    def _on_view_toggled(self, checked):
-        try:
-            self._view.set_stretch_to_view(bool(checked))
+            self._view.stretch_to_view()
         except Exception as e:
-            logging.debug(f"[_StretchBar] stretch to view toggle failed: {e}")
+            logging.debug(f"[_StretchBar] stretch to view failed: {e}")
         self.show_briefly()
 
     def _on_auto_clicked(self):
