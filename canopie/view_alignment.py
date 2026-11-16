@@ -4,9 +4,12 @@ root that cover the same ground but do not share a pixel grid (two
 orthomosaics of one forest with different row / column counts, resolution, a
 small rotation or a residual georeference error).
 
-A few spots of the reference image are matched in each other image with the
-canopy finder, and a SIMILARITY (shift + rotation + one scale) is fitted per
-image, from reference RAW file pixels to that image's RAW file pixels. Raw
+Spots of the reference image (picked, clicked, or the user's own polygons)
+are matched in each other image with the canopy finder, and a fit is made per
+image, from reference RAW file pixels to that image's RAW file pixels: a
+SIMILARITY (shift + rotation + one scale), plus, in the default "local" mode,
+a smooth correction from the nearby spots so the local distortions of each
+mosaic are followed (fit_alignment). Raw
 pixels, not records: a polygon record is a fraction of the post-.ax frame in
 raw-basis units, which is anisotropic once a crop is applied, and a later .ax
 edit would invalidate anything stored in it. Raw pixels never change.
@@ -25,8 +28,9 @@ import numpy as np
 
 from . import ax_geometry as G
 
-__all__ = ["pick_spots", "spot_side_px", "fit_similarity", "similarity_params",
+__all__ = ["pick_spots", "spot_side_px", "fit_similarity", "fit_alignment", "similarity_params",
            "invert", "compose", "apply", "record_to_raw_pts", "raw_to_record_pts",
+           "warp_forward", "warp_inverse", "chain_apply", "chain_global", "IDENTITY_WARP",
            "AlignmentSets", "map_record_points", "map_record", "spot_residuals"]
 
 #: spot side (raw px of the reference's export frame), and in metres of ground
@@ -98,7 +102,7 @@ def spot_residuals(M, spots):
     return out
 
 
-def fit_similarity(spots, min_spots=2, side_px=None):
+def fit_similarity(spots, min_spots=2, side_px=None, reject=True):
     """Least-squares similarity (no reflection) from matched spots.
 
     spots: [{"src": (k, 2) points, "dst": (k, 2) points, "weight": float}]
@@ -122,12 +126,13 @@ def fit_similarity(spots, min_spots=2, side_px=None):
         src = np.vstack([np.asarray(spots[i]["src"], np.float64).reshape(-1, 2) for i in idx])
         dst = np.vstack([np.asarray(spots[i]["dst"], np.float64).reshape(-1, 2) for i in idx])
         w = np.concatenate([np.full(len(np.asarray(spots[i]["src"]).reshape(-1, 2)),
-                                    max(1e-3, float(spots[i].get("weight", 1.0)))) for i in idx])
+                                    max(1e-3, float(spots[i].get("weight", 1.0)))
+                                    / len(np.asarray(spots[i]["src"]).reshape(-1, 2))) for i in idx])
         return _umeyama(src, dst, w)
 
     idx = list(use)
     M, refl = _fit(idx)
-    while len(idx) > 3:
+    while reject and len(idx) > 3:
         # leave-one-out: a wrong spot drags a plain least-squares fit toward
         # itself and hides; judged against the fit of the OTHERS it stands out
         loo = []
@@ -148,6 +153,221 @@ def fit_similarity(spots, min_spots=2, side_px=None):
     rms = float(math.sqrt(np.mean(np.square(r_used)))) if r_used else float("nan")
     return {"M": M, "used": used, "rms_px": rms, "residuals": res_all, "reflected": bool(refl),
             "n_used": len(idx)}
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Local fit: a global similarity plus a smooth correction from nearby spots
+# ════════════════════════════════════════════════════════════════════════
+#
+# Orthomosaics of one forest are rarely related by one similarity: each
+# mosaic has its own local distortions, so the shift, rotation and scale that
+# line up one corner are off in another. The local fit keeps the global
+# similarity M and adds a correction field r(p): the residual of every matched
+# spot point (dst - M src) blended with Gaussian weights around where the spot
+# is. Near a spot its own residuals decide, between spots they blend smoothly
+# (a rotation or scale that changes across the image shows up as the field's
+# gradient), and far from every spot the field fades to 0 so the global
+# similarity takes over:
+#
+#     F(p) = M p + sum_i q_i g_i(p) r_i / (W0 + sum_i q_i g_i(p)),
+#     g_i(p) = exp(-|p - c_i|^2 / (2 sigma^2))
+#
+# q_i shares one spot's weight among its points; sigma follows the spacing of
+# the spots. Plain data (a "warp" dict), so it is stored in global.ax and
+# travels to worker threads.
+
+#: identity warp (the reference image)
+IDENTITY_WARP = {"M": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]}
+
+LOCAL_W0 = 0.02          # prior weight of "no correction" (where no spot is near)
+
+
+def _field(local, P):
+    C = np.asarray(local["pts"], np.float64).reshape(-1, 2)
+    if not len(C) or not len(P):
+        return np.zeros_like(P)
+    R = np.asarray(local["res"], np.float64).reshape(-1, 2)
+    q = np.asarray(local["q"], np.float64).reshape(-1)
+    s2 = 2.0 * float(local["sigma"]) ** 2
+    out = np.empty_like(P)
+    w0 = float(local.get("w0", LOCAL_W0))
+    for a in range(0, len(P), 4096):              # bounded memory for big rings
+        p = P[a:a + 4096]
+        d2 = ((p[:, None, :] - C[None]) ** 2).sum(-1)
+        g = np.exp(-d2 / s2) * q[None]
+        out[a:a + 4096] = (g @ R) / (w0 + g.sum(1))[:, None]
+    return out
+
+
+def warp_forward(warp, pts):
+    """raw reference px -> raw image px through a warp {"M", "local"?}."""
+    P = np.asarray(pts, np.float64).reshape(-1, 2)
+    Q = apply(warp["M"], P)
+    loc = warp.get("local")
+    if loc:
+        Q = Q + _field(loc, P)
+    return Q
+
+
+def warp_inverse(warp, pts, iters=8):
+    """raw image px -> raw reference px (fixed-point inverse of warp_forward;
+    the field is smooth and small, so a few iterations are exact to << 0.01 px)."""
+    Q = np.asarray(pts, np.float64).reshape(-1, 2)
+    Mi = invert(warp["M"])
+    P = apply(Mi, Q)
+    loc = warp.get("local")
+    if loc:
+        for _ in range(int(iters)):
+            P = apply(Mi, Q - _field(loc, P))
+    return P
+
+
+def chain_apply(chain, pts):
+    """raw a -> raw b for a chain {"a": warp ref->a, "b": warp ref->b}."""
+    return warp_forward(chain["b"], warp_inverse(chain["a"], pts))
+
+
+def chain_global(chain):
+    """The global 2x3 part of a chain (raw a -> raw b)."""
+    return compose(np.asarray(chain["b"]["M"], np.float64), invert(chain["a"]["M"]))
+
+
+def _spot_xy(spot):
+    return np.asarray(spot["src"], np.float64).reshape(-1, 2)
+
+
+def _build_local(M, spots, idx, sigma):
+    C, R, q = [], [], []
+    for i in idx:
+        src = _spot_xy(spots[i])
+        dst = np.asarray(spots[i]["dst"], np.float64).reshape(-1, 2)
+        k = len(src)
+        C.append(src)
+        R.append(dst - apply(M, src))
+        q.append(np.full(k, max(1e-3, float(spots[i].get("weight", 1.0))) / k))
+    return {"pts": np.vstack(C).round(3).tolist(), "res": np.vstack(R).round(4).tolist(),
+            "q": np.concatenate(q).round(5).tolist(), "sigma": float(sigma), "w0": LOCAL_W0}
+
+
+def _local_sigma(spots, idx, side_px):
+    cen = np.array([_spot_xy(spots[i]).mean(0) for i in idx])
+    if len(cen) < 2:
+        return float(side_px or 100.0) * 3.0
+    d = np.sqrt(((cen[:, None] - cen[None]) ** 2).sum(-1))
+    np.fill_diagonal(d, np.inf)
+    nn = float(np.median(d.min(1)))
+    return float(max(0.7 * nn, 1.5 * float(side_px or 0.0), 1.0))
+
+
+def fit_alignment(spots, mode="local", min_spots=2, side_px=None):
+    """The fit used by viewer alignment.
+
+    mode "global": fit_similarity (one shift, rotation and scale).
+    mode "local":  the global similarity of all spots plus the correction
+                   field above. A spot is dropped when its neighbours predict
+                   it badly (leave-one-out against the field of the others:
+                   the local counterpart of fit_similarity's test, which would
+                   otherwise throw out every spot that sits in a distorted
+                   part of the mosaic).
+
+    Returns fit_similarity's dict plus "mode", "local" (the field or None),
+    "warp" ({"M", "local"}) and "loo_px" (RMS error of each spot as predicted
+    by the others: the accuracy to expect between spots)."""
+    if side_px is None:
+        try:
+            side_px = float(np.median([np.ptp(_spot_xy(s), axis=0).max() for s in spots
+                                       if s.get("dst") is not None]))
+        except Exception:
+            side_px = 100.0
+    if mode != "local":
+        g = fit_similarity(spots, min_spots=min_spots, side_px=side_px)
+        if g is None:
+            return None
+        g.update(mode="global", local=None, warp={"M": np.asarray(g["M"]).tolist()},
+                 loo_px=_loo_global(spots, g, side_px))
+        return g
+    g = fit_similarity(spots, min_spots=min_spots, side_px=side_px, reject=False)
+    if g is None:
+        return None
+    idx = [i for i, u in enumerate(g["used"]) if u]
+    if len(idx) < 3:
+        g.update(mode="global", local=None, warp={"M": np.asarray(g["M"]).tolist()}, loo_px=float("nan"))
+        return g
+
+    def _glob(ix):
+        r = fit_similarity([spots[i] for i in ix], min_spots=1, side_px=side_px, reject=False)
+        return np.asarray(r["M"], np.float64), bool(r["reflected"])
+
+    def _loo(ix, M):
+        sig = _local_sigma(spots, ix, side_px)
+        errs = []
+        for j in range(len(ix)):
+            rest = ix[:j] + ix[j + 1:]
+            w = {"M": M, "local": _build_local(M, spots, rest, sig)}
+            pred = warp_forward(w, _spot_xy(spots[ix[j]]))
+            dst = np.asarray(spots[ix[j]]["dst"], np.float64).reshape(-1, 2)
+            errs.append(float(np.hypot(*(pred - dst).T).mean()))
+        return errs
+
+    # 1. wrong matches first: the strict global test (on a real mosaic pair a
+    #    third of the spots can be mismatches, which would inflate the median
+    #    the local test below is judged against and keep them all)
+    g0 = fit_similarity(spots, min_spots=min_spots, side_px=side_px, reject=True)
+    inl = [i for i, u in enumerate(g0["used"]) if u]
+    if len(inl) >= 3:
+        # 2. a spot the global test dropped only because it sits in a
+        #    distorted part of the mosaic comes back when the field of the
+        #    inliers explains it
+        M0, _r0 = _glob(inl)
+        loo0 = _loo(inl, M0)
+        lim = max(3.0 * float(np.median(loo0)), 0.015 * side_px)
+        w0 = {"M": M0, "local": _build_local(M0, spots, inl, _local_sigma(spots, inl, side_px))}
+        back = []
+        for j in idx:
+            if j in inl:
+                continue
+            dst = np.asarray(spots[j]["dst"], np.float64).reshape(-1, 2)
+            e = float(np.hypot(*(warp_forward(w0, _spot_xy(spots[j])) - dst).T).mean())
+            if e <= lim:
+                back.append(j)
+        idx = sorted(inl + back)
+    M, refl = _glob(idx)
+    errs = _loo(idx, M)
+    while len(idx) > 4:
+        k = int(np.argmax(errs))
+        if errs[k] <= max(3.0 * float(np.median(errs)), 0.015 * side_px):
+            break
+        idx.pop(k)
+        M, refl = _glob(idx)
+        errs = _loo(idx, M)
+    sigma = _local_sigma(spots, idx, side_px)
+    local = _build_local(M, spots, idx, sigma)
+    warp = {"M": M.tolist(), "local": local}
+    res_all = []
+    for s in spots:
+        if s.get("dst") is None:
+            res_all.append(float("nan"))
+            continue
+        p = warp_forward(warp, _spot_xy(s))
+        res_all.append(float(np.hypot(*(p - np.asarray(s["dst"], np.float64).reshape(-1, 2)).T).mean()))
+    r_used = [res_all[i] for i in idx]
+    return {"M": M, "used": [i in idx for i in range(len(spots))],
+            "rms_px": float(math.sqrt(np.mean(np.square(r_used)))),
+            "residuals": res_all, "reflected": refl, "n_used": len(idx),
+            "mode": "local", "local": local, "warp": warp,
+            "loo_px": float(math.sqrt(np.mean(np.square(errs))))}
+
+
+def _loo_global(spots, g, side_px):
+    idx = [i for i, u in enumerate(g["used"]) if u]
+    if len(idx) < 3:
+        return float("nan")
+    errs = []
+    for j in range(len(idx)):
+        rest = [spots[i] for i in idx[:j] + idx[j + 1:]]
+        r = fit_similarity(rest, min_spots=1, side_px=side_px, reject=False)
+        errs.append(spot_residuals(r["M"], [spots[idx[j]]])[0])
+    return float(math.sqrt(np.mean(np.square(errs))))
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -225,10 +445,32 @@ def pick_spots(img, valid=None, n=5, side=None, region=None):
     if not (score > 0).any():
         return []
     picks = []
-    cells = [(0.2, 0.2), (0.8, 0.2), (0.2, 0.8), (0.8, 0.8), (0.5, 0.5)]
-    for cx, cy in cells[:max(1, n)]:
-        x0, x1 = int((cx - 0.17) * sw), int((cx + 0.17) * sw)
-        y0, y1 = int((cy - 0.17) * sh), int((cy + 0.17) * sh)
+    n = max(1, int(n))
+    if n <= 5:
+        cells = [(0.2, 0.2), (0.8, 0.2), (0.2, 0.8), (0.8, 0.8), (0.5, 0.5)][:n]
+        hx = hy = 0.17
+    else:
+        # more spots (a local fit): a grid of cells over the frame, ~one spot each
+        # the grid with the fewest spare cells whose cells are closest to square
+        asp = sw / float(max(1, sh))
+        gx, gy = min(((x, int(math.ceil(n / float(x)))) for x in range(1, n + 1)),
+                     key=lambda g: (g[0] * g[1] - n) + 2.0 * abs(math.log((g[0] / float(g[1])) / asp)))
+        cells = [((i + 0.5) / gx, (j + 0.5) / gy) for j in range(gy) for i in range(gx)]
+        # with more cells than spots, take them spread out (farthest first),
+        # not row by row (that left the last row of the frame empty)
+        C = np.array(cells, np.float64) * (sw, sh)
+        order = [int(np.argmin(((C - C.mean(0)) ** 2).sum(1)))]
+        while len(order) < len(cells):
+            d = np.sqrt(((C[:, None] - C[order][None]) ** 2).sum(-1)).min(1)
+            d[order] = -1.0
+            order.append(int(np.argmax(d)))
+        cells = [cells[i] for i in order]
+        hx, hy = 0.5 / gx, 0.5 / gy
+    for cx, cy in cells:
+        if len(picks) >= n:
+            break
+        x0, x1 = int((cx - hx) * sw), int((cx + hx) * sw)
+        y0, y1 = int((cy - hy) * sh), int((cy + hy) * sh)
         x0, y0 = max(0, x0), max(0, y0)
         sub = score[y0:y1, x0:x1]
         if sub.size and sub.max() > 0:
@@ -295,14 +537,23 @@ def raw_to_export(pts, ax, raw_w, raw_h):
     return G.forward_np(ops, a) if ops else a
 
 
+def map_raw_points(raw, pm):
+    """Raw source px -> raw target px through a point map: its "chain"
+    (local fits) or its plain "M" (2x3)."""
+    if pm.get("chain"):
+        return chain_apply(pm["chain"], raw)
+    return apply(pm["M"], raw)
+
+
 def map_record_points(pts, pm, ref_wh=None):
     """Record points of the source image -> record points of the target,
-    through a point map {"M" (raw src -> raw dst), "src_ax", "dst_ax",
-    "src_raw_wh", "dst_raw_wh"} (plain data: it travels to worker threads)."""
+    through a point map {"chain" (or "M": raw src -> raw dst), "src_ax",
+    "dst_ax", "src_raw_wh", "dst_raw_wh"} (plain data: it travels to worker
+    threads)."""
     sw, sh = pm["src_raw_wh"]
     dw, dh = pm["dst_raw_wh"]
     raw = record_to_raw_pts(pts, pm.get("src_ax"), sw, sh, ref_wh=ref_wh)
-    return raw_to_record_pts(apply(pm["M"], raw), pm.get("dst_ax"), dw, dh)
+    return raw_to_record_pts(map_raw_points(raw, pm), pm.get("dst_ax"), dw, dh)
 
 
 def map_record(full, pm, src_wh=None, stamp=None):
@@ -327,7 +578,8 @@ def map_record(full, pm, src_wh=None, stamp=None):
     out["points"] = map_record_points(pts, pm, rwh).tolist() if len(pts) else []
     dw, dh = pm["dst_raw_wh"]
     out["image_ref_size"] = {"w": int(dw), "h": int(dh)}
-    s2 = float(abs(np.linalg.det(np.asarray(pm["M"], np.float64).reshape(2, 3)[:, :2])))
+    Mg = chain_global(pm["chain"]) if pm.get("chain") else np.asarray(pm["M"], np.float64).reshape(2, 3)
+    s2 = float(abs(np.linalg.det(Mg[:, :2])))
     patches = full.get("annotator_patches")
     if patches:
         newp = {}
@@ -417,26 +669,35 @@ class AlignmentSets:
         return None, None
 
     @staticmethod
-    def _to_ref(s, fp):
-        """2x3 raw ref -> raw fp, or None."""
+    def warp_of(s, fp):
+        """The warp raw ref -> raw fp ({"M", "local"?}), or None."""
         if _norm(fp) == _norm(s["reference"]):
-            return np.array([[1.0, 0, 0], [0, 1.0, 0]])
+            return dict(IDENTITY_WARP)
         for k, t in (s.get("targets") or {}).items():
             if _norm(k) == _norm(fp) and t.get("M") is not None:
-                return np.asarray(t["M"], np.float64).reshape(2, 3)
+                w = {"M": np.asarray(t["M"], np.float64).reshape(2, 3).tolist()}
+                if t.get("local"):
+                    w["local"] = t["local"]
+                return w
         return None
 
     def chain(self, fp_a, fp_b, enabled_only=True):
-        """2x3 raw a -> raw b, or None when no (enabled) set holds both."""
+        """{"a": warp ref->a, "b": warp ref->b} (chain_apply maps raw a ->
+        raw b), or None when no (enabled) set holds both."""
         if _norm(fp_a) == _norm(fp_b):
             return None
         _sid, s = self.set_for(fp_a, fp_b, enabled_only=enabled_only)
         if s is None:
             return None
-        Ma, Mb = self._to_ref(s, fp_a), self._to_ref(s, fp_b)
-        if Ma is None or Mb is None:
+        wa, wb = self.warp_of(s, fp_a), self.warp_of(s, fp_b)
+        if wa is None or wb is None:
             return None
-        return compose(Mb, invert(Ma))
+        return {"a": wa, "b": wb}
+
+    def matrix(self, fp_a, fp_b, enabled_only=True):
+        """The global 2x3 part of chain(): raw a -> raw b, or None."""
+        ch = self.chain(fp_a, fp_b, enabled_only=enabled_only)
+        return None if ch is None else chain_global(ch)
 
     def reference_of(self, fp, enabled_only=True):
         _sid, s = self.set_for(fp, enabled_only=enabled_only)

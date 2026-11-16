@@ -1,8 +1,9 @@
 """
-The window of viewer alignment (view_alignment.py): pick spots on the
-reference image, match them in the other images of the root with the canopy
-finder's worker, fit one similarity per image, let the user correct spots in
-the canopy browser, re-fit, and apply.
+The window of viewer alignment (view_alignment.py): spots on the reference
+image (picked automatically, clicked, or the user's own polygons), matched in
+the other images of the root or of every root with the canopy finder's
+worker; one fit per image (local by default: it follows each mosaic's
+distortions), the canopy browser to correct spots, re-fit, and apply.
 
 Reuses, unchanged in their logic:
   canopy_finder_dialog.CanopyFindWorker  -- the matching (threads / processes,
@@ -37,7 +38,7 @@ def _affine_from_3(P, Q):
 class AlignmentDialog(QtWidgets.QDialog):
     browser_allows_save = False
 
-    def __init__(self, pt, ref_viewer, target_fps, spot_scene_pts=None, cfg=None):
+    def __init__(self, pt, ref_viewer, target_fps=None, spot_scene_pts=None, cfg=None):
         super().__init__(pt, QtCore.Qt.Window)
         self.setWindowTitle("Align viewers")
         self.setStyleSheet(D.STYLE)
@@ -48,10 +49,10 @@ class AlignmentDialog(QtWidgets.QDialog):
         self.ref_geo = CF.frame_for(self.ref_fp, ax=self.ref_ax)
         self.frames = CF.Frames(pt)
         self.targets = []
-        for f in target_fps:
-            ax = (pt._load_ax_mods(f) or {}) if hasattr(pt, "_load_ax_mods") else {}
-            self.targets.append({"fp": f, "ax": ax, "root": os.path.basename(f), "project": None,
-                                 "external": False})
+        self._explicit_targets = target_fps is not None
+        if target_fps is not None:
+            self._set_targets(target_fps)
+        self._clicker = None
         self.spot_scene_pts = None if spot_scene_pts is None else np.asarray(spot_scene_pts, np.float64)
         self.extra_cfg = dict(cfg or {})
         self.results = []           # [Result, target dict, saved state] -- the browser's model
@@ -62,7 +63,44 @@ class AlignmentDialog(QtWidgets.QDialog):
         self.browser = None
         self._prior = None          # {fp: 2x3 export ref -> export target}
         self._build_ui()
-        self.resize(760, 380)
+        self.resize(860, 420)
+        self._update_info()
+
+    def _set_targets(self, fps):
+        self.targets = []
+        for f in fps:
+            ax = (self.pt._load_ax_mods(f) or {}) if hasattr(self.pt, "_load_ax_mods") else {}
+            root = None
+            try:
+                root = self.pt.get_root_by_filepath(f)
+            except Exception:
+                root = None
+            self.targets.append({"fp": f, "ax": ax, "root": root or os.path.basename(f), "project": None,
+                                 "external": False})
+
+    def _scope_targets(self):
+        if self._explicit_targets:
+            return [t["fp"] for t in self.targets]
+        return self.pt._view_align_target_fps(self.ref_fp, all_roots=self.scope.currentData() == "all")
+
+    def set_source(self, kind):
+        i = self.source.findData(kind)
+        if i >= 0:
+            self.source.setCurrentIndex(i)
+
+    def _n_polygons(self):
+        try:
+            return len(self.pt._view_align_polygon_records(self.ref_fp))
+        except Exception:
+            return 0
+
+    def _update_info(self):
+        try:
+            n = len(self._scope_targets())
+        except Exception:
+            n = len(self.targets)
+        self.info.setText(f"Reference: <b>{os.path.basename(self.ref_fp)}</b> — {n} image(s) to align. "
+                          "Choose the spots and press <b>Match</b>.")
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -70,6 +108,36 @@ class AlignmentDialog(QtWidgets.QDialog):
         self.info = QtWidgets.QLabel()
         self.info.setWordWrap(True)
         lay.addWidget(self.info)
+        row0 = QtWidgets.QHBoxLayout()
+        self.scope = QtWidgets.QComboBox()
+        self.scope.addItem("This root", "root")
+        self.scope.addItem("All roots", "all")
+        self.scope.setToolTip("Align the other images of this root, or every image of the project, "
+                              "to this image")
+        self.source = QtWidgets.QComboBox()
+        self.source.addItem("Automatic", "auto")
+        self.source.addItem("Click them on the image", "click")
+        self.source.addItem("My polygons on this image", "polygons")
+        self.source.setToolTip("Where the spots come from. Your polygons: each crown drawn on this "
+                               "image is matched (the most spread ones, up to the number of spots)")
+        self.n_spots = QtWidgets.QSpinBox()
+        self.n_spots.setRange(3, 60)
+        self.n_spots.setValue(12)
+        self.n_spots.setToolTip("More spots let the local fit follow the distortions of each mosaic")
+        self.fit_mode = QtWidgets.QComboBox()
+        self.fit_mode.addItem("Local (follows distortions)", "local")
+        self.fit_mode.addItem("Global (one shift, rotation, scale)", "global")
+        self.fit_mode.setToolTip("Local: each place takes its shift, rotation and scale from the nearby "
+                                 "spots. Global: one similarity for the whole image")
+        row0.addWidget(QtWidgets.QLabel("Images")); row0.addWidget(self.scope)
+        row0.addSpacing(12)
+        row0.addWidget(QtWidgets.QLabel("Spots")); row0.addWidget(self.source); row0.addWidget(self.n_spots)
+        row0.addSpacing(12)
+        row0.addWidget(QtWidgets.QLabel("Fit")); row0.addWidget(self.fit_mode)
+        row0.addStretch(1)
+        lay.addLayout(row0)
+        self.scope.currentIndexChanged.connect(lambda _i: self._update_info())
+        self.fit_mode.currentIndexChanged.connect(lambda _i: self.fits and self.refit())
         row = QtWidgets.QHBoxLayout()
         self.radius = QtWidgets.QDoubleSpinBox()
         self.radius.setRange(2.0, 150.0); self.radius.setValue(40.0); self.radius.setSuffix(" m")
@@ -85,13 +153,20 @@ class AlignmentDialog(QtWidgets.QDialog):
         self.progress = QtWidgets.QProgressBar()
         self.progress.setTextVisible(True)
         lay.addWidget(self.progress)
-        self.table = QtWidgets.QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["Image", "Spots used", "RMS", "Scale", "Rotation", "Status"])
+        self.table = QtWidgets.QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["Image", "Spots used", "Fit error", "Between spots",
+                                              "Scale", "Rotation", "Status"])
+        self.table.horizontalHeaderItem(3).setToolTip(
+            "Each spot predicted from the others: the accuracy to expect between spots")
         self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         lay.addWidget(self.table, 1)
         btns = QtWidgets.QHBoxLayout()
+        self.b_match = QtWidgets.QPushButton("Match")
+        self.b_match.setToolTip("Pick the spots and search them in the images")
+        btns.addWidget(self.b_match)
+        self.b_match.clicked.connect(self._on_match)
         self.b_browser = QtWidgets.QPushButton("Show matches…")
         self.b_browser.setToolTip("The spots in every image: drag a spot that was not found to its place, "
                                   "reject a wrong one, then Re-fit")
@@ -115,8 +190,10 @@ class AlignmentDialog(QtWidgets.QDialog):
         self._set_busy(False)
 
     def _set_busy(self, busy):
-        for b in (self.b_browser, self.b_refit, self.b_rematch, self.b_apply):
+        for b in (self.b_browser, self.b_refit, self.b_rematch, self.b_apply, self.b_match):
             b.setEnabled(not busy)
+        for w in (self.scope, self.source, self.n_spots):
+            w.setEnabled(not busy)
         self.b_rematch.setEnabled(not busy and bool(self.fits))
         self.b_apply.setEnabled(not busy and bool(self.fits))
 
@@ -162,10 +239,40 @@ class AlignmentDialog(QtWidgets.QDialog):
             return inter
         return np.logical_or.reduce(masks)
 
+    def _polygon_spots(self, n):
+        """Spots from the polygons drawn on the reference: the canopy finder's
+        own use (a crown matched in another image), up to `n`, spread out."""
+        recs = self.pt._view_align_polygon_records(self.ref_fp)
+        items = []
+        for g, rec in recs:
+            try:
+                pts = rec.get("points") or []
+                r = {"points": [tuple(map(float, p[:2])) for p in pts],
+                     "coord_space": rec.get("coord_space", "image"),
+                     "image_ref_size": rec.get("image_ref_size"), "type": "polygon"}
+                c = np.asarray(self.ref_geo.from_record(r), np.float64).reshape(-1, 2).mean(0)
+            except Exception:
+                continue
+            if np.all(np.isfinite(c)):
+                items.append((g, r, c))
+        if not items:
+            return []
+        C = np.array([c for _g, _r, c in items])
+        pick = [int(np.argmin(((C - C.mean(0)) ** 2).sum(1)))]
+        while len(pick) < min(n, len(items)):
+            d = np.sqrt(((C[:, None] - C[pick][None]) ** 2).sum(-1)).min(1)
+            d[pick] = -1
+            pick.append(int(np.argmax(d)))
+        return [{"group": f"spot {k + 1}: {items[i][0]}", "center": tuple(items[i][2]), "rec": items[i][1]}
+                for k, i in enumerate(pick)]
+
     def _make_spots(self):
         W, H = self._export_wh()
         side = VA.spot_side_px(W, H, self._gsd())
+        n = int(self.n_spots.value())
         centers = []
+        if self.source.currentData() == "polygons" and self.spot_scene_pts is None:
+            return self._polygon_spots(n)
         if self.spot_scene_pts is not None and len(self.spot_scene_pts):
             rec_pts = self.pt._scene_to_image_xy(self.ref_viewer, self.spot_scene_pts)
             bw, bh = self.ref_geo.basis
@@ -177,7 +284,10 @@ class AlignmentDialog(QtWidgets.QDialog):
                 return []
             ph, pw = prev.shape[:2]
             region = self._overlap_region(prev.shape)
-            cp = VA.pick_spots(prev, None, n=5, side=side * pw / float(W), region=region)
+            if n > 8:
+                # many spots: smaller squares, so neighbours stay apart
+                side = max(VA.SPOT_MIN_PX, min(side, 0.5 * min(W, H) / (n ** 0.5)))
+            cp = VA.pick_spots(prev, None, n=n, side=side * pw / float(W), region=region)
             centers = [(x * W / float(pw), y * H / float(ph)) for x, y in cp]
         spots = []
         for k, (cx, cy) in enumerate(centers):
@@ -200,20 +310,61 @@ class AlignmentDialog(QtWidgets.QDialog):
         cfg.update(self.extra_cfg)
         return cfg
 
-    def _fit_prior(self, fp):
-        """export ref -> export target, from the current fit (or None)."""
+    def _fit_prior(self, fp, center=None):
+        """export ref -> export target, from the current fit (or None): the
+        fit's local affine around `center` (export px of the reference) when
+        given, else over the whole frame."""
         f = self.fits.get(fp)
         t = next((x for x in self.targets if x["fp"] == fp), None)
         if not f or t is None:
             return None
         tg = CF.frame_for(fp, ax=t["ax"])
         W, H = self._export_wh()
-        P = np.array([[0.0, 0.0], [W, 0.0], [0.0, H]])
+        if center is not None:
+            d = max(8.0, 0.05 * min(W, H))
+            cx, cy = center
+            P = np.array([[cx, cy], [cx + d, cy], [cx, cy + d]], np.float64)
+        else:
+            P = np.array([[0.0, 0.0], [W, 0.0], [0.0, H]])
         rw, rh = self._raw_wh(self.ref_geo)
         tw, th = self._raw_wh(tg)
         raw = VA.export_to_raw(P, self.ref_ax, rw, rh)
-        Q = VA.raw_to_export(VA.apply(f["M"], raw), t["ax"], tw, th)
+        Q = VA.raw_to_export(VA.warp_forward(f.get("warp") or {"M": f["M"]}, raw), t["ax"], tw, th)
         return _affine_from_3(P, Q)
+
+    def _on_match(self):
+        if self.worker is not None and self.worker.isRunning():
+            return
+        self.spots, self.fits = [], {}
+        if not self._explicit_targets:
+            self._set_targets(self._scope_targets())
+        if not self.targets:
+            self.info.setText("There is no other image to align.")
+            return
+        if self.source.currentData() == "click":
+            self.spot_scene_pts = None
+            self._start_clicks()
+            return
+        if self.source.currentData() != "click":
+            self.spot_scene_pts = None
+        if self.source.currentData() == "polygons" and not self._n_polygons():
+            self.info.setText("No polygon is drawn on this image: draw a few crowns spread over it, "
+                              "or use automatic spots.")
+            return
+        self.start()
+
+    def _start_clicks(self):
+        def _done(pts):
+            self._clicker = None
+            self.spot_scene_pts = np.asarray(pts, np.float64)
+            self.spots = []
+            self.show(); self.raise_()
+            self.start()
+        if self._clicker is not None:
+            self._clicker._cleanup()
+        self._clicker = ClickSpotsMode(self.ref_viewer, on_done=_done, n=int(self.n_spots.value()))
+        self.info.setText(f"Click up to {int(self.n_spots.value())} spots on "
+                          f"<b>{os.path.basename(self.ref_fp)}</b> (Enter when done).")
 
     def start(self, use_fit_prior=False):
         if self.worker is not None and self.worker.isRunning():
@@ -221,9 +372,10 @@ class AlignmentDialog(QtWidgets.QDialog):
         prior = {}
         if use_fit_prior:
             for t in self.targets:
-                A = self._fit_prior(t["fp"])
-                if A is not None:
-                    prior[t["fp"]] = A.tolist()
+                if self._fit_prior(t["fp"]) is not None:
+                    prior[t["fp"]] = True
+        if not self.targets and not self._explicit_targets:
+            self._set_targets(self._scope_targets())
         if not self.spots:
             try:
                 self.spots = self._make_spots()
@@ -242,7 +394,9 @@ class AlignmentDialog(QtWidgets.QDialog):
             for t in self.targets:
                 tt = dict(t)
                 if t["fp"] in prior:
-                    tt["cfg"] = {"prior_affine": prior[t["fp"]]}
+                    A = self._fit_prior(t["fp"], center=s.get("center"))
+                    if A is not None:
+                        tt["cfg"] = {"prior_affine": A.tolist()}
                 ts.append(tt)
             jobs.append({"group": s["group"], "rec": s["rec"], "targets": ts})
         self.info.setText(f"Reference: <b>{os.path.basename(self.ref_fp)}</b> — matching "
@@ -328,25 +482,28 @@ class AlignmentDialog(QtWidgets.QDialog):
         self.table.setRowCount(len(self.targets))
         for row, t in enumerate(self.targets):
             pairs, tg = self._spot_pairs(t)
-            fit = VA.fit_similarity(pairs, min_spots=2)
+            fit = VA.fit_alignment(pairs, mode=self.fit_mode.currentData(), min_spots=2)
             name = QtWidgets.QTableWidgetItem(os.path.basename(t["fp"]))
             name.setToolTip(t["fp"])
             self.table.setItem(row, 0, name)
             n_ok = sum(1 for p in pairs if p["dst"] is not None)
             if fit is None:
-                for c, txt in enumerate(["0 / %d" % len(pairs), "", "", "", "not enough spots found"], 1):
+                for c, txt in enumerate(["0 / %d" % len(pairs), "", "", "", "", "not enough spots found"], 1):
                     self.table.setItem(row, c, QtWidgets.QTableWidgetItem(txt))
                 continue
             s, ang, _tx, _ty = VA.similarity_params(fit["M"])
-            rms_m = None
+            rms_m = loo_m = None
             try:
                 base = tg.base or tg
                 if base.located:
                     tw, th = self._raw_wh(tg)
-                    rms_m = fit["rms_px"] * float(min(CF.gsd_m(base, tw / 2.0, th / 2.0)))
+                    g = float(min(CF.gsd_m(base, tw / 2.0, th / 2.0)))
+                    rms_m = fit["rms_px"] * g
+                    loo_m = fit["loo_px"] * g if np.isfinite(fit.get("loo_px", np.nan)) else None
             except Exception:
-                rms_m = None
+                rms_m = loo_m = None
             fit["rms_m"] = rms_m
+            fit["loo_m"] = loo_m
             fit["pairs"] = pairs
             self.fits[t["fp"]] = fit
             warn = []
@@ -354,9 +511,12 @@ class AlignmentDialog(QtWidgets.QDialog):
                 warn.append("only %d spots: check it" % fit["n_used"])
             if fit["reflected"]:
                 warn.append("mirrored?")
+            loo = fit.get("loo_px", float("nan"))
             vals = [f"{fit['n_used']} / {len(pairs)}  ({n_ok} matched)",
                     f"{fit['rms_px']:.1f} px" + (f" ({rms_m:.2f} m)" if rms_m is not None else ""),
-                    f"{s:.4f}", f"{ang:+.2f}°", "; ".join(warn) or "ok"]
+                    (f"{loo:.1f} px" + (f" ({loo_m:.2f} m)" if loo_m is not None else ""))
+                    if np.isfinite(loo) else "",
+                    f"{s:.4f}", f"{ang:+.2f}°", "; ".join(warn) or fit.get("mode", "ok")]
             for c, txt in enumerate(vals, 1):
                 self.table.setItem(row, c, QtWidgets.QTableWidgetItem(txt))
         self._set_busy(False)
@@ -380,7 +540,8 @@ class AlignmentDialog(QtWidgets.QDialog):
                     continue
                 pred = None
                 if fit is not None:
-                    raw = VA.apply(fit["M"], VA.export_to_raw(ctx.raw_pts, self.ref_ax, rw, rh))
+                    raw = VA.warp_forward(fit.get("warp") or {"M": fit["M"]},
+                                          VA.export_to_raw(ctx.raw_pts, self.ref_ax, rw, rh))
                     pred = VA.raw_to_export(raw, t["ax"], tw, th)
                 elif r.geo_pts is not None:
                     pred = np.asarray(r.geo_pts, np.float64)
@@ -436,11 +597,16 @@ class AlignmentDialog(QtWidgets.QDialog):
             used = f.get("used") or []
             for k, sp in enumerate(spots):
                 sp["used"] = bool(used[k]) if k < len(used) else False
-            targets[fp] = {"M": np.asarray(f["M"]).tolist(), "rms_px": float(f["rms_px"]),
-                           "rms_m": f.get("rms_m"), "n_used": int(f["n_used"]), "spots": spots,
+            loo = f.get("loo_px", float("nan"))
+            targets[fp] = {"M": np.asarray(f["M"]).tolist(), "local": f.get("local"),
+                           "mode": f.get("mode", "global"), "rms_px": float(f["rms_px"]),
+                           "rms_m": f.get("rms_m"), "loo_px": float(loo) if np.isfinite(loo) else None,
+                           "loo_m": f.get("loo_m"), "n_used": int(f["n_used"]), "spots": spots,
                            "method": self.method.currentData(), "created": time.strftime("%Y-%m-%d %H:%M:%S")}
         missing = [os.path.basename(t["fp"]) for t in self.targets if t["fp"] not in self.fits]
         root = self.pt.get_root_by_filepath(self.ref_fp) if hasattr(self.pt, "get_root_by_filepath") else None
+        if not self._explicit_targets and self.scope.currentData() == "all":
+            root = "all roots"
         self.pt.apply_view_alignment(self.ref_fp, targets, root=root)
         msg = f"Aligned {len(targets)} image(s) to {os.path.basename(self.ref_fp)}."
         if missing:
@@ -448,6 +614,9 @@ class AlignmentDialog(QtWidgets.QDialog):
         self.info.setText(msg.replace("\n", "<br>"))
 
     def closeEvent(self, ev):
+        if self._clicker is not None:
+            self._clicker._cleanup()
+            self._clicker = None
         if self.worker is not None and self.worker.isRunning():
             self.worker.cancel()
             self.worker.wait(3000)

@@ -534,37 +534,63 @@ no longer makes a window several thousand pixels wide.
 
 ### Viewer alignment (display-only "fake registration")
 
-Images of one root that cover the same ground on different pixel grids (orthomosaics with
-different row/col counts or resolution, a small rotation, a residual georeference error) are
-aligned for DISPLAY and POLYGONS only: nothing is resampled or reprojected.
+Images that cover the same ground on different pixel grids (orthomosaics with different
+row/col counts or resolution, a small rotation, a residual georeference error, local
+distortions) are aligned for DISPLAY and POLYGON PLACEMENT only: nothing is resampled or
+reprojected.
 
 - **UI:** the tiny ⌖ button beside **Fix** on the zoom bar (`_ZoomBar._btn_align`, menu built
-  by `_build_align_menu`): align the other viewers of the root to this image (automatic spots
-  or 5 clicked spots, `view_alignment_dialog.ClickSpotsMode`), Use alignment, Show matches,
-  Clear. `AlignmentDialog` picks spots (`view_alignment.pick_spots` on the in-memory preview,
-  inside the overlap of the target footprints), matches each in every target with the canopy
-  finder's `CanopyFindWorker` (per-target `cfg` and `prior_affine` hooks in
-  `find_in_target`), fits a similarity per target (`fit_similarity`: weighted Umeyama over
-  every spot corner, leave-one-out outlier rejection), and shows the spots in `CanopyBrowser`
-  (`browser_allows_save = False`) so spots that were not found can be dragged into place,
-  then Re-fit / Re-match with this fit / Apply. Apply switches Fix on.
+  by `_build_align_menu`): *Align viewers to this image…*, Use alignment, Show matches, Clear.
+  `AlignmentDialog` has the options and starts on **Match**:
+  - images: this root or all roots (`ProjectTab._view_align_target_fps`);
+  - spots: automatic (`view_alignment.pick_spots` on the in-memory preview, inside the overlap
+    of the target footprints; a grid of cells for many spots), clicked
+    (`view_alignment_dialog.ClickSpotsMode`), or the user's polygons on the reference
+    (`_view_align_polygon_records`, the most spread ones);
+  - the number of spots (3–60) and the fit (local or global).
+
+  Each spot is matched in every target with the canopy finder's `CanopyFindWorker`
+  (per-target `cfg` and `prior_affine` hooks in `find_in_target`). The spots are shown in
+  `CanopyBrowser` (`browser_allows_save = False`), so spots that were not found can be dragged
+  into place, then Re-fit, Re-match with this fit (the fit's local affine around each spot
+  becomes its prior), or Apply. Apply switches Fix on.
+- **Fit:** `fit_alignment`.
+  - **Global:** `fit_similarity`, a weighted Umeyama over every spot point (a spot's weight is
+    shared by its points) with leave-one-out outlier rejection.
+  - **Local** (default): the global similarity plus a correction field. The residuals of the
+    spot points are blended with Gaussian weights whose sigma follows the spot spacing, and
+    fade to the global fit far from every spot. Outliers are rejected by leave-one-out
+    against the field of the other spots. `loo_px` (each spot predicted by the others) is the
+    error to expect between spots.
+  - Plain data: `{"M", "local"}` warps, `warp_forward` / `warp_inverse` (fixed point).
 - **Model:** `global.ax` → `"view_alignment": {"sets": {id: {"reference", "root", "enabled",
-  "targets": {fp: {"M", "rms_px", "rms_m", "n_used", "spots", ...}}}}}`. `M` maps reference
-  **raw file pixels** → target raw pixels (records are fractions of the post-.ax frame and
-  anisotropic after a crop; raw pixels survive later .ax edits). Any two members map through
-  the reference (`AlignmentSets.chain`). Records ↔ raw: `record_to_raw_pts` /
-  `raw_to_record_pts` through each file's `.ax` (`ax_geometry`).
-- **Views:** `_ZoomBar._pose_aligned(src, dst)` maps src's view centre and a small step
-  through `ProjectTab._view_align_scene_map` (scene → record → raw → M → raw → record →
-  scene), sets dst's zoom and view rotation from the local Jacobian
-  (`viewer._view_rotation_deg`, kept by `set_zoom_factor` / `_apply_fixed_zoom`) and centres
-  it. Used by `update_fixed_center`, `_sync_zoom_to_all_viewers`, and after navigation
-  (`_resync_aligned`). Unaligned viewers keep the fraction sync.
-- **Polygons:** `add_polygon_to_other_images` (live drawing sync), `_bulk_copy_jobs` →
-  `polygon_bulk.run_job(point_map=...)` (Replicate / Copy; never hard-linked), and edits
-  (`on_polygon_modified`, `modify_polygon_command` → `_propagate_aligned_edit`; sibling
-  `ModifyPolygonCommand`s in the same macro, so one undo reverts all) use
-  `_aligned_record_map` / `_aligned_point_map` when an enabled alignment holds both images.
+  "targets": {fp: {"M", "local", "mode", "rms_px", "loo_px", "n_used", "spots", ...}}}}}`.
+  - The warps map reference **raw file pixels** → target raw pixels. Records are fractions of
+    the post-.ax frame and anisotropic after a crop, while raw pixels survive later .ax edits.
+  - Any two members map through the reference (`AlignmentSets.chain` → `chain_apply`).
+  - An image belongs to one alignment: a new one replaces older sets holding its images.
+  - Records ↔ raw: `record_to_raw_pts` / `raw_to_record_pts` through each file's `.ax`
+    (`ax_geometry`).
+- **Views:** an ANCHOR on the ProjectTab (`_view_align_anchor`: the view centre in reference
+  raw pixels and the view's linear part per reference pixel).
+  - `_ZoomBar._align_anchor_from(viewer)` stores it from the viewer the user moves, through
+    `ProjectTab._view_align_ground` (scene ↔ reference raw).
+  - `_pose_from_anchor(viewer)` poses any member: centre, zoom and view rotation from the
+    local Jacobian of the warp (`viewer._view_rotation_deg`, kept by `set_zoom_factor` /
+    `_apply_fixed_zoom`). A local fit therefore gives each place its own rotation and scale,
+    and a root whose reference is not shown still lands on the same tree.
+  - Used by `update_fixed_center`, `_sync_zoom_to_all_viewers`, and after navigation
+    (`apply_fixed_zoom_to_viewer` → `_resync_aligned`). While a fresh viewer is posed by
+    fraction the anchor is frozen (`_align_anchor_frozen`).
+  - Unaligned viewers keep the fraction sync.
+  - A rotated view draws with `SmoothPixmapTransform` below 3 screen px per scene unit
+    (`ImageViewer.paintEvent`). Nearest-neighbour sampling of a slightly rotated image shows
+    bands of pixels.
+- **Polygons:** placement only. `add_polygon_to_other_images` (live drawing sync) and
+  `_bulk_copy_jobs` → `polygon_bulk.run_job(point_map=...)` (Replicate / Copy; never
+  hard-linked) use `_aligned_record_map` / `_aligned_point_map` when an enabled alignment holds
+  both images. Moving or reshaping a polygon changes only its own image, since each copy is
+  fitted to its own tree.
 - **Not done:** a coarse pre-pass for misregistration beyond the search radius (use a larger
   radius, or correct a few spots by hand and *Re-match with this fit*).
 

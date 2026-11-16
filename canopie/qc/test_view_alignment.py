@@ -5,11 +5,17 @@ different pixel grids (Nathan, 2026-11-16: orthomosaics that are georeferenced
 but do not match in row / column count, so polygons drawn on one land off
 position on the other).
 
-5 spots are matched with the canopy finder, a similarity (shift + rotation +
-one scale) is fitted per image in RAW file pixels, and then:
-  * zoom / pan / view rotation of the aligned viewers follow it,
-  * a polygon drawn, replicated or edited on one image lands on the same
-    ground in the others.
+Spots (automatic, clicked, or the user's polygons) are matched with the
+canopy finder, and a fit is made per image in RAW file pixels: a similarity
+(shift + rotation + one scale), plus by default a local correction from the
+nearby spots that follows each mosaic's distortions (Nathan, same day: "an
+adaptive matching depending where you are in the image"). Then:
+  * zoom / pan / view rotation of the aligned viewers follow it, through an
+    anchor in reference pixels, so roots without the reference shown follow too,
+  * a polygon drawn or replicated on one image lands on the same ground in
+    the others, but an EDIT stays on its own image (each copy is fitted to its
+    own tree),
+  * a rotated view draws with smoothing (no bands of pixels when zoomed out).
 
 Built on test_canopy_finder's Scene: a source GeoTIFF and a target with a
 known 7.3 m georeference error, a -3 degree rotation and 0.2 m pixels
@@ -102,11 +108,64 @@ def test_sets_round_trip_and_compose_through_the_reference(tmp_path):
     p = np.array([[10.0, 20.0], [300.0, 50.0]])
     # b -> c goes through the reference: c = Mc(ref) and ref = Mb^-1(b)
     want = VA.apply(Mc, VA.apply(VA.invert(Mb), p))
-    assert np.abs(VA.apply(B.chain("b.tif", "c.tif"), p) - want).max() < 1e-9
-    assert np.abs(VA.apply(B.chain("ref.tif", "b.tif"), p) - VA.apply(Mb, p)).max() < 1e-9
+    assert np.abs(VA.chain_apply(B.chain("b.tif", "c.tif"), p) - want).max() < 1e-9
+    assert np.abs(VA.apply(B.matrix("b.tif", "c.tif"), p) - want).max() < 1e-9
+    assert np.abs(VA.chain_apply(B.chain("ref.tif", "b.tif"), p) - VA.apply(Mb, p)).max() < 1e-9
     assert B.chain("b.tif", "x.tif") is None
     B.sets[next(iter(B.sets))]["enabled"] = False
     assert B.chain("ref.tif", "b.tif") is None, "a disabled alignment still maps"
+
+
+def _bent(p):
+    """A distorted 'truth': a similarity plus a smooth bend, like two
+    orthomosaics whose local errors differ across the forest."""
+    p = np.asarray(p, np.float64).reshape(-1, 2)
+    q = VA.apply(_sim(0.75, -2.0, 30.0, -12.0), p)
+    q[:, 0] += 6.0 * np.sin(p[:, 1] / 1500.0)
+    q[:, 1] += 4.0 * np.cos(p[:, 0] / 1800.0)
+    return q
+
+
+def _bent_spots(n=25, seed=1):
+    rng = np.random.default_rng(seed)
+    out = []
+    for c in rng.uniform(300, 4700, (n, 2)):
+        sq = c + np.array([[-60, -60], [60, -60], [60, 60], [-60, 60]])
+        out.append({"src": sq, "dst": _bent(sq) + rng.normal(0, 0.3, (4, 2)), "weight": 1.0})
+    return out
+
+
+def test_the_local_fit_follows_distortions_the_global_one_cannot():
+    spots = _bent_spots()
+    spots[3]["dst"] = spots[3]["dst"] + (40.0, 10.0)            # one wrong match
+    test = np.random.default_rng(7).uniform(600, 4400, (400, 2))
+    g = VA.fit_alignment(spots, mode="global")
+    l = VA.fit_alignment(spots, mode="local")
+    eg = np.hypot(*(VA.warp_forward(g["warp"], test) - _bent(test)).T)
+    el = np.hypot(*(VA.warp_forward(l["warp"], test) - _bent(test)).T)
+    assert not l["used"][3] and not g["used"][3], "the wrong match was kept"
+    assert np.median(el) < 0.5 * np.median(eg), (np.median(el), np.median(eg))
+    assert np.median(el) < 1.5
+    assert l["loo_px"] < g["loo_px"]
+    # the inverse is exact, and a chain through the reference composes the
+    # local warps (b -> c)
+    p = VA.warp_inverse(l["warp"], VA.warp_forward(l["warp"], test))
+    assert np.abs(p - test).max() < 1e-6
+    A = VA.AlignmentSets()
+    A.put("ref", {"b": {"M": np.asarray(l["M"]).tolist(), "local": l["local"]},
+                  "c": {"M": _sim(1.0, 0.0, 5.0, 5.0).tolist()}})
+    B = VA.AlignmentSets(__import__("json").loads(__import__("json").dumps(A.to_json())))
+    got = VA.chain_apply(B.chain("b", "c"), VA.warp_forward(l["warp"], test))
+    assert np.abs(got - (test + 5.0)).max() < 1e-6
+
+
+def test_many_spots_cover_the_frame():
+    rng = np.random.default_rng(3)
+    img = rng.random((600, 800)).astype(np.float32) * 100
+    pts = np.asarray(VA.pick_spots(img, img > -1, n=16, side=24))
+    assert len(pts) == 16
+    hx, _e1, _e2 = np.histogram2d(pts[:, 0], pts[:, 1], bins=(4, 3), range=((0, 800), (0, 600)))
+    assert (hx > 0).sum() >= 11, "16 spots crowd into a few parts of the frame"
 
 
 def test_record_map_goes_through_both_images_ax(scene):
@@ -208,6 +267,9 @@ def test_matching_and_fit_recover_the_scene(aligned):
     assert err < 1.0, f"fit off by {err:.2f} px"
     s, ang, _tx, _ty = VA.similarity_params(f["M"])
     assert s == pytest.approx(0.15 / 0.2, rel=0.01) and ang == pytest.approx(3.0, abs=0.3)
+    assert f["mode"] == "local"
+    err = np.abs(VA.warp_forward(f["warp"], P) - aligned.scene.truth(P)).max()
+    assert err < 1.0, f"local fit off by {err:.2f} px"
 
 
 def test_the_target_view_shows_the_same_ground(aligned, qapp):
@@ -257,9 +319,13 @@ def test_a_drawn_polygon_lands_on_the_same_ground(aligned):
     assert np.abs(got - sc.truth()).max() < 1.0
 
 
-def test_an_edit_moves_the_copy_and_one_undo_reverts_it(aligned):
-    pt, sc = aligned.pt, aligned.scene
+def test_an_edit_stays_on_its_own_image(aligned, qapp):
+    """Moving a crown on one image must not move its copy on the aligned
+    image: each copy is fitted to its own tree (Nathan: "whenever I move the
+    polygon in one window it moves in the other -- the wrong behavior")."""
+    pt, sc, vs = aligned.pt, aligned.scene, aligned.vs
     aligned.dlg.apply()
+    assert not hasattr(pt, "_propagate_aligned_edit")
     grp = "__align_test_crown"
     n, m = sc.B.shape[0], sc.m
     pt.all_polygons[grp] = {
@@ -270,28 +336,120 @@ def test_an_edit_moves_the_copy_and_one_undo_reverts_it(aligned):
     saved = pt.__dict__.get("_save_specific_polygon_file")
     pt._save_specific_polygon_file = lambda *a, **k: None
     try:
-        moved = sc.P + (25.0, -10.0)
-        cmds = pt._propagate_aligned_edit(aligned.vs, grp, sc.src, moved.tolist(), undoable=True)
-        assert len(cmds) == 1
-        pt.undo_stack.beginMacro("t")
-        for c in cmds:
-            pt.undo_stack.push(c)
-        pt.undo_stack.endMacro()
+        sc_old = pt._image_to_scene_xy(vs, sc.P)
+        old = QtGui.QPolygonF([QtCore.QPointF(x, y) for x, y in sc_old])
+        new = QtGui.QPolygonF([QtCore.QPointF(x + 12.0, y - 7.0) for x, y in sc_old])
+        vs.add_polygon_to_scene(old, grp)
+        item = next(it for it in vs.scene().items() if getattr(it, "name", None) == grp)
+        n0 = pt.undo_stack.count()
+        pt.modify_polygon_command(item, old, new, viewer=vs)
+        qapp.processEvents()
+        assert pt.undo_stack.count() == n0 + 1, "more than the one edit went on the undo stack"
         tgt_pts = np.asarray(pt.all_polygons[grp][sc.tgt]["points"])
-        assert np.abs(tgt_pts - sc.truth(moved)).max() < 1.0, "the copy did not follow the edit"
-        pt.undo_stack.undo()
-        tgt_pts = np.asarray(pt.all_polygons[grp][sc.tgt]["points"])
-        assert np.abs(tgt_pts - sc.truth()).max() < 1e-6, "undo did not revert the copy"
-        # the non-undoable path (vertex drag) updates the record directly
-        pt._propagate_aligned_edit(aligned.vs, grp, sc.src, moved.tolist())
-        tgt_pts = np.asarray(pt.all_polygons[grp][sc.tgt]["points"])
-        assert np.abs(tgt_pts - sc.truth(moved)).max() < 1.0
+        assert np.abs(tgt_pts - sc.truth()).max() < 1e-9, "the copy on the aligned image moved"
+        src_pts = np.asarray(pt.all_polygons[grp][sc.src]["points"])
+        assert np.abs(src_pts - sc.P).max() > 1.0, "the edited polygon itself did not move"
     finally:
         pt.all_polygons.pop(grp, None)
+        for it in list(vs.scene().items()):
+            if getattr(it, "name", None) == grp:
+                vs.scene().removeItem(it)
         if saved is None:
             pt.__dict__.pop("_save_specific_polygon_file", None)
         else:
             pt._save_specific_polygon_file = saved
+
+
+def test_a_root_without_the_reference_still_lands_on_the_same_ground(aligned, qapp):
+    """All roots aligned to one image: in a root where the reference is not
+    shown, a viewer is posed from the stored anchor (where the views were
+    looking, in reference pixels), so switching roots keeps the same tree."""
+    from ..image_viewer import _ZoomBar
+    pt, vs, vt, sc = aligned.pt, aligned.vs, aligned.vt, aligned.scene
+    aligned.dlg.apply()
+    vs.set_zoom_factor(1.5, anchor=QtWidgets.QGraphicsView.AnchorViewCenter)
+    vs.centerOn(300, 600)
+    _ZoomBar._sync_zoom_to_all_viewers(vs._zoombar, 1.5)
+    qapp.processEvents()
+    # where the views look, in reference pixels (the source has no .ax:
+    # its raw pixels are its record points)
+    c = np.array([pt._view_align_anchor["c"]])
+    assert np.abs(c - pt._scene_to_image_xy(vs, [_centre(vs)])).max() < 12.0
+    want = sc.truth(c)[0]
+    # "another root": only the target is shown, freshly posed by fraction
+    pt.viewer_widgets = [r for r in pt.viewer_widgets if r["viewer"] is vt]
+    vt._view_rotation_deg = 0.0
+    vt.resetTransform(); vt.scale(0.4, 0.4); vt.centerOn(50, 50)     # a fresh image
+    # navigation applies the fixed zoom / fraction, then the alignment: the
+    # fraction pose of the fresh viewer must not move the anchor
+    assert _ZoomBar.apply_fixed_zoom_to_viewer(vt)
+    qapp.processEvents()
+    rec_t = pt._scene_to_image_xy(vt, [_centre(vt)])[0]
+    assert np.abs(rec_t - want).max() < 1.5
+    assert vt.current_zoom_factor() == pytest.approx(1.5 / 0.75, rel=0.03)
+
+
+def test_polygons_drawn_on_the_reference_can_be_the_spots(aligned, qapp):
+    import time
+    from ..view_alignment_dialog import AlignmentDialog
+    pt, sc = aligned.pt, aligned.scene
+    n = sc.B.shape[0]
+    rng = np.random.default_rng(5)
+    made = []
+    for k, c in enumerate(rng.uniform(n * 0.2, n * 0.8, (6, 2))):
+        g = f"__align_spot_{k}"
+        ring = c + 45.0 * np.column_stack((np.cos(np.linspace(0, 6.0, 9)), np.sin(np.linspace(0, 6.0, 9))))
+        pt.all_polygons[g] = {sc.src: {"points": ring.tolist(), "coord_space": "image",
+                                       "image_ref_size": {"w": n, "h": n}, "name": g,
+                                       "type": "polygon", "root": "1"}}
+        made.append(g)
+    saved_lookup = pt.__dict__.get("_poly_index_lookup")
+    pt._poly_index_lookup = lambda fp: [(g, fp) for g in made if fp in pt.all_polygons.get(g, {})]
+    try:
+        assert len(pt._view_align_polygon_records(sc.src)) == 6
+        dlg = AlignmentDialog(pt, aligned.vs, [sc.tgt], cfg={"processes": False})
+        dlg.set_source("polygons")
+        dlg.n_spots.setValue(5)
+        dlg.start()
+        t0 = time.monotonic()
+        while dlg.worker is not None and dlg.worker.isRunning() and time.monotonic() - t0 < 60:
+            qapp.processEvents()
+            time.sleep(0.02)
+        qapp.processEvents()
+        assert len(dlg.spots) == 5 and all(sp["group"].startswith("spot") for sp in dlg.spots)
+        f = dlg.fits.get(sc.tgt)
+        assert f is not None and f["n_used"] >= 3
+        P = np.array([[300.0, 300.0], [600, 500]])
+        assert np.abs(VA.warp_forward(f["warp"], P) - sc.truth(P)).max() < 2.0
+        dlg.close(); dlg.deleteLater()
+    finally:
+        for g in made:
+            pt.all_polygons.pop(g, None)
+        if saved_lookup is None:
+            pt.__dict__.pop("_poly_index_lookup", None)
+        else:
+            pt._poly_index_lookup = saved_lookup
+
+
+def test_a_rotated_view_draws_smoothly(viewer_factory, qapp):
+    """Nearest-neighbour sampling of a slightly rotated image repeats or skips
+    a row every 1/sin(angle) rows: bands of pixels when zoomed out."""
+    v = viewer_factory()
+    q = QtGui.QImage(400, 300, QtGui.QImage.Format_RGB32)
+    q.fill(0x336699)
+    v.set_image(QtGui.QPixmap.fromImage(q))
+    v.show()
+    smooth = QtGui.QPainter.SmoothPixmapTransform
+    v.setTransform(QtGui.QTransform().scale(0.5, 0.5))
+    v.viewport().repaint()
+    qapp.processEvents()
+    assert not (v.renderHints() & smooth), "an unrotated view lost its crisp pixels"
+    t = math.radians(-3.0)
+    z = 0.5
+    v.setTransform(QtGui.QTransform(z * math.cos(t), z * math.sin(t), -z * math.sin(t), z * math.cos(t), 0, 0))
+    v.viewport().repaint()
+    qapp.processEvents()
+    assert v.renderHints() & smooth, "a rotated, zoomed-out view draws nearest-neighbour"
 
 
 def test_the_button_sits_beside_fix(viewer_factory):

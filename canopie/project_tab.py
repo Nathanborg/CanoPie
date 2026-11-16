@@ -26304,11 +26304,17 @@ class ProjectTab(QtWidgets.QWidget):
         except Exception:
             ax = {}
         h = w = None
-        try:
-            from .shapefile_io import _raw_image_dims
-            h, w = _raw_image_dims(fp)
-        except Exception:
-            h = w = None
+        cache = self.__dict__.setdefault("_align_dims_cache", {})
+        if fp in cache:
+            h, w = cache[fp]                 # the raw size never changes; no file open per pan
+        else:
+            try:
+                from .shapefile_io import _raw_image_dims
+                h, w = _raw_image_dims(fp)
+            except Exception:
+                h = w = None
+            if h and w:
+                cache[fp] = (h, w)
         if not (h and w):
             v = self.get_viewer_by_filepath(fp)
             if v is not None:
@@ -26318,8 +26324,9 @@ class ProjectTab(QtWidgets.QWidget):
                     h = w = None
         return ax, int(w or 0), int(h or 0)
 
-    def _aligned_raw_matrix(self, fp_a, fp_b):
-        """2x3 raw a -> raw b when an enabled alignment holds both, else None."""
+    def _aligned_chain(self, fp_a, fp_b):
+        """The alignment chain raw a -> raw b (view_alignment.chain_apply)
+        when an enabled alignment holds both images, else None."""
         if not fp_a or not fp_b or not getattr(self, "view_alignment_on", True):
             return None
         try:
@@ -26327,16 +26334,25 @@ class ProjectTab(QtWidgets.QWidget):
         except Exception:
             return None
 
+    def _aligned_raw_matrix(self, fp_a, fp_b):
+        """The global 2x3 part of _aligned_chain (raw a -> raw b), or None."""
+        ch = self._aligned_chain(fp_a, fp_b)
+        if ch is None:
+            return None
+        from .view_alignment import chain_global
+        return chain_global(ch)
+
     def _aligned_point_map(self, fp_a, fp_b):
         """Plain-data point map (view_alignment.map_record_points) a -> b, or None."""
-        M = self._aligned_raw_matrix(fp_a, fp_b)
-        if M is None:
+        ch = self._aligned_chain(fp_a, fp_b)
+        if ch is None:
             return None
         ax_a, wa, ha = self._align_raw_info(fp_a)
         ax_b, wb, hb = self._align_raw_info(fp_b)
         if not (wa and ha and wb and hb):
             return None
-        return {"M": np.asarray(M, np.float64).tolist(), "src_ax": ax_a, "dst_ax": ax_b,
+        from .view_alignment import chain_global
+        return {"chain": ch, "M": chain_global(ch).tolist(), "src_ax": ax_a, "dst_ax": ax_b,
                 "src_raw_wh": (wa, ha), "dst_raw_wh": (wb, hb)}
 
     def _aligned_record_map(self, fp_a, fp_b):
@@ -26374,27 +26390,49 @@ class ProjectTab(QtWidgets.QWidget):
         try:
             if va is None or vb is None or va is vb:
                 return None
-            views = self._tab_viewers()
-            if va not in views or vb not in views:
+            ga, gb = self._view_align_ground(va), self._view_align_ground(vb)
+            if ga is None or gb is None or ga[0] != gb[0]:
                 return None
-            fa = getattr(getattr(va, "image_data", None), "filepath", None)
-            fb = getattr(getattr(vb, "image_data", None), "filepath", None)
-            M = self._aligned_raw_matrix(fa, fb)
-            if M is None or getattr(va, "_image", None) is None or getattr(vb, "_image", None) is None:
-                return None
-            from . import view_alignment as VA
-            ax_a, wa, ha = self._align_raw_info(fa)
-            ax_b, wb, hb = self._align_raw_info(fb)
-            if not (wa and ha and wb and hb):
-                return None
-
-            def fn(xy):
-                rec_a = self._scene_to_image_xy(va, xy)
-                raw_b = VA.apply(M, VA.record_to_raw_pts(rec_a, ax_a, wa, ha))
-                return self._image_to_scene_xy(vb, VA.raw_to_record_pts(raw_b, ax_b, wb, hb))
-            return fn
+            return lambda xy: gb[2](ga[1](xy))
         except Exception as e:
             logging.debug(f"[view alignment] scene map failed: {e}")
+            return None
+
+    def _view_align_ground(self, viewer):
+        """(set id, scene -> reference raw px, reference raw px -> scene) for
+        a viewer of this tab whose image is in an enabled alignment, else
+        None. The viewers are posed through these (image_viewer._ZoomBar
+        alignment anchor)."""
+        try:
+            if viewer is None or sip.isdeleted(viewer) or not getattr(self, "view_alignment_on", True):
+                return None
+            if viewer not in self._tab_viewers() or getattr(viewer, "_image", None) is None:
+                return None
+            fp = getattr(getattr(viewer, "image_data", None), "filepath", None)
+            if not fp:
+                return None
+            A = self._alignment_sets()
+            sid, st = A.set_for(fp)
+            if st is None:
+                return None
+            w = A.warp_of(st, fp)
+            if w is None:
+                return None
+            from . import view_alignment as VA
+            ax, rw, rh = self._align_raw_info(fp)
+            if not (rw and rh):
+                return None
+
+            def to_ref(xy):
+                rec = self._scene_to_image_xy(viewer, xy)
+                return VA.warp_inverse(w, VA.record_to_raw_pts(rec, ax, rw, rh))
+
+            def from_ref(xy):
+                raw = VA.warp_forward(w, xy)
+                return self._image_to_scene_xy(viewer, VA.raw_to_record_pts(raw, ax, rw, rh))
+            return sid, to_ref, from_ref
+        except Exception as e:
+            logging.debug(f"[view alignment] ground map failed: {e}")
             return None
 
     def _view_align_reference_viewer(self, viewer):
@@ -26412,13 +26450,16 @@ class ProjectTab(QtWidgets.QWidget):
         return v if v in self._tab_viewers() else None
 
     def _view_align_peer_viewers(self, viewer):
-        fp = getattr(getattr(viewer, "image_data", None), "filepath", None)
-        if not fp or not getattr(self, "view_alignment_on", True):
+        """The other viewers of this tab whose images share `viewer`'s alignment."""
+        g = self._view_align_ground(viewer)
+        if g is None:
             return []
         out = []
-        for m in self._alignment_sets().members(fp):
-            v = self.get_viewer_by_filepath(m)
-            if v is not None and v is not viewer and v in self._tab_viewers():
+        for v in self._tab_viewers():
+            if v is viewer:
+                continue
+            gv = self._view_align_ground(v)
+            if gv is not None and gv[0] == g[0]:
                 out.append(v)
         return out
 
@@ -26431,38 +26472,76 @@ class ProjectTab(QtWidgets.QWidget):
             return False, "Align viewers: not aligned"
         on = bool(s.get("enabled", True)) and getattr(self, "view_alignment_on", True)
         lines = [f"Reference: {os.path.basename(s['reference'])}"]
-        for k, t in (s.get("targets") or {}).items():
-            lines.append(f"{os.path.basename(k)}: RMS {t.get('rms_px', float('nan')):.1f} px"
-                         + (f" ({t['rms_m']:.2f} m)" if t.get("rms_m") is not None else "")
-                         + f", {t.get('n_used', 0)} spots")
+        tg = s.get("targets") or {}
+        for k, t in list(tg.items())[:12]:
+            lines.append(f"{os.path.basename(k)}: {t.get('mode', 'global')} fit, "
+                         f"{t.get('n_used', 0)} spots, between spots "
+                         f"{t.get('loo_px', t.get('rms_px', float('nan'))):.1f} px")
+        if len(tg) > 12:
+            lines.append(f"... and {len(tg) - 12} more")
         return on, ("Aligned viewers (on)\n" if on else "Aligned viewers (off)\n") + "\n".join(lines)
 
+    def _view_align_target_fps(self, ref_fp, all_roots=False):
+        """The images to align to `ref_fp`: the other images of its root, or
+        of every root of the project."""
+        if all_roots:
+            roots = list(getattr(self, "multispectral_root_names", None) or [])
+            if not roots:
+                roots = list((getattr(self, "image_data_groups", None) or {}).keys())
+        else:
+            r = self.get_root_by_filepath(ref_fp)
+            roots = [r] if r else []
+        seen, out = {os.path.normcase(os.path.abspath(ref_fp))}, []
+        for r in roots:
+            for f in (self._filepaths_for_loaded_root(r) or []):
+                k = os.path.normcase(os.path.abspath(f))
+                if k not in seen:
+                    seen.add(k)
+                    out.append(f)
+        return out
+
+    def _view_align_polygon_records(self, fp):
+        """[(group, record)] of the polygons drawn on image `fp` (spots made
+        from the user's own crowns)."""
+        out = []
+        try:
+            pairs = list(self._poly_index_lookup(fp))
+        except Exception:
+            pairs = []
+        if not pairs:
+            for g, gmap in (self.all_polygons or {}).items():
+                if fp in (gmap or {}):
+                    pairs.append((g, fp))
+        for g, key in pairs:
+            rec = (self.all_polygons.get(g) or {}).get(key)
+            if rec is None:
+                continue
+            try:
+                pts = rec.get("points") or []
+            except Exception:
+                pts = []
+            if len(pts) >= 3 and str(rec.get("type", "polygon") or "polygon") != "point":
+                out.append((g, rec))
+        return out
+
     def start_view_alignment(self, viewer, manual=False):
-        """Align the other viewers of `viewer`'s root to it (the reference)."""
-        from .view_alignment_dialog import AlignmentDialog, ClickSpotsMode
+        """Open the alignment window with `viewer`'s image as the reference."""
+        from .view_alignment_dialog import AlignmentDialog
         fp = getattr(getattr(viewer, "image_data", None), "filepath", None)
         if not fp:
             return
-        root = self.get_root_by_filepath(fp)
-        fps = [f for f in (self._filepaths_for_loaded_root(root) if root else [])
-               if os.path.normcase(os.path.abspath(f)) != os.path.normcase(os.path.abspath(fp))]
-        targets = [(f, self.get_viewer_by_filepath(f)) for f in fps]
-        targets = [(f, v) for f, v in targets if v is not None]
-        if not targets:
-            QtWidgets.QMessageBox.information(self, "Align viewers",
-                                              "There is no other image in this root to align.")
-            return
-
-        def _go(spot_scene_pts=None):
-            dlg = AlignmentDialog(self, viewer, [f for f, _v in targets], spot_scene_pts=spot_scene_pts)
-            self._view_align_dialog = dlg
-            dlg.show()
-            dlg.start()
-
+        old = getattr(self, "_view_align_dialog", None)
+        if old is not None and not sip.isdeleted(old):
+            try:
+                old.close()
+            except Exception:
+                pass
+        dlg = AlignmentDialog(self, viewer)
         if manual:
-            self._view_align_clicker = ClickSpotsMode(viewer, on_done=_go)
-        else:
-            _go()
+            dlg.set_source("click")
+        self._view_align_dialog = dlg
+        dlg.show()
+        dlg.raise_()
 
     def show_view_alignment_matches(self):
         dlg = getattr(self, "_view_align_dialog", None)
@@ -26475,6 +26554,7 @@ class ProjectTab(QtWidgets.QWidget):
 
     def set_view_alignment_enabled(self, on):
         self.view_alignment_on = bool(on)
+        self._view_align_anchor = None
         self._repose_aligned_viewers(reset=not on)
 
     def clear_view_alignment(self, viewer):
@@ -26485,14 +26565,18 @@ class ProjectTab(QtWidgets.QWidget):
         members = A.members(fp, enabled_only=False)
         A.remove_for(members or [fp])
         self._save_alignment_sets()
+        self._view_align_anchor = None
         self._repose_aligned_viewers(reset=True)
 
     def apply_view_alignment(self, reference_fp, targets, root=None):
         """Store a finished alignment and pose the viewers with it."""
         A = self._alignment_sets()
+        # an image belongs to one alignment: the new one replaces older ones
+        A.remove_for([reference_fp] + list(targets or {}))
         A.put(reference_fp, targets, root=root, enabled=True)
         self._save_alignment_sets()
         self.view_alignment_on = True
+        self._view_align_anchor = None
         # zoom / pan follow the alignment through Fix (view sync): switch it on
         try:
             from .image_viewer import _ZoomBar
@@ -26508,11 +26592,12 @@ class ProjectTab(QtWidgets.QWidget):
                     _ZoomBar._store_scroll_position(ref_v)
         except Exception as e:
             logging.debug(f"[view alignment] could not switch Fix on: {e}")
-        self._repose_aligned_viewers()
+        self._repose_aligned_viewers(leader_fp=reference_fp)
 
-    def _repose_aligned_viewers(self, reset=False):
-        """Pose every viewer from its alignment reference (or, with `reset`,
-        drop view rotations and fall back to plain fraction sync)."""
+    def _repose_aligned_viewers(self, reset=False, leader_fp=None):
+        """Pose the aligned viewers from one of them (the reference when it
+        is shown), or, with `reset`, drop view rotations and fall back to
+        plain fraction sync."""
         from .image_viewer import _ZoomBar
         views = self._tab_viewers()
         if reset:
@@ -26530,101 +26615,17 @@ class ProjectTab(QtWidgets.QWidget):
                 except Exception:
                     pass
         else:
-            done = set()
-            for v in views:
-                ref = self._view_align_reference_viewer(v)
-                if ref is not None and ref not in done:
-                    done.add(ref)
-                    _ZoomBar._resync_aligned(ref)
+            leader = self.get_viewer_by_filepath(leader_fp) if leader_fp else None
+            if leader not in views or self._view_align_ground(leader) is None:
+                leader = next((v for v in views if self._view_align_ground(v) is not None), None)
+            if leader is not None:
+                if _ZoomBar._align_anchor_from(leader):
+                    for peer in self._view_align_peer_viewers(leader):
+                        _ZoomBar._pose_from_anchor(peer)
         for v in views:
             zb = getattr(v, "_zoombar", None)
             if zb is not None and hasattr(zb, "sync_align_button"):
                 zb.sync_align_button()
-
-    def _propagate_aligned_edit(self, viewer, group_name, filepath, img_points, undoable=False,
-                                old_img_points=None):
-        """A crown edited on one image: move its copies (same group) on the
-        images aligned with it. Records + items; with `undoable`, as sibling
-        ModifyPolygonCommands pushed by the caller's macro."""
-        if getattr(self, "_aligned_edit_busy", False) or not getattr(self, "sync_enabled", True):
-            return []
-        if not getattr(self, "view_alignment_on", True) or not filepath or not group_name:
-            return []
-        members = self._alignment_sets().members(filepath)
-        if not members:
-            return []
-        cmds = []
-        self._aligned_edit_busy = True
-        try:
-            gmap = self.all_polygons.get(group_name) or {}
-            for other in members:
-                if os.path.normcase(os.path.abspath(other)) == os.path.normcase(os.path.abspath(filepath)):
-                    continue
-                key = ModifyPolygonCommand._storage_key(self, group_name, other)
-                rec = gmap.get(key)
-                if rec is None:
-                    continue
-                fmap = self._aligned_record_map(filepath, other)
-                if fmap is None:
-                    continue
-                new_pts = [(float(x), float(y)) for x, y in fmap(img_points)]
-                ax_o, wo, ho = self._align_raw_info(other)
-                v = self.get_viewer_by_filepath(other)
-                if undoable and v is not None:
-                    old_pts = [tuple(p) for p in (rec.get("points") or [])]
-                    sc_new = self._image_to_scene_xy(v, new_pts)
-                    sc_old = self._image_to_scene_xy(v, old_pts) if old_pts else sc_new
-                    cmd = ModifyPolygonCommand(
-                        self, group_name, other, group_name,
-                        QtGui.QPolygonF([QtCore.QPointF(x, y) for x, y in sc_old]),
-                        QtGui.QPolygonF([QtCore.QPointF(x, y) for x, y in sc_new]),
-                        old_pts, new_pts, wo, ho)
-                    cmd._first_run = False          # the sibling's item must be redrawn
-                    cmds.append(cmd)
-                    continue
-                try:
-                    rec.get("points")                # a lazy record loads before the edit
-                    rec.pop("lod", None)
-                    rec.pop("display_points", None)
-                    rec["points"] = new_pts
-                    rec["coord_space"] = "image"
-                    rec["image_ref_size"] = {"w": int(wo), "h": int(ho)}
-                    rec["last_modified"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                except Exception:
-                    continue
-                if hasattr(self, "_save_specific_polygon_file"):
-                    try:
-                        self._save_specific_polygon_file(group_name, key)
-                    except Exception:
-                        pass
-                if v is not None:
-                    self._redraw_aligned_item(v, group_name, new_pts,
-                                              str(rec.get("type", "polygon") or "polygon"))
-        finally:
-            self._aligned_edit_busy = False
-        return cmds
-
-    def _redraw_aligned_item(self, viewer, group_name, img_pts, shape_type="polygon"):
-        """Replace the item of `group_name` in `viewer` with `img_pts`."""
-        try:
-            scene = viewer.scene()
-            for it in list(scene.items()):
-                if getattr(it, "name", None) == group_name and it is not getattr(viewer, "_image", None) \
-                        and (isinstance(it, EditablePolygonItem) or hasattr(it, "points")):
-                    scene.removeItem(it)
-            sc = self._image_to_scene_xy(viewer, img_pts)
-            poly = QtGui.QPolygonF([QtCore.QPointF(float(x), float(y)) for x, y in sc])
-            if shape_type == "point":
-                viewer.add_point_to_scene(poly, group_name)
-            else:
-                viewer.add_polygon_to_scene(poly, group_name)
-            try:
-                viewer.invalidate_polygon_batch()
-            except Exception:
-                pass
-            viewer.viewport().update()
-        except Exception as e:
-            logging.debug(f"[view alignment] redraw failed: {e}")
 
     def _apply_view_stretch(self, viewer):
         """Stretch to view, ENVI style, as ONE action: the bounds are computed
@@ -29658,20 +29659,9 @@ class ProjectTab(QtWidgets.QWidget):
         
         try:
              cmd = ModifyPolygonCommand(self, label, filepath, group_name, old_points, new_points, old_img_pts, new_img_pts, eff_w, eff_h)
-             # Viewer alignment: the copies on the aligned images move with it,
-             # in the same undo step.
-             sib = []
-             try:
-                 sib = self._propagate_aligned_edit(viewer, group_name, filepath, new_img_pts, undoable=True)
-             except Exception as e:
-                 logging.debug(f"[view alignment] edit propagation skipped: {e}")
-             if sib:
-                 self.undo_stack.beginMacro(f"Move '{label}' (aligned images)")
+             # Viewer alignment never moves the copies on the other images: each
+             # image keeps its own outline, fitted to its own tree.
              self.undo_stack.push(cmd)
-             for c in sib:
-                 self.undo_stack.push(c)
-             if sib:
-                 self.undo_stack.endMacro()
         except NameError:
              logging.error("ModifyPolygonCommand class not found")
 
@@ -29856,12 +29846,6 @@ class ProjectTab(QtWidgets.QWidget):
         
         # INCREMENTAL SAVE: Mark this specific entry as dirty
         self._mark_polygon_dirty(group_name, filepath)
-
-        # Viewer alignment: move the copies of this crown on the aligned images
-        try:
-            self._propagate_aligned_edit(viewer, group_name, filepath, img_points)
-        except Exception as e:
-            logging.debug(f"[view alignment] edit propagation skipped: {e}")
 
         # Check if this polygon is used as a mask, and clear caches if so
         is_mask_polygon = False

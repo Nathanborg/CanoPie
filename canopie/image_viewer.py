@@ -3621,7 +3621,8 @@ class ImageViewer(QtWidgets.QGraphicsView):
             # 3) Clamp to the native-resolution cap if fitInView overshot it.
             if native_hw and native_hw[0] and native_hw[1] and cached_pw:
                 native_h, native_w = native_hw
-                cur = self.transform().m11()
+                _t = self.transform()
+                cur = math.hypot(_t.m11(), _t.m12())
                 screen_px_per_native_px = cur * (cached_pw / float(native_w))
                 if screen_px_per_native_px > max_native_scale:
                     clamp_factor = max_native_scale / screen_px_per_native_px
@@ -3939,7 +3940,8 @@ class ImageViewer(QtWidgets.QGraphicsView):
         if not getattr(self, "_highres_enabled", False):
             return
         current_req_id = getattr(self, "_highres_request_id", 0)
-        scale = self.transform().m11()
+        _t = self.transform()
+        scale = math.hypot(_t.m11(), _t.m12())   # the zoom, also when the view is rotated
         vp = self.viewport()
         cached_size = getattr(self, '_cached_pixmap_size', None)
         if vp and cached_size and cached_size[0] > 0 and cached_size[1] > 0:
@@ -4214,7 +4216,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
         try:
             # Get current zoom factor directly from transform matrix
             tr = self.transform()
-            current_zoom = tr.m11()
+            current_zoom = math.hypot(tr.m11(), tr.m12())   # rotation-safe (viewer alignment)
             
             # Calculate the minimum zoom (fit to window) - use CACHED dimensions
             vp = self.viewport()
@@ -6475,7 +6477,8 @@ class ImageViewer(QtWidgets.QGraphicsView):
             if not self._batch_tiles:
                 return
 
-        scale = self.transform().m11() or 1.0
+        _t = self.transform()
+        scale = math.hypot(_t.m11(), _t.m12()) or 1.0
         want = scale < self._batch_scale_threshold()
         if want != getattr(self, "_batch_active", False):
             self._set_batch_active(want, items)
@@ -6638,7 +6641,8 @@ class ImageViewer(QtWidgets.QGraphicsView):
         # because changing item visibility during a paint is not allowed.
         n = len(getattr(self, "polygons", ()))
         if getattr(self, "_batch_tiles", None) or n >= self._BATCH_MIN_POLYGONS:
-            scale = self.transform().m11() or 1.0
+            _t = self.transform()
+            scale = math.hypot(_t.m11(), _t.m12()) or 1.0
             want = scale < self._batch_scale_threshold()
             # Staleness must NOT be gated on n >= _BATCH_MIN_POLYGONS. Deleting
             # every polygon takes n to 0, which under that gate reported "not
@@ -6651,6 +6655,20 @@ class ImageViewer(QtWidgets.QGraphicsView):
                 self._batch_sync_queued = True
                 QtCore.QTimer.singleShot(0, self._deferred_batch_sync)
         self._maybe_schedule_lod_refine()
+        # A view rotated by viewer alignment draws the image with smoothing.
+        # Nearest-neighbour sampling of a slightly rotated image skips or
+        # repeats a source row every 1/sin(angle) rows, which shows as
+        # horizontal bands of pixels when zoomed out. Unrotated views keep the
+        # crisp nearest-neighbour pixels, and so do rotated views zoomed in far
+        # enough that each image pixel is several screen pixels.
+        try:
+            _t = self.transform()
+            rotated = abs(_t.m12()) > 1e-9 or abs(_t.m21()) > 1e-9
+            want_smooth = bool(rotated and math.hypot(_t.m11(), _t.m12()) < 3.0)
+            if want_smooth != bool(self.renderHints() & QtGui.QPainter.SmoothPixmapTransform):
+                self.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, want_smooth)
+        except Exception:
+            pass
         super().paintEvent(event)
 
     # ---- QGIS-style on-the-fly level of detail --------------------------------
@@ -8775,52 +8793,105 @@ class _ZoomBar(QtWidgets.QFrame):
             return
         on, _tip = pt.view_alignment_state(self._view)
         v = self._view
-        m.addAction("Align viewers to this image (automatic spots)",
+        m.addAction("Align viewers to this image\u2026",
                     lambda: pt.start_view_alignment(v, manual=False))
-        m.addAction("Align with spots I click on this image\u2026",
-                    lambda: pt.start_view_alignment(v, manual=True))
         m.addSeparator()
         act = m.addAction("Use alignment")
         act.setCheckable(True)
         act.setChecked(bool(getattr(pt, "view_alignment_on", True)))
         act.toggled.connect(lambda c: pt.set_view_alignment_enabled(c))
         m.addAction("Show matches\u2026", pt.show_view_alignment_matches)
-        m.addAction("Clear alignment of this root", lambda: pt.clear_view_alignment(v))
+        m.addAction("Clear this alignment", lambda: pt.clear_view_alignment(v))
         self.sync_align_button()
 
+    # The alignment ANCHOR: where the aligned viewers look, in raw pixels of
+    # the alignment's reference image, plus the view's linear part per
+    # reference pixel. Every aligned viewer is posed from it, so the views keep
+    # the same ground even when the reference image is not shown (another
+    # root), and switching roots lands on the same tree.
+    @staticmethod
+    def _view_center_scene(v):
+        vp = v.viewport().rect()
+        tl = v.mapToScene(0, 0)
+        br = v.mapToScene(vp.width(), vp.height())
+        return ((tl.x() + br.x()) / 2.0, (tl.y() + br.y()) / 2.0)
+
+    @staticmethod
+    def _linear(tr):
+        return np.array([[tr.m11(), tr.m21()], [tr.m12(), tr.m22()]], np.float64)
+
+    #: True while a freshly loaded viewer is posed by fraction (navigation):
+    #: its view is not where the user looks, so it must not move the anchor
+    _align_anchor_frozen = False
+
     @classmethod
-    def _pose_aligned(cls, src, dst):
-        """Pose `dst` so it shows the same ground as `src` through the stored
-        alignment (centre, zoom and view rotation). False when the two
-        viewers are not aligned: the caller then uses the plain fraction."""
+    def _align_anchor_from(cls, src):
+        """Store the anchor from `src`'s current view. False when `src` is
+        not in an enabled alignment. While frozen, the anchor is kept and
+        only checked."""
+        if cls._align_anchor_frozen:
+            try:
+                pt = _find_nodata_owner(src)
+                g = pt._view_align_ground(src) if pt is not None and hasattr(pt, "_view_align_ground") else None
+                a = getattr(pt, "_view_align_anchor", None) if pt is not None else None
+                return bool(g is not None and a and a.get("sid") == g[0])
+            except Exception:
+                return False
         try:
             import sip as _sip
-            if src is None or dst is None or src is dst or _sip.isdeleted(src) or _sip.isdeleted(dst):
+            if src is None or _sip.isdeleted(src):
                 return False
             pt = _find_nodata_owner(src)
-            if pt is None or not hasattr(pt, "_view_align_scene_map") or _find_nodata_owner(dst) is not pt:
+            if pt is None or not hasattr(pt, "_view_align_ground"):
                 return False
-            fn = pt._view_align_scene_map(src, dst)
-            if fn is None:
+            g = pt._view_align_ground(src)
+            if g is None:
                 return False
-            vp = src.viewport().rect()
-            tl = src.mapToScene(0, 0)
-            br = src.mapToScene(vp.width(), vp.height())
-            c = ((tl.x() + br.x()) / 2.0, (tl.y() + br.y()) / 2.0)
+            sid, to_ref, _from_ref = g
+            c = cls._view_center_scene(src)
             tr = src.transform()
-            za = max(1e-9, math.hypot(tr.m11(), tr.m12()))
-            d = 25.0 / za
-            P = np.asarray(fn(np.array([c, (c[0] + d, c[1]), (c[0], c[1] + d)], np.float64)), np.float64)
+            d = 25.0 / max(1e-9, math.hypot(tr.m11(), tr.m12()))
+            P = np.asarray(to_ref(np.array([c, (c[0] + d, c[1]), (c[0], c[1] + d)], np.float64)), np.float64)
             if P.shape != (3, 2) or not np.all(np.isfinite(P)):
                 return False
-            J = np.column_stack(((P[1] - P[0]) / d, (P[2] - P[0]) / d))
-            LA = np.array([[tr.m11(), tr.m21()], [tr.m12(), tr.m22()]], np.float64)
-            LB = LA @ np.linalg.inv(J)
+            J = np.column_stack(((P[1] - P[0]) / d, (P[2] - P[0]) / d))      # d ref / d scene
+            L = cls._linear(tr) @ np.linalg.inv(J)                            # device per ref px
+            pt._view_align_anchor = {"sid": sid, "c": (float(P[0, 0]), float(P[0, 1])), "L": L}
+            return True
+        except Exception as e:
+            logging.debug(f"[view alignment] anchor failed: {e}")
+            return False
+
+    @classmethod
+    def _pose_from_anchor(cls, dst):
+        """Pose `dst` on the stored anchor: centre, zoom and view rotation
+        from the alignment at that place (a local fit gives each place its own
+        rotation and scale). False when `dst` is not in the anchor's set."""
+        try:
+            import sip as _sip
+            if dst is None or _sip.isdeleted(dst):
+                return False
+            pt = _find_nodata_owner(dst)
+            if pt is None or not hasattr(pt, "_view_align_ground"):
+                return False
+            a = getattr(pt, "_view_align_anchor", None)
+            g = pt._view_align_ground(dst)
+            if not a or g is None or g[0] != a["sid"]:
+                return False
+            _sid, _to_ref, from_ref = g
+            L = np.asarray(a["L"], np.float64)
+            c = a["c"]
+            d = 25.0 / max(1e-9, math.sqrt(abs(np.linalg.det(L))))
+            P = np.asarray(from_ref(np.array([c, (c[0] + d, c[1]), (c[0], c[1] + d)], np.float64)), np.float64)
+            if P.shape != (3, 2) or not np.all(np.isfinite(P)):
+                return False
+            J = np.column_stack(((P[1] - P[0]) / d, (P[2] - P[0]) / d))      # d scene / d ref
+            LB = L @ np.linalg.inv(J)
             z = math.sqrt(abs(np.linalg.det(LB)))
             th = math.atan2(LB[1, 0] - LB[0, 1], LB[0, 0] + LB[1, 1])
             cap = dst.max_zoom_factor() if hasattr(dst, "max_zoom_factor") else 50.0
             z = max(0.005, min(cap, z))
-            dst._view_rotation_deg = math.degrees(th)
+            dst._view_rotation_deg = math.degrees(th) if abs(th) > 1e-7 else 0.0
             cz, sz = z * math.cos(th), z * math.sin(th)
             dst._suppress_sync = True
             try:
@@ -8838,21 +8909,35 @@ class _ZoomBar(QtWidgets.QFrame):
             return False
 
     @classmethod
+    def _pose_aligned(cls, src, dst):
+        """Pose `dst` so it shows the same ground as `src` through the stored
+        alignment (centre, zoom and view rotation). False when the two
+        viewers are not aligned: the caller then uses the plain fraction."""
+        if src is None or dst is None or src is dst:
+            return False
+        if not cls._align_anchor_from(src):
+            return False
+        return cls._pose_from_anchor(dst)
+
+    @classmethod
     def _resync_aligned(cls, viewer):
-        """After `viewer` was posed by fraction (navigation): its alignment
-        reference, or itself when it is the reference, poses the others."""
+        """After `viewer` was posed by fraction (navigation, a fresh image):
+        pose it on the anchor when one exists for its alignment; otherwise its
+        view becomes the anchor and the aligned peers follow it."""
         try:
             pt = _find_nodata_owner(viewer)
-            if pt is None or not hasattr(pt, "_view_align_reference_viewer"):
+            if pt is None or not hasattr(pt, "_view_align_ground"):
                 return
-            ref = pt._view_align_reference_viewer(viewer)
-            if ref is None:
+            g = pt._view_align_ground(viewer)
+            if g is None:
                 return
-            if ref is viewer:
+            a = getattr(pt, "_view_align_anchor", None)
+            if a and a.get("sid") == g[0]:
+                cls._pose_from_anchor(viewer)
+                return
+            if cls._align_anchor_from(viewer):
                 for peer in pt._view_align_peer_viewers(viewer):
-                    cls._pose_aligned(viewer, peer)
-            else:
-                cls._pose_aligned(ref, viewer)
+                    cls._pose_from_anchor(peer)
         except Exception as e:
             logging.debug(f"[view alignment] resync failed: {e}")
 
@@ -8979,6 +9064,7 @@ class _ZoomBar(QtWidgets.QFrame):
                 # 1. Store the new center from source
                 cls._store_scroll_position(source_viewer)
                 center_norm = cls._fixed_center_norm
+                cls._align_anchor_from(source_viewer)   # viewer alignment: where it looks
                 
                 if not center_norm:
                     return
@@ -9091,6 +9177,7 @@ class _ZoomBar(QtWidgets.QFrame):
         if _ZoomBar._zoom_sync_enabled:
             _ZoomBar._fixed_zoom = zoom_factor
             _ZoomBar._store_scroll_position(self._view)
+            _ZoomBar._align_anchor_from(self._view)  # viewer alignment: where it looks
             
         center_norm = _ZoomBar._fixed_center_norm
         
@@ -9177,6 +9264,7 @@ class _ZoomBar(QtWidgets.QFrame):
         if cls._syncing:
             return False
         
+        cls._align_anchor_frozen = True          # viewer alignment: see _align_anchor_from
         try:
             # Apply zoom
             if hasattr(viewer, "set_zoom_factor"):
@@ -9213,11 +9301,14 @@ class _ZoomBar(QtWidgets.QFrame):
                 zb._update_label(cls._fixed_zoom)
                 if hasattr(zb, "sync_align_button"):
                     zb.sync_align_button()
+            cls._align_anchor_frozen = False
             cls._resync_aligned(viewer)
             return True
         except Exception as e:
             logging.debug(f"Failed to apply fixed zoom: {e}")
             return False
+        finally:
+            cls._align_anchor_frozen = False
 
     # ---------- auto-hide ----------
     def _do_hide(self):
