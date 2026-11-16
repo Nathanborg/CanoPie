@@ -283,6 +283,12 @@ class CanopyBrowser(QtWidgets.QWidget):
         for w in (self.prev_btn, self.slider, self.next_btn, self.page_lbl, self.cols, self.rows,
                   self.filter, self.sync, self.edit, self.save_all_btn, self.export_btn):
             bar.addWidget(w, 1 if w is self.slider else 0)
+        # A parent whose outlines are not crowns (viewer alignment's spots)
+        # hides saving and export.
+        self.allows_save = bool(getattr(self.dlg, "browser_allows_save", True))
+        if not self.allows_save:
+            self.save_all_btn.hide()
+            self.export_btn.hide()
         lay.addLayout(bar)
 
     # ---------------- entries ----------------
@@ -424,6 +430,7 @@ class CanopyBrowser(QtWidgets.QWidget):
                 st = self._saved_state(e)
                 b_save.setEnabled(e["kind"] == "target" and not e["external"]
                                   and st not in ("saved", "replaced", "browser"))
+                b_save.setVisible(self.allows_save)
                 b_rej.setEnabled(e["kind"] == "target")
                 b_grid.setEnabled(not e["external"])
                 b_save.clicked.connect(lambda _c=False, e=e: self._save(e))

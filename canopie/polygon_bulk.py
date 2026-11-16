@@ -227,6 +227,8 @@ def run_job(job, stamp=None):
       src                         -- else: the source record WITH points, or
       src_path                    -- the sidecar to read them from
       src_wh                      -- basis of the source points (w, h) fallback
+      point_map                   -- optional view_alignment point map: placed on
+                                     the same ground instead of the same fraction
       dst_wh                      -- target basis (w, h)
       root_id, coords             -- target's root id / fallback GPS
       replace                     -- an existing target sidecar is moved to trash
@@ -249,7 +251,12 @@ def run_job(job, stamp=None):
         if not isinstance(full, dict):
             raise IOError("could not read %s" % path)
     src_wh = record_basis_wh(full, job.get("src_wh"))
-    rec = copy_record(full, src_wh, job.get("dst_wh"), stamp=stamp)
+    if job.get("point_map"):
+        # viewer alignment: the same ground on an image with another grid
+        from .view_alignment import map_record
+        rec = map_record(full, job["point_map"], src_wh=src_wh, stamp=stamp)
+    else:
+        rec = copy_record(full, src_wh, job.get("dst_wh"), stamp=stamp)
     payload = sidecar_payload(rec, job["group"], job.get("root_id", "0"), job.get("coords"))
     polygon_lod.dump_sidecar(job["sidecar"], payload, remember=True)
     return lazy_meta(payload, job["group"]), trash, False

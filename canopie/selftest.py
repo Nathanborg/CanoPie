@@ -34,6 +34,7 @@ CANOPIE_MODULES = [
     "project_tab", "random_shapes_dialog", "random_shapes_generator",
     "raster_reader", "remote_images_dialog", "remote_portal", "remote_raster", "remote_tiles", "shapefile_import_dialog", "shapefile_io",
     "similarity_dialog", "spatial_index", "stretch_stats", "thumbnail_options_dialog", "utils",
+    "view_alignment", "view_alignment_dialog",
 ]
 
 

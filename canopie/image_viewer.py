@@ -3779,6 +3779,9 @@ class ImageViewer(QtWidgets.QGraphicsView):
         try:
             self.resetTransform()
             self.scale(z, z)
+            _rot = float(getattr(self, "_view_rotation_deg", 0.0) or 0.0)
+            if _rot:
+                self.rotate(_rot)
             
             # Prefer normalized center if available
             if center_norm:
@@ -3808,6 +3811,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
         finally:
             self._suppress_sync = False
             _ZoomBar._applying_fixed_zoom = False
+        _ZoomBar._resync_aligned(self)       # viewer alignment: pose the aligned peers
 
     # --- High-Resolution Dynamic Viewport Region Loading ---
     def enable_highres_viewport(self, callback=None, cancel_callback=None):
@@ -8670,6 +8674,20 @@ class _ZoomBar(QtWidgets.QFrame):
         lay.setContentsMargins(6, 4, 6, 4)  # smaller margins
         lay.setSpacing(3)  # tighter spacing
         lay.addWidget(self._btn_fix)
+        # Viewer alignment (fake registration): a very small button beside Fix
+        self._btn_align = QtWidgets.QToolButton(self)
+        self._btn_align.setObjectName("_ZoomBarAlignBtn")
+        self._btn_align.setText("\u2316")
+        self._btn_align.setCheckable(True)
+        self._btn_align.setFixedSize(20, 20)
+        self._btn_align.setStyleSheet("QToolButton#_ZoomBarAlignBtn { font-size: 13px; padding: 0px; }")
+        self._btn_align.setToolTip("Align viewers: match 5 spots and make zoom, pan and polygons of "
+                                   "images with different grids follow the same ground")
+        self._btn_align.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        self._align_menu = QtWidgets.QMenu(self._btn_align)
+        self._align_menu.aboutToShow.connect(self._build_align_menu)
+        self._btn_align.setMenu(self._align_menu)
+        lay.addWidget(self._btn_align)
         lay.addSpacing(2)
         lay.addWidget(self._btn_minus)
         lay.addWidget(self._slider)
@@ -8725,6 +8743,119 @@ class _ZoomBar(QtWidgets.QFrame):
         self._slider.sliderReleased.connect(self._start_hide_timer)
 
     # ---------- Fix button / zoom + pan sync ----------
+    # ---------- viewer alignment ----------
+    def _align_owner(self):
+        try:
+            return _find_nodata_owner(self._view)
+        except Exception:
+            return None
+
+    def sync_align_button(self):
+        pt = self._align_owner()
+        on, tip = (False, "Align viewers")
+        if pt is not None and hasattr(pt, "view_alignment_state"):
+            try:
+                on, tip = pt.view_alignment_state(self._view)
+            except Exception:
+                pass
+        b = self._btn_align.blockSignals(True)
+        try:
+            self._btn_align.setChecked(bool(on))
+        finally:
+            self._btn_align.blockSignals(b)
+        self._btn_align.setToolTip(tip)
+
+    def _build_align_menu(self):
+        m = self._align_menu
+        m.clear()
+        pt = self._align_owner()
+        if pt is None or not hasattr(pt, "start_view_alignment"):
+            a = m.addAction("Viewer alignment needs a project")
+            a.setEnabled(False)
+            return
+        on, _tip = pt.view_alignment_state(self._view)
+        v = self._view
+        m.addAction("Align viewers to this image (automatic spots)",
+                    lambda: pt.start_view_alignment(v, manual=False))
+        m.addAction("Align with spots I click on this image\u2026",
+                    lambda: pt.start_view_alignment(v, manual=True))
+        m.addSeparator()
+        act = m.addAction("Use alignment")
+        act.setCheckable(True)
+        act.setChecked(bool(getattr(pt, "view_alignment_on", True)))
+        act.toggled.connect(lambda c: pt.set_view_alignment_enabled(c))
+        m.addAction("Show matches\u2026", pt.show_view_alignment_matches)
+        m.addAction("Clear alignment of this root", lambda: pt.clear_view_alignment(v))
+        self.sync_align_button()
+
+    @classmethod
+    def _pose_aligned(cls, src, dst):
+        """Pose `dst` so it shows the same ground as `src` through the stored
+        alignment (centre, zoom and view rotation). False when the two
+        viewers are not aligned: the caller then uses the plain fraction."""
+        try:
+            import sip as _sip
+            if src is None or dst is None or src is dst or _sip.isdeleted(src) or _sip.isdeleted(dst):
+                return False
+            pt = _find_nodata_owner(src)
+            if pt is None or not hasattr(pt, "_view_align_scene_map") or _find_nodata_owner(dst) is not pt:
+                return False
+            fn = pt._view_align_scene_map(src, dst)
+            if fn is None:
+                return False
+            vp = src.viewport().rect()
+            tl = src.mapToScene(0, 0)
+            br = src.mapToScene(vp.width(), vp.height())
+            c = ((tl.x() + br.x()) / 2.0, (tl.y() + br.y()) / 2.0)
+            tr = src.transform()
+            za = max(1e-9, math.hypot(tr.m11(), tr.m12()))
+            d = 25.0 / za
+            P = np.asarray(fn(np.array([c, (c[0] + d, c[1]), (c[0], c[1] + d)], np.float64)), np.float64)
+            if P.shape != (3, 2) or not np.all(np.isfinite(P)):
+                return False
+            J = np.column_stack(((P[1] - P[0]) / d, (P[2] - P[0]) / d))
+            LA = np.array([[tr.m11(), tr.m21()], [tr.m12(), tr.m22()]], np.float64)
+            LB = LA @ np.linalg.inv(J)
+            z = math.sqrt(abs(np.linalg.det(LB)))
+            th = math.atan2(LB[1, 0] - LB[0, 1], LB[0, 0] + LB[1, 1])
+            cap = dst.max_zoom_factor() if hasattr(dst, "max_zoom_factor") else 50.0
+            z = max(0.005, min(cap, z))
+            dst._view_rotation_deg = math.degrees(th)
+            cz, sz = z * math.cos(th), z * math.sin(th)
+            dst._suppress_sync = True
+            try:
+                dst.setTransform(QtGui.QTransform(cz, sz, -sz, cz, 0.0, 0.0))
+                dst.centerOn(float(P[0, 0]), float(P[0, 1]))
+            finally:
+                dst._suppress_sync = False
+            zb = getattr(dst, "_zoombar", None)
+            if zb is not None and not _sip.isdeleted(zb):
+                zb._set_slider_from_zoom(z)
+                zb._update_label(z)
+            return True
+        except Exception as e:
+            logging.debug(f"[view alignment] pose failed: {e}")
+            return False
+
+    @classmethod
+    def _resync_aligned(cls, viewer):
+        """After `viewer` was posed by fraction (navigation): its alignment
+        reference, or itself when it is the reference, poses the others."""
+        try:
+            pt = _find_nodata_owner(viewer)
+            if pt is None or not hasattr(pt, "_view_align_reference_viewer"):
+                return
+            ref = pt._view_align_reference_viewer(viewer)
+            if ref is None:
+                return
+            if ref is viewer:
+                for peer in pt._view_align_peer_viewers(viewer):
+                    cls._pose_aligned(viewer, peer)
+            else:
+                cls._pose_aligned(ref, viewer)
+        except Exception as e:
+            logging.debug(f"[view alignment] resync failed: {e}")
+
     def _on_fix_clicked(self):
         """Toggle zoom/pan sync across all viewers."""
         _ZoomBar._zoom_sync_enabled = self._btn_fix.isChecked()
@@ -8858,6 +8989,8 @@ class _ZoomBar(QtWidgets.QFrame):
                 for viewer in cls._get_all_viewers():
                     if viewer == source_viewer:
                         continue
+                    if cls._pose_aligned(source_viewer, viewer):
+                        continue                 # aligned: the same ground
                     try:
                         img_rect = viewer._get_image_rect()
                         if not img_rect.isEmpty():
@@ -8985,6 +9118,8 @@ class _ZoomBar(QtWidgets.QFrame):
                 try:
                     if sip.isdeleted(viewer): continue
                     
+                    if _ZoomBar._pose_aligned(self._view, viewer):
+                        continue                 # aligned: the same ground
                     # Suppress sync timer to prevent infinite ping-pong loops
                     viewer._suppress_sync = True
                     try:
@@ -9076,6 +9211,9 @@ class _ZoomBar(QtWidgets.QFrame):
             if zb:
                 zb._set_slider_from_zoom(cls._fixed_zoom)
                 zb._update_label(cls._fixed_zoom)
+                if hasattr(zb, "sync_align_button"):
+                    zb.sync_align_button()
+            cls._resync_aligned(viewer)
             return True
         except Exception as e:
             logging.debug(f"Failed to apply fixed zoom: {e}")
@@ -9516,6 +9654,9 @@ def attach_zoom_bar(viewer):
         viewer.setTransformationAnchor(anchor)
         viewer.resetTransform()
         viewer.scale(z, z)
+        _rot = float(getattr(viewer, "_view_rotation_deg", 0.0) or 0.0)
+        if _rot:
+            viewer.rotate(_rot)          # viewer alignment: the view's rotation stays
         viewer.setTransformationAnchor(prev_anchor)
         if getattr(viewer, "_zoombar", None):
             viewer._zoombar.set_zoom(z)

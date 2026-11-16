@@ -1430,8 +1430,15 @@ def find_in_target(src, target_fp, target_ax=None, cfg=None, cancel=None):
         for note in (src.geo.note, tg.note):
             if note and kind == "exif":
                 res.message = (res.message + "; " if res.message else "") + note
-        A0 = local_affine(src.geo, tg, c0 - Rsrc, r0 - Rsrc, c1 + Rsrc, r1 + Rsrc)
-        geo_pts = map_px(src.geo, tg, src.raw_pts)
+        prior = cfg.get("prior_affine")
+        if prior is not None:
+            # A known map source frame -> target frame (viewer alignment's
+            # current fit): the search starts there instead of the georeference
+            A0 = np.asarray(prior, np.float64).reshape(2, 3)
+            geo_pts = src.raw_pts @ A0[:, :2].T + A0[:, 2]
+        else:
+            A0 = local_affine(src.geo, tg, c0 - Rsrc, r0 - Rsrc, c1 + Rsrc, r1 + Rsrc)
+            geo_pts = map_px(src.geo, tg, src.raw_pts)
         res.geo_pts = geo_pts
         res.extra["ax"], res.extra["frame"] = target_ax, tg
         gcx, gcy = geo_pts.mean(axis=0)

@@ -37,6 +37,8 @@ MODULE_MARKERS = {
     "canopy_finder.py":           ["polygons"],
     "canopy_finder_dialog.py":    ["polygons"],
     "canopy_finder_meta.py":      ["polygons"],
+    "view_alignment.py":          ["polygons", "viewer"],
+    "view_alignment_dialog.py":   ["polygons", "viewer"],
     "canopy_browser.py":          ["polygons"],
     "shapefile_io.py":            ["io"],
     "loaders.py":                 ["io", "viewer"],

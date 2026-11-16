@@ -532,6 +532,42 @@ The Stretch Viewer's body is a scroll area bounded by the screen (`ImageStretchD
 and its band combos are compact (`_compact_band_combo`), so a 298-band cube with long band names
 no longer makes a window several thousand pixels wide.
 
+### Viewer alignment (display-only "fake registration")
+
+Images of one root that cover the same ground on different pixel grids (orthomosaics with
+different row/col counts or resolution, a small rotation, a residual georeference error) are
+aligned for DISPLAY and POLYGONS only: nothing is resampled or reprojected.
+
+- **UI:** the tiny ⌖ button beside **Fix** on the zoom bar (`_ZoomBar._btn_align`, menu built
+  by `_build_align_menu`): align the other viewers of the root to this image (automatic spots
+  or 5 clicked spots, `view_alignment_dialog.ClickSpotsMode`), Use alignment, Show matches,
+  Clear. `AlignmentDialog` picks spots (`view_alignment.pick_spots` on the in-memory preview,
+  inside the overlap of the target footprints), matches each in every target with the canopy
+  finder's `CanopyFindWorker` (per-target `cfg` and `prior_affine` hooks in
+  `find_in_target`), fits a similarity per target (`fit_similarity`: weighted Umeyama over
+  every spot corner, leave-one-out outlier rejection), and shows the spots in `CanopyBrowser`
+  (`browser_allows_save = False`) so spots that were not found can be dragged into place,
+  then Re-fit / Re-match with this fit / Apply. Apply switches Fix on.
+- **Model:** `global.ax` → `"view_alignment": {"sets": {id: {"reference", "root", "enabled",
+  "targets": {fp: {"M", "rms_px", "rms_m", "n_used", "spots", ...}}}}}`. `M` maps reference
+  **raw file pixels** → target raw pixels (records are fractions of the post-.ax frame and
+  anisotropic after a crop; raw pixels survive later .ax edits). Any two members map through
+  the reference (`AlignmentSets.chain`). Records ↔ raw: `record_to_raw_pts` /
+  `raw_to_record_pts` through each file's `.ax` (`ax_geometry`).
+- **Views:** `_ZoomBar._pose_aligned(src, dst)` maps src's view centre and a small step
+  through `ProjectTab._view_align_scene_map` (scene → record → raw → M → raw → record →
+  scene), sets dst's zoom and view rotation from the local Jacobian
+  (`viewer._view_rotation_deg`, kept by `set_zoom_factor` / `_apply_fixed_zoom`) and centres
+  it. Used by `update_fixed_center`, `_sync_zoom_to_all_viewers`, and after navigation
+  (`_resync_aligned`). Unaligned viewers keep the fraction sync.
+- **Polygons:** `add_polygon_to_other_images` (live drawing sync), `_bulk_copy_jobs` →
+  `polygon_bulk.run_job(point_map=...)` (Replicate / Copy; never hard-linked), and edits
+  (`on_polygon_modified`, `modify_polygon_command` → `_propagate_aligned_edit`; sibling
+  `ModifyPolygonCommand`s in the same macro, so one undo reverts all) use
+  `_aligned_record_map` / `_aligned_point_map` when an enabled alignment holds both images.
+- **Not done:** a coarse pre-pass for misregistration beyond the search radius (use a larger
+  radius, or correct a few spots by hand and *Re-match with this fit*).
+
 ## Where to start for common tasks
 
 | Task | Start here |

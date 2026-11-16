@@ -572,7 +572,8 @@ class CanopyFindWorker(QtCore.QThread):
             _low_priority()
             if self._cancelled:
                 return None
-            r = CF.find_in_target(ctx, t["fp"], t.get("ax"), self.cfg, cancel=lambda: self._cancelled)
+            r = CF.find_in_target(ctx, t["fp"], t.get("ax"), dict(self.cfg, **(t.get("cfg") or {})),
+                                  cancel=lambda: self._cancelled)
             report(r, t, "in parallel")
             return r
         # `workers` searches at once, each single-threaded inside (OpenCV's own pool
@@ -654,7 +655,7 @@ class CanopyFindWorker(QtCore.QThread):
         for item in items:
             ctx, t = item
             try:
-                futs[pool.search(ctx, t["fp"], t.get("ax"), self.cfg)] = item
+                futs[pool.search(ctx, t["fp"], t.get("ax"), dict(self.cfg, **(t.get("cfg") or {})))] = item
             except Exception as e:
                 logging.warning("[canopy_finder] worker processes failed (%s): threads used", e)
                 left.append(item)
